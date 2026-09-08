@@ -32,6 +32,21 @@ impl Provider for OneAnswer {
     }
 }
 
+struct BlockingCommand {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl rness_engine::interaction::Command for BlockingCommand {
+    fn name(&self) -> &str { "blocked" }
+    fn description(&self) -> &str { "Test running command reservation" }
+    fn execute(&self, _: &SessionService, _: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
+        self.entered.lock().unwrap().take().unwrap().send(()).unwrap();
+        self.release.lock().unwrap().recv().unwrap();
+        Ok(Default::default())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     let dir = tempfile::tempdir().unwrap();
@@ -55,6 +70,35 @@ async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     assert_eq!(result.message, "hello  world");
     assert_eq!(result.data["session"], id);
     assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/broken".into()}]).is_err());
+    assert_eq!(sessions.store().history(&id).unwrap(), before);
+
+    // Pause between admission and execution: unload must not invalidate the
+    // captured handler or reinterpret the original input as a model prompt.
+    let prepared = sessions.prepare_command(&id, "/greet reserved").unwrap().unwrap();
+    let unload = tokio::time::timeout(std::time::Duration::from_secs(3), host.unload_coordinated("commands", vec![], |_| {})).await.unwrap();
+    assert!(unload.unwrap_err().contains("busy"));
+    assert!(matches!(prepared.execute(&sessions).unwrap(), rness_engine::inbox::Disposition::Command(_)));
+    assert_eq!(sessions.store().history(&id).unwrap(), before);
+
+    let cancelled = sessions.send_async(id.clone(), UserIntent::Followup, vec![ContentPart::Text { text: "/spin".into() }]);
+    sessions.cancel(&id);
+    assert!(cancelled.await.unwrap_err().to_string().contains("cancelled"));
+    assert!(!sessions.command_running(&id));
+
+    // A native handler leaves the actor free to process unload while the
+    // command is actually executing, not merely waiting for admission.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    sessions.commands().register(Arc::new(BlockingCommand {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(release_rx),
+    })).unwrap();
+    let blocked = tokio::spawn(sessions.send_async(id.clone(), UserIntent::Followup, vec![ContentPart::Text { text: "/blocked".into() }]));
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered_rx).await.unwrap().unwrap();
+    let unload = tokio::time::timeout(std::time::Duration::from_secs(3), host.unload_coordinated("commands", vec![], |_| {})).await;
+    release_tx.send(()).unwrap();
+    assert!(unload.unwrap().unwrap_err().contains("busy"));
+    blocked.await.unwrap().unwrap();
     assert_eq!(sessions.store().history(&id).unwrap(), before);
     let running = {
         let sessions = sessions.clone();

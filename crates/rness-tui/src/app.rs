@@ -29,6 +29,7 @@ pub trait Backend: Send + Sync {
         self.request(request);
         Ok(None)
     }
+    fn command_running(&self, _session: &SessionId) -> bool { false }
     fn history(&self, session: &SessionId) -> History;
     fn prepare_input(&self, _session: &SessionId, text: &str) -> Result<Option<Vec<ContentPart>>, String> {
         Ok(Some(vec![ContentPart::Text { text: text.into() }]))
@@ -300,7 +301,7 @@ impl App {
         use crate::keymaps::HostAction;
         match self.keymap.lookup(&key) {
             Some(HostAction::CancelOrQuit) => {
-                if self.model.busy {
+                if self.model.busy || self.backend.command_running(&self.model.session) {
                     vec![Action::Cancel]
                 } else {
                     vec![Action::Quit]
@@ -494,6 +495,20 @@ mod tests {
         fn history(&self, _session: &SessionId) -> History {
             self.history.clone()
         }
+    }
+
+    #[test]
+    fn ctrl_c_cancels_admitted_command_before_any_turn_frame() {
+        struct Pending;
+        impl Backend for Pending {
+            fn request(&self, _: ClientRequest) {}
+            fn command_running(&self, _: &SessionId) -> bool { true }
+            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+        }
+        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), Arc::new(Pending));
+        assert!(!app.model.busy);
+        let actions = app.route_key(KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
+        assert!(matches!(actions.as_slice(), [Action::Cancel]));
     }
 
     #[test]

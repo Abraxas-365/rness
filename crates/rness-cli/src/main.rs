@@ -694,18 +694,27 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
 }
 
 impl rness_tui::app::Backend for LocalBackend {
+    fn command_running(&self, session: &SessionId) -> bool {
+        self.sessions.command_running(session)
+    }
+
     fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         match request {
             ClientRequest::Send { session, intent, content } => {
-                if matches!(content.as_slice(), [ContentPart::Text { text }] if self.sessions.commands().resolve(text).is_some()) {
+                let prepared = match content.as_slice() {
+                    [ContentPart::Text { text }] => self.sessions.prepare_command(&session, text).map_err(|e| e.to_string())?,
+                    _ => None,
+                };
+                if let Some(command) = prepared {
                     let sessions = self.sessions.clone();
                     let tx = self.results.clone();
                     tokio::spawn(async move {
-                        let result = sessions.send_async(session.clone(), intent, content).await;
+                        let result = tokio::task::spawn_blocking(move || command.execute(&sessions)).await;
                         let message = match result {
-                            Ok(rness_engine::inbox::Disposition::Command(result)) => result.message,
-                            Ok(_) => "Command no longer available".into(),
-                            Err(error) => error.to_string(),
+                            Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => result.message,
+                            Ok(Ok(_)) => unreachable!("prepared command always returns a command result"),
+                            Ok(Err(error)) => error.to_string(),
+                            Err(error) => format!("Command failed: {error}"),
                         };
                         let _ = tx.send(rness_tui::app::Action::CommandResult(session, message));
                     });

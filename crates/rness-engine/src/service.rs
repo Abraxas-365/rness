@@ -121,6 +121,36 @@ impl Default for Live {
     }
 }
 
+/// An admitted command holds session and extension reservations even before execution.
+/// Dropping it (including during unwinding) releases both reservations.
+pub struct PreparedCommand {
+    live: Arc<Live>,
+    _activity: tokio::sync::OwnedRwLockReadGuard<()>,
+    command: Arc<dyn crate::interaction::Command>,
+    session: SessionId,
+    raw_input: String,
+    cancel: CancellationToken,
+}
+
+impl PreparedCommand {
+    pub fn execute(self, service: &SessionService) -> Result<Disposition, ServiceError> {
+        if self.cancel.is_cancelled() {
+            return Err(ServiceError::InvalidConfig("command cancelled".into()));
+        }
+        self.command.execute(service, crate::interaction::CommandInvocation {
+            session: &self.session,
+            raw_input: &self.raw_input,
+            cancel: self.cancel.clone(),
+        }).map(Disposition::Command)
+    }
+}
+
+impl Drop for PreparedCommand {
+    fn drop(&mut self) {
+        *self.live.command.lock().unwrap() = None;
+    }
+}
+
 // -- the service -----------------------------------------------------------
 
 pub type ProviderResolver = dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>, String> + Send + Sync;
@@ -486,20 +516,8 @@ impl SessionService {
         content: Vec<ContentPart>,
     ) -> Result<Disposition, ServiceError> {
         if let [ContentPart::Text { text }] = content.as_slice() {
-            if let Some((command, offset)) = self.commands.resolve(text) {
-                self.store.workspace(session)?;
-                let live = self.live(session);
-                let mut active = live.command.lock().unwrap();
-                if active.is_some() || self.phase(session) != crate::inbox::Phase::Idle {
-                    return Err(ServiceError::Busy);
-                }
-                let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
-                let cancel = CancellationToken::new();
-                *active = Some(cancel.clone());
-                drop(active);
-                let result = command.execute(self, crate::interaction::CommandInvocation { session, raw_input: &text[offset..], cancel });
-                *live.command.lock().unwrap() = None;
-                return result.map(Disposition::Command);
+            if let Some(command) = self.prepare_command(session, text)? {
+                return command.execute(self);
             }
         }
         let workspace = self.store.workspace(session)?.map(std::path::PathBuf::from);
@@ -573,12 +591,40 @@ impl SessionService {
         Ok(disposition)
     }
 
-    /// Cancel the running burst. The current step commits an attempt and
-    /// the turn ends `cancelled`; queued followups stay queued.
-    pub async fn send_async(self: &Arc<Self>, session: SessionId, intent: UserIntent, content: Vec<ContentPart>) -> Result<Disposition, ServiceError> {
+    /// Resolve and reserve synchronously, before handing work to a scheduler.
+    /// The lifecycle guard prevents unload between lookup and execution.
+    pub fn prepare_command(&self, session: &SessionId, text: &str) -> Result<Option<PreparedCommand>, ServiceError> {
+        let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let Some((command, offset)) = self.commands.resolve(text) else { return Ok(None); };
+        self.store.workspace(session)?;
+        let live = self.live(session);
+        let mut active = live.command.lock().unwrap();
+        if active.is_some() || self.phase(session) != Phase::Idle {
+            return Err(ServiceError::Busy);
+        }
+        let cancel = CancellationToken::new();
+        *active = Some(cancel.clone());
+        drop(active);
+        Ok(Some(PreparedCommand {
+            live, _activity: activity, command, session: session.clone(),
+            raw_input: text[offset..].to_owned(), cancel,
+        }))
+    }
+
+    /// Admission happens when called, not when the returned future is polled.
+    pub fn send_async(self: &Arc<Self>, session: SessionId, intent: UserIntent, content: Vec<ContentPart>) -> impl std::future::Future<Output = Result<Disposition, ServiceError>> + Send + 'static {
+        let prepared = match content.as_slice() {
+            [ContentPart::Text { text }] => self.prepare_command(&session, text),
+            _ => Ok(None),
+        };
         let service = Arc::clone(self);
-        tokio::task::spawn_blocking(move || service.send(&session, intent, content)).await
-            .map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?
+        async move {
+            let prepared = prepared?;
+            tokio::task::spawn_blocking(move || match prepared {
+                Some(command) => command.execute(&service),
+                None => service.send(&session, intent, content),
+            }).await.map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?
+        }
     }
 
     pub fn command_running(&self, session: &SessionId) -> bool {

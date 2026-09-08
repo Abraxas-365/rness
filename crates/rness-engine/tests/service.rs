@@ -56,6 +56,66 @@ async fn workspace_survives_resume_and_controls_instructions_and_input() {
     assert!(resumed.create(Some(project.path().join("missing").to_string_lossy().into_owned())).is_err());
 }
 
+struct PanicCommand;
+impl rness_engine::interaction::Command for PanicCommand {
+    fn name(&self) -> &str { "panic" }
+    fn description(&self) -> &str { "Test unwinding" }
+    fn execute(&self, _: &SessionService, _: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
+        panic!("handler panic");
+    }
+}
+
+#[tokio::test]
+async fn command_admission_cancellation_drop_and_panic_release_reservations() {
+    let logs = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![]);
+    let service = Arc::new(SessionService::new(SessionStore::new(logs.path()), provider.clone(), Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default())));
+    service.commands().register(Arc::new(PanicCommand)).unwrap();
+    let id = service.create(None).unwrap();
+    let before = service.store().history(&id).unwrap();
+    let input = || vec![ContentPart::Text { text: "/panic".into() }];
+
+    let pending = service.send_async(id.clone(), UserIntent::Followup, input());
+    assert!(service.command_running(&id));
+    assert!(service.try_extension_maintenance().is_err());
+    assert!(service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "must not start".into() }]).is_err());
+    service.cancel(&id);
+    assert!(pending.await.unwrap_err().to_string().contains("cancelled"));
+    assert!(!service.command_running(&id));
+
+    let abandoned = service.send_async(id.clone(), UserIntent::Followup, input());
+    drop(abandoned);
+    assert!(!service.command_running(&id));
+    assert!(service.try_extension_maintenance().is_ok());
+
+    let error = service.send_async(id.clone(), UserIntent::Followup, input()).await.unwrap_err();
+    assert!(error.to_string().contains("panic"));
+    assert!(!service.command_running(&id));
+    assert!(service.try_extension_maintenance().is_ok());
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.send(&id, UserIntent::Followup, input()))).is_err());
+    assert!(!service.command_running(&id));
+    assert!(service.try_extension_maintenance().is_ok());
+    assert_eq!(service.store().history(&id).unwrap(), before);
+    assert!(provider.seen().is_empty());
+    assert!(matches!(service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "/help".into() }]).unwrap(), Disposition::Command(_)));
+}
+
+#[tokio::test]
+async fn active_turn_rejects_command_admission_without_losing_cancellation() {
+    let logs = tempfile::tempdir().unwrap();
+    let provider = Scripted::gated(vec![], Arc::new(tokio::sync::Semaphore::new(0)));
+    let service = Arc::new(SessionService::new(SessionStore::new(logs.path()), provider, Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default())));
+    let id = service.create(None).unwrap();
+    service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "turn".into() }]).unwrap();
+    assert!(matches!(service.prepare_command(&id, "/help"), Err(rness_engine::service::ServiceError::Busy)));
+    assert!(!service.command_running(&id));
+    assert!(service.try_extension_maintenance().is_err());
+    service.cancel(&id);
+    tokio::time::timeout(std::time::Duration::from_secs(3), service.join(&id)).await.unwrap();
+    assert!(service.prepare_command(&id, "/help").unwrap().is_some());
+    assert!(service.try_extension_maintenance().is_ok());
+}
+
 // -- fakes -----------------------------------------------------------------
 
 fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> AssistantMessage {

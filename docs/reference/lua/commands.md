@@ -27,7 +27,11 @@ Names must start with a lowercase letter and contain lowercase letters, digits, 
 
 ## Execution and cancellation
 
-TUI commands and HTTP submissions dispatch through `SessionService::send_async`, keeping frontend/runtime threads free while the Lua actor runs the handler. Rust handlers execute on a blocking worker and receive a cancellation token. Rust integrations must poll or await that token themselves. The synchronous `send` entry point remains available for synchronous callers.
+TUI commands use `SessionService::prepare_command` before scheduling the captured handler on a blocking worker. HTTP submissions use `SessionService::send_async`, which reserves recognized commands synchronously when called, before its returned future is polled. Neither path reinterprets an admitted command as a model prompt. Rust handlers receive a cancellation token and must poll it themselves. The synchronous `send` entry point remains available for synchronous callers.
+
+Admission reserves both the session and extension lifecycle before execution is scheduled. Canceling at this point prevents the callback from starting; Ctrl+C in the TUI cancels admitted commands even without a model turn. Dropping an unpolled submission or prepared command releases its reservations. Handler errors and unwinding panics also release reservations; blocking-worker panics become frontend errors. Dropping a future after the blocking worker has started does not stop that worker: use session cancellation.
+
+Coordinated unload cannot remove a plugin while an admitted command holds its reservation. When the actor processes such an unload request, it returns busy without changing registrations. The Lua actor processes requests serially, so an unload queued behind a running Lua callback waits for that callback to exit before checking the reservation; it may then succeed or return busy. Retry busy unloads after command completion.
 
 Only one command runs per session. Another command or model submission is rejected while it runs. A command is rejected during an active model turn. Extension maintenance cannot acquire its reservation while a command executes. Cancellation uses the ordinary session cancel operation; Lua instruction hooks interrupt Lua execution, including infinite Lua loops. The execution reservation remains held until the handler exits.
 
