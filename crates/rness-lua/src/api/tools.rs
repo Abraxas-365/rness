@@ -9,18 +9,22 @@ use crate::runtime::LuaToolSpec;
 /// Adapter: one Lua tool as an engine tool. Registered into the
 /// composition root's ToolRegistry like any built-in.
 pub struct LuaTool {
+    context: serde_json::Value,
     spec: LuaToolSpec,
     host: LuaHost,
 }
 
 impl LuaTool {
     pub fn new(spec: LuaToolSpec, host: LuaHost) -> Self {
-        Self { spec, host }
+        Self { spec, host, context: serde_json::json!({}) }
     }
 }
 
 #[async_trait::async_trait]
 impl Tool for LuaTool {
+    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<std::sync::Arc<dyn Tool>> {
+        Some(std::sync::Arc::new(Self { spec: self.spec.clone(), host: self.host.clone(), context: serde_json::json!({"session": session, "workspace":workspace}) }))
+    }
     fn name(&self) -> &str {
         &self.spec.name
     }
@@ -38,7 +42,7 @@ impl Tool for LuaTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
-        self.host.call_tool(&self.spec.name, args).await
+        self.host.call_tool_context(&self.spec.name, args, self.context.clone()).await
     }
 }
 

@@ -43,6 +43,7 @@ pub struct LuaRuntime {
     /// None = unbind. The host recomputes stock+binds on every sync.
     keymap_binds: Vec<(String, Option<String>, Option<String>)>,
     registration_owners: HashMap<(&'static str, String), String>,
+    command_metadata: HashMap<String, (String, Vec<(String, String)>)>,
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
 }
@@ -84,6 +85,7 @@ impl LuaRuntime {
             tool_cards: HashMap::new(),
             keymap_binds: Vec::new(),
             registration_owners: HashMap::new(),
+            command_metadata: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
         })
@@ -133,6 +135,12 @@ impl LuaRuntime {
 
     /// Remove a loaded chunk's current VM registrations, without restoring
     /// implementations it replaced. Hosts must reconcile their own caches.
+    pub(crate) fn lua(&self) -> &Lua { &self.lua }
+
+    pub fn command_metadata(&self, name: &str) -> (String, Vec<(String, String)>) {
+        self.command_metadata.get(name).cloned().unwrap_or_default()
+    }
+
     pub fn command_specs(&self) -> Vec<(String, String)> {
         self.commands.iter().map(|(name, (description, _))| (name.clone(), description.clone())).collect()
     }
@@ -168,6 +176,7 @@ impl LuaRuntime {
         for (category, key) in owned {
             match category {
                 "commands" => {
+                    self.command_metadata.remove(&key);
                     if let Some((_, callback)) = self.commands.remove(&key) {
                         self.lua.remove_registry_value(callback)?;
                     }
@@ -279,12 +288,16 @@ impl LuaRuntime {
         name: &str,
         args: &serde_json::Value,
     ) -> Result<Result<String, String>, LuaError> {
+        self.call_tool_context(name, args, &serde_json::json!({}))
+    }
+
+    pub fn call_tool_context(&self, name: &str, args: &serde_json::Value, context: &serde_json::Value) -> Result<Result<String, String>, LuaError> {
         let Some((_, key)) = self.tools.get(name) else {
             return Err(LuaError::UnknownTool(name.to_string()));
         };
         let f: Function = self.lua.registry_value(key)?;
         let lua_args = self.lua.to_value(args)?;
-        match f.call::<LuaValue>(lua_args) {
+        match f.call::<LuaValue>((lua_args, self.lua.to_value(context)?)) {
             Ok(LuaValue::Nil) => Ok(Ok(String::new())),
             Ok(v) => Ok(Ok(lua_display(&self.lua, v)?)),
             Err(e) => Ok(Err(user_message(&e))),
@@ -408,6 +421,8 @@ impl LuaRuntime {
             let name: String = entry.get("name")?;
             let run: Function = entry.get("run")?;
             let key = self.lua.create_registry_value(run)?;
+            let arguments: LuaValue = entry.get("arguments")?;
+            self.command_metadata.insert(name.clone(), (entry.get("usage")?, self.lua.from_value(arguments)?));
             self.commands.insert(name.clone(), (entry.get("description")?, key));
             if let Some(owner) = owner {
                 self.registration_owners.insert(("commands", name), owner.to_owned());
@@ -560,13 +575,17 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         let name: String = spec.get("name")?;
         if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
             || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
-            || ["agent", "skill", "unload", "colorscheme"].contains(&name.as_str()) {
+            || ["agent", "help", "skill", "unload", "colorscheme"].contains(&name.as_str()) {
             return Err(mlua::Error::runtime("invalid or reserved command name"));
         }
         if names.contains_key(name.as_str())? { return Err(mlua::Error::runtime("command already registered")); }
         let entry = lua.create_table()?;
         entry.set("name", name.clone())?;
         entry.set("description", spec.get::<Option<String>>("description")?.unwrap_or_default())?;
+        entry.set("usage", spec.get::<Option<String>>("usage")?.unwrap_or_default())?;
+        let arguments = spec.get::<Option<Table>>("arguments")?.map(|table| table.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()).transpose()?.unwrap_or_default();
+        let arguments: Vec<_> = arguments.into_iter().map(|value| (value, String::new())).collect();
+        entry.set("arguments", lua.to_value(&arguments)?)?;
         entry.set("run", owned_callback(lua, spec.get::<Function>("run")?)?)?;
         let pending: Table = lua.globals().get("__rness_pending")?;
         pending.get::<Table>("commands")?.push(entry)?;

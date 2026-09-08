@@ -60,7 +60,7 @@ pub struct UnloadSnapshot {
 }
 
 enum Cmd {
-    Command { name: String, context: serde_json::Value, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
+    Command { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
     CoordinatedUnload {
         name: String,
@@ -81,6 +81,7 @@ enum Cmd {
         reply: tokio::sync::oneshot::Sender<Vec<LuaToolSpec>>,
     },
     CallTool {
+        context: serde_json::Value,
         name: String,
         args: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
@@ -142,12 +143,16 @@ pub struct LuaHost {
 
 struct LuaCommand {
     name: String,
+    usage: String,
+    arguments: Vec<(String, String)>,
     description: String,
     tx: std::sync::Weak<mpsc::Sender<Cmd>>,
 }
 
 impl rness_engine::interaction::Command for LuaCommand {
     fn name(&self) -> &str { &self.name }
+    fn usage(&self) -> &str { &self.usage }
+    fn arguments(&self) -> Vec<(String, String)> { self.arguments.clone() }
     fn description(&self) -> &str { &self.description }
     fn execute(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
         use rness_engine::service::ServiceError;
@@ -156,7 +161,7 @@ impl rness_engine::interaction::Command for LuaCommand {
         }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
-        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), reply })
+        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), cancel: input.cancel, reply })
             .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
         receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
             .map_err(ServiceError::InvalidConfig)
@@ -172,7 +177,8 @@ fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak
     });
     for (name, description) in specs {
         if installed.iter().any(|c| c.name() == name) { continue; }
-        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, description, tx: tx.clone() });
+        let (usage, arguments) = rt.command_metadata(&name);
+        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, usage, arguments, description, tx: tx.clone() });
         binding.sessions.commands().register(command.clone())?;
         installed.push(command);
     }
@@ -225,7 +231,15 @@ impl LuaHost {
                 let mut session_binding: Option<SessionBinding> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        Cmd::Command { name, context, reply } => { let _ = reply.send(rt.call_command(&name, context)); }
+                        Cmd::Command { name, context, cancel, reply } => {
+                            let token = cancel.clone();
+                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                                if token.is_cancelled() { Err(mlua::Error::runtime("command cancelled")) } else { Ok(mlua::VmState::Continue) }
+                            });
+                            let result = if cancel.is_cancelled() { Err("command cancelled".into()) } else { rt.call_command(&name, context) };
+                            rt.lua().remove_hook();
+                            let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
+                        }
                         Cmd::Load { name, source, reply } => {
                             let r = rt.load(&name, &source).map_err(|e| e.to_string()).and_then(|()| {
                                 if let Some(binding) = &session_binding {
@@ -273,8 +287,8 @@ impl LuaHost {
                         Cmd::ToolSpecs { reply } => {
                             let _ = reply.send(rt.tool_specs());
                         }
-                        Cmd::CallTool { name, args, reply } => {
-                            let r = match rt.call_tool(&name, &args) {
+                        Cmd::CallTool { name, args, context, reply } => {
+                            let r = match rt.call_tool_context(&name, &args, &context) {
                                 Ok(r) => r,
                                 Err(e) => Err(e.to_string()),
                             };
@@ -422,9 +436,13 @@ impl LuaHost {
     }
 
     pub async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
+        self.call_tool_context(name, args, serde_json::json!({})).await
+    }
+
+    pub async fn call_tool_context(&self, name: &str, args: serde_json::Value, context: serde_json::Value) -> Result<String, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::CallTool { name: name.into(), args, reply })
+            .send(Cmd::CallTool { name: name.into(), args, context, reply })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }

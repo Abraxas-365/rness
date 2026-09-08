@@ -40,11 +40,14 @@ async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
     host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "fake-1".into()).await.unwrap();
     host.load("commands", r#"
-        rness.commands.register{name='greet', description='Greet', run=function(ctx)
+        rness.commands.register{name='greet', description='Greet', usage='<name>', arguments={'world', 'team'}, run=function(ctx)
             return {message='hello' .. ctx.raw_input, data={session=ctx.session}}
         end}
+        rness.commands.register{name='spin', run=function() while true do end end}
         rness.commands.register{name='broken', run=function() error('command failed') end}
     "#).await.unwrap();
+    assert!(sessions.commands().help("greet").unwrap().message.contains("<name>"));
+    assert!(sessions.commands().completions().iter().any(|(name, _)| name == "greet world"));
     let id = sessions.create(None).unwrap();
     let before = sessions.store().history(&id).unwrap();
     let result = sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/greet  world".into()}]).unwrap();
@@ -53,6 +56,23 @@ async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     assert_eq!(result.data["session"], id);
     assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/broken".into()}]).is_err());
     assert_eq!(sessions.store().history(&id).unwrap(), before);
+    let running = {
+        let sessions = sessions.clone();
+        let id = id.clone();
+        tokio::spawn(async move { sessions.send_async(id, UserIntent::Followup, vec![ContentPart::Text{text:"/spin".into()}]).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if sessions.command_running(&id) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"model prompt".into()}]).is_err());
+    assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/greet".into()}]).is_err());
+    sessions.cancel(&id);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), running).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    assert!(sessions.try_extension_maintenance().is_ok());
     assert!(host.unload_coordinated("commands", vec![], |_| {}).await.unwrap());
     assert!(sessions.commands().resolve("/greet").is_none());
     assert!(sessions.commands().resolve("/agent").is_some());

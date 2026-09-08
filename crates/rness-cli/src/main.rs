@@ -659,6 +659,7 @@ fn print_parts(who: &str, parts: &[ContentPart]) {
 
 /// In-process protocol backend: the TUI sees ClientRequest/History only.
 struct LocalBackend {
+    results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
 }
 
@@ -696,6 +697,20 @@ impl rness_tui::app::Backend for LocalBackend {
     fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         match request {
             ClientRequest::Send { session, intent, content } => {
+                if matches!(content.as_slice(), [ContentPart::Text { text }] if self.sessions.commands().resolve(text).is_some()) {
+                    let sessions = self.sessions.clone();
+                    let tx = self.results.clone();
+                    tokio::spawn(async move {
+                        let result = sessions.send_async(session.clone(), intent, content).await;
+                        let message = match result {
+                            Ok(rness_engine::inbox::Disposition::Command(result)) => result.message,
+                            Ok(_) => "Command no longer available".into(),
+                            Err(error) => error.to_string(),
+                        };
+                        let _ = tx.send(rness_tui::app::Action::CommandResult(session, message));
+                    });
+                    return Ok(Some("Command running".into()));
+                }
                 match self.sessions.send(&session, intent, content).map_err(|e| e.to_string())? {
                     rness_engine::inbox::Disposition::Command(result) => Ok(Some(if result.message.is_empty() { "Command completed".into() } else { result.message })),
                     _ => Ok(None),
@@ -901,14 +916,14 @@ async fn run_tui(
     // Initial hydration: continued sessions may already hold tool results.
     let _ = card_tx.send(session.clone());
 
-    let backend = Arc::new(LocalBackend { sessions: Arc::clone(&sessions) });
+    let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
+    let backend = Arc::new(LocalBackend { sessions: Arc::clone(&sessions), results: host_tx.clone() });
 
     // Drive view/key round-trips for the mounted apps from a host task.
     // The TUI stays Lua-agnostic — it renders published lines and
     // forwards keys.
     let (app_ev_tx, mut app_ev_rx) = tokio::sync::mpsc::unbounded_channel();
     apps_state.connect(app_ev_tx);
-    let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
     let plugin_catalog_task = {
         let lua = lua.clone();
         let tx = host_tx.clone();
@@ -932,7 +947,7 @@ async fn run_tui(
                     }
                     previous_session = Some(session);
                 }
-                let commands = sessions.commands().catalog();
+                let commands = sessions.commands().completions();
                 if previous_commands.as_ref() != Some(&commands) {
                     if tx.send(rness_tui::app::Action::Custom("input:commands".into(), serde_json::json!(commands))).is_err() { break; }
                     previous_commands = Some(commands);

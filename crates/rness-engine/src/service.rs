@@ -102,6 +102,7 @@ impl Event for FrameEv {
 // -- live session state ----------------------------------------------------
 
 struct Live {
+    command: Mutex<Option<CancellationToken>>,
     inbox: Mutex<Inbox>,
     /// Token of the current (or last) burst. Replaced on each new burst.
     cancel: Mutex<CancellationToken>,
@@ -112,6 +113,7 @@ struct Live {
 impl Default for Live {
     fn default() -> Self {
         Self {
+            command: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             cancel: Mutex::new(CancellationToken::new()),
             handle: Mutex::new(None),
@@ -238,6 +240,7 @@ impl SessionService {
             default_workspace: Mutex::new(None),
             commands: {
                 let commands = crate::interaction::CommandRegistry::default();
+                commands.register(Arc::new(crate::interaction::HelpCommand)).expect("built-in command");
                 commands.register(Arc::new(crate::interaction::AgentCommand)).expect("built-in command");
                 commands
             },
@@ -485,12 +488,18 @@ impl SessionService {
         if let [ContentPart::Text { text }] = content.as_slice() {
             if let Some((command, offset)) = self.commands.resolve(text) {
                 self.store.workspace(session)?;
-                if self.phase(session) != crate::inbox::Phase::Idle {
+                let live = self.live(session);
+                let mut active = live.command.lock().unwrap();
+                if active.is_some() || self.phase(session) != crate::inbox::Phase::Idle {
                     return Err(ServiceError::Busy);
                 }
                 let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
-                let result = command.execute(self, crate::interaction::CommandInvocation { session, raw_input: &text[offset..] })?;
-                return Ok(Disposition::Command(result));
+                let cancel = CancellationToken::new();
+                *active = Some(cancel.clone());
+                drop(active);
+                let result = command.execute(self, crate::interaction::CommandInvocation { session, raw_input: &text[offset..], cancel });
+                *live.command.lock().unwrap() = None;
+                return result.map(Disposition::Command);
             }
         }
         let workspace = self.store.workspace(session)?.map(std::path::PathBuf::from);
@@ -506,6 +515,8 @@ impl SessionService {
         };
         let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
+        let command = live.command.lock().unwrap();
+        if command.is_some() { return Err(ServiceError::Busy); }
         let mut inbox = live.inbox.lock().unwrap();
         let (intent, disposition) = inbox.submit(intent, content.clone());
         match &disposition {
@@ -564,7 +575,18 @@ impl SessionService {
 
     /// Cancel the running burst. The current step commits an attempt and
     /// the turn ends `cancelled`; queued followups stay queued.
+    pub async fn send_async(self: &Arc<Self>, session: SessionId, intent: UserIntent, content: Vec<ContentPart>) -> Result<Disposition, ServiceError> {
+        let service = Arc::clone(self);
+        tokio::task::spawn_blocking(move || service.send(&session, intent, content)).await
+            .map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?
+    }
+
+    pub fn command_running(&self, session: &SessionId) -> bool {
+        self.live(session).command.lock().unwrap().is_some()
+    }
+
     pub fn cancel(&self, session: &SessionId) {
+        if let Some(token) = self.live(session).command.lock().unwrap().as_ref() { token.cancel(); }
         self.live(session).cancel.lock().unwrap().cancel();
     }
 

@@ -15,6 +15,27 @@ use rness_lua::plugin_host::LuaHost;
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn custom_tools_receive_session_workspace_without_chdir() {
+    let host = LuaHost::spawn().unwrap();
+    host.load("context", "rness.tool.register{name='where', run=function(args, ctx) return ctx.session .. ':' .. ctx.workspace end}").await.unwrap();
+    let registry = ToolRegistry::default();
+    rness_lua::api::tools::sync_lua_tools(&registry, &host, &[]).await;
+    let a = registry.for_workspace(&"a".into(), std::path::Path::new("/project-a"));
+    let b = registry.for_workspace(&"b".into(), std::path::Path::new("/project-b"));
+    assert_eq!(a.get("where").unwrap().execute(serde_json::json!({})).await.unwrap(), "a:/project-a");
+    assert_eq!(b.get("where").unwrap().execute(serde_json::json!({})).await.unwrap(), "b:/project-b");
+}
+
+#[test]
+fn command_example_registers_help_and_arguments() {
+    let mut runtime = rness_lua::runtime::LuaRuntime::new().unwrap();
+    runtime.load("commands", include_str!("../../../examples/plugins/commands.lua")).unwrap();
+    let result = runtime.call_command("project", serde_json::json!({"session":"s", "workspace":"/project", "raw_input":" path"})).unwrap();
+    assert_eq!(result.message, "/project");
+    assert_eq!(runtime.command_metadata("project").1.len(), 2);
+}
+
 struct NativeText;
 
 #[async_trait]

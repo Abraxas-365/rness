@@ -166,7 +166,7 @@ async fn resolve_approval(
 async fn request(State(s): State<ServerState>, Json(req): Json<ClientRequest>) -> Response {
     match req {
         ClientRequest::Send { session, intent, content } => {
-            match s.sessions.send(&session, intent, content) {
+            match s.sessions.send_async(session, intent, content).await {
                 Ok(outcome) => {
                     let status = match outcome {
                         rness_engine::inbox::Disposition::Command(result) => return Json(json!({"status":"command", "result":result})).into_response(),

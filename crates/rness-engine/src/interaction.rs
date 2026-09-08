@@ -19,11 +19,14 @@ pub struct CommandInvocation<'a> {
     pub session: &'a SessionId,
     /// Original arguments, including separator whitespace.
     pub raw_input: &'a str,
+    pub cancel: tokio_util::sync::CancellationToken,
 }
 
 pub trait Command: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn usage(&self) -> &str { "" }
+    fn arguments(&self) -> Vec<(String, String)> { Vec::new() }
     fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError>;
 }
 
@@ -62,6 +65,25 @@ impl CommandRegistry {
             .map(|c| (c.name().to_owned(), c.description().to_owned())).collect()
     }
 
+    pub fn completions(&self) -> Vec<(String, String)> {
+        let commands: Vec<_> = self.commands.read().expect("command registry lock").values().cloned().collect();
+        commands.into_iter().flat_map(|command| {
+            let mut items = vec![(command.name().to_owned(), command.description().to_owned())];
+            items.extend(command.arguments().into_iter().map(|(value, description)| (format!("{} {value}", command.name()), description)));
+            items
+        }).collect()
+    }
+
+    pub fn help(&self, name: &str) -> Result<CommandResult, ServiceError> {
+        let commands = self.commands.read().expect("command registry lock");
+        let selected: Vec<_> = if name.is_empty() { commands.values().cloned().collect() } else {
+            vec![commands.get(name).cloned().ok_or_else(|| ServiceError::InvalidConfig(format!("unknown command: {name}")))?]
+        };
+        drop(commands);
+        let message = selected.iter().map(|c| format!("/{} {} — {}", c.name(), c.usage(), c.description())).collect::<Vec<_>>().join("\n");
+        Ok(CommandResult { message, ..Default::default() })
+    }
+
     pub fn resolve(&self, text: &str) -> Option<(Arc<dyn Command>, usize)> {
         let input = text.strip_prefix('/')?;
         let end = input.find(char::is_whitespace).unwrap_or(input.len());
@@ -90,6 +112,16 @@ mod tests {
         assert!(!registry.unregister_if_current(&other));
         assert!(registry.unregister_if_current(&original));
         assert!(registry.resolve("/agent").is_none());
+    }
+}
+
+pub struct HelpCommand;
+impl Command for HelpCommand {
+    fn name(&self) -> &str { "help" }
+    fn description(&self) -> &str { "List commands or show command usage" }
+    fn usage(&self) -> &str { "[command]" }
+    fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
+        service.commands().help(invocation.raw_input.trim().trim_start_matches('/'))
     }
 }
 

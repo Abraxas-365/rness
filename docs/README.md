@@ -20,6 +20,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Configure and switch colors | [Colorschemes](guides/configuration/colorschemes.md) |
 | Install Lua packages | [Plugin packages](guides/plugins/packages.md) |
 | Load and unload plugins | [Plugin lifecycle](guides/plugins/loading-and-lifecycle.md) |
+| Register commands and use session context | [Lua commands](reference/lua/commands.md) |
 | Write native extensions | [Native extension contracts](contributing/native-extensions.md) |
 | Contribute to the codebase | [Contributor documentation](contributing/README.md) |
 

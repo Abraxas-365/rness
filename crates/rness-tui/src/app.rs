@@ -211,6 +211,7 @@ pub enum Action {
     /// mounted component. How Lua/plugin components talk to each other
     /// without extending this enum.
     Custom(String, serde_json::Value),
+    CommandResult(SessionId, String),
     Notice(String),
     /// Point the TUI at another session: model resets and rehydrates
     /// from that session's durable history.
@@ -371,6 +372,9 @@ impl App {
                 if let Some(pending) = self.model.pending_approval.take() {
                     let _ = pending.respond.send(decision);
                 }
+            }
+            Action::CommandResult(session, message) => {
+                if session == self.model.session { self.model.entries.push(Entry::Notice(message)); }
             }
             Action::Notice(text) => self.model.entries.push(Entry::Notice(text)),
             Action::Custom(name, payload) => {
