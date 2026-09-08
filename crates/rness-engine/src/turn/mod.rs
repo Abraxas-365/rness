@@ -1,0 +1,229 @@
+//! The turn loop: one user intent driven to completion.
+//!
+//! Contract (each stage observable via kernel events, docs §4):
+//!   turn/start → [ pre-step → request → stream → commit → tools ]* → turn/end
+//!
+//! - Before every step: drain steers from the inbox (committed as
+//!   user/message steer events — the model sees them next request).
+//! - Every request input is derived by replay (invariant #1 checked).
+//! - A stream that dies is committed as assistant/attempt (invariant #5)
+//!   and retried up to `max_retries` if the provider says retryable.
+//! - Cancellation commits an attempt + turn/ended(cancelled). Committed
+//!   prior steps stay — cancellation never un-happens anything.
+//! - Tool calls run through the registry (parallel, model-order commits).
+
+pub mod provider;
+
+use rness_protocol::events::{
+    AssistantAttempt, AttemptOutcome, ContentPart, SessionEvent, StopReason, TurnOutcome,
+    UserMessage,
+};
+use rness_protocol::frames::Frame;
+use tokio_util::sync::CancellationToken;
+
+use crate::inbox::Pending;
+use crate::session::log::SessionLog;
+use crate::session::replay::{replay, ReplayError};
+use crate::session::branch::SessionStore;
+use crate::tools::{ToolCall, ToolRegistry};
+use provider::{Provider, StepOutcome, StepRequest};
+
+/// Live frame observer for one turn (invariant #9: ephemeral, never
+/// persisted). Frontends attach via the service layer; headless runs
+/// pass a no-op.
+pub type FrameSink<'a> = dyn Fn(Frame) + Send + Sync + 'a;
+
+#[derive(Debug, thiserror::Error)]
+pub enum TurnError {
+    #[error(transparent)]
+    Replay(#[from] ReplayError),
+    #[error(transparent)]
+    Log(#[from] crate::session::log::LogError),
+    #[error("model failed after {attempts} attempts: {last}")]
+    ModelExhausted { attempts: u32, last: String },
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnConfig {
+    pub max_retries: u32,
+    pub max_tool_concurrency: usize,
+    /// Safety valve: maximum steps (model requests) per turn.
+    pub max_steps: u32,
+    /// System prompt sent with every request.
+    pub system: String,
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            max_tool_concurrency: 4,
+            max_steps: 50,
+            system: String::new(),
+        }
+    }
+}
+
+/// Steers pulled at step boundaries. Supplied by the service layer;
+/// a closure keeps the loop testable without a full inbox/service.
+pub type SteerSource<'a> = dyn FnMut() -> Vec<Pending> + Send + 'a;
+
+/// Run one turn to completion on an open session log.
+///
+/// `turn_no` is the caller-tracked ordinal. Returns the outcome that was
+/// committed as `turn/ended`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    tools: &ToolRegistry,
+    config: &TurnConfig,
+    cancel: &CancellationToken,
+    steers: &mut SteerSource<'_>,
+    turn_no: u32,
+    frames: &FrameSink<'_>,
+) -> Result<TurnOutcome, TurnError> {
+    log.append(&SessionEvent::TurnStarted { turn: turn_no })?;
+    let outcome = drive(store, log, provider, tools, config, cancel, steers, turn_no, frames).await;
+    let ended = match &outcome {
+        Ok(o) => *o,
+        Err(_) => TurnOutcome::Failed,
+    };
+    log.append(&SessionEvent::TurnEnded { turn: turn_no, outcome: ended })?;
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    tools: &ToolRegistry,
+    config: &TurnConfig,
+    cancel: &CancellationToken,
+    steers: &mut SteerSource<'_>,
+    turn_no: u32,
+    frames: &FrameSink<'_>,
+) -> Result<TurnOutcome, TurnError> {
+    let session = log.session().clone();
+    let call_config = replay(store, log.session())?.context.config;
+    let ceiling = call_config.tool_ceiling.as_ref().map(|names| tools.restricted(names));
+    let tools = ceiling.as_ref().unwrap_or(tools);
+    let active = call_config.agent;
+    let restricted = active.as_ref().and_then(|agent| agent.tools.as_ref()).map(|names| tools.restricted(names));
+    let tools = restricted.as_ref().unwrap_or(tools);
+    let system = match &active {
+        Some(agent) => format!("{}\n\n{}", config.system, agent.instructions),
+        None => config.system.clone(),
+    };
+    let tool_specs = tools.specs();
+    for _step in 0..config.max_steps {
+        // Pre-step: steers (and boundary injects) committed so the request
+        // derivation sees them, intents preserved.
+        for pending in steers() {
+            log.append(&SessionEvent::UserMessage(UserMessage {
+                intent: pending.intent,
+                content: pending.content,
+                        source: None,
+            }))?;
+        }
+
+        // Derive the request input from the log — never from memory.
+        let replayed = replay(store, log.session())?;
+
+        // Request with retry-on-retryable; every dead stream is an attempt.
+        let mut attempts = 0u32;
+        let message = loop {
+            attempts += 1;
+            frames(Frame::StepStarted { session: session.clone(), turn: turn_no });
+            let on_delta = |delta: &rness_protocol::events::ChunkDelta| {
+                frames(Frame::Delta { session: session.clone(), chunk: delta.clone() });
+            };
+            let request = StepRequest {
+                context: &replayed.context,
+                system: &system,
+                tools: &tool_specs,
+                on_delta: Some(&on_delta),
+            };
+            match provider.step(request, cancel).await {
+                StepOutcome::Committed(msg) => break msg,
+                StepOutcome::Cancelled { partial } => {
+                    log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
+                        model: provider.model().to_string(),
+                        outcome: AttemptOutcome::Cancelled,
+                        chunks: partial,
+                    }))?;
+                    return Ok(TurnOutcome::Cancelled);
+                }
+                StepOutcome::Failed { error, partial } => {
+                    let retryable = error.retryable;
+                    log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
+                        model: provider.model().to_string(),
+                        outcome: AttemptOutcome::Error {
+                            message: error.message.clone(),
+                            retryable,
+                        },
+                        chunks: partial,
+                    }))?;
+                    if !retryable || attempts > config.max_retries {
+                        return Err(TurnError::ModelExhausted {
+                            attempts,
+                            last: error.message,
+                        });
+                    }
+                }
+            }
+        };
+
+        let stop = message.stop;
+        let calls: Vec<ToolCall> = message
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolUse { call, name, args } => Some(ToolCall {
+                    call: call.clone(),
+                    name: name.clone(),
+                    args: args.clone(),
+                }),
+                _ => None,
+            })
+            .collect();
+
+        log.append(&SessionEvent::AssistantMessage(message)).map(|env| {
+            frames(Frame::StepCommitted { session: session.clone(), event: env.id });
+        })?;
+
+        match stop {
+            StopReason::EndTurn | StopReason::MaxTokens => return Ok(TurnOutcome::Completed),
+            StopReason::ToolUse => {
+                for call in &calls {
+                    frames(Frame::ToolStarted {
+                        session: session.clone(),
+                        call: call.call.clone(),
+                        name: call.name.clone(),
+                    });
+                }
+                let results =
+                    tools.dispatch(&session, &calls, config.max_tool_concurrency, cancel).await;
+                for result in results {
+                    frames(Frame::ToolOutput {
+                        session: session.clone(),
+                        call: result.call.clone(),
+                        output: result.output.clone(),
+                    });
+                    log.append(&SessionEvent::ToolResult(result))?;
+                }
+                // Cancellation between steps: commit and stop cleanly.
+                if cancel.is_cancelled() {
+                    return Ok(TurnOutcome::Cancelled);
+                }
+            }
+        }
+    }
+    // Step budget exhausted: not an error — the work so far is committed.
+    Ok(TurnOutcome::Completed)
+}
+
+/// Convenience: the errors a provider reports.
+pub use provider::ProviderError as TurnProviderError;

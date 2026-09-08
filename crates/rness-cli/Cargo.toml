@@ -1,0 +1,31 @@
+[package]
+name = "rness-cli"
+description = "The rness binary: config layers, composition root, mode selection (tui/server/headless)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rness"
+path = "src/main.rs"
+
+[dependencies]
+rness-kernel.workspace = true
+rness-protocol.workspace = true
+rness-engine.workspace = true
+rness-providers.workspace = true
+rness-tools.workspace = true
+rness-lua.workspace = true
+rness-tui.workspace = true
+rness-server.workspace = true
+axum.workspace = true
+clap.workspace = true
+dirs.workspace = true
+keyring.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true

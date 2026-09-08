@@ -1,0 +1,173 @@
+//! Control tools for continuable children (dsh tool-subagent-control):
+//! `send_message` steers across one parent/child edge, `interrupt_agent`
+//! stops a child's current turn, `list_agents` lists continuable
+//! children. Thin adapters over the engine's [`SubagentRuntime`] — the
+//! tools perform no lifecycle routing; authorization (exact adjacency,
+//! ancestry) belongs to the service.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use rness_engine::subagent::SubagentRuntime;
+use rness_engine::tools::Tool;
+use rness_protocol::events::SessionId;
+use serde_json::{json, Value};
+
+// -- send_message ------------------------------------------------------------
+
+pub struct SendMessageTool {
+    runtime: Arc<SubagentRuntime>,
+}
+
+#[async_trait]
+impl Tool for SendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to a continuable agent named by agent_id: your \
+         direct continuable child, or (if you are a continuable child) \
+         your direct parent. A working target sees it at its next step; \
+         an idle target starts a turn. Returns acceptance only, never a \
+         reply — the target's answers arrive as settle notices."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": { "type": "string", "description": "Session id of the target agent" },
+                "message": { "type": "string", "description": "The message to deliver" },
+            },
+            "required": ["agent_id", "message"],
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("send_message requires a calling session".into())
+    }
+
+    async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
+        let target = crate::required_str(&args, "agent_id")?.to_string();
+        let message = crate::required_str(&args, "message")?.to_string();
+        self.runtime
+            .send_message(session, &target, message)
+            .map_err(|e| format!("message not delivered: {e}"))?;
+        Ok(format!("message accepted by {target}"))
+    }
+}
+
+// -- interrupt_agent ---------------------------------------------------------
+
+pub struct InterruptAgentTool {
+    runtime: Arc<SubagentRuntime>,
+}
+
+#[async_trait]
+impl Tool for InterruptAgentTool {
+    fn name(&self) -> &str {
+        "interrupt_agent"
+    }
+
+    fn description(&self) -> &str {
+        "Stop a descendant agent's CURRENT turn only: queued messages \
+         stay parked, its own children keep running, and the agent stays \
+         available for later send_message. Interrupting an idle agent is \
+         an accepted no-op."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": { "type": "string", "description": "Session id of the agent to interrupt" },
+            },
+            "required": ["agent_id"],
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("interrupt_agent requires a calling session".into())
+    }
+
+    async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
+        let target = crate::required_str(&args, "agent_id")?.to_string();
+        self.runtime
+            .interrupt(session, &target)
+            .map_err(|e| e.to_string())?;
+        Ok(format!("interrupt accepted for {target}"))
+    }
+}
+
+// -- list_agents -------------------------------------------------------------
+
+pub struct ListAgentsTool {
+    runtime: Arc<SubagentRuntime>,
+}
+
+#[async_trait]
+impl Tool for ListAgentsTool {
+    fn name(&self) -> &str {
+        "list_agents"
+    }
+
+    fn description(&self) -> &str {
+        "List your continuable child agents: scope 'children' (default) \
+         shows direct children, 'descendants' walks the whole tree in \
+         pre-order. Each line: <session id> depth=<n> <running|idle> \
+         parent=<id>. One-shot children are absent — they cannot accept \
+         send_message."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["children", "descendants"],
+                    "description": "Direct children (default) or the full descendant tree",
+                },
+            },
+        })
+    }
+
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("list_agents requires a calling session".into())
+    }
+
+    async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
+        let descendants = args["scope"].as_str() == Some("descendants");
+        let children = self
+            .runtime
+            .list_children(session, descendants)
+            .map_err(|e| e.to_string())?;
+        if children.is_empty() {
+            return Ok("No continuable child agents".into());
+        }
+        Ok(children
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} depth={} {} parent={}",
+                    c.session,
+                    c.depth,
+                    if c.running { "running" } else { "idle" },
+                    c.parent
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+}
+
+/// Register the three control tools.
+pub fn register_subagent_control(
+    registry: &rness_engine::tools::ToolRegistry,
+    runtime: Arc<SubagentRuntime>,
+) {
+    registry.register(Arc::new(SendMessageTool { runtime: Arc::clone(&runtime) }));
+    registry.register(Arc::new(InterruptAgentTool { runtime: Arc::clone(&runtime) }));
+    registry.register(Arc::new(ListAgentsTool { runtime }));
+}

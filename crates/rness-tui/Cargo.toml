@@ -1,0 +1,25 @@
+[package]
+name = "rness-tui"
+description = "ratatui client. Speaks rness-protocol only — never engine internals."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rness-kernel.workspace = true
+rness-protocol.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+pulldown-cmark.workspace = true
+syntect.workspace = true
+unicode-width.workspace = true
+textwrap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+insta.workspace = true

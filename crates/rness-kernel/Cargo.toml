@@ -1,0 +1,13 @@
+[package]
+name = "rness-kernel"
+description = "Plugin kernel: context, services, typed events, reversible effects. Zero domain knowledge."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

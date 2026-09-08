@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rness-kernel",
+    "crates/rness-protocol",
+    "crates/rness-engine",
+    "crates/rness-providers",
+    "crates/rness-tools",
+    "crates/rness-lua",
+    "crates/rness-mcp",
+    "crates/rness-tui",
+    "crates/rness-server",
+    "crates/rness-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Abraxas-365/rness"
+
+# Shared dependency versions. Crates opt in with `dep.workspace = true`.
+[workspace.dependencies]
+# -- kernel / async
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# -- lua (the heart)
+mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize", "send"] }
+
+# -- llm providers
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+eventsource-stream = "0.2"
+futures-core = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"
+bytes = "1"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+open = "5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiktoken-rs = "0.6"
+
+# -- session log
+ulid = "1"
+jiff = "0.1"
+
+# -- tui
+ratatui = "0.29"
+crossterm = "0.28"
+pulldown-cmark = "0.12"
+syntect = "5"
+unicode-width = "0.2"
+textwrap = "0.16"
+
+# -- tools
+portable-pty = "0.8"
+globset = "0.4"
+ignore = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+similar = "2"
+notify = "7"
+
+# -- server
+axum = { version = "0.7", features = ["ws"] }
+
+# -- cli
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
+keyring = "3"
+
+# -- testing
+insta = "1"
+wiremock = "0.6"
+proptest = "1"
+tempfile = "3"
+
+# -- internal crates
+rness-kernel = { path = "crates/rness-kernel" }
+rness-protocol = { path = "crates/rness-protocol" }
+rness-engine = { path = "crates/rness-engine" }
+rness-mcp = { path = "crates/rness-mcp" }
+rness-providers = { path = "crates/rness-providers" }
+rness-tools = { path = "crates/rness-tools" }
+rness-lua = { path = "crates/rness-lua" }
+rness-tui = { path = "crates/rness-tui" }
+rness-server = { path = "crates/rness-server" }

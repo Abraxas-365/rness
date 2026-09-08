@@ -1,0 +1,252 @@
+//! Startup-only declarations. Evaluated before any provider is constructed.
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use mlua::{Lua, LuaSerdeExt, Table};
+use rness_engine::config::{ModelDeclaration, ModelRegistry, Profile};
+
+#[derive(Clone, Default)]
+pub struct StartupConfig {
+    pub plugins: Vec<String>,
+    pub colorschemes: BTreeMap<String, serde_json::Value>,
+    pub colorscheme: Option<String>,
+    pub models: ModelRegistry,
+    pub providers: BTreeMap<String, ProviderDeclaration>,
+    pub default_profile: Option<String>,
+    pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
+    pub default_agent: Option<String>,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderDeclaration {
+    pub protocol: String,
+    pub base_url: String,
+    pub auth: ProviderAuth,
+}
+
+#[derive(Clone, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ProviderAuth {
+    Disabled(bool),
+    Store { credential: String },
+    Env { env: String },
+    OAuth { oauth: String },
+}
+
+pub fn load(path: &std::path::Path) -> Result<StartupConfig, Box<dyn std::error::Error + Send + Sync>> {
+    if !path.is_file() { return Ok(StartupConfig::default()); }
+    let lua = Lua::new();
+    lua.globals().set("rness", lua.create_table()?)?;
+    evaluate(&lua, path)
+}
+
+pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let state = Arc::new(Mutex::new(StartupConfig::default()));
+    let ui = match lua.globals().get::<Table>("rness")?.get::<Option<Table>>("ui")? { Some(ui) => ui, None => lua.create_table()? };
+    let schemes = lua.create_table()?;
+    let registered = state.clone();
+    schemes.set("register", lua.create_function(move |lua, (name, spec): (String, Table)| {
+        crate::loader::validate_name(&name).map_err(mlua::Error::runtime)?;
+        let value = lua.from_value(mlua::Value::Table(spec))?;
+        let mut config = registered.lock().unwrap();
+        if name == "default" || config.colorschemes.contains_key(&name) { return Err(mlua::Error::runtime("duplicate colorscheme")); }
+        config.colorschemes.insert(name, value);
+        Ok(())
+    })?)?;
+    let selected = state.clone();
+    schemes.set("set", lua.create_function(move |_, name: String| {
+        let mut config = selected.lock().unwrap();
+        if name != "default" && !config.colorschemes.contains_key(&name) { return Err(mlua::Error::runtime("unknown colorscheme")); }
+        config.colorscheme = Some(name);
+        Ok(())
+    })?)?;
+    ui.set("colorscheme", schemes)?;
+    lua.globals().get::<Table>("rness")?.set("ui", ui)?;
+    let rness: Table = lua.globals().get("rness")?;
+    let plugins = lua.create_table()?;
+    let s = state.clone();
+    plugins.set("load", lua.create_function(move |_, name: String| {
+        crate::loader::validate_name(&name).map_err(mlua::Error::runtime)?;
+        let mut state = s.lock().unwrap();
+        if state.plugins.contains(&name) {
+            return Err(mlua::Error::runtime(format!("duplicate plugin: {name}")));
+        }
+        state.plugins.push(name);
+        Ok(())
+    })?)?;
+    rness.set("plugins", plugins)?;
+    let models = lua.create_table()?;
+    let s = state.clone();
+    models.set("declare", lua.create_function(move |lua, value: Table| {
+        let declaration: ModelDeclaration = lua.from_value(mlua::Value::Table(value))?;
+        s.lock().unwrap().models.declare_model(declaration).map_err(mlua::Error::runtime)
+    })?)?;
+    rness.set("models", models)?;
+    let profiles = lua.create_table()?;
+    let s = state.clone();
+    profiles.set("declare", lua.create_function(move |lua, (name, value): (String, Table)| {
+        let profile: Profile = lua.from_value(mlua::Value::Table(value))?;
+        s.lock().unwrap().models.declare_profile(name, profile).map_err(mlua::Error::runtime)
+    })?)?;
+    rness.set("profiles", profiles)?;
+    let providers = lua.create_table()?;
+    let s = state.clone();
+    providers.set("register", lua.create_function(move |lua, (name, value): (String, Table)| {
+        let declaration: ProviderDeclaration = lua.from_value(mlua::Value::Table(value))?;
+        if name.is_empty() || name.contains('/') { return Err(mlua::Error::runtime("invalid provider name")); }
+        if matches!(declaration.auth, ProviderAuth::Disabled(true)) {
+            return Err(mlua::Error::runtime("auth must be false or {credential = name}"));
+        }
+        let mut s = s.lock().unwrap();
+        if s.providers.contains_key(&name) { return Err(mlua::Error::runtime("duplicate provider")); }
+        s.providers.insert(name, declaration);
+        Ok(())
+    })?)?;
+    let agents = lua.create_table()?;
+    let s = state.clone();
+    agents.set("declare", lua.create_function(move |lua, (name, value): (String, Table)| {
+        let definition: rness_engine::config::AgentDefinition = lua.from_value(mlua::Value::Table(value))?;
+        if name.trim().is_empty() || definition.description.trim().is_empty() || definition.instructions.trim().is_empty() {
+            return Err(mlua::Error::runtime("agent name, description and instructions must not be empty"));
+        }
+        let mut state = s.lock().unwrap();
+        if state.agents.contains_key(&name) { return Err(mlua::Error::runtime("duplicate agent")); }
+        state.agents.insert(name, definition);
+        Ok(())
+    })?)?;
+    rness.set("agents", agents)?;
+    rness.set("providers", providers)?;
+    lua.globals().set("rness", rness.clone())?;
+    if let Some(root) = path.parent() {
+        let package: Table = lua.globals().get("package")?;
+        let existing: String = package.get("path")?;
+        package.set("path", format!("{}/lua/?.lua;{}/lua/?/init.lua;{existing}", root.display(), root.display()))?;
+    }
+    if path.is_file() {
+        lua.load(std::fs::read_to_string(path)?).set_name(path.to_string_lossy()).exec()?;
+    }
+    for (table, method) in [("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
+        let table: Table = rness.get(table)?;
+        table.set(method, lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
+            Err(mlua::Error::runtime("startup declarations are closed; edit init.lua and restart"))
+        })?)?;
+    }
+    let mut config = state.lock().unwrap().clone();
+    config.default_agent = rness.get("default_agent")?;
+    if config.default_agent.as_ref().is_some_and(|name| !config.agents.contains_key(name)) {
+        return Err(std::io::Error::other("unknown default_agent").into());
+    }
+    for agent in config.agents.values() {
+        if let Some(profile) = &agent.profile {
+            config.models.resolve_profile(profile).map_err(std::io::Error::other)?;
+        }
+    }
+    config.default_profile = rness.get("default_profile")?;
+    if let Some(name) = &config.default_profile { config.models.resolve_profile(name).map_err(std::io::Error::other)?; }
+    Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn startup_registry_reaches_plugins_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.lua");
+        std::fs::write(&path, r#"
+            rness.providers.register('local', {
+                protocol = 'openai-chat', base_url = 'http://localhost:11434/v1', auth = false,
+            })
+            rness.models.declare {provider='local', model='qwen', capabilities={max_output_tokens=8000}}
+            rness.profiles.declare('work', {provider='local', model='qwen', options={max_output_tokens=4000}})
+            rness.default_profile = 'work'
+        "#).unwrap();
+        let config = load(&path).unwrap();
+        let host = crate::plugin_host::LuaHost::spawn_with_config(config).unwrap();
+        let check = r#"
+            assert(rness.default_profile == 'work')
+            local c = rness.models.capabilities('local', 'qwen')
+            assert(c.max_output_tokens == 8000)
+            c.max_output_tokens = 1
+            assert(rness.models.capabilities('local', 'qwen').max_output_tokens == 8000)
+            assert(rness.profiles.resolve('work').max_output_tokens == 4000)
+        "#;
+        host.load("check", check).await.unwrap();
+        assert!(host.reload(vec![crate::loader::PluginSource {
+            name: "check".into(), source: check.into(),
+        }]).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn shipped_startup_example_loads_without_credentials() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/init.lua");
+        let config = load(&path).unwrap();
+        assert_eq!(config.providers.len(), 4);
+        assert_eq!(config.models.resolve_profile("local-qwen").unwrap()
+            .selection.unwrap().route, "ollama");
+        assert!(config.models.resolve_profile("router-sonnet").is_ok());
+        assert!(config.default_profile.is_none());
+    }
+
+    #[tokio::test]
+    async fn init_runs_once_preserves_callbacks_and_loads_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lua")).unwrap();
+        std::fs::write(dir.path().join("lua/preferences.lua"), "rness.profiles.declare('local', {provider='ollama', model='qwen'})").unwrap();
+        std::fs::write(dir.path().join("init.lua"), r#"
+            require('preferences')
+            executions = (executions or 0) + 1
+            rness.hook.on('ready', function() ready = true end)
+            rness.ui.statusline(function() return ready and 'ready' or 'booting' end)
+        "#).unwrap();
+        let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(dir.path().join("init.lua")).unwrap();
+        assert!(config.models.resolve_profile("local").is_ok());
+        assert_eq!(host.statusline().await.as_deref(), Some("booting"));
+        host.fire_hook("ready", serde_json::json!({}));
+        assert_eq!(host.statusline().await.as_deref(), Some("ready"));
+        assert!(host.reload(vec![]).await.is_err());
+        host.load("check", "assert(executions == 1); assert(ready)").await.unwrap();
+    }
+
+    #[test]
+    fn agent_delegation_is_explicit_and_profile_optional() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, r#"
+            rness.agents.declare('principal', {description='Main', instructions='Plan'})
+            rness.agents.declare('worker', {description='Work', instructions='Implement', subagent=true})
+            rness.default_agent = 'principal'
+        "#).unwrap();
+        let config = load(&path).unwrap();
+        assert!(!config.agents["principal"].subagent);
+        assert!(config.agents["worker"].subagent);
+        assert!(config.agents["worker"].profile.is_none());
+        assert_eq!(config.default_agent.as_deref(), Some("principal"));
+    }
+
+    #[tokio::test]
+    async fn plugins_are_explicit_deferred_ordered_and_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("plugins")).unwrap();
+        std::fs::write(dir.path().join("plugins/b.lua"), "assert(mounted); order = 'b'").unwrap();
+        std::fs::write(dir.path().join("plugins/a.lua"), "assert(order == 'b'); order = order .. 'a'").unwrap();
+        std::fs::write(dir.path().join("plugins/unselected.lua"), "error('must not run')").unwrap();
+        std::fs::write(dir.path().join("init.lua"), "rness.plugins.load('b'); rness.plugins.load('a'); assert(order == nil)").unwrap();
+        let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(dir.path().join("init.lua")).unwrap();
+        assert_eq!(config.plugins, vec!["b", "a"]);
+        host.load("mount-check", "assert(order == nil); mounted = true; assert(not pcall(rness.plugins.load, 'late'))").await.unwrap();
+        let sources = crate::loader::discover(dir.path(), &config.plugins).unwrap();
+        assert!(crate::loader::load_all(&host, &sources).await.is_empty());
+        host.load("check", "assert(order == 'ba')").await.unwrap();
+        for script in ["rness.plugins.load('../bad')", "rness.plugins.load('a'); rness.plugins.load('a')"] {
+            std::fs::write(dir.path().join("init.lua"), script).unwrap();
+            assert!(load(&dir.path().join("init.lua")).is_err());
+        }
+    }
+
+    #[test]
+    fn missing_file_is_empty() {
+        assert!(load(std::path::Path::new("/nonexistent/rness/config.lua")).unwrap().default_profile.is_none());
+    }
+}
