@@ -123,7 +123,7 @@ impl Default for Live {
 
 pub type ProviderResolver = dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>, String> + Send + Sync;
 
-pub type InputResolver = dyn Fn(Vec<ContentPart>) -> Result<Vec<ContentPart>, String> + Send + Sync;
+pub type InputResolver = dyn Fn(Option<&std::path::Path>, Vec<ContentPart>) -> Result<Vec<ContentPart>, String> + Send + Sync;
 
 pub struct SessionService {
     store: Arc<SessionStore>,
@@ -139,6 +139,8 @@ pub struct SessionService {
     bus: Arc<EventBus>,
     live: Mutex<HashMap<SessionId, Arc<Live>>>,
     lifecycle: Arc<tokio::sync::RwLock<()>>,
+    default_workspace: Mutex<Option<String>>,
+    commands: crate::interaction::CommandRegistry,
     input_resolver: Mutex<Option<Arc<InputResolver>>>,
     /// Workspace instruction policy (None = feature off). Mechanism in
     /// [`crate::instructions`]; this only holds the caller's choices.
@@ -146,6 +148,15 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    pub fn commands(&self) -> &crate::interaction::CommandRegistry {
+        &self.commands
+    }
+
+    pub fn set_default_workspace(&self, workspace: String) -> Result<(), ServiceError> {
+        *self.default_workspace.lock().unwrap() = Self::normalize_workspace(Some(workspace))?;
+        Ok(())
+    }
+
     pub fn set_input_resolver(&self, resolver: Arc<InputResolver>) {
         *self.input_resolver.lock().unwrap() = Some(resolver);
     }
@@ -224,6 +235,12 @@ impl SessionService {
             config,
             bus,
             live: Mutex::new(HashMap::new()),
+            default_workspace: Mutex::new(None),
+            commands: {
+                let commands = crate::interaction::CommandRegistry::default();
+                commands.register(Arc::new(crate::interaction::AgentCommand)).expect("built-in command");
+                commands
+            },
             input_resolver: Mutex::new(None),
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             instructions: Mutex::new(None),
@@ -291,9 +308,12 @@ impl SessionService {
         log: &mut crate::session::log::SessionLog,
         session: &SessionId,
     ) -> Result<(), ServiceError> {
-        let Some(config) = self.instructions.lock().unwrap().clone() else {
+        let Some(mut config) = self.instructions.lock().unwrap().clone() else {
             return Ok(());
         };
+        if let Some(workspace) = self.store.workspace(session)? {
+            config.cwd = workspace.into();
+        }
         let Some(baseline) = crate::instructions::render(&config) else {
             return Ok(());
         };
@@ -351,7 +371,21 @@ impl SessionService {
     /// Create a new root session. Returns its id; no turn starts. The
     /// explicit composition-root seed is committed once, immediately after
     /// the header, so HTTP-created sessions carry the same selection.
+    fn normalize_workspace(workspace: Option<String>) -> Result<Option<String>, ServiceError> {
+        workspace.map(|path| {
+            let root = std::fs::canonicalize(&path)
+                .map_err(|e| ServiceError::InvalidConfig(format!("workspace {path}: {e}")))?;
+            if !root.is_dir() {
+                return Err(ServiceError::InvalidConfig(format!("workspace {path} is not a directory")));
+            }
+            root.to_str().map(str::to_owned)
+                .ok_or_else(|| ServiceError::InvalidConfig("workspace must be valid UTF-8".into()))
+        }).transpose()
+    }
+
     pub fn create(&self, workspace: Option<String>) -> Result<SessionId, ServiceError> {
+        let workspace = workspace.or_else(|| self.default_workspace.lock().unwrap().clone());
+        let workspace = Self::normalize_workspace(workspace)?;
         let mut log = self.store.create(workspace)?;
         self.append_creation_seed(&mut log)?;
         Ok(log.session().clone())
@@ -364,6 +398,11 @@ impl SessionService {
         workspace: Option<String>,
         delegation: rness_protocol::branch::Delegation,
     ) -> Result<SessionId, ServiceError> {
+        let workspace = match workspace {
+            Some(path) => Some(path),
+            None => self.store.workspace(&delegation.parent)?,
+        };
+        let workspace = Self::normalize_workspace(workspace)?;
         let mut log = self.store.create_delegated(workspace, delegation)?;
         self.append_creation_seed(&mut log)?;
         Ok(log.session().clone())
@@ -444,24 +483,33 @@ impl SessionService {
         content: Vec<ContentPart>,
     ) -> Result<Disposition, ServiceError> {
         if let [ContentPart::Text { text }] = content.as_slice() {
-            let mut words = text.split_whitespace();
-            if words.next() == Some("/agent") {
-                let name = words.next().ok_or_else(|| ServiceError::InvalidConfig("Usage: /agent <name>".into()))?;
-                if words.next().is_some() { return Err(ServiceError::InvalidConfig("Usage: /agent <name>".into())); }
-                self.select_agent(session, name)?;
-                return Ok(Disposition::LogOnly);
+            if let Some((command, offset)) = self.commands.resolve(text) {
+                self.store.workspace(session)?;
+                if self.phase(session) != crate::inbox::Phase::Idle {
+                    return Err(ServiceError::Busy);
+                }
+                let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+                let result = command.execute(self, crate::interaction::CommandInvocation { session, raw_input: &text[offset..] })?;
+                return Ok(Disposition::Command(result));
+            }
+        }
+        let workspace = self.store.workspace(session)?.map(std::path::PathBuf::from);
+        if let Some(path) = &workspace {
+            if !path.is_absolute() || !path.is_dir() {
+                return Err(ServiceError::InvalidConfig(format!("session workspace is not an available absolute directory: {}", path.display())));
             }
         }
         let resolver = self.input_resolver.lock().unwrap().clone();
         let content = match resolver {
-            Some(resolve) => resolve(content).map_err(ServiceError::InvalidConfig)?,
+            Some(resolve) => resolve(workspace.as_deref(), content).map_err(ServiceError::InvalidConfig)?,
             None => content,
         };
         let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
         let mut inbox = live.inbox.lock().unwrap();
         let (intent, disposition) = inbox.submit(intent, content.clone());
-        match disposition {
+        match &disposition {
+            Disposition::Command(_) => unreachable!("inbox does not execute commands"),
             Disposition::Queued => {}
             Disposition::LogOnly => {
                 drop(inbox);

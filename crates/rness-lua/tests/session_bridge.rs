@@ -33,6 +33,32 @@ impl Provider for OneAnswer {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(OneAnswer), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "fake-1".into()).await.unwrap();
+    host.load("commands", r#"
+        rness.commands.register{name='greet', description='Greet', run=function(ctx)
+            return {message='hello' .. ctx.raw_input, data={session=ctx.session}}
+        end}
+        rness.commands.register{name='broken', run=function() error('command failed') end}
+    "#).await.unwrap();
+    let id = sessions.create(None).unwrap();
+    let before = sessions.store().history(&id).unwrap();
+    let result = sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/greet  world".into()}]).unwrap();
+    let rness_engine::inbox::Disposition::Command(result) = result else { panic!("expected command result") };
+    assert_eq!(result.message, "hello  world");
+    assert_eq!(result.data["session"], id);
+    assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/broken".into()}]).is_err());
+    assert_eq!(sessions.store().history(&id).unwrap(), before);
+    assert!(host.unload_coordinated("commands", vec![], |_| {}).await.unwrap());
+    assert!(sessions.commands().resolve("/greet").is_none());
+    assert!(sessions.commands().resolve("/agent").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lua_drives_a_session_through_the_bridge() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = Arc::new(SessionService::new(

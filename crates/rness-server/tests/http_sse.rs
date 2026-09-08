@@ -150,7 +150,9 @@ async fn slash_agent_uses_service_without_starting_model() {
     let response = post_json(&format!("{base}/api/request"), serde_json::json!({
         "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":"/agent planner"}]
     })).await;
-    assert_ne!(response["status"], "started");
+    assert_eq!(response["status"], "command");
+    assert_eq!(response["result"]["data"]["agent"], "planner");
+    assert_eq!(response["result"]["message"], "Agent selected: planner");
     let history = sessions.store().history(&id.to_string()).unwrap();
     assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::RequestConfig(c) if c.agent.as_ref().is_some_and(|a| a.name == "planner"))));
     assert!(!history.iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_) | SessionEvent::AssistantMessage(_))));
@@ -164,10 +166,33 @@ async fn slash_agent_uses_service_without_starting_model() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn remote_sessions_resolve_their_own_workspace() {
+    let logs = tempfile::tempdir().unwrap();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve(logs.path()).await;
+    sessions.set_input_resolver(Arc::new(|workspace, mut content| {
+        content.push(ContentPart::Text { text: format!("workspace={}", workspace.unwrap().display()) });
+        Ok(content)
+    }));
+    for project in [&a, &b] {
+        let created = post_json(&format!("{base}/api/sessions"), serde_json::json!({"workspace":project.path()})).await;
+        let id = created["session"].as_str().unwrap().to_string();
+        let sent = post_json(&format!("{base}/api/request"), serde_json::json!({
+            "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":"hello"}]
+        })).await;
+        assert_eq!(sent["status"], "started");
+        sessions.join(&id).await;
+        let history = get_json(&format!("{base}/api/sessions/{id}")).await;
+        assert!(history.to_string().contains(&format!("workspace={}", project.path().canonicalize().unwrap().display())));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn remote_send_uses_shared_resolver_and_rejects_before_logging() {
     let dir = tempfile::tempdir().unwrap();
     let (base, sessions, _kernel) = serve(dir.path()).await;
-    sessions.set_input_resolver(Arc::new(|mut content| {
+    sessions.set_input_resolver(Arc::new(|_workspace, mut content| {
         if matches!(content.first(), Some(ContentPart::Text { text }) if text == "/skill missing") {
             return Err("unknown skill".into());
         }

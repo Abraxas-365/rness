@@ -72,6 +72,7 @@ pub fn install(
                 .send(&id, UserIntent::Followup, vec![ContentPart::Text { text }])
                 .map_err(err)?;
             Ok(match disposition {
+                Disposition::Command(_) => "command",
                 Disposition::StartTurn => "started",
                 Disposition::Queued => "queued",
                 Disposition::LogOnly => "logged",

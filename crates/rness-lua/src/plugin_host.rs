@@ -60,6 +60,7 @@ pub struct UnloadSnapshot {
 }
 
 enum Cmd {
+    Command { name: String, context: serde_json::Value, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
     CoordinatedUnload {
         name: String,
@@ -136,7 +137,46 @@ enum Cmd {
 /// fire-and-forget so event fan-out never blocks on Lua.
 #[derive(Clone)]
 pub struct LuaHost {
-    tx: mpsc::Sender<Cmd>,
+    tx: std::sync::Arc<mpsc::Sender<Cmd>>,
+}
+
+struct LuaCommand {
+    name: String,
+    description: String,
+    tx: std::sync::Weak<mpsc::Sender<Cmd>>,
+}
+
+impl rness_engine::interaction::Command for LuaCommand {
+    fn name(&self) -> &str { &self.name }
+    fn description(&self) -> &str { &self.description }
+    fn execute(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
+        use rness_engine::service::ServiceError;
+        if std::thread::current().name() == Some("lua-vm") {
+            return Err(ServiceError::InvalidConfig("Lua commands cannot recursively invoke Lua commands".into()));
+        }
+        let workspace = service.store().workspace(input.session)?;
+        let (reply, receive) = mpsc::channel();
+        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), reply })
+            .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
+        receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
+            .map_err(ServiceError::InvalidConfig)
+    }
+}
+
+fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak<mpsc::Sender<Cmd>>, installed: &mut Vec<std::sync::Arc<dyn rness_engine::interaction::Command>>) -> Result<(), String> {
+    let specs = rt.command_specs();
+    installed.retain(|command| {
+        if specs.iter().any(|(name, _)| name == command.name()) { return true; }
+        binding.sessions.commands().unregister_if_current(command);
+        false
+    });
+    for (name, description) in specs {
+        if installed.iter().any(|c| c.name() == name) { continue; }
+        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, description, tx: tx.clone() });
+        binding.sessions.commands().register(command.clone())?;
+        installed.push(command);
+    }
+    Ok(())
 }
 
 impl LuaHost {
@@ -155,6 +195,8 @@ impl LuaHost {
 
     fn spawn_inner(mut config: crate::api::config::StartupConfig, init: Option<std::path::PathBuf>) -> Result<(Self, crate::api::config::StartupConfig), String> {
         let (tx, rx) = mpsc::channel::<Cmd>();
+        let tx = std::sync::Arc::new(tx);
+        let command_tx = std::sync::Arc::downgrade(&tx);
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("lua-vm".into())
@@ -179,11 +221,22 @@ impl LuaHost {
                         return;
                     }
                 };
+                let mut installed_commands = Vec::new();
                 let mut session_binding: Option<SessionBinding> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
+                        Cmd::Command { name, context, reply } => { let _ = reply.send(rt.call_command(&name, context)); }
                         Cmd::Load { name, source, reply } => {
-                            let r = rt.load(&name, &source).map_err(|e| e.to_string());
+                            let r = rt.load(&name, &source).map_err(|e| e.to_string()).and_then(|()| {
+                                if let Some(binding) = &session_binding {
+                                    if let Err(error) = sync_commands(&rt, binding, &command_tx, &mut installed_commands) {
+                                        let _ = rt.unload(&name);
+                                        let _ = sync_commands(&rt, binding, &command_tx, &mut installed_commands);
+                                        return Err(error);
+                                    }
+                                }
+                                Ok(())
+                            });
                             let _ = reply.send(r);
                         }
                         Cmd::CoordinatedUnload { name, installed, apply_ui, reply } => {
@@ -192,6 +245,7 @@ impl LuaHost {
                                 let _maintenance = binding.sessions.try_extension_maintenance().map_err(|e| e.to_string())?;
                                 let removed = rt.unload(&name).map_err(|e| e.to_string())?;
                                 if removed {
+                                    sync_commands(&rt, binding, &command_tx, &mut installed_commands)?;
                                     let remaining = rt.tool_specs();
                                     for tool in installed {
                                         if !remaining.iter().any(|spec| spec.name == tool.name()) {
@@ -261,11 +315,12 @@ impl LuaHost {
                                     binding.model.clone(),
                                 )
                                 .map_err(|e| e.to_string());
+                            let r = r.and_then(|()| sync_commands(&rt, &binding, &command_tx, &mut installed_commands));
                             session_binding = Some(binding);
                             let _ = reply.send(r);
                         }
                         Cmd::Reload { sources, reply } => {
-                            if init.is_some() {
+                            if init.is_some() || !installed_commands.is_empty() {
                                 let _ = reply.send(Err("Lua files changed; restart rness to reload without re-executing init.lua".into()));
                                 continue;
                             }
@@ -296,6 +351,10 @@ impl LuaHost {
                                         if let Err(e) = fresh.load(&p.name, &p.source) {
                                             errors.push((p.name.clone(), e.to_string()));
                                         }
+                                    }
+                                    if session_binding.is_some() && !fresh.command_specs().is_empty() {
+                                        let _ = reply.send(Err("restart rness to activate commands during reload".into()));
+                                        continue;
                                     }
                                     // Swap: old VM (and every stale
                                     // registration) drops here.

@@ -21,6 +21,10 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    /// Bind workspace-dependent tools without mutating shared registrations.
+    fn for_workspace(&self, _session: &SessionId, _workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+        None
+    }
     /// Shown to the model in the tool list.
     fn description(&self) -> &str {
         ""
@@ -77,6 +81,13 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    pub fn for_workspace(&self, session: &SessionId, workspace: &std::path::Path) -> Self {
+        let tools = self.tools.read().expect("registry lock").iter()
+            .map(|(name, tool)| (name.clone(), tool.for_workspace(session, workspace).unwrap_or_else(|| Arc::clone(tool))))
+            .collect();
+        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals) }
+    }
+
     pub fn restricted(&self, allowed: &[String]) -> Self {
         let tools = self.tools.read().expect("registry lock").iter()
             .filter(|(name, _)| allowed.contains(name))

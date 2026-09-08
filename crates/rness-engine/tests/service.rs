@@ -18,6 +18,44 @@ use rness_kernel::{EventBus, Kernel};
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn workspace_survives_resume_and_controls_instructions_and_input() {
+    let logs = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let launch = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("RULES"), "project-specific-rule").unwrap();
+    std::fs::write(launch.path().join("RULES"), "wrong-launch-rule").unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
+    let build = || SessionService::new(SessionStore::new(logs.path()), provider.clone(), Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()));
+    let first = build();
+    first.set_default_workspace(project.path().to_str().unwrap().into()).unwrap();
+    let id = first.create(None).unwrap();
+    let expected = project.path().canonicalize().unwrap();
+    drop(first);
+    let resumed = build();
+    resumed.set_default_workspace(launch.path().to_str().unwrap().into()).unwrap();
+    resumed.set_instructions(rness_engine::instructions::InstructionsConfig {
+        cwd: launch.path().into(), candidates: vec!["RULES".into()], max_bytes: 10000,
+    });
+    let expected_input = expected.clone();
+    resumed.set_input_resolver(Arc::new(move |workspace, content| {
+        assert_eq!(workspace, Some(expected_input.as_path()));
+        Ok(content)
+    }));
+    resumed.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }]).unwrap();
+    resumed.join(&id).await;
+    let seen = provider.seen().join("\n");
+    assert!(seen.contains("project-specific-rule"));
+    assert!(!seen.contains("wrong-launch-rule"));
+    let spawned = resumed.create_delegated(None, rness_protocol::branch::Delegation {
+        parent: id.clone(), depth: 1, mode: Default::default(),
+    }).unwrap();
+    assert_eq!(resumed.store().workspace(&spawned).unwrap().as_deref(), expected.to_str());
+    let child = resumed.fork(&id, None).unwrap();
+    assert_eq!(resumed.store().workspace(&child).unwrap().as_deref(), expected.to_str());
+    assert!(resumed.create(Some(project.path().join("missing").to_string_lossy().into_owned())).is_err());
+}
+
 // -- fakes -----------------------------------------------------------------
 
 fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> AssistantMessage {

@@ -444,8 +444,12 @@ async fn main() -> anyhow::Result<()> {
         .services()
         .get::<SessionService>("sessions")
         .context("sessions service missing")?;
-    let skill_roots = rness_tools::skills::default_roots(&std::env::current_dir()?);
-    sessions.set_input_resolver(Arc::new(move |content| rness_tools::skills::resolve_input(&skill_roots, content)));
+    sessions.set_default_workspace(cwd.to_string_lossy().into_owned())?;
+    let legacy_skill_roots = rness_tools::skills::default_roots(&cwd);
+    sessions.set_input_resolver(Arc::new(move |workspace, content| {
+        let roots = workspace.map(rness_tools::skills::default_roots);
+        rness_tools::skills::resolve_input(roots.as_deref().unwrap_or(&legacy_skill_roots), content)
+    }));
 
     // Workspace instructions (dsh agent-instructions model): explicit
     // policy from flags — candidates + budget — mechanism in the engine.
@@ -689,14 +693,15 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
 }
 
 impl rness_tui::app::Backend for LocalBackend {
-    fn submit(&self, request: ClientRequest) -> Result<bool, String> {
+    fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         match request {
             ClientRequest::Send { session, intent, content } => {
-                let command = matches!(content.as_slice(), [ContentPart::Text { text }] if text.split_whitespace().next() == Some("/agent"));
-                self.sessions.send(&session, intent, content).map_err(|e| e.to_string())?;
-                Ok(!command)
+                match self.sessions.send(&session, intent, content).map_err(|e| e.to_string())? {
+                    rness_engine::inbox::Disposition::Command(result) => Ok(Some(if result.message.is_empty() { "Command completed".into() } else { result.message })),
+                    _ => Ok(None),
+                }
             }
-            ClientRequest::Cancel { session } => { self.sessions.cancel(&session); Ok(false) }
+            ClientRequest::Cancel { session } => { self.sessions.cancel(&session); Ok(Some("Cancelled".into())) }
         }
     }
 
@@ -765,7 +770,9 @@ async fn run_tui(
     for (name, definition) in sessions.agents() {
         candidates.push((format!("agent {name}"), definition.description.clone()));
     }
-    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots(&std::env::current_dir()?)) {
+    let workspace = sessions.store().workspace(&session)?.map(std::path::PathBuf::from)
+        .unwrap_or(std::env::current_dir()?);
+    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots(&workspace)) {
         candidates.push((format!("skill {}", skill.name), skill.description.clone()));
         if !["agent", "skill", "unload"].contains(&skill.name.as_str()) {
             candidates.push((skill.name, format!("Skill: {}", skill.description)));
@@ -905,11 +912,31 @@ async fn run_tui(
     let plugin_catalog_task = {
         let lua = lua.clone();
         let tx = host_tx.clone();
+        let sessions = sessions.clone();
+        let watched = watched.clone();
+        let workspace_fallback = std::env::current_dir()?;
         tokio::spawn(async move {
             let mut previous = None;
+            let mut previous_commands = None;
+            let mut previous_session = None;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 tick.tick().await;
+                let session = watched.read().unwrap().clone();
+                if previous_session.as_ref() != Some(&session) {
+                    if let Ok(workspace) = sessions.store().workspace(&session) {
+                        let root = workspace.map(std::path::PathBuf::from).unwrap_or_else(|| workspace_fallback.clone());
+                        let skills: Vec<_> = rness_tools::skills::discover(&rness_tools::skills::default_roots(&root))
+                            .into_iter().map(|s| (s.name, s.description)).collect();
+                        if tx.send(rness_tui::app::Action::Custom("input:skills".into(), serde_json::json!(skills))).is_err() { break; }
+                    }
+                    previous_session = Some(session);
+                }
+                let commands = sessions.commands().catalog();
+                if previous_commands.as_ref() != Some(&commands) {
+                    if tx.send(rness_tui::app::Action::Custom("input:commands".into(), serde_json::json!(commands))).is_err() { break; }
+                    previous_commands = Some(commands);
+                }
                 let names = lua.plugin_names().await;
                 if previous.as_ref() != Some(&names) {
                     if tx.send(rness_tui::app::Action::Custom("input:plugins".into(), serde_json::json!(names))).is_err() { break; }

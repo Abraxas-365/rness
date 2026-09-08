@@ -46,11 +46,17 @@ impl FileVersion {
 pub struct Workspace {
     root: PathBuf,
     read_at: Mutex<HashMap<PathBuf, FileVersion>>,
+    sessions: Mutex<HashMap<String, Arc<Workspace>>>,
 }
 
 impl Workspace {
     pub fn new(root: impl Into<PathBuf>) -> Arc<Self> {
-        Arc::new(Self { root: root.into(), read_at: Mutex::new(HashMap::new()) })
+        Arc::new(Self { root: root.into(), read_at: Mutex::new(HashMap::new()), sessions: Mutex::new(HashMap::new()) })
+    }
+
+    fn for_session(&self, session: &str, root: &Path) -> Arc<Self> {
+        let mut sessions = self.sessions.lock().expect("workspace sessions lock");
+        Arc::clone(sessions.entry(session.to_owned()).or_insert_with(|| Self::new(root)))
     }
 
     pub fn root(&self) -> &Path {

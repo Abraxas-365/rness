@@ -34,8 +34,9 @@ pub struct Pending {
 }
 
 /// What the caller should do with an input it just submitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Disposition {
+    Command(crate::interaction::CommandResult),
     /// Start a turn with it now (it was committed as followup).
     StartTurn,
     /// Queued; a later drain will surface it.

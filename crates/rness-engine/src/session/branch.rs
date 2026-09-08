@@ -55,6 +55,14 @@ impl SessionStore {
         Ok(SessionLog::create(&self.root, &sid, workspace, None, Some(delegation))?)
     }
 
+    pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
+        let events = read_session(&self.root, session)?;
+        match &events[0].event {
+            SessionEvent::Header(header) => Ok(header.workspace.clone()),
+            _ => unreachable!("read_session guarantees header first"),
+        }
+    }
+
     pub fn open(&self, session: &SessionId) -> Result<SessionLog, BranchError> {
         Ok(SessionLog::open(&self.root, session)?)
     }

@@ -43,6 +43,7 @@ pub struct LuaRuntime {
     /// None = unbind. The host recomputes stock+binds on every sync.
     keymap_binds: Vec<(String, Option<String>, Option<String>)>,
     registration_owners: HashMap<(&'static str, String), String>,
+    commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
 }
 
@@ -83,6 +84,7 @@ impl LuaRuntime {
             tool_cards: HashMap::new(),
             keymap_binds: Vec::new(),
             registration_owners: HashMap::new(),
+            commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
         })
     }
@@ -95,10 +97,10 @@ impl LuaRuntime {
         }
         let declarations: Table = self.lua.globals().get("__rness_declarations")?;
         let mut snapshots = Vec::new();
-        for name in ["tools", "apps", "cards"] {
+        for name in ["tools", "apps", "cards", "commands"] {
             let table: Table = declarations.get(name)?;
             let values = table.clone().pairs::<String, bool>().collect::<mlua::Result<Vec<_>>>()?;
-            snapshots.push((table, values));
+            snapshots.push((name, values));
         }
         let hook_cleanup = self.lua.create_table()?;
         let hook_owner = self.lua.create_table()?;
@@ -113,11 +115,12 @@ impl LuaRuntime {
             }
             hook_owner.clear()?;
             let pending: Table = self.lua.globals().get("__rness_pending")?;
-            for category in ["tools", "apps", "tool_cards", "keymaps"] {
+            for category in ["tools", "apps", "tool_cards", "keymaps", "commands"] {
                 pending.get::<Table>(category)?.clear()?;
             }
             pending.set("statusline", LuaValue::Nil)?;
-            for (table, values) in snapshots {
+            for (category, values) in snapshots {
+                let table: Table = declarations.get(category)?;
                 table.clear()?;
                 for (key, value) in values { table.set(key, value)?; }
             }
@@ -130,6 +133,22 @@ impl LuaRuntime {
 
     /// Remove a loaded chunk's current VM registrations, without restoring
     /// implementations it replaced. Hosts must reconcile their own caches.
+    pub fn command_specs(&self) -> Vec<(String, String)> {
+        self.commands.iter().map(|(name, (description, _))| (name.clone(), description.clone())).collect()
+    }
+
+    pub fn call_command(&self, name: &str, context: serde_json::Value) -> Result<rness_engine::interaction::CommandResult, String> {
+        let (_, key) = self.commands.get(name).ok_or_else(|| format!("command unavailable: {name}"))?;
+        let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
+        let context = self.lua.to_value(&context).map_err(|e| e.to_string())?;
+        let result: LuaValue = run.call(context).map_err(|e| e.to_string())?;
+        match result {
+            LuaValue::Nil => Ok(Default::default()),
+            LuaValue::String(text) => Ok(rness_engine::interaction::CommandResult { message: text.to_str().map_err(|e| e.to_string())?.to_owned(), ..Default::default() }),
+            value => self.lua.from_value(value).map_err(|e| e.to_string()),
+        }
+    }
+
     pub fn plugin_names(&self) -> Vec<String> {
         let mut names = self.plugin_hooks.keys().cloned().collect::<Vec<_>>();
         names.sort();
@@ -148,6 +167,12 @@ impl LuaRuntime {
         let declarations: Table = self.lua.globals().get("__rness_declarations")?;
         for (category, key) in owned {
             match category {
+                "commands" => {
+                    if let Some((_, callback)) = self.commands.remove(&key) {
+                        self.lua.remove_registry_value(callback)?;
+                    }
+                    declarations.get::<Table>("commands")?.set(key.as_str(), LuaValue::Nil)?;
+                }
                 "tools" => {
                     if let Some((_, callback)) = self.tools.remove(&key) {
                         self.lua.remove_registry_value(callback)?;
@@ -206,8 +231,8 @@ impl LuaRuntime {
             return Err(LuaError::UnknownApp(name.to_string()));
         };
         let f: Function = self.lua.registry_value(view)?;
-        let lines: Vec<String> = f.call(self.lua.to_value(ctx)?)?;
-        Ok(lines)
+        let lines: Table = f.call(self.lua.to_value(ctx)?)?;
+        Ok(lines.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?)
     }
 
     /// Deliver a key to an app's `on_key(key, ctx)`. The return value
@@ -377,6 +402,18 @@ impl LuaRuntime {
     fn drain_registrations(&mut self, owner: Option<&str>) -> Result<(), LuaError> {
         let pending: Table = self.lua.globals().get("__rness_pending")?;
 
+        let commands: Table = pending.get("commands")?;
+        for entry in commands.sequence_values::<Table>() {
+            let entry = entry?;
+            let name: String = entry.get("name")?;
+            let run: Function = entry.get("run")?;
+            let key = self.lua.create_registry_value(run)?;
+            self.commands.insert(name.clone(), (entry.get("description")?, key));
+            if let Some(owner) = owner {
+                self.registration_owners.insert(("commands", name), owner.to_owned());
+            }
+        }
+        commands.clear()?;
         let tools: Table = pending.get("tools")?;
         for entry in tools.sequence_values::<Table>() {
             let entry = entry?;
@@ -500,6 +537,7 @@ fn require_declaration_phase(lua: &Lua) -> mlua::Result<()> {
 /// `__rness_pending`; the runtime drains them after each chunk load.
 fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let pending = lua.create_table()?;
+    pending.set("commands", lua.create_table()?)?;
     pending.set("tools", lua.create_table()?)?;
     pending.set("apps", lua.create_table()?)?;
     pending.set("tool_cards", lua.create_table()?)?;
@@ -514,6 +552,28 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     // rness.tool.register{ name=, description=, schema=, sensitive=, run= }
     let declarations = lua.create_table()?;
     lua.globals().set("__rness_declarations", declarations.clone())?;
+    let commands = lua.create_table()?;
+    let names = lua.create_table()?;
+    declarations.set("commands", names.clone())?;
+    commands.set("register", lua.create_function(move |lua, spec: Table| {
+        require_declaration_phase(lua)?;
+        let name: String = spec.get("name")?;
+        if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_')
+            || ["agent", "skill", "unload", "colorscheme"].contains(&name.as_str()) {
+            return Err(mlua::Error::runtime("invalid or reserved command name"));
+        }
+        if names.contains_key(name.as_str())? { return Err(mlua::Error::runtime("command already registered")); }
+        let entry = lua.create_table()?;
+        entry.set("name", name.clone())?;
+        entry.set("description", spec.get::<Option<String>>("description")?.unwrap_or_default())?;
+        entry.set("run", owned_callback(lua, spec.get::<Function>("run")?)?)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        pending.get::<Table>("commands")?.push(entry)?;
+        names.set(name, true)?;
+        Ok(())
+    })?)?;
+    rness.set("commands", commands)?;
     let tool = lua.create_table()?;
     let declared = lua.create_table()?;
     declarations.set("tools", declared.clone())?;
@@ -1148,6 +1208,27 @@ mod tests {
         assert_eq!(apps[0].keymap.as_deref(), Some("ctrl+p"));
         assert_eq!(rt.app_view("panel", &serde_json::json!({})).unwrap(), vec!["original"]);
         assert_eq!(rt.app_key("panel", "x", &serde_json::json!({})).unwrap(), AppKeyOutcome::Consumed);
+    }
+
+    #[test]
+    fn commands_snapshot_results_failure_cleanup_and_unload() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("commands", r#"
+            local spec = {name='hello', description='Greeting', run=function(ctx)
+                return {message='Hello' .. ctx.raw_input, data={session=ctx.session}}
+            end}
+            rness.commands.register(spec)
+            spec.run = function() error('mutated') end
+        "#).unwrap();
+        let result = rt.call_command("hello", serde_json::json!({"session":"s", "raw_input":"  world"})).unwrap();
+        assert_eq!(result.message, "Hello  world");
+        assert_eq!(result.data["session"], "s");
+        assert!(rt.load("duplicate", "rness.commands.register{name='hello', run=function() end}").is_err());
+        assert!(rt.load("broken", "rness.commands.register{name='retry', run=function() end}; error('fail')").is_err());
+        rt.load("next", "rness.commands.register{name='retry', run=function() return 'ok' end}").unwrap();
+        assert!(rt.unload("commands").unwrap());
+        assert!(rt.call_command("hello", serde_json::json!({})).is_err());
+        assert_eq!(rt.call_command("retry", serde_json::json!({})).unwrap().message, "ok");
     }
 
     #[test]

@@ -25,6 +25,9 @@ impl GlobTool {
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
+    }
     fn name(&self) -> &str {
         "Glob"
     }

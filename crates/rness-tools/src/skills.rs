@@ -182,6 +182,9 @@ impl SkillTool {
 
 #[async_trait]
 impl Tool for SkillTool {
+    fn for_workspace(&self, _session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self::new(default_roots(workspace))))
+    }
     fn name(&self) -> &str {
         "skill"
     }

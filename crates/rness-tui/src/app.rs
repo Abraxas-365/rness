@@ -25,9 +25,9 @@ use crate::theme::Theme;
 /// later — the TUI only ever sees protocol types.
 pub trait Backend: Send + Sync {
     fn request(&self, request: ClientRequest);
-    fn submit(&self, request: ClientRequest) -> Result<bool, String> {
+    fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         self.request(request);
-        Ok(true)
+        Ok(None)
     }
     fn history(&self, session: &SessionId) -> History;
     fn prepare_input(&self, _session: &SessionId, text: &str) -> Result<Option<Vec<ContentPart>>, String> {
@@ -351,8 +351,8 @@ impl App {
                     intent: UserIntent::Followup,
                     content: content.clone(),
                 }) {
-                    Ok(true) => self.model.entries.push(Entry::User { content }),
-                    Ok(false) => self.model.entries.push(Entry::Notice("Command completed".into())),
+                    Ok(None) => self.model.entries.push(Entry::User { content }),
+                    Ok(Some(message)) => self.model.entries.push(Entry::Notice(message)),
                     Err(error) => self.model.entries.push(Entry::Notice(error)),
                 }
                 self.model.scroll_from_bottom = 0;
@@ -493,11 +493,24 @@ mod tests {
     }
 
     #[test]
+    fn command_result_is_notice_without_user_echo() {
+        struct CommandBackend;
+        impl Backend for CommandBackend {
+            fn request(&self, _: ClientRequest) { panic!("use submit"); }
+            fn submit(&self, _: ClientRequest) -> Result<Option<String>, String> { Ok(Some("hello world".into())) }
+            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+        }
+        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), Arc::new(CommandBackend));
+        app.apply(Action::Submit("/hello world".into()));
+        assert_eq!(app.model.entries, vec![Entry::Notice("hello world".into())]);
+    }
+
+    #[test]
     fn rejected_submission_is_notice_not_optimistic_message() {
         struct Reject;
         impl Backend for Reject {
             fn request(&self, _: ClientRequest) { panic!("must use acknowledged submit"); }
-            fn submit(&self, _: ClientRequest) -> Result<bool, String> { Err("engine busy".into()) }
+            fn submit(&self, _: ClientRequest) -> Result<Option<String>, String> { Err("engine busy".into()) }
             fn history(&self, _: &SessionId) -> History { prior_history("s") }
         }
         let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), Arc::new(Reject));

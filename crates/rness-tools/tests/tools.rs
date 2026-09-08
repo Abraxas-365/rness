@@ -17,6 +17,42 @@ async fn exec(tool: &dyn Tool, args: serde_json::Value) -> Result<String, String
     tool.execute(args).await
 }
 
+#[tokio::test]
+async fn session_workspaces_isolate_files_shell_skills_and_freshness() {
+    let launch = TempDir::new().unwrap();
+    let a = TempDir::new().unwrap();
+    let b = TempDir::new().unwrap();
+    for (dir, marker) in [(&a, "alpha"), (&b, "beta")] {
+        std::fs::write(dir.path().join("file.txt"), marker).unwrap();
+        std::fs::create_dir_all(dir.path().join(".rness/skills")).unwrap();
+        std::fs::write(dir.path().join(".rness/skills/review.md"), format!("---\nname: review\ndescription: {marker}\n---\n{marker}")).unwrap();
+    }
+    let registry = rness_engine::tools::ToolRegistry::default();
+    rness_tools::register_all(&registry, ws(&launch));
+    rness_tools::skills::register_skills(&registry, rness_tools::skills::default_roots(launch.path()));
+    let ra = registry.for_workspace(&"a".into(), a.path());
+    let rb = registry.for_workspace(&"b".into(), b.path());
+    let (oa, ob) = tokio::join!(
+        async { ra.get("Read").unwrap().execute(json!({"path":"file.txt"})).await.unwrap() },
+        async { rb.get("Read").unwrap().execute(json!({"path":"file.txt"})).await.unwrap() }
+    );
+    assert!(oa.contains("alpha"));
+    assert!(ob.contains("beta"));
+    for (registry, marker) in [(&ra, "alpha"), (&rb, "beta")] {
+        let shell = registry.get("Bash").unwrap().execute(json!({"command":"cat file.txt", "description":"Read marker"})).await.unwrap();
+        assert!(shell.contains(marker));
+        let skill = registry.get("skill").unwrap().execute(json!({"name":"review"})).await.unwrap();
+        assert!(skill.contains(marker));
+        assert!(registry.specs().iter().find(|s| s.name == "skill").unwrap().description.contains(marker));
+    }
+    let other = registry.for_workspace(&"other".into(), a.path());
+    assert!(other.get("Write").unwrap().execute(json!({"path":"file.txt", "content":"blocked"})).await.is_err());
+    let next_turn = registry.for_workspace(&"a".into(), a.path());
+    next_turn.get("Write").unwrap().execute(json!({"path":"file.txt", "content":"updated"})).await.unwrap();
+    assert_eq!(std::fs::read_to_string(b.path().join("file.txt")).unwrap(), "beta");
+    assert!(!launch.path().join("file.txt").exists());
+}
+
 // -- Read ------------------------------------------------------------------
 
 #[tokio::test]

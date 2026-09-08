@@ -107,6 +107,9 @@ async fn drive(
     frames: &FrameSink<'_>,
 ) -> Result<TurnOutcome, TurnError> {
     let session = log.session().clone();
+    let workspace = store.workspace(&session).map_err(ReplayError::from)?;
+    let scoped = workspace.as_ref().map(|path| tools.for_workspace(&session, std::path::Path::new(path)));
+    let tools = scoped.as_ref().unwrap_or(tools);
     let call_config = replay(store, log.session())?.context.config;
     let ceiling = call_config.tool_ceiling.as_ref().map(|names| tools.restricted(names));
     let tools = ceiling.as_ref().unwrap_or(tools);

@@ -29,6 +29,7 @@ pub struct Input {
     editor: Editor,
     /// First wrapped row currently shown (scrollport offset).
     scroll_top: usize,
+    commands: Vec<(String, String)>,
     candidates: Vec<(String, String)>,
     selected: usize,
     dismissed: bool,
@@ -44,7 +45,7 @@ pub fn install(slots: &mut Slots) {
 
 impl Input {
     pub fn new() -> Self {
-        Self { editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: String::new() }
+        Self { commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: String::new() }
     }
 
     pub fn with_candidates(candidates: Vec<(String, String)>) -> Self {
@@ -55,7 +56,7 @@ impl Input {
         let text = self.editor.text();
         if self.dismissed || !text.starts_with('/') || text.contains('\n') { return Vec::new(); }
         let query = text[1..].to_lowercase();
-        self.candidates.iter().filter(|(name, _)| {
+        self.commands.iter().chain(self.candidates.iter().filter(|(name, _)| !self.commands.iter().any(|(command, _)| command == name))).filter(|(name, _)| {
             if query.contains(' ') { name.contains(' ') && name.to_lowercase().starts_with(&query) }
             else { !name.contains(' ') && name.to_lowercase().starts_with(&query) }
         }).collect()
@@ -74,6 +75,20 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_catalog_shadows_skills_and_removes_unloaded_commands() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::with_candidates(vec![("hello".into(), "Skill".into())]);
+        input.editor.insert_str("/he");
+        input.on_action(&ctx, "input:commands", &serde_json::json!([["hello", "Command"]]));
+        assert_eq!(input.matches().len(), 1);
+        assert_eq!(input.matches()[0].1, "Command");
+        input.on_action(&ctx, "input:commands", &serde_json::json!([]));
+        assert_eq!(input.matches()[0].1, "Skill");
+    }
 
     #[test]
     fn plugin_catalog_removes_stale_candidates() {
@@ -142,6 +157,27 @@ impl Default for Input {
 
 impl Component for Input {
     fn on_action(&mut self, _ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "input:commands" {
+            if let Ok(commands) = serde_json::from_value(payload.clone()) {
+                self.commands = commands;
+                self.selected = 0;
+            }
+            return;
+        }
+        if name == "input:skills" {
+            if let Ok(skills) = serde_json::from_value::<Vec<(String, String)>>(payload.clone()) {
+                let old_names: Vec<_> = self.candidates.iter().filter_map(|(name, _)| name.strip_prefix("skill ").map(str::to_owned)).collect();
+                self.candidates.retain(|(name, _)| !name.starts_with("skill ") && (!old_names.contains(name) || ["agent", "skill", "unload", "colorscheme"].contains(&name.as_str())));
+                for (name, description) in skills {
+                    self.candidates.push((format!("skill {name}"), description.clone()));
+                    if !["agent", "skill", "unload", "colorscheme"].contains(&name.as_str()) {
+                        self.candidates.push((name, format!("Skill: {description}")));
+                    }
+                }
+                self.selected = 0;
+            }
+            return;
+        }
         if name != "input:plugins" { return; }
         if let Ok(names) = serde_json::from_value::<Vec<String>>(payload.clone()) {
             self.candidates.retain(|(name, _)| !name.starts_with("unload "));

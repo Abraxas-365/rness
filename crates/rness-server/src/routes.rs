@@ -169,6 +169,7 @@ async fn request(State(s): State<ServerState>, Json(req): Json<ClientRequest>) -
             match s.sessions.send(&session, intent, content) {
                 Ok(outcome) => {
                     let status = match outcome {
+                        rness_engine::inbox::Disposition::Command(result) => return Json(json!({"status":"command", "result":result})).into_response(),
                         rness_engine::inbox::Disposition::StartTurn => "started",
                         rness_engine::inbox::Disposition::Queued => "queued",
                         rness_engine::inbox::Disposition::LogOnly => "logged",

@@ -62,6 +62,9 @@ fn spawn_shell(command: &str, workdir: &std::path::Path) -> std::io::Result<toki
 
 #[async_trait]
 impl Tool for BashTool {
+    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self::new(self.ws.for_session(session, workspace), self.jobs.clone())))
+    }
     fn name(&self) -> &str {
         "Bash"
     }
