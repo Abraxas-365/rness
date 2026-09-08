@@ -199,7 +199,7 @@ impl ToolRegistry {
                 let started = Instant::now();
                 let outcome = match tool {
                     Some(t) => {
-                        if t.sensitive() {
+                        {
                             let request = ApprovalRequest {
                                 session: session.clone(),
                                 call: call.call.clone(),
@@ -211,7 +211,8 @@ impl ToolRegistry {
                             // it (the dropped check future cleans up
                             // answerer-side state).
                             let decision = tokio::select! {
-                                d = approvals.check(&request) => d,
+                                biased;
+                                d = approvals.check_tool(&request, t.sensitive()) => d,
                                 _ = cancel.cancelled() => Decision::Cancelled,
                             };
                             match decision {
@@ -228,8 +229,6 @@ impl ToolRegistry {
                                         .into(),
                                 ),
                             }
-                        } else {
-                            t.execute_in(&session, call.args.clone()).await
                         }
                     }
                     None => Err(format!("unknown tool '{}'", call.name)),

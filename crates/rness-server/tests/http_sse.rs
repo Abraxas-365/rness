@@ -315,7 +315,8 @@ async fn ask_server(
 ) -> (String, Arc<SessionService>, Kernel) {
     let tools = Arc::new(ToolRegistry::default());
     tools.register(Arc::new(Danger { ran }));
-    tools.approvals().set_policy(rness_engine::approval::Policy::Ask);
+    tools.approvals().set_rules([("Danger".into(), rness_engine::approval::ToolPolicy::Ask)].into());
+    assert_eq!(tools.approvals().policy(), rness_engine::approval::Policy::Allow);
     let provider = Arc::new(ToolThenDone { asked: std::sync::atomic::AtomicBool::new(false) });
     serve_with(dir, provider, tools).await
 }

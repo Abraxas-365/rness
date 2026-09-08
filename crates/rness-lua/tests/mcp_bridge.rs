@@ -49,6 +49,8 @@ for line in sys.stdin:
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "ping", "description": "pong", "inputSchema": {"type": "object"}}]}})
     elif method == "tools/call":
+        if len(sys.argv) > 1:
+            with open(sys.argv[1], 'a') as calls: calls.write('called\n')
         send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "pong!"}]}})
 "#;
 
@@ -58,6 +60,7 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
     let script = dir.path().join("server.py");
     std::fs::write(&script, FAKE_SERVER).unwrap();
 
+    let marker = dir.path().join("calls");
     let registry = Arc::new(ToolRegistry::default());
     let sessions = Arc::new(SessionService::new(
         SessionStore::new(dir.path()),
@@ -88,17 +91,27 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
             local tools = rness.mcp.connect{{
                 name = "fake",
                 command = "python3",
-                args = {{ "{}" }},
+                args = {{ "{}", "{}" }},
                 timeout_ms = 5000,
             }}
             assert(tools[1] == "mcp__fake__ping", "bridged: " .. tostring(tools[1]))
             assert(rness.mcp.servers()[1] == "fake", "listed")
             "#,
-            script.display()
+            script.display(), marker.display()
         ),
     )
     .await
     .unwrap();
+
+    let calls = vec![rness_engine::tools::ToolCall { call: "permission".into(), name: "mcp__fake__ping".into(), args: serde_json::json!({}) }];
+    registry.approvals().set_rules([("mcp__fake__ping".into(), rness_engine::approval::ToolPolicy::Deny)].into());
+    let result = registry.dispatch(&"s".into(), &calls, 1, &CancellationToken::new()).await;
+    assert!(result[0].is_error);
+    assert!(!marker.exists(), "denied MCP call reached the server");
+    registry.approvals().set_rules(Default::default());
+    let result = registry.dispatch(&"s".into(), &calls, 1, &CancellationToken::new()).await;
+    assert!(!result[0].is_error);
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "called\n");
 
     // The bridged tool is callable through the shared registry.
     let tool = registry.get("mcp__fake__ping").unwrap();

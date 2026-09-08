@@ -415,11 +415,12 @@ async fn main() -> anyhow::Result<()> {
     let policy: rness_engine::approval::Policy =
         cli.approval.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     tools.approvals().set_policy(policy);
+    tools.approvals().set_rules(startup.permissions.clone());
 
     // Under `ask`, the TUI overlay is the answerer; approvals channel
     // bridges engine → UI. (Headless ask fails closed by design.)
     let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel();
-    if policy == rness_engine::approval::Policy::Ask {
+    if policy == rness_engine::approval::Policy::Ask || startup.permissions.values().any(|rule| *rule == rness_engine::approval::ToolPolicy::Ask) {
         tools.approvals().set_answerer(Arc::new(TuiAnswerer { tx: approval_tx }));
     }
 
@@ -567,7 +568,7 @@ async fn main() -> anyhow::Result<()> {
         // answerer (there is no TUI here) with the HTTP/SSE one. Pending
         // questions surface as `approval_requested` frames and resolve
         // via POST /api/approvals/:call.
-        if policy == rness_engine::approval::Policy::Ask {
+        if policy == rness_engine::approval::Policy::Ask || startup.permissions.values().any(|rule| *rule == rness_engine::approval::ToolPolicy::Ask) {
             tools.approvals().set_answerer(Arc::clone(&state.approvals) as _);
         }
         let listener = tokio::net::TcpListener::bind(&addr)
@@ -666,6 +667,66 @@ struct LocalBackend {
 /// Bridges engine approval checks to the TUI overlay: sends the pending
 /// question over a channel, awaits the one-shot answer. A dropped
 /// receiver or responder resolves as Cancelled (fail closed).
+#[cfg(test)]
+mod permission_integration {
+    use super::*;
+    use rness_engine::approval::ToolPolicy;
+    use rness_engine::tools::{Tool, ToolCall, ToolRegistry};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Count(Arc<AtomicUsize>);
+    #[async_trait::async_trait]
+    impl Tool for Count {
+        fn name(&self) -> &str { "Read" }
+        async fn execute(&self, _: serde_json::Value) -> Result<String, String> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("executed".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn per_tool_permissions_cross_dispatch_and_real_tui_answerer() {
+        for mode in ["allow", "deny", "yes", "no", "drop", "disconnect", "cancel"] {
+            let registry = Arc::new(ToolRegistry::default());
+            let count = Arc::new(AtomicUsize::new(0));
+            registry.register(Arc::new(Count(count.clone())));
+            if mode != "allow" {
+                registry.approvals().set_rules([("Read".into(), if mode == "deny" { ToolPolicy::Deny } else { ToolPolicy::Ask })].into());
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            registry.approvals().set_answerer(Arc::new(TuiAnswerer { tx }));
+            if mode == "disconnect" { rx.close(); }
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let token = cancel.clone();
+            let task = tokio::spawn(async move {
+                registry.dispatch(&"s".into(), &[ToolCall { call: "c".into(), name: "Read".into(), args: serde_json::json!({}) }], 1, &token).await
+            });
+            if ["yes", "no", "drop", "cancel"].contains(&mode) {
+                let pending = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+                assert_eq!(pending.request.tool, "Read");
+                match mode {
+                    "yes" | "no" => {
+                        use rness_tui::component::Component;
+                        let model = rness_tui::app::Model::new("s".into(), "m".into());
+                        let theme = rness_tui::theme::Theme::default();
+                        let ctx = rness_tui::component::Ctx { model: &model, theme: &theme };
+                        let mut overlay = rness_tui::modules::approval::ApprovalOverlay;
+                        let outcome = overlay.on_key(&ctx, crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Char(if mode == "yes" { 'y' } else { 'n' }), crossterm::event::KeyModifiers::NONE));
+                        let rness_tui::app::Action::ResolveApproval(decision) = outcome.actions.into_iter().next().unwrap() else { panic!("approval action") };
+                        pending.respond.send(decision).unwrap();
+                    }
+                    "cancel" => { cancel.cancel(); drop(pending); }
+                    _ => drop(pending),
+                }
+            }
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap();
+            let allowed = mode == "allow" || mode == "yes";
+            assert_eq!(!result[0].is_error, allowed, "{mode}");
+            assert_eq!(count.load(Ordering::SeqCst), usize::from(allowed), "{mode}");
+        }
+    }
+}
+
 struct TuiAnswerer {
     tx: tokio::sync::mpsc::UnboundedSender<rness_tui::modules::approval::PendingApproval>,
 }

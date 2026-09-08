@@ -36,6 +36,31 @@ fn command_example_registers_help_and_arguments() {
     assert_eq!(runtime.command_metadata("project").1.len(), 2);
 }
 
+#[tokio::test]
+async fn lua_permission_rules_survive_workspace_and_ceiling_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("executed");
+    let init = dir.path().join("init.lua");
+    std::fs::write(&init, "rness.permissions.set { guarded = 'deny' }").unwrap();
+    let config = rness_lua::api::config::load(&init).unwrap();
+    let host = LuaHost::spawn().unwrap();
+    host.load("guarded", &format!("rness.tool.register{{name='guarded', run=function() rness.fs.write({:?}, 'ran'); return 'ok' end}}", marker.to_str().unwrap())).await.unwrap();
+    let registry = ToolRegistry::default();
+    rness_lua::api::tools::sync_lua_tools(&registry, &host, &[]).await;
+    registry.approvals().set_rules(config.permissions);
+    let calls = vec![rness_engine::tools::ToolCall { call: "c".into(), name: "guarded".into(), args: serde_json::json!({}) }];
+    for session in ["parent", "child"] {
+        let scoped = registry.for_workspace(&session.into(), dir.path()).restricted(&["guarded".into()]);
+        let result = scoped.dispatch(&session.into(), &calls, 1, &CancellationToken::new()).await;
+        assert!(result[0].is_error);
+        assert!(!marker.exists());
+    }
+    registry.approvals().set_rules(Default::default());
+    let result = registry.dispatch(&"parent".into(), &calls, 1, &CancellationToken::new()).await;
+    assert!(!result[0].is_error);
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "ran");
+}
+
 struct NativeText;
 
 #[async_trait]

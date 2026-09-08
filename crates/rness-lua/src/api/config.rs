@@ -6,6 +6,7 @@ use rness_engine::config::{ModelDeclaration, ModelRegistry, Profile};
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
     pub plugins: Vec<String>,
     pub colorschemes: BTreeMap<String, serde_json::Value>,
     pub colorscheme: Option<String>,
@@ -14,6 +15,27 @@ pub struct StartupConfig {
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
     pub default_agent: Option<String>,
+}
+
+#[cfg(test)]
+mod permission_tests {
+    #[test]
+    fn rules_are_explicit_validated_and_replace_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.permissions.set { Read = 'ask', Bash = 'deny' }").unwrap();
+        let config = super::load(&path).unwrap();
+        assert_eq!(config.permissions["Read"], rness_engine::approval::ToolPolicy::Ask);
+        assert_eq!(config.permissions["Bash"], rness_engine::approval::ToolPolicy::Deny);
+        for source in ["rness.permissions.set { Read = 'alow' }", "rness.permissions.set { ['*'] = 'deny' }"] {
+            std::fs::write(&path, source).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+        std::fs::write(&path, "rness.permissions.set { Bash = 'deny' }; rness.permissions.set {}").unwrap();
+        assert!(super::load(&path).unwrap().permissions.is_empty());
+        std::fs::write(&path, "").unwrap();
+        assert!(super::load(&path).unwrap().permissions.is_empty());
+    }
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -63,6 +85,17 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     ui.set("colorscheme", schemes)?;
     lua.globals().get::<Table>("rness")?.set("ui", ui)?;
     let rness: Table = lua.globals().get("rness")?;
+    let permissions = lua.create_table()?;
+    let s = state.clone();
+    permissions.set("set", lua.create_function(move |lua, value: Table| {
+        let rules: BTreeMap<String, rness_engine::approval::ToolPolicy> = lua.from_value(mlua::Value::Table(value))?;
+        if rules.keys().any(|name| name.is_empty() || name.trim() != name || name.contains('*')) {
+            return Err(mlua::Error::runtime("permissions require exact, nonempty tool names (no wildcards)"));
+        }
+        s.lock().unwrap().permissions = rules;
+        Ok(())
+    })?)?;
+    rness.set("permissions", permissions)?;
     let plugins = lua.create_table()?;
     let s = state.clone();
     plugins.set("load", lua.create_function(move |_, name: String| {

@@ -1,5 +1,24 @@
 # Lua commands and session context
 
+## Opt-in tool permissions
+
+In `init.lua`, explicitly configure exact tool names:
+
+```lua
+rness.permissions.set {
+  Read = "allow",
+  Write = "ask",
+  Bash = "deny",
+}
+```
+
+No configuration means unrestricted tool execution by default. Rules are case-sensitive and apply to agent-dispatched Rust, Lua, and MCP tools regardless of their sensitivity flag. `allow` executes, `deny` blocks, and `ask` requires approval for each call. Missing or disconnected approvers fail closed. TUI and HTTP/SSE use their existing approval interfaces.
+
+Explicit rules override the global `--approval` setting for that tool. Unmatched tools retain the existing global behavior: `allow` permits everything; `ask`/`never` affect sensitive tools only. `set` replaces the full map; `{}` clears it. Unknown actions, empty names, and wildcards fail startup. Names may refer to tools loaded later. Rules are startup configuration, not a live plugin registration API.
+
+These permissions cannot broaden agent tool ceilings. They do not sandbox plugins or intercept direct tool calls, command callbacks, `rness.process`, filesystem access, or network calls inside plugins. No filesystem/network restriction is enabled automatically.
+
+
 Load the plugin explicitly with `rness.plugins.load("commands")` from init.lua. Registration occurs during plugin loading, not inside callbacks.
 
 ```lua

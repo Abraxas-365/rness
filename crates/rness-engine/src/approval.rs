@@ -39,6 +39,10 @@ impl std::str::FromStr for Policy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolPolicy { Allow, Ask, Deny }
+
 /// The one-shot verdict on a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -62,13 +66,14 @@ pub trait Answerer: Send + Sync {
 /// which behaves exactly like not having the seam at all.
 #[derive(Default)]
 pub struct Approvals {
+    rules: RwLock<std::collections::BTreeMap<String, ToolPolicy>>,
     policy: RwLock<Policy>,
     answerer: RwLock<Option<std::sync::Arc<dyn Answerer>>>,
 }
 
 impl Approvals {
     pub fn with_policy(policy: Policy) -> Self {
-        Self { policy: RwLock::new(policy), answerer: RwLock::new(None) }
+        Self { policy: RwLock::new(policy), ..Default::default() }
     }
 
     pub fn policy(&self) -> Policy {
@@ -85,8 +90,28 @@ impl Approvals {
     }
 
     /// Decide whether `request` may run. Policy first, answerer second.
+    pub fn set_rules(&self, rules: std::collections::BTreeMap<String, ToolPolicy>) {
+        *self.rules.write().expect("rules lock") = rules;
+    }
+
+    pub async fn check_tool(&self, request: &ApprovalRequest, sensitive: bool) -> Decision {
+        let rule = self.rules.read().expect("rules lock").get(&request.tool).copied();
+        let policy = match rule {
+            Some(ToolPolicy::Allow) => Policy::Allow,
+            Some(ToolPolicy::Ask) => Policy::Ask,
+            Some(ToolPolicy::Deny) => Policy::Never,
+            None if sensitive => self.policy(),
+            None => Policy::Allow,
+        };
+        self.decide(request, policy).await
+    }
+
     pub async fn check(&self, request: &ApprovalRequest) -> Decision {
-        match self.policy() {
+        self.decide(request, self.policy()).await
+    }
+
+    async fn decide(&self, request: &ApprovalRequest, policy: Policy) -> Decision {
+        match policy {
             Policy::Allow => Decision::Allowed,
             Policy::Never => Decision::Rejected,
             Policy::Ask => {
@@ -120,6 +145,26 @@ mod tests {
             tool: "Bash".into(),
             args: serde_json::json!({}),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_rules_override_sensitivity_and_global_policy() {
+        let approvals = Approvals::default();
+        for sensitive in [false, true] { assert_eq!(approvals.check_tool(&req(), sensitive).await, Decision::Allowed); }
+        approvals.set_rules([("Bash".into(), ToolPolicy::Deny)].into());
+        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Rejected);
+        approvals.set_rules([("Bash".into(), ToolPolicy::Ask)].into());
+        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Unavailable);
+        approvals.set_answerer(Arc::new(Always(Decision::Allowed)));
+        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Allowed);
+        approvals.set_answerer(Arc::new(Always(Decision::Rejected)));
+        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Rejected);
+        approvals.set_policy(Policy::Never);
+        approvals.set_rules([("Bash".into(), ToolPolicy::Allow)].into());
+        assert_eq!(approvals.check_tool(&req(), true).await, Decision::Allowed);
+        approvals.set_rules(Default::default());
+        assert_eq!(approvals.check_tool(&req(), true).await, Decision::Rejected);
+        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Allowed);
     }
 
     #[tokio::test]
