@@ -77,6 +77,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dynamic_completion_ignores_stale_queries() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.editor.insert_str("/project pa");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/project pa"));
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"/project old", "values":["wrong"]}));
+        assert!(input.matches().is_empty());
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"/project pa", "values":["path"]}));
+        assert_eq!(input.matches()[0].0, "project path");
+    }
+
+    #[test]
     fn command_catalog_shadows_skills_and_removes_unloaded_commands() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -157,6 +172,18 @@ impl Default for Input {
 
 impl Component for Input {
     fn on_action(&mut self, _ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "input:completion" {
+            if payload["text"].as_str() != Some(self.editor.text().as_str()) { return; }
+            if let (Some(text), Ok(values)) = (payload["text"].as_str(), serde_json::from_value::<Vec<String>>(payload["values"].clone())) {
+                let command = text.trim_start_matches('/').split_whitespace().next().unwrap_or_default();
+                let prefix = format!("{command} ");
+                self.commands.retain(|(name, _)| !name.starts_with(&prefix));
+                self.commands.extend(values.into_iter().map(|value| (format!("{prefix}{value}"), String::new())));
+                self.dismissed = false;
+                self.selected = 0;
+            }
+            return;
+        }
         if name == "input:commands" {
             if let Ok(commands) = serde_json::from_value(payload.clone()) {
                 self.commands = commands;
@@ -267,6 +294,12 @@ impl Component for Input {
     }
 
     fn on_key(&mut self, _ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
+        let text = self.editor.text();
+        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL
+            && text.starts_with('/') && text.contains(' ')
+        {
+            return KeyOutcome::act(vec![Action::Complete(text)]);
+        }
         let matches = self.matches();
         if !matches.is_empty() {
             let count = matches.len();

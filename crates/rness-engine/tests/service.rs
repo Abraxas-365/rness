@@ -77,6 +77,10 @@ async fn command_admission_cancellation_drop_and_panic_release_reservations() {
 
     let pending = service.send_async(id.clone(), UserIntent::Followup, input());
     assert!(service.command_running(&id));
+    assert!(matches!(service.compact(&id, 0).await, Err(rness_engine::service::ServiceError::Busy)));
+    assert!(matches!(service.set_config(&id, service.config(&id).unwrap()), Err(rness_engine::service::ServiceError::Busy)));
+    assert!(matches!(service.select_agent(&id, "any"), Err(rness_engine::service::ServiceError::Busy)));
+    assert!(matches!(service.prune_tool_results(&id, rness_engine::service::PruneOptions { threshold_chars: 100, head_chars: 20, tail_chars: 20, keep_turns: 1 }), Err(rness_engine::service::ServiceError::Busy)));
     assert!(service.try_extension_maintenance().is_err());
     assert!(service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "must not start".into() }]).is_err());
     service.cancel(&id);

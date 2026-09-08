@@ -60,6 +60,7 @@ pub struct UnloadSnapshot {
 }
 
 enum Cmd {
+    Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<String>, String>> },
     Command { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
     CoordinatedUnload {
@@ -154,6 +155,16 @@ impl rness_engine::interaction::Command for LuaCommand {
     fn usage(&self) -> &str { &self.usage }
     fn arguments(&self) -> Vec<(String, String)> { self.arguments.clone() }
     fn description(&self) -> &str { &self.description }
+    fn complete(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<String>, rness_engine::service::ServiceError> {
+        use rness_engine::service::ServiceError;
+        if std::thread::current().name() == Some("lua-vm") { return Err(ServiceError::InvalidConfig("recursive Lua completion".into())); }
+        let workspace = service.store().workspace(input.session)?;
+        let (reply, receive) = mpsc::channel();
+        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Complete {
+            name: self.name.clone(), context: serde_json::json!({"session":input.session,"workspace":workspace,"raw_input":input.raw_input}), cancel: input.cancel, reply,
+        }).map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
+        receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?.map_err(ServiceError::InvalidConfig)
+    }
     fn execute(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
         use rness_engine::service::ServiceError;
         if std::thread::current().name() == Some("lua-vm") {
@@ -231,13 +242,26 @@ impl LuaHost {
                 let mut session_binding: Option<SessionBinding> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
+                        Cmd::Complete { name, context, cancel, reply } => {
+                            let token = cancel.clone();
+                            rt.lua().set_app_data(cancel.clone());
+                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                                if token.is_cancelled() { Err(mlua::Error::runtime("completion cancelled")) } else { Ok(mlua::VmState::Continue) }
+                            });
+                            let result = if cancel.is_cancelled() { Err("completion cancelled".into()) } else { rt.complete_command(&name, context) };
+                            rt.lua().remove_hook();
+                            rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
+                            let _ = reply.send(result);
+                        }
                         Cmd::Command { name, context, cancel, reply } => {
+                            rt.lua().set_app_data(cancel.clone());
                             let token = cancel.clone();
                             rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
                                 if token.is_cancelled() { Err(mlua::Error::runtime("command cancelled")) } else { Ok(mlua::VmState::Continue) }
                             });
                             let result = if cancel.is_cancelled() { Err("command cancelled".into()) } else { rt.call_command(&name, context) };
                             rt.lua().remove_hook();
+                            rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
                         }
                         Cmd::Load { name, source, reply } => {

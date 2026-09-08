@@ -102,6 +102,7 @@ impl Event for FrameEv {
 // -- live session state ----------------------------------------------------
 
 struct Live {
+    operation: Arc<tokio::sync::Mutex<()>>,
     command: Mutex<Option<CancellationToken>>,
     inbox: Mutex<Inbox>,
     /// Token of the current (or last) burst. Replaced on each new burst.
@@ -113,6 +114,7 @@ struct Live {
 impl Default for Live {
     fn default() -> Self {
         Self {
+            operation: Arc::new(tokio::sync::Mutex::new(())),
             command: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             cancel: Mutex::new(CancellationToken::new()),
@@ -125,6 +127,7 @@ impl Default for Live {
 /// Dropping it (including during unwinding) releases both reservations.
 pub struct PreparedCommand {
     live: Arc<Live>,
+    _operation: tokio::sync::OwnedMutexGuard<()>,
     _activity: tokio::sync::OwnedRwLockReadGuard<()>,
     command: Arc<dyn crate::interaction::Command>,
     session: SessionId,
@@ -133,6 +136,13 @@ pub struct PreparedCommand {
 }
 
 impl PreparedCommand {
+    pub fn complete(self, service: &SessionService) -> Result<Vec<String>, ServiceError> {
+        if self.cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("completion cancelled".into())); }
+        self.command.complete(service, crate::interaction::CommandInvocation {
+            session: &self.session, raw_input: &self.raw_input, cancel: self.cancel.clone(),
+        })
+    }
+
     pub fn execute(self, service: &SessionService) -> Result<Disposition, ServiceError> {
         if self.cancel.is_cancelled() {
             return Err(ServiceError::InvalidConfig("command cancelled".into()));
@@ -201,6 +211,13 @@ impl SessionService {
     pub fn agents(&self) -> &std::collections::BTreeMap<String, crate::config::AgentDefinition> { &self.agents }
 
     pub fn select_agent(&self, session: &SessionId, name: &str) -> Result<(), ServiceError> {
+        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let live = self.live(session);
+        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        self.select_agent_reserved(session, name)
+    }
+
+    pub(crate) fn select_agent_reserved(&self, session: &SessionId, name: &str) -> Result<(), ServiceError> {
         let live = self.live(session);
         let inbox = live.inbox.lock().unwrap();
         if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
@@ -533,6 +550,7 @@ impl SessionService {
         };
         let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
+        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         let command = live.command.lock().unwrap();
         if command.is_some() { return Err(ServiceError::Busy); }
         let mut inbox = live.inbox.lock().unwrap();
@@ -598,6 +616,7 @@ impl SessionService {
         let Some((command, offset)) = self.commands.resolve(text) else { return Ok(None); };
         self.store.workspace(session)?;
         let live = self.live(session);
+        let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         let mut active = live.command.lock().unwrap();
         if active.is_some() || self.phase(session) != Phase::Idle {
             return Err(ServiceError::Busy);
@@ -606,7 +625,7 @@ impl SessionService {
         *active = Some(cancel.clone());
         drop(active);
         Ok(Some(PreparedCommand {
-            live, _activity: activity, command, session: session.clone(),
+            live, _operation: operation, _activity: activity, command, session: session.clone(),
             raw_input: text[offset..].to_owned(), cancel,
         }))
     }
@@ -651,6 +670,8 @@ impl SessionService {
         keep_turns: usize,
     ) -> Result<CompactReport, ServiceError> {
         let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let live = self.live(session);
+        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         if self.phase(session) != Phase::Idle {
             return Err(ServiceError::Busy);
         }
@@ -737,6 +758,9 @@ impl SessionService {
         session: &SessionId,
         opts: PruneOptions,
     ) -> Result<usize, ServiceError> {
+        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let live = self.live(session);
+        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         if self.phase(session) != Phase::Idle {
             return Err(ServiceError::Busy);
         }
@@ -832,7 +856,9 @@ impl SessionService {
         session: &SessionId,
         config: CallConfig,
     ) -> Result<(), ServiceError> {
+        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
+        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         let inbox = live.inbox.lock().unwrap();
         if inbox.phase() != Phase::Idle {
             return Err(ServiceError::Busy);

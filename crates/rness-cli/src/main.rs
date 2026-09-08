@@ -694,6 +694,24 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
 }
 
 impl rness_tui::app::Backend for LocalBackend {
+    fn complete(&self, session: &SessionId, text: String) {
+        let prepared = self.sessions.prepare_command(session, &text);
+        let tx = self.results.clone();
+        let session = session.clone();
+        let sessions = self.sessions.clone();
+        tokio::spawn(async move {
+            let result = match prepared {
+                Ok(Some(command)) => tokio::task::spawn_blocking(move || command.complete(&sessions)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())),
+                Ok(None) => Ok(Vec::new()),
+                Err(error) => Err(error.to_string()),
+            };
+            match result {
+                Ok(values) => { let _ = tx.send(rness_tui::app::Action::CompletionResult(session, text, values)); }
+                Err(error) => { let _ = tx.send(rness_tui::app::Action::CommandResult(session, format!("Completion failed: {error}"))); }
+            }
+        });
+    }
+
     fn command_running(&self, session: &SessionId) -> bool {
         self.sessions.command_running(session)
     }

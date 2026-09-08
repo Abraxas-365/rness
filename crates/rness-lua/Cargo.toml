@@ -22,6 +22,9 @@ tracing.workspace = true
 notify.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 rness-tui.workspace = true
 tempfile.workspace = true

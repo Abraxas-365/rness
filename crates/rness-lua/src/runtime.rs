@@ -43,6 +43,7 @@ pub struct LuaRuntime {
     /// None = unbind. The host recomputes stock+binds on every sync.
     keymap_binds: Vec<(String, Option<String>, Option<String>)>,
     registration_owners: HashMap<(&'static str, String), String>,
+    command_completers: HashMap<String, RegistryKey>,
     command_metadata: HashMap<String, (String, Vec<(String, String)>)>,
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
@@ -85,6 +86,7 @@ impl LuaRuntime {
             tool_cards: HashMap::new(),
             keymap_binds: Vec::new(),
             registration_owners: HashMap::new(),
+            command_completers: HashMap::new(),
             command_metadata: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
@@ -145,6 +147,17 @@ impl LuaRuntime {
         self.commands.iter().map(|(name, (description, _))| (name.clone(), description.clone())).collect()
     }
 
+    pub fn complete_command(&self, name: &str, context: serde_json::Value) -> Result<Vec<String>, String> {
+        if !self.commands.contains_key(name) { return Err(format!("command unavailable: {name}")); }
+        let Some(key) = self.command_completers.get(name) else {
+            return Ok(self.command_metadata(name).1.into_iter().map(|(value, _)| value).collect());
+        };
+        let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
+        let context = self.lua.to_value(&context).map_err(|e| e.to_string())?;
+        let result: Table = run.call(context).map_err(|e| e.to_string())?;
+        result.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>().map_err(|e| e.to_string())
+    }
+
     pub fn call_command(&self, name: &str, context: serde_json::Value) -> Result<rness_engine::interaction::CommandResult, String> {
         let (_, key) = self.commands.get(name).ok_or_else(|| format!("command unavailable: {name}"))?;
         let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
@@ -176,6 +189,7 @@ impl LuaRuntime {
         for (category, key) in owned {
             match category {
                 "commands" => {
+                    if let Some(callback) = self.command_completers.remove(&key) { self.lua.remove_registry_value(callback)?; }
                     self.command_metadata.remove(&key);
                     if let Some((_, callback)) = self.commands.remove(&key) {
                         self.lua.remove_registry_value(callback)?;
@@ -423,6 +437,9 @@ impl LuaRuntime {
             let key = self.lua.create_registry_value(run)?;
             let arguments: LuaValue = entry.get("arguments")?;
             self.command_metadata.insert(name.clone(), (entry.get("usage")?, self.lua.from_value(arguments)?));
+            if let Some(complete) = entry.get::<Option<Function>>("complete")? {
+                self.command_completers.insert(name.clone(), self.lua.create_registry_value(complete)?);
+            }
             self.commands.insert(name.clone(), (entry.get("description")?, key));
             if let Some(owner) = owner {
                 self.registration_owners.insert(("commands", name), owner.to_owned());
@@ -586,6 +603,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         let arguments = spec.get::<Option<Table>>("arguments")?.map(|table| table.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()).transpose()?.unwrap_or_default();
         let arguments: Vec<_> = arguments.into_iter().map(|value| (value, String::new())).collect();
         entry.set("arguments", lua.to_value(&arguments)?)?;
+        if let Some(complete) = spec.get::<Option<Function>>("complete")? { entry.set("complete", owned_callback(lua, complete)?)?; }
         entry.set("run", owned_callback(lua, spec.get::<Function>("run")?)?)?;
         let pending: Table = lua.globals().get("__rness_pending")?;
         pending.get::<Table>("commands")?.push(entry)?;
@@ -899,6 +917,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
 
     crate::api::fs::install(lua, &rness)?;
     crate::api::http::install(lua, &rness)?;
+    crate::api::process::install(lua, &rness)?;
 
     lua.globals().set("rness", rness)?;
     Ok(())

@@ -27,6 +27,9 @@ pub trait Command: Send + Sync {
     fn description(&self) -> &str;
     fn usage(&self) -> &str { "" }
     fn arguments(&self) -> Vec<(String, String)> { Vec::new() }
+    fn complete(&self, _service: &SessionService, _invocation: CommandInvocation<'_>) -> Result<Vec<String>, ServiceError> {
+        Ok(self.arguments().into_iter().map(|(value, _)| value).collect())
+    }
     fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError>;
 }
 
@@ -136,7 +139,7 @@ impl Command for AgentCommand {
         if args.next().is_some() {
             return Err(ServiceError::InvalidConfig("Usage: /agent <name>".into()));
         }
-        service.select_agent(invocation.session, name)?;
+        service.select_agent_reserved(invocation.session, name)?;
         Ok(CommandResult { message: format!("Agent selected: {name}"), data: serde_json::json!({"agent": name}) })
     }
 }

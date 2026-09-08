@@ -29,6 +29,7 @@ pub trait Backend: Send + Sync {
         self.request(request);
         Ok(None)
     }
+    fn complete(&self, _session: &SessionId, _text: String) {}
     fn command_running(&self, _session: &SessionId) -> bool { false }
     fn history(&self, session: &SessionId) -> History;
     fn prepare_input(&self, _session: &SessionId, text: &str) -> Result<Option<Vec<ContentPart>>, String> {
@@ -212,6 +213,8 @@ pub enum Action {
     /// mounted component. How Lua/plugin components talk to each other
     /// without extending this enum.
     Custom(String, serde_json::Value),
+    Complete(String),
+    CompletionResult(SessionId, String, Vec<String>),
     CommandResult(SessionId, String),
     Notice(String),
     /// Point the TUI at another session: model resets and rehydrates
@@ -230,6 +233,7 @@ pub struct App {
     /// Rebindable host bindings (chord → named action). Lua rewrites
     /// this via rness.keymaps; the shell only reads.
     pub keymap: crate::keymaps::KeymapState,
+    command_results: std::collections::HashMap<SessionId, Vec<String>>,
     backend: Arc<dyn Backend>,
 }
 
@@ -242,6 +246,7 @@ impl App {
             colorschemes: [("default".into(), Theme::default())].into(),
             apps: None,
             keymap: crate::keymaps::KeymapState::stock(),
+            command_results: Default::default(),
             backend,
         }
     }
@@ -250,6 +255,9 @@ impl App {
     pub fn reconcile(&mut self) {
         let history = self.backend.history(&self.model.session);
         self.model.load_history(&history);
+        if let Some(results) = self.command_results.get(&self.model.session) {
+            self.model.entries.extend(results.iter().cloned().map(Entry::Notice));
+        }
     }
 
     pub fn apply_frame(&mut self, frame: &Frame) {
@@ -374,7 +382,15 @@ impl App {
                     let _ = pending.respond.send(decision);
                 }
             }
+            Action::Complete(text) => self.backend.complete(&self.model.session, text),
+            Action::CompletionResult(session, text, values) => {
+                if session == self.model.session {
+                    let ctx = Ctx { model: &self.model, theme: &self.theme };
+                    self.slots.broadcast(&ctx, "input:completion", &serde_json::json!({"text":text,"values":values}));
+                }
+            }
             Action::CommandResult(session, message) => {
+                self.command_results.entry(session.clone()).or_default().push(message.clone());
                 if session == self.model.session { self.model.entries.push(Entry::Notice(message)); }
             }
             Action::Notice(text) => self.model.entries.push(Entry::Notice(text)),
@@ -509,6 +525,19 @@ mod tests {
         assert!(!app.model.busy);
         let actions = app.route_key(KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
         assert!(matches!(actions.as_slice(), [Action::Cancel]));
+    }
+
+    #[test]
+    fn hidden_command_results_survive_switch_and_reconcile_without_duplicates() {
+        let backend = Arc::new(FakeBackend { history: prior_history("s") });
+        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), backend);
+        app.apply(Action::CommandResult("other".into(), "saved result".into()));
+        assert!(app.model.entries.is_empty());
+        app.apply(Action::SwitchSession("other".into()));
+        app.reconcile();
+        assert_eq!(app.model.entries.iter().filter(|entry| **entry == Entry::Notice("saved result".into())).count(), 1);
+        app.apply(Action::SwitchSession("s".into()));
+        assert!(!app.model.entries.contains(&Entry::Notice("saved result".into())));
     }
 
     #[test]

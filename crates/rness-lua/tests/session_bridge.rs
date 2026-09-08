@@ -58,6 +58,7 @@ async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
         rness.commands.register{name='greet', description='Greet', usage='<name>', arguments={'world', 'team'}, run=function(ctx)
             return {message='hello' .. ctx.raw_input, data={session=ctx.session}}
         end}
+        rness.commands.register{name='dynamic', complete=function(ctx) return {ctx.session .. ctx.raw_input} end, run=function() end}
         rness.commands.register{name='spin', run=function() while true do end end}
         rness.commands.register{name='broken', run=function() error('command failed') end}
     "#).await.unwrap();
@@ -65,6 +66,35 @@ async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     assert!(sessions.commands().completions().iter().any(|(name, _)| name == "greet world"));
     let id = sessions.create(None).unwrap();
     let before = sessions.store().history(&id).unwrap();
+    let completion = sessions.prepare_command(&id, "/dynamic query").unwrap().unwrap();
+    assert_eq!(completion.complete(&sessions).unwrap(), vec![format!("{id} query")]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    host.load("http-command", &format!("rness.commands.register{{name='network', run=function() return rness.http.get({url:?}).body end}}")).await.unwrap();
+    let network = tokio::spawn(sessions.send_async(id.clone(), UserIntent::Followup, vec![ContentPart::Text { text: "/network".into() }]));
+    let (socket, _) = tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept()).await.unwrap().unwrap();
+    sessions.cancel(&id);
+    let error = tokio::time::timeout(std::time::Duration::from_secs(3), network).await.unwrap().unwrap().unwrap_err();
+    assert!(error.to_string().contains("cancelled"));
+    drop(socket);
+    assert!(host.unload_coordinated("http-command", vec![], |_| {}).await.unwrap());
+    #[cfg(unix)]
+    {
+        let marker = dir.path().join("process-ready");
+        host.load("process-command", &format!(r#"rness.commands.register{{name='external', run=function()
+            return rness.process.run{{program='/bin/sh', args={{'-c', 'echo ready > "$1"; sleep 100 & wait', 'sh', {:?}}}}}.stdout
+        end}}"#, marker.to_str().unwrap())).await.unwrap();
+        let external = tokio::spawn(sessions.send_async(id.clone(), UserIntent::Followup, vec![ContentPart::Text { text: "/external".into() }]));
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !marker.exists() { tokio::task::yield_now().await; }
+        }).await;
+        sessions.cancel(&id);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(3), external).await.unwrap().unwrap().unwrap_err();
+        ready.unwrap();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(sessions.try_extension_maintenance().is_ok());
+        assert!(host.unload_coordinated("process-command", vec![], |_| {}).await.unwrap());
+    }
     let result = sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text{text:"/greet  world".into()}]).unwrap();
     let rness_engine::inbox::Disposition::Command(result) = result else { panic!("expected command result") };
     assert_eq!(result.message, "hello  world");
