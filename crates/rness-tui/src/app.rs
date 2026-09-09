@@ -133,6 +133,11 @@ impl Model {
                         content: m.content.clone(),
                     });
                 }
+                SessionEvent::AssistantAttempt(attempt) => {
+                    if let rness_protocol::events::AttemptOutcome::Error { message, .. } = &attempt.outcome {
+                        self.entries.push(Entry::Notice(format!("Provider error ({}): {}", attempt.model, message)));
+                    }
+                }
                 SessionEvent::ToolResult(r) => self.entries.push(Entry::ToolResult {
                     call: r.call.clone(),
                     name: names.get(&r.call).cloned().unwrap_or_default(),
@@ -584,6 +589,19 @@ mod tests {
 
     fn env(event: SessionEvent) -> Envelope {
         Envelope { id: "01TEST".into(), at: "2026-01-01T00:00:00.000Z".into(), event }
+    }
+
+    #[test]
+    fn provider_errors_are_visible_after_history_reload() {
+        use rness_protocol::events::{AssistantAttempt, AttemptOutcome};
+        let mut model = Model::new("s".into(), "fake".into());
+        let history = History { session: "s".into(), envelopes: vec![env(SessionEvent::AssistantAttempt(AssistantAttempt {
+            model: "fake".into(), chunks: vec![], outcome: AttemptOutcome::Error { message: "connection closed before message_stop".into(), retryable: true },
+        }))] };
+        model.load_history(&history);
+        assert!(matches!(&model.entries[0], Entry::Notice(text) if text.contains("Provider error (fake)") && text.contains("connection closed")));
+        model.load_history(&history);
+        assert_eq!(model.entries.len(), 1);
     }
 
     fn prior_history(session: &str) -> History {

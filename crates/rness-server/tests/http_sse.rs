@@ -14,6 +14,44 @@ use rness_protocol::events::*;
 use rness_server::{router, ServerState};
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn questions_http_sse_validation_resolution_and_cancellation() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ToolRegistry::default());
+    let mut kernel = Kernel::new();
+    kernel.mount(SessionsPlugin { root: dir.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), agents: Default::default(), models: Default::default(), tools: tools.clone(), config: TurnConfig::default() }).unwrap();
+    let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
+    let state = ServerState::new(sessions.clone());
+    state.questions.set_available(true);
+    tools.register(Arc::new(rness_engine::questions::AskUser(state.questions.clone())));
+    let id = sessions.create(None).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap(); });
+    let http = reqwest::Client::new();
+    let mut stream = http.get(format!("{base}/api/events/{id}")).send().await.unwrap();
+    for cancelled in [false, true] {
+        let token = CancellationToken::new(); let cancel = token.clone(); let registry = tools.clone(); let session = id.clone();
+        let task = tokio::spawn(async move { registry.dispatch(&session, &[rness_engine::tools::ToolCall { call: "q-call".into(), name: "AskUser".into(), args: serde_json::json!({"questions":[{"id":"q","question":"Choose","options":[{"label":"A"},{"label":"B"}],"multi_select":true}]}) }], 1, &token).await });
+        let mut received = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async { while !received.contains("question_requested") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); } }).await.unwrap();
+        let pending: serde_json::Value = http.get(format!("{base}/api/questions")).send().await.unwrap().json().await.unwrap();
+        assert_eq!(pending[0]["session"], id);
+        let endpoint = format!("{base}/api/questions/{id}/q-call");
+        assert_eq!(http.post(&endpoint).json(&serde_json::json!({"answers":[]})).send().await.unwrap().status(), 400);
+        if cancelled { cancel.cancel(); } else {
+            assert_eq!(http.post(&endpoint).json(&serde_json::json!({"answers":[{"id":"q","selected":["A","B"],"custom":"context"}]})).send().await.unwrap().status(), 204);
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap();
+        assert_eq!(result[0].is_error, cancelled);
+        received.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async { while !received.contains("question_resolved") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); } }).await.unwrap();
+        assert_eq!(http.get(format!("{base}/api/questions")).send().await.unwrap().json::<serde_json::Value>().await.unwrap(), serde_json::json!([]));
+        assert_eq!(http.delete(&endpoint).send().await.unwrap().status(), 404);
+    }
+    server.abort();
+}
+
 struct OneAnswer;
 
 #[async_trait]

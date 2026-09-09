@@ -4,6 +4,11 @@ use std::sync::{Arc, Mutex};
 use mlua::{Lua, LuaSerdeExt, Table};
 use rness_engine::config::{ModelDeclaration, ModelRegistry, Profile};
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct QuestionOverlayConfig { pub enabled: bool, pub priority: i32, pub height: u16, pub title: String }
+impl Default for QuestionOverlayConfig { fn default() -> Self { Self { enabled: true, priority: 99, height: 20, title: "AskUser".into() } } }
+
 #[derive(Clone, Default)]
 pub struct StartupConfig {
     pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
@@ -14,6 +19,8 @@ pub struct StartupConfig {
     pub providers: BTreeMap<String, ProviderDeclaration>,
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
+    pub question_overlay: QuestionOverlayConfig,
+    pub ask_user: bool,
     pub default_agent: Option<String>,
 }
 
@@ -85,6 +92,14 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     ui.set("colorscheme", schemes)?;
     lua.globals().get::<Table>("rness")?.set("ui", ui)?;
     let rness: Table = lua.globals().get("rness")?;
+    let questions = lua.create_table()?;
+    let s = state.clone();
+    questions.set("enable", lua.create_function(move |lua, options: Option<Table>| {
+        let config: QuestionOverlayConfig = match options { Some(table) => lua.from_value(mlua::Value::Table(table))?, None => Default::default() };
+        if config.height < 10 || config.title.trim().is_empty() { return Err(mlua::Error::runtime("questions height must be >= 10 and title nonempty")); }
+        let mut state = s.lock().unwrap(); state.ask_user = true; state.question_overlay = config; Ok(())
+    })?)?;
+    rness.set("questions", questions)?;
     let permissions = lua.create_table()?;
     let s = state.clone();
     permissions.set("set", lua.create_function(move |lua, value: Table| {

@@ -117,6 +117,8 @@ impl AppsState {
         *self.events.write().expect("apps lock") = Some(tx);
     }
 
+    pub fn active_overlay(&self) -> bool { self.active_in_slot(OVERLAY).is_some() }
+
     pub fn active(&self) -> Option<String> {
         self.inner.read().expect("apps lock").active.clone()
     }

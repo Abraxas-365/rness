@@ -147,7 +147,11 @@ impl Component for Chat {
                     }
                 }
                 Entry::Notice(text) => {
-                    lines.push(Line::styled(text.clone(), theme.dim));
+                    for line in text.lines() {
+                        for wrapped in textwrap::wrap(&sanitize(line), usize::from(width.max(1))) {
+                            lines.push(Line::styled(wrapped.into_owned(), theme.dim));
+                        }
+                    }
                 }
             }
         }
@@ -178,6 +182,26 @@ impl Component for Chat {
 #[cfg(test)]
 mod tests {
     use super::sanitize;
+
+    #[test]
+    fn provider_notice_wraps_without_losing_cause() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+
+        let mut model = Model::new("qa".into(), "fake".into());
+        let text = "Provider error (fake): anthropic: stream ended before message_stop (connection closed or incomplete response)";
+        model.entries.push(Entry::Notice(text.into()));
+        let theme = Theme::default();
+        for width in [40, 80, 120] {
+            let area = Rect::new(0, 0, width, 12);
+            let mut buf = Buffer::empty(area);
+            Chat { cards: CardCache::default() }.render(&Ctx { model: &model, theme: &theme }, area, &mut buf);
+            let rendered = (0..area.height).map(|y| {
+                (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+            }).collect::<Vec<_>>().join(" ");
+            assert_eq!(rendered.split_whitespace().collect::<Vec<_>>(), text.split_whitespace().collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn tabs_expand_to_8_col_stops() {

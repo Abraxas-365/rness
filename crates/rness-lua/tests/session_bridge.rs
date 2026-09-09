@@ -32,6 +32,50 @@ impl Provider for OneAnswer {
     }
 }
 
+#[tokio::test]
+async fn questions_transactional_lifecycle_and_pending_unload() {
+    use rness_engine::questions::{Questions, QuestionEvent};
+    use rness_engine::tools::ToolCall;
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(OneAnswer), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3));
+    let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+    host.install_session(sessions, subagents, registry.clone(), Default::default(), tokio::runtime::Handle::current(), "fake-1".into()).await.unwrap();
+    let qs = Arc::new(Questions::default());
+    qs.bind_registry(&registry);
+    host.install_questions(qs.clone()).await.unwrap();
+    assert!(!qs.is_available());
+    assert!(registry.get("AskUser").is_none());
+    assert!(host.load("broken", "rness.questions.enable(); error('broken')").await.is_err());
+    assert!(!qs.is_available());
+    assert!(registry.get("AskUser").is_none());
+    host.load("owner", "rness.questions.enable {priority=123, title='Decisions'}").await.unwrap();
+    assert_eq!(qs.overlay_config().priority, 123);
+    let mut events = qs.subscribe();
+    let tools = registry.clone();
+    let task = tokio::spawn(async move {
+        tools.dispatch(&"s".into(), &[ToolCall { call:"c".into(), name:"AskUser".into(), args:serde_json::json!({"questions":[{"id":"q","question":"Choose"}]}) }], 1, &CancellationToken::new()).await
+    });
+    assert!(matches!(tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.unwrap().unwrap(), QuestionEvent::QuestionRequested {..}));
+    assert!(host.load("failed-disable", "rness.questions.disable(); error('broken')").await.is_err());
+    assert_eq!(qs.pending().len(), 1);
+    assert!(host.unload_coordinated("owner", vec![], |_| {}).await.unwrap());
+    assert!(task.await.unwrap()[0].is_error);
+    assert!(matches!(events.recv().await.unwrap(), QuestionEvent::QuestionResolved {..}));
+    assert!(qs.pending().is_empty());
+    assert!(!qs.is_available());
+    assert!(registry.get("AskUser").is_none());
+    host.load("disabled", "rness.questions.enable {enabled=false}").await.unwrap();
+    assert!(!qs.is_available());
+    assert!(registry.get("AskUser").is_none());
+    host.load("next", "rness.questions.enable()").await.unwrap();
+    host.reload(vec![]).await.unwrap();
+    assert!(!qs.is_available());
+    assert!(registry.get("AskUser").is_none());
+    assert!(qs.owner().is_none());
+}
+
 struct BlockingCommand {
     entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,

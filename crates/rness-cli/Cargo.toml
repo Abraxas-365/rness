@@ -30,6 +30,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 
+crossterm.workspace = true
+ratatui.workspace = true
+textwrap.workspace = true
+
 [dev-dependencies]
 tokio-util.workspace = true
-crossterm.workspace = true

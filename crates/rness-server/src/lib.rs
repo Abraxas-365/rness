@@ -38,6 +38,7 @@ use tokio::sync::broadcast;
 /// reconcile from durable history — frames are ephemeral by contract).
 #[derive(Clone)]
 pub struct ServerState {
+    pub questions: Arc<rness_engine::questions::Questions>,
     pub sessions: Arc<SessionService>,
     pub frames: broadcast::Sender<rness_protocol::frames::Frame>,
     /// Remote answerer for the `ask` policy. Always constructed; it only
@@ -50,7 +51,7 @@ impl ServerState {
     pub fn new(sessions: Arc<SessionService>) -> Self {
         let (frames, _) = broadcast::channel(1024);
         let approvals = Arc::new(approvals::RemoteApprovals::new(frames.clone()));
-        Self { sessions, frames, approvals }
+        Self { sessions, frames, approvals, questions: Arc::new(Default::default()) }
     }
 
     /// The callback to hang on the kernel bus (`FrameEv`).

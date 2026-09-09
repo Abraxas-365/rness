@@ -11,6 +11,7 @@
 //! - [`interaction`]: UI-agnostic approval / ask-user contracts
 //! - [`service`]: SessionService — the ONLY public API frontends use
 
+pub mod questions;
 pub mod approval;
 pub mod config;
 pub mod inbox;

@@ -60,7 +60,10 @@ impl Slots {
         self.slots
             .get_mut(slot)?
             .iter_mut()
-            .find(|m| m.component.wants(ctx))
+            .filter(|m| m.component.wants(ctx))
+            .enumerate()
+            .max_by_key(|(index, m)| (m.component.priority().unwrap_or(m.priority), std::cmp::Reverse(*index)))
+            .map(|(_, m)| m)
             .map(|m| &mut m.component)
     }
 
@@ -68,7 +71,10 @@ impl Slots {
         self.slots
             .get(slot)?
             .iter()
-            .find(|m| m.component.wants(ctx))
+            .filter(|m| m.component.wants(ctx))
+            .enumerate()
+            .max_by_key(|(index, m)| (m.component.priority().unwrap_or(m.priority), std::cmp::Reverse(*index)))
+            .map(|(_, m)| m)
             .map(|m| m.component.as_ref())
     }
 
@@ -136,7 +142,7 @@ impl Slots {
         // Overlay: centered box over everything.
         if let Some(c) = self.winner_mut(OVERLAY, ctx) {
             let h = c.height(ctx, area.width).unwrap_or(area.height / 2).min(area.height);
-            let w = area.width.saturating_sub(8).max(area.width / 2);
+            let w = if area.width < 60 { area.width } else { area.width.saturating_sub(8) };
             let rect = Rect::new(
                 area.x + (area.width - w) / 2,
                 area.y + (area.height.saturating_sub(h)) / 2,
@@ -174,6 +180,29 @@ mod tests {
 
     fn ctx_fixture() -> (Model, Theme) {
         (Model::new("s".into(), "m".into()), Theme::default())
+    }
+
+    #[test]
+    fn dynamic_priority_changes_render_and_focus_winner() {
+        use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
+        struct Dynamic(Arc<AtomicI32>);
+        impl Component for Dynamic {
+            fn name(&self) -> &str { "dynamic" }
+            fn priority(&self) -> Option<i32> { Some(self.0.load(Ordering::SeqCst)) }
+            fn height(&self, _: &Ctx<'_>, _: u16) -> Option<u16> { Some(1) }
+            fn render(&mut self, _: &Ctx<'_>, _: Rect, _: &mut Buffer) {}
+        }
+        let (model, theme) = ctx_fixture();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let priority = Arc::new(AtomicI32::new(20));
+        let mut slots = Slots::default();
+        slots.mount(OVERLAY, 10, Box::new(Probe { name: "base", wants: true }));
+        slots.mount(OVERLAY, 0, Box::new(Dynamic(priority.clone())));
+        assert_eq!(slots.winner(OVERLAY, &ctx).unwrap().name(), "dynamic");
+        assert_eq!(slots.focused_mut(&ctx).unwrap().name(), "dynamic");
+        priority.store(5, Ordering::SeqCst);
+        assert_eq!(slots.winner(OVERLAY, &ctx).unwrap().name(), "base");
+        assert_eq!(slots.focused_mut(&ctx).unwrap().name(), "base");
     }
 
     #[test]

@@ -452,8 +452,12 @@ impl Provider for AnthropicProvider {
                             }
                             emitted = acc.chunks.len();
                         }
+                        if event == "message_stop" { return StepOutcome::Committed(acc.finish(&self.model)); }
                     }
-                    SsePull::Done => return StepOutcome::Committed(acc.finish(&self.model)),
+                    SsePull::Done => return StepOutcome::Failed {
+                        error: ProviderError { message: "anthropic: stream ended before message_stop (connection closed or incomplete response)".into(), retryable: true },
+                        partial: acc.chunks,
+                    },
                     SsePull::Cancelled => {
                         return StepOutcome::Cancelled { partial: acc.chunks }
                     }

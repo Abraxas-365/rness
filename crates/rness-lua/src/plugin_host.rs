@@ -125,6 +125,12 @@ enum Cmd {
         binding: SessionBinding,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Inject the shared questions broker so plugins can dynamically
+    /// enable/disable the AskUser tool via `rness.questions.enable()`.
+    InstallQuestions {
+        questions: std::sync::Arc<rness_engine::questions::Questions>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Build a FRESH VM, load `sources` into it, and swap it in. Broken
     /// plugins are skipped (reported in the reply) — same policy as boot.
     /// If the fresh VM itself can't be built, the old VM stays.
@@ -240,6 +246,7 @@ impl LuaHost {
                 };
                 let mut installed_commands = Vec::new();
                 let mut session_binding: Option<SessionBinding> = None;
+                let mut questions_ref: Option<std::sync::Arc<rness_engine::questions::Questions>> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::Complete { name, context, cancel, reply } => {
@@ -265,6 +272,16 @@ impl LuaHost {
                             let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
                         }
                         Cmd::Load { name, source, reply } => {
+                            let staged = questions_ref.as_ref().map(|qs| {
+                                let staged = std::sync::Arc::new(rness_engine::questions::Questions::default());
+                                staged.set_overlay_config(qs.overlay_config());
+                                staged.set_owner(qs.owner());
+                                staged.set_available(qs.is_available());
+                                staged
+                            });
+                            if let Some(staged) = &staged {
+                                if let Err(error) = rt.install_questions(staged.clone()) { let _ = reply.send(Err(error.to_string())); continue; }
+                            }
                             let r = rt.load(&name, &source).map_err(|e| e.to_string()).and_then(|()| {
                                 if let Some(binding) = &session_binding {
                                     if let Err(error) = sync_commands(&rt, binding, &command_tx, &mut installed_commands) {
@@ -275,6 +292,14 @@ impl LuaHost {
                                 }
                                 Ok(())
                             });
+                            if let (Some(qs), Some(staged)) = (&questions_ref, staged) {
+                                rt.install_questions(qs.clone()).expect("questions API installation");
+                                if r.is_ok() {
+                                    qs.set_overlay_config(staged.overlay_config());
+                                    qs.set_owner(staged.owner());
+                                    qs.set_available(staged.is_available());
+                                }
+                            }
                             let _ = reply.send(r);
                         }
                         Cmd::CoordinatedUnload { name, installed, apply_ui, reply } => {
@@ -357,11 +382,20 @@ impl LuaHost {
                             session_binding = Some(binding);
                             let _ = reply.send(r);
                         }
+                        Cmd::InstallQuestions { questions, reply } => {
+                            questions_ref = Some(questions.clone());
+                            let r = rt.install_questions(questions).map_err(|e| e.to_string());
+                            let _ = reply.send(r);
+                        }
                         Cmd::Reload { sources, reply } => {
                             if init.is_some() || !installed_commands.is_empty() {
                                 let _ = reply.send(Err("Lua files changed; restart rness to reload without re-executing init.lua".into()));
                                 continue;
                             }
+                            let _maintenance = match session_binding.as_ref().map(|b| b.sessions.try_extension_maintenance()).transpose() {
+                                Ok(guard) => guard,
+                                Err(error) => { let _ = reply.send(Err(error.to_string())); continue; }
+                            };
                             let r = match LuaRuntime::new() {
                                 Ok(mut fresh) => {
                                     if let Err(e) = fresh.install_config(&config) {
@@ -384,6 +418,13 @@ impl LuaHost {
                                             continue;
                                         }
                                     }
+                                    let staged_questions = std::sync::Arc::new(rness_engine::questions::Questions::default());
+                                    if questions_ref.is_some() {
+                                        if let Err(e) = fresh.install_questions(staged_questions.clone()) {
+                                            let _ = reply.send(Err(e.to_string()));
+                                            continue;
+                                        }
+                                    }
                                     let mut errors = Vec::new();
                                     for p in &sources {
                                         if let Err(e) = fresh.load(&p.name, &p.source) {
@@ -396,6 +437,13 @@ impl LuaHost {
                                     }
                                     // Swap: old VM (and every stale
                                     // registration) drops here.
+                                    if let Some(qs) = &questions_ref {
+                                        fresh.install_questions(qs.clone()).expect("questions API installation");
+                                        qs.set_available(false);
+                                        qs.set_overlay_config(staged_questions.overlay_config());
+                                        qs.set_owner(staged_questions.owner());
+                                        qs.set_available(staged_questions.is_available());
+                                    }
                                     rt = fresh;
                                     Ok(errors)
                                 }
@@ -559,6 +607,13 @@ impl LuaHost {
         rx.await.map_err(|_| "lua vm gone")?
     }
 
+    /// Inject the shared questions broker. Sticky across hot reloads.
+    pub async fn install_questions(&self, questions: std::sync::Arc<rness_engine::questions::Questions>) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::InstallQuestions { questions, reply }).map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
+    }
+
     /// Inject `rness.session` (post-mount). Sticky across hot reloads.
     pub async fn install_session(
         &self,
@@ -641,5 +696,32 @@ mod tests {
         let host = LuaHost::spawn().unwrap();
         let err = host.load("broken.lua", "this is not lua").await.unwrap_err();
         assert!(err.contains("broken.lua"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn questions_lifecycle_through_host() {
+        let host = LuaHost::spawn().unwrap();
+        let qs = std::sync::Arc::new(rness_engine::questions::Questions::default());
+        host.install_questions(qs.clone()).await.unwrap();
+
+        // Plugin enables questions.
+        host.load("q-plugin", "rness.questions.enable { height = 25, title = 'Decisions' }").await.unwrap();
+        assert!(qs.is_available());
+        assert_eq!(qs.owner().as_deref(), Some("q-plugin"));
+        assert_eq!(qs.overlay_config().height, 25);
+        assert_eq!(qs.overlay_config().title, "Decisions");
+
+        // Unload via unmounted host disables questions.
+        assert!(host.unload("q-plugin").await.unwrap());
+        assert!(!qs.is_available());
+        assert!(qs.owner().is_none());
+
+        // Re-enable works after unload.
+        host.load("q-plugin", "rness.questions.enable()").await.unwrap();
+        assert!(qs.is_available());
+
+        // Explicit disable from Lua.
+        host.load("off", "rness.questions.disable()").await.unwrap();
+        assert!(!qs.is_available());
     }
 }

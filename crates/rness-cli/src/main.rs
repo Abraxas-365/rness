@@ -414,6 +414,16 @@ async fn main() -> anyhow::Result<()> {
 
     let policy: rness_engine::approval::Policy =
         cli.approval.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let questions = Arc::new(rness_engine::questions::Questions::default());
+    questions.bind_registry(&tools);
+    if startup.ask_user {
+        questions.set_available(startup.question_overlay.enabled);
+        questions.set_overlay_config(rness_engine::questions::OverlayConfig {
+            priority: startup.question_overlay.priority,
+            height: startup.question_overlay.height,
+            title: startup.question_overlay.title.clone(),
+        });
+    }
     tools.approvals().set_policy(policy);
     tools.approvals().set_rules(startup.permissions.clone());
 
@@ -500,6 +510,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("lua session bridge: {e}"))?;
+    lua.install_questions(questions.clone()).await.map_err(|e| anyhow::anyhow!("lua questions bridge: {e}"))?;
 
     // NOW load the user's plugins: every rness.* namespace is live.
     // ONLY ~/.rness loads — nothing is embedded, nothing is implicit.
@@ -562,7 +573,8 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        let state = rness_server::ServerState::new(Arc::clone(&sessions));
+        let mut state = rness_server::ServerState::new(Arc::clone(&sessions));
+        state.questions = questions.clone();
         let _frame_sub = kernel.bus().on::<rness_engine::service::FrameEv>(state.frame_sink());
         // Under `ask`, remote clients are the approvers: replace the TUI
         // answerer (there is no TUI here) with the HTTP/SSE one. Pending
@@ -615,10 +627,11 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         // Run the TUI over protocol frames.
-        return run_tui(kernel, sessions, session, selection.model.clone(), approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone())
+        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone())
             .await;
     };
 
+    questions.set_available(false);
     sessions.send(
         &session,
         UserIntent::Followup,
@@ -659,6 +672,8 @@ fn print_parts(who: &str, parts: &[ContentPart]) {
 }
 
 /// In-process protocol backend: the TUI sees ClientRequest/History only.
+mod questions;
+
 struct LocalBackend {
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
@@ -830,6 +845,8 @@ async fn run_tui(
     sessions: Arc<SessionService>,
     session: SessionId,
     model_name: String,
+    questions: Arc<rness_engine::questions::Questions>,
+    overlay_priority: i32,
     approval_rx: tokio::sync::mpsc::UnboundedReceiver<
         rness_tui::modules::approval::PendingApproval,
     >,
@@ -894,6 +911,9 @@ async fn run_tui(
     // External (Lua) apps: mount the renderer early so the status poll
     // below can re-sync the roster after hot reloads.
     let apps_state = ext_apps::install(&mut slots);
+    let mut question_overlay = questions::QuestionOverlay::new(questions.clone());
+    question_overlay.apps = Some(apps_state.clone());
+    slots.mount(rness_tui::slots::OVERLAY, overlay_priority, Box::new(question_overlay));
     let apps_for_status = apps_state.clone();
 
     // Lua statusline: a background task polls the VM's provider and

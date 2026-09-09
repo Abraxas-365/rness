@@ -22,6 +22,8 @@ pub trait Component: Send {
     /// Stable identity (for unmounting / debugging).
     fn name(&self) -> &str;
 
+    fn priority(&self) -> Option<i32> { None }
+
     /// Chain select (dsh pattern): whether this component wants to render
     /// given the current model. The highest-priority willing component in
     /// a slot wins. Default: always. Modal features return true only

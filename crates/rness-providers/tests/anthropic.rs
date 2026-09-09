@@ -60,6 +60,19 @@ async fn step(
 }
 
 #[tokio::test]
+async fn clean_eof_without_terminal_event_is_failure_not_commit() {
+    let server = MockServer::start().await;
+    let mut events = stream_happy("partial");
+    events.pop();
+    Mock::given(method("POST")).respond_with(sse_response(&events)).mount(&server).await;
+    let provider = AnthropicProvider::new("fake", "test").with_base_url(server.uri());
+    let StepOutcome::Failed { error, partial } = step(&provider, &user_context("hi"), "", &[]).await else { panic!("truncated stream committed") };
+    assert!(error.message.contains("message_stop"));
+    assert!(error.retryable);
+    assert!(!partial.is_empty());
+}
+
+#[tokio::test]
 async fn happy_path_text_stream_commits_with_chunks_and_usage() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

@@ -44,6 +44,9 @@ pub trait Tool: Send + Sync {
     /// Session-aware entry point the dispatcher calls. Most tools don't
     /// care who called them — the default drops the session. Tools that
     /// delegate (subagent) override this instead of `execute`.
+    async fn execute_call(&self, session: &SessionId, _call: &str, args: serde_json::Value, _cancel: &CancellationToken) -> Result<String, String> {
+        self.execute_in(session, args).await
+    }
     async fn execute_in(
         &self,
         session: &SessionId,
@@ -216,7 +219,7 @@ impl ToolRegistry {
                                 _ = cancel.cancelled() => Decision::Cancelled,
                             };
                             match decision {
-                                Decision::Allowed => t.execute_in(&session, call.args.clone()).await,
+                                Decision::Allowed => t.execute_call(&session, &call.call, call.args.clone(), &cancel).await,
                                 Decision::Rejected => {
                                     Err("the user rejected this tool call".into())
                                 }

@@ -19,12 +19,25 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/sessions/:id/fork", post(fork))
         .route("/api/sessions/:id/compact", post(compact))
         .route("/api/sessions/:id/prune", post(prune))
+        .route("/api/questions", get(pending_questions))
+        .route("/api/questions/:session/:call", post(answer_questions).delete(dismiss_questions))
         .route("/api/request", post(request))
         .route("/api/approvals", get(pending_approvals))
         .route("/api/approvals/:call", post(resolve_approval))
         .route("/api/events", get(crate::sse::all_events))
         .route("/api/events/:id", get(crate::sse::session_events))
         .with_state(state)
+}
+
+async fn pending_questions(State(s): State<ServerState>) -> Response { Json(s.questions.pending()).into_response() }
+async fn answer_questions(State(s): State<ServerState>, Path((session, call)): Path<(String, String)>, Json(answers): Json<rness_engine::questions::Answers>) -> Response {
+    match s.questions.resolve(&session, &call, answers) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+async fn dismiss_questions(State(s): State<ServerState>, Path((session, call)): Path<(String, String)>) -> Response {
+    if s.questions.dismiss(&session, &call) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }.into_response()
 }
 
 /// Service errors become plain-text 4xx/5xx. Unknown sessions are the

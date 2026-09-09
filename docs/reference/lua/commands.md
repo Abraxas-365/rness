@@ -1,5 +1,28 @@
 # Lua commands and session context
 
+## Opt-in structured questions
+
+Enable the built-in question tool in `~/.rness/plugins/questions.lua`, loaded explicitly with `rness.plugins.load("questions")` from `init.lua`:
+
+```lua
+rness.questions.enable {
+  enabled = true, -- false removes the tool and dismisses pending questions
+  title = "AskUser",
+  height = 20, -- minimum 10; actual drawing is clipped to the terminal
+  priority = 99, -- slot priority, below approval by default
+}
+```
+
+Calling `enable()` without arguments uses these defaults. No tool is registered unless explicitly enabled. `enable` and `disable` are plugin-load declarations, not callback APIs. The last successful enabling plugin owns the configuration; unloading that owner removes the tool and dismisses pending questions. For a loose plugin file, use `/unload plugins/questions.lua`. Unloading another plugin does not disable questions. Failed loads and failed reloads do not apply question changes. Successful reload replaces the owner/configuration from the new plugin set. Startup declarations in `init.lua` remain supported.
+
+The stock renderer remains mounted but inactive without pending questions. It reads title, height and priority dynamically and uses the active theme. An explicitly opened Lua overlay (such as the session picker) temporarily takes focus; closing it restores the question. Drafts are preserved per session/call. Closing the local frontend dismisses pending questions and removes the tool. Headless prompt mode removes AskUser because it has no human answer frontend.
+
+`AskUser` accepts `questions`, an array of 1–16 objects with unique `id`, `question`, optional `header`, `options` (`label`, optional `description`), and `multi_select`. Custom text is always allowed. Results contain `answers`, each with `id`, `selected` labels and optional `custom`. Invalid answers leave the question pending for correction; cancellation or dismissal removes it and returns a tool error. Headless execution without a question frontend fails immediately.
+
+TUI: Up/Down moves through options, Space toggles a selection (single or multiple), Enter advances/submits. Select Other to edit custom text, Enter finishes editing, and Enter again advances/submits. Tab/Shift-Tab revisits questions without losing answers. Esc dismisses; Ctrl+C cancels the turn. Long option lists scroll with the selection. Labels wrap; oversized items show a preview. PgDown opens full question/option details and scrolls down, PgUp scrolls back, and Esc returns to selection. The editor follows the end of long text. Terminals smaller than 30×10 show a resize/cancel notice instead of an unusable form.
+
+HTTP: `GET /api/questions` reconciles pending questions across sessions. `POST /api/questions/:session/:call` accepts `{ "answers": [{ "id": "q", "selected": ["A"], "custom": null }] }`; `DELETE` on the same URL dismisses. SSE `/api/events` and `/api/events/:session` emit `question_requested` (session, call, questions) and `question_resolved` (session, call). SSE is ephemeral; reconnecting clients must fetch pending questions. Resolution is first-writer-wins; disconnecting an SSE client does not dismiss questions, allowing reconnects and other clients to answer.
+
 ## Opt-in tool permissions
 
 In `init.lua`, explicitly configure exact tool names:

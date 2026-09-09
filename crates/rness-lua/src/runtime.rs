@@ -47,6 +47,8 @@ pub struct LuaRuntime {
     command_metadata: HashMap<String, (String, Vec<(String, String)>)>,
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
+    /// Shared questions broker, injected post-mount for dynamic enable/disable.
+    questions: Option<std::sync::Arc<rness_engine::questions::Questions>>,
 }
 
 impl LuaRuntime {
@@ -90,7 +92,37 @@ impl LuaRuntime {
             command_metadata: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
+            questions: None,
         })
+    }
+
+    /// Inject the shared questions broker so plugins can call
+    /// `rness.questions.enable()` / `disable()` at load time.
+    pub fn install_questions(&mut self, questions: std::sync::Arc<rness_engine::questions::Questions>) -> Result<(), LuaError> {
+        self.questions = Some(questions.clone());
+        let rness: Table = self.lua.globals().get("rness")?;
+        let q_table = self.lua.create_table()?;
+        q_table.set("enable", self.lua.create_function(move |lua, options: Option<Table>| {
+            let config: crate::api::config::QuestionOverlayConfig = match options {
+                Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                None => Default::default(),
+            };
+            if config.height < 10 || config.title.trim().is_empty() {
+                return Err(mlua::Error::runtime("questions height must be >= 10 and title nonempty"));
+            }
+            require_declaration_phase(lua)?;
+            let pending: Table = lua.globals().get("__rness_pending")?;
+            pending.set("questions", lua.to_value(&config)?)?;
+            Ok(())
+        })?)?;
+        q_table.set("disable", self.lua.create_function(move |lua, ()| {
+            require_declaration_phase(lua)?;
+            let pending: Table = lua.globals().get("__rness_pending")?;
+            pending.set("questions", false)?;
+            Ok(())
+        })?)?;
+        rness.set("questions", q_table)?;
+        Ok(())
     }
 
     /// Run a plugin chunk. Registrations made during execution are
@@ -110,9 +142,11 @@ impl LuaRuntime {
         let hook_owner = self.lua.create_table()?;
         self.lua.globals().set("__rness_load_owner", hook_owner.clone())?;
         self.lua.globals().set("__rness_loading_hooks", hook_cleanup.clone())?;
+        self.lua.globals().set("__rness_loading_plugin", name)?;
         let execution = self.lua.load(source).set_name(format!("@{name}")).exec();
         self.lua.globals().set("__rness_loading_hooks", LuaValue::Nil)?;
         self.lua.globals().set("__rness_load_owner", LuaValue::Nil)?;
+        self.lua.globals().set("__rness_loading_plugin", LuaValue::Nil)?;
         if let Err(error) = execution {
             for unsubscribe in hook_cleanup.sequence_values::<Function>() {
                 unsubscribe?.call::<bool>(())?;
@@ -123,6 +157,7 @@ impl LuaRuntime {
                 pending.get::<Table>(category)?.clear()?;
             }
             pending.set("statusline", LuaValue::Nil)?;
+            pending.set("questions", LuaValue::Nil)?;
             for (category, values) in snapshots {
                 let table: Table = declarations.get(category)?;
                 table.clear()?;
@@ -131,6 +166,21 @@ impl LuaRuntime {
             return Err(error.into());
         }
         self.drain_registrations(Some(name))?;
+        let pending: Table = self.lua.globals().get("__rness_pending")?;
+        let declaration: LuaValue = pending.get("questions")?;
+        if let Some(qs) = &self.questions {
+            match declaration {
+                LuaValue::Table(table) => {
+                    let config: crate::api::config::QuestionOverlayConfig = self.lua.from_value(LuaValue::Table(table))?;
+                    qs.set_overlay_config(rness_engine::questions::OverlayConfig { priority: config.priority, height: config.height, title: config.title });
+                    qs.set_available(config.enabled);
+                    qs.set_owner(Some(name.to_owned()));
+                }
+                LuaValue::Boolean(false) => { qs.set_available(false); qs.set_owner(None); }
+                _ => {}
+            }
+        }
+        pending.set("questions", LuaValue::Nil)?;
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
         Ok(())
     }
@@ -225,6 +275,12 @@ impl LuaRuntime {
             self.registration_owners.remove(&(category, key));
         }
         self.keymap_binds.retain(|(_, _, owner)| owner.as_deref() != Some(name));
+        if let Some(qs) = &self.questions {
+            if qs.owner().as_deref() == Some(name) {
+                qs.set_available(false);
+                qs.set_owner(None);
+            }
+        }
         Ok(true)
     }
 
@@ -1443,5 +1499,51 @@ mod tests {
         )
         .unwrap();
         rt.load("check", r#"assert(encoded == '{"b":"x"}')"#).unwrap();
+    }
+
+    #[test]
+    fn questions_enable_disable_and_unload_ownership() {
+        use rness_engine::questions::Questions;
+        use std::sync::Arc;
+
+        let mut rt = LuaRuntime::new().unwrap();
+        let qs = Arc::new(Questions::default());
+        rt.install_questions(qs.clone()).unwrap();
+
+        // Not available by default.
+        assert!(!qs.is_available());
+
+        // Plugin enables questions — becomes the owner.
+        rt.load("asker", "rness.questions.enable()").unwrap();
+        assert!(qs.is_available());
+        assert_eq!(qs.owner().as_deref(), Some("asker"));
+
+        // Config is applied.
+        rt.load("custom", "rness.questions.enable { height = 30, title = 'Custom' }").unwrap();
+        assert!(qs.is_available());
+        let config = qs.overlay_config();
+        assert_eq!(config.height, 30);
+        assert_eq!(config.title, "Custom");
+        assert_eq!(qs.owner().as_deref(), Some("custom"));
+
+        // Unloading a non-owner does NOT disable questions.
+        assert!(rt.unload("asker").unwrap());
+        assert!(qs.is_available());
+
+        // Unloading the owner DOES disable questions.
+        assert!(rt.unload("custom").unwrap());
+        assert!(!qs.is_available());
+        assert!(qs.owner().is_none());
+
+        // Explicit disable from Lua.
+        rt.load("re-enable", "rness.questions.enable()").unwrap();
+        assert!(qs.is_available());
+        rt.load("off", "rness.questions.disable()").unwrap();
+        assert!(!qs.is_available());
+        assert!(qs.owner().is_none());
+
+        // Validation: bad config.
+        assert!(rt.load("bad", "rness.questions.enable { height = 5 }").is_err());
+        assert!(rt.load("bad2", "rness.questions.enable { title = '' }").is_err());
     }
 }
