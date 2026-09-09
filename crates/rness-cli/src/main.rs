@@ -291,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
             _ => anyhow::bail!("provider {name}: invalid credential declaration"),
         };
         route_table.insert(name.clone(), routes::Route {
-            kind, base_url: Some(declaration.base_url.clone()), credential,
+            kind, base_url: Some(declaration.base_url.clone()), credential, stream_idle_timeout: Some(std::time::Duration::from_secs(300)),
         });
     }
     for spec in &cli.route {
@@ -300,6 +300,10 @@ async fn main() -> anyhow::Result<()> {
         auth_oauth.remove(&name);
         auth_store.remove(&name);
         route_table.insert(name, route);
+    }
+    for (name, milliseconds) in &startup.stream_idle_timeouts {
+        let route = route_table.get_mut(name).with_context(|| format!("timeout configured for unknown provider: {name}"))?;
+        route.stream_idle_timeout = (*milliseconds != 0).then(|| std::time::Duration::from_millis(*milliseconds));
     }
     let cli_selection = match cli.model.as_deref() {
         Some(model) => Some(if let Some(provider) = &cli.provider {
@@ -819,6 +823,7 @@ impl rness_tui::app::Backend for LocalBackend {
                     _ => Ok(None),
                 }
             }
+            ClientRequest::Retry { session } => self.sessions.retry(&session).map(|_| None).map_err(|e| e.to_string()),
             ClientRequest::Cancel { session } => { self.sessions.cancel(&session); Ok(Some("Cancelled".into())) }
         }
     }
@@ -829,6 +834,9 @@ impl rness_tui::app::Backend for LocalBackend {
                 if let Err(e) = self.sessions.send(&session, intent, content) {
                     tracing::error!(error = %e, "send failed");
                 }
+            }
+            ClientRequest::Retry { session } => {
+                if let Err(e) = self.sessions.retry(&session) { tracing::error!(error = %e, "retry failed"); }
             }
             ClientRequest::Cancel { session } => self.sessions.cancel(&session),
         }
@@ -902,6 +910,7 @@ async fn run_tui(
     for (name, spec) in schemes {
         colorschemes.insert(name.clone(), rness_tui::theme::Theme::from_overrides(&spec).map_err(|e| anyhow::anyhow!("colorscheme {name}: {e}"))?);
     }
+    candidates.push(("retry".into(), "Retry failed turn from saved context".into()));
     candidates.push(("colorscheme".into(), "Command: change colorscheme".into()));
     for name in colorschemes.keys() { candidates.push((format!("colorscheme {name}"), "Colorscheme".into())); }
     slots.mount(rness_tui::slots::INPUT_FOOTER, 0, Box::new(input::Input::with_candidates(candidates)));
@@ -1099,6 +1108,7 @@ async fn run_tui(
                 if let Some(rows) = state.rows_for(app) {
                     ctx["rows"] = rows.into();
                 }
+                if let Some(cols) = state.cols_for(app) { ctx["cols"] = cols.into(); }
                 ctx
             };
             let refresh = |app: String,

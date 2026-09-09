@@ -135,6 +135,37 @@ async fn agent_instructions_and_ceiling_apply_to_schema_and_dispatch() {
 }
 
 #[tokio::test]
+async fn tasks_commit_in_model_order_and_survive_compaction_and_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    let tasks = |content: &str| serde_json::json!({"tasks":[{"id":"one","content":content,"status":"in_progress"}]});
+    let mut message = assistant("tracking", StopReason::ToolUse, vec![]);
+    for (call, content) in [("a", "first"), ("b", "second")] {
+        message.content.push(ContentPart::ToolUse { call: call.into(), name: "TaskWrite".into(), args: tasks(content) });
+    }
+    let provider = Scripted::new(vec![StepOutcome::Committed(message), StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(rness_engine::tasks::TaskWrite(Default::default())));
+    run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(), &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    let history = store.history(&sid).unwrap();
+    let results: Vec<_> = history.iter().filter_map(|env| match &env.event { SessionEvent::ToolResult(result) => Some(result), _ => None }).collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].tasks.as_ref().unwrap().tasks[0].content, "first");
+    assert_eq!(TaskSnapshot::from_history(&history).tasks[0].content, "second");
+    log.append(&SessionEvent::Compaction(Compaction { replaces: history.iter().skip(1).map(|env| env.id.clone()).collect(), summary: "compacted".into(), model: "test".into() })).unwrap();
+    let fork_at = history.iter().find(|env| matches!(&env.event, SessionEvent::ToolResult(result) if result.call == "a")).unwrap().id.clone();
+    drop(log);
+    let reopened = SessionStore::new(dir.path());
+    let child = reopened.fork(&sid, Some(fork_at)).unwrap();
+    assert_eq!(TaskSnapshot::from_history(&reopened.history(child.session()).unwrap()).tasks[0].content, "first");
+    assert_eq!(TaskSnapshot::from_history(&replay(&reopened, &sid).unwrap().history).tasks[0].content, "second");
+    let other = reopened.create(None).unwrap();
+    assert!(TaskSnapshot::from_history(&reopened.history(other.session()).unwrap()).tasks.is_empty());
+}
+
+#[tokio::test]
 async fn tool_roundtrip_turn_commits_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
@@ -266,7 +297,7 @@ async fn retryable_failure_becomes_attempt_then_succeeds() {
 
     let provider = Scripted::new(vec![
         StepOutcome::Failed {
-            error: ProviderError { message: "overloaded".into(), retryable: true },
+            error: ProviderError { code: "PROVIDER", retry_after: None, message: "overloaded".into(), retryable: true },
             partial: vec![TimedChunk { ms: 5, delta: ChunkDelta::Text { t: "par".into() } }],
         },
         StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![])),
@@ -311,7 +342,7 @@ async fn non_retryable_failure_fails_turn_but_commits_trace() {
     .unwrap();
 
     let provider = Scripted::new(vec![StepOutcome::Failed {
-        error: ProviderError { message: "invalid api key".into(), retryable: false },
+        error: ProviderError { code: "PROVIDER", retry_after: None, message: "invalid api key".into(), retryable: false },
         partial: vec![],
     }]);
     let mut steers = no_steers();

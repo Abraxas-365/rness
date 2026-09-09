@@ -29,6 +29,7 @@ pub struct LuaToolSpec {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub sensitive: bool,
+    pub tasks: Option<rness_engine::tasks::TasksConfig>,
 }
 
 /// VM-side state: the interpreter plus everything plugins registered.
@@ -158,6 +159,7 @@ impl LuaRuntime {
             }
             pending.set("statusline", LuaValue::Nil)?;
             pending.set("questions", LuaValue::Nil)?;
+            pending.set("tasks_disabled", LuaValue::Nil)?;
             for (category, values) in snapshots {
                 let table: Table = declarations.get(category)?;
                 table.clear()?;
@@ -179,6 +181,13 @@ impl LuaRuntime {
                 LuaValue::Boolean(false) => { qs.set_available(false); qs.set_owner(None); }
                 _ => {}
             }
+        }
+        if pending.get::<Option<bool>>("tasks_disabled")?.unwrap_or(false) {
+            if self.tools.get("TaskWrite").is_some_and(|(spec, _)| spec.tasks.is_some()) {
+                if let Some((_, callback)) = self.tools.remove("TaskWrite") { self.lua.remove_registry_value(callback)?; }
+                self.registration_owners.remove(&("tools", "TaskWrite".into()));
+            }
+            pending.set("tasks_disabled", LuaValue::Nil)?;
         }
         pending.set("questions", LuaValue::Nil)?;
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
@@ -516,6 +525,7 @@ impl LuaRuntime {
                 } else {
                     self.lua.from_value(schema)?
                 },
+                tasks: entry.get::<Option<Table>>("tasks_config")?.map(|table| self.lua.from_value(LuaValue::Table(table))).transpose()?,
                 sensitive: entry.get::<Option<bool>>("sensitive")?.unwrap_or(false),
             };
             let key = self.lua.create_registry_value(run)?;
@@ -675,6 +685,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         tool.set(method, lua.create_function(move |lua, spec: Table| {
             require_declaration_phase(lua)?;
             let name: String = spec.get("name").map_err(|_| mlua::Error::runtime("tool 'name' (string) is required"))?;
+            if name == "TaskWrite" { return Err(mlua::Error::runtime("TaskWrite is reserved; use rness.tasks.enable")); }
             if name.trim().is_empty() { return Err(mlua::Error::runtime("tool name must not be empty")); }
             let run: Function = spec.get("run").map_err(|_| mlua::Error::runtime("tool 'run' (function) is required"))?;
             let description: Option<String> = spec.get("description")?;
@@ -705,6 +716,42 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         })?)?;
     }
     rness.set("tool", tool)?;
+
+    let tasks = lua.create_table()?;
+    tasks.set("enable", lua.create_function(|lua, options: Option<Table>| {
+        require_declaration_phase(lua)?;
+        let config: rness_engine::tasks::TasksConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_default();
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        if pending.get::<Option<bool>>("tasks_disabled")?.unwrap_or(false) { return Err(mlua::Error::runtime("enable or disable tasks once per plugin load")); }
+        let declarations: Table = lua.globals().get("__rness_declarations")?;
+        let declared: Table = declarations.get("tools")?;
+        if declared.contains_key("TaskWrite")? { return Err(mlua::Error::runtime("TaskWrite already registered")); }
+        use rness_engine::tools::Tool;
+        let native = rness_engine::tasks::TaskWrite(config.clone());
+        let entry = lua.create_table()?;
+        entry.set("name", native.name())?;
+        entry.set("description", native.description())?;
+        entry.set("schema", lua.to_value(&native.input_schema())?)?;
+        entry.set("tasks_config", lua.to_value(&config)?)?;
+        entry.set("run", lua.create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("TaskWrite requires durable agent dispatch")))?)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        pending.get::<Table>("tools")?.push(entry)?;
+        declared.set("TaskWrite", true)?;
+        Ok(())
+    })?)?;
+    tasks.set("disable", lua.create_function(|lua, ()| {
+        require_declaration_phase(lua)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        for entry in pending.get::<Table>("tools")?.sequence_values::<Table>() {
+            if entry?.get::<String>("name")? == "TaskWrite" { return Err(mlua::Error::runtime("enable or disable tasks once per plugin load")); }
+        }
+        let declarations: Table = lua.globals().get("__rness_declarations")?;
+        declarations.get::<Table>("tools")?.set("TaskWrite", LuaValue::Nil)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        pending.set("tasks_disabled", true)?;
+        Ok(())
+    })?)?;
+    rness.set("tasks", tasks)?;
 
     // rness.hook.on(event, handler)
     let hook = lua.create_table()?;
@@ -827,6 +874,11 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
 
     // rness.ui.statusline(provider) — provider() -> string|nil
     let ui = lua.create_table()?;
+    ui.set("wrap", lua.create_function(|_, (text, columns): (String, u16)| {
+        if columns == 0 { return Err(mlua::Error::runtime("wrap columns must be positive")); }
+        let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        Ok(textwrap::wrap(&text, usize::from(columns)).into_iter().map(|line| line.into_owned()).collect::<Vec<_>>())
+    })?)?;
     ui.set(
         "statusline",
         lua.create_function(|lua, provider: Function| {

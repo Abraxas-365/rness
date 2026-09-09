@@ -190,6 +190,10 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    pub fn tasks(&self, session: &SessionId) -> Result<rness_protocol::events::TaskSnapshot, ServiceError> {
+        Ok(rness_protocol::events::TaskSnapshot::from_history(&self.store.history(session)?))
+    }
+
     pub fn commands(&self) -> &crate::interaction::CommandRegistry {
         &self.commands
     }
@@ -532,6 +536,15 @@ impl SessionService {
         intent: UserIntent,
         content: Vec<ContentPart>,
     ) -> Result<Disposition, ServiceError> {
+        self.send_or_retry(session, intent, content, false)
+    }
+
+    /// Continue a failed turn from durable context without appending user content.
+    pub fn retry(&self, session: &SessionId) -> Result<Disposition, ServiceError> {
+        self.send_or_retry(session, UserIntent::Followup, vec![], true)
+    }
+
+    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool) -> Result<Disposition, ServiceError> {
         if let [ContentPart::Text { text }] = content.as_slice() {
             if let Some(command) = self.prepare_command(session, text)? {
                 return command.execute(self);
@@ -554,6 +567,14 @@ impl SessionService {
         let command = live.command.lock().unwrap();
         if command.is_some() { return Err(ServiceError::Busy); }
         let mut inbox = live.inbox.lock().unwrap();
+        if retry {
+            if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
+            let history = self.store.history(session)?;
+            let tip = history.iter().rev().find(|e| !matches!(e.event, SessionEvent::RequestConfig(_)));
+            if !matches!(tip.map(|e| &e.event), Some(SessionEvent::TurnEnded { outcome: rness_protocol::events::TurnOutcome::Failed, .. })) {
+                return Err(ServiceError::InvalidConfig("retry requires a failed turn at the session tip".into()));
+            }
+        }
         let (intent, disposition) = inbox.submit(intent, content.clone());
         match &disposition {
             Disposition::Command(_) => unreachable!("inbox does not execute commands"),
@@ -573,11 +594,13 @@ impl SessionService {
                 // Workspace instructions precede the prompt that opens
                 // the turn (dsh baseline order).
                 self.ensure_instructions(&mut log, session)?;
-                log.append(&SessionEvent::UserMessage(UserMessage {
-                    intent,
-                    content,
-                    source: None,
-                }))?;
+                if !retry {
+                    log.append(&SessionEvent::UserMessage(UserMessage {
+                        intent,
+                        content,
+                        source: None,
+                    }))?;
+                }
                 let turns_so_far = log
                     .read_all()?
                     .iter()

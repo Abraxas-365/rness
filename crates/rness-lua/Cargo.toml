@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+textwrap.workspace = true
 tempfile.workspace = true
 rness-kernel.workspace = true
 rness-protocol.workspace = true

@@ -55,7 +55,7 @@ fn full_turn_with_attempt_projects_and_replays() {
     // First model call dies (overloaded) — preserved as an attempt.
     log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
         model: "m1".into(),
-        outcome: AttemptOutcome::Error { message: "overloaded".into(), retryable: true },
+        outcome: AttemptOutcome::Error { code: None, retry_in_ms: None, message: "overloaded".into(), retryable: true },
         chunks: vec![TimedChunk { ms: 10, delta: ChunkDelta::Text { t: "wha".into() } }],
     }))
     .unwrap();
@@ -63,6 +63,7 @@ fn full_turn_with_attempt_projects_and_replays() {
     // Retry succeeds with a tool call, tool result commits, final answer.
     log.append(&assistant_tool_use()).unwrap();
     log.append(&SessionEvent::ToolResult(ToolResult {
+        tasks: None,
         call: "c1".into(),
         name: "Read".into(),
         output: "127.0.0.1 localhost".into(),

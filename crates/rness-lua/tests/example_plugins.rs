@@ -176,8 +176,43 @@ fn examples() -> Vec<rness_lua::loader::PluginSource> {
     sources
 }
 
+#[tokio::test]
+async fn task_wrapping_preserves_long_tokens_and_unicode() {
+    let host = LuaHost::spawn().unwrap();
+    host.load("fixture", "rness.session = { tasks = function() return {tasks={{id='x', content=string.rep('abcdefgh', 20)..' 日本語 café END-MARKER', status='completed'}}} end }").await.unwrap();
+    host.load("tasks", include_str!("../../../examples/plugins/tasks.lua")).await.unwrap();
+    let ctx = serde_json::json!({"session":"a", "rows":6, "cols":20});
+    let first = host.app_view("tasks", ctx.clone()).await.unwrap();
+    assert!(first[1].starts_with("[x]"));
+    assert!(first[2].starts_with("    "));
+    host.app_key("tasks", "end", ctx.clone()).await.unwrap();
+    let last = host.app_view("tasks", ctx.clone()).await.unwrap();
+    let content: String = last.iter().skip(1).map(|line| line.trim()).collect();
+    assert!(content.contains("END-MARKER"), "{last:?}");
+    host.app_key("tasks", "home", ctx.clone()).await.unwrap();
+    assert_eq!(host.app_view("tasks", ctx).await.unwrap(), first);
+}
+
+#[tokio::test]
+async fn task_overlay_scrolls_and_isolates_sessions() {
+    let host = LuaHost::spawn().unwrap();
+    host.load("fixture", "rness.session = { tasks = function(id) local tasks = {}; if id == 'a' then for i=1,20 do tasks[i] = {id=tostring(i),content='Task '..i,status='pending'} end end; return {tasks=tasks} end }").await.unwrap();
+    host.load("tasks", include_str!("../../../examples/plugins/tasks.lua")).await.unwrap();
+    let ctx = serde_json::json!({"session":"a", "rows":4});
+    let lines = host.app_view("tasks", ctx.clone()).await.unwrap();
+    assert_eq!(lines.len(), 21); // desired height is independent of clipped viewport
+    assert!(lines[4..].iter().all(String::is_empty));
+    assert!(lines[1].contains("Task 1"));
+    host.app_key("tasks", "j", ctx.clone()).await.unwrap();
+    assert!(host.app_view("tasks", ctx.clone()).await.unwrap()[1].contains("Task 2"));
+    assert_eq!(host.app_view("tasks", serde_json::json!({"session":"b","rows":4})).await.unwrap()[1], "No saved tasks.");
+    assert!(host.app_view("tasks", ctx).await.unwrap()[1].contains("Task 2"));
+    host.unload("tasks").await.unwrap();
+    assert!(host.app_specs().await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn example_plugins_load_and_register_three_apps() {
+async fn example_plugins_load_and_register_four_apps() {
     let dir = tempfile::tempdir().unwrap();
     let host = booted_host(dir.path()).await;
     let errors = rness_lua::loader::load_all(&host, &examples()).await;
@@ -185,7 +220,7 @@ async fn example_plugins_load_and_register_three_apps() {
 
     let apps = host.app_specs().await;
     let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
-    assert_eq!(names, vec!["branches", "sessions", "tree"]);
+    assert_eq!(names, vec!["branches", "sessions", "tasks", "tree"]);
 
     let tree = apps.iter().find(|a| a.name == "tree").unwrap();
     assert_eq!(tree.slot, "sidebar");

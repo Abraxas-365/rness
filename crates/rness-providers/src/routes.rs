@@ -31,6 +31,7 @@ pub struct Route {
     /// Credential key: names the store record and (uppercased) the
     /// `<KEY>_API_KEY` env var. `None` = unauthenticated (local servers).
     pub credential: Option<String>,
+    pub stream_idle_timeout: Option<std::time::Duration>,
 }
 
 /// The routes rness ships with.
@@ -39,6 +40,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "anthropic".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::Anthropic,
                 base_url: None,
                 credential: Some("anthropic".into()),
@@ -47,6 +49,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "openai".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::OpenAiCompatible,
                 base_url: Some("https://api.openai.com/v1".into()),
                 credential: Some("openai".into()),
@@ -55,6 +58,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "deepseek".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::OpenAiCompatible,
                 base_url: Some("https://api.deepseek.com/v1".into()),
                 credential: Some("deepseek".into()),
@@ -63,6 +67,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "groq".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::OpenAiCompatible,
                 base_url: Some("https://api.groq.com/openai/v1".into()),
                 credential: Some("groq".into()),
@@ -71,6 +76,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "openai-chatgpt".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::ChatGptResponses,
                 base_url: None,
                 credential: Some(crate::auth::openai::STORE_KEY.into()),
@@ -79,6 +85,7 @@ pub fn builtin_routes() -> HashMap<String, Route> {
         (
             "ollama".into(),
             Route {
+                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
                 kind: Kind::OpenAiCompatible,
                 base_url: Some(crate::ollama::DEFAULT_BASE_URL.into()),
                 credential: None,
@@ -139,12 +146,12 @@ pub fn build_with_api_key(route: &Route, model: &str, key: String) -> Result<Arc
         Kind::OpenAiCompatible => {
             let mut provider = OpenAiProvider::new(key, model);
             if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::Anthropic => {
             let mut provider = AnthropicProvider::new(key, model);
             if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::ChatGptResponses => Err("ChatGPT subscription transport requires OAuth, not an API key".into()),
     }
@@ -158,13 +165,13 @@ pub fn build_with_oauth(route: &Route, model: &str, store: CredentialStore, cred
             let source = CredentialSource::new(store).oauth_only(credential);
             let mut provider = AnthropicProvider::with_credentials(source, model);
             if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::ChatGptResponses => {
             let source = crate::auth::openai::CodexCredentialSource::new(store).with_credential(credential);
             let mut provider = crate::responses::ResponsesProvider::new(source, model);
             if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::OpenAiCompatible => Err("OAuth is not implemented for generic OpenAI chat connections".into()),
     }
@@ -191,7 +198,7 @@ pub fn parse_route_spec(spec: &str) -> Result<(String, Route), RouteError> {
     }
     Ok((
         name.to_string(),
-        Route { kind: Kind::OpenAiCompatible, base_url: Some(url.to_string()), credential },
+        Route { kind: Kind::OpenAiCompatible, base_url: Some(url.to_string()), credential, stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT },
     ))
 }
 
@@ -273,7 +280,7 @@ pub fn build(
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.clone());
             }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::ChatGptResponses => {
             // Subscription OAuth only — tokens resolve per request with
@@ -283,7 +290,7 @@ pub fn build(
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.clone());
             }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
         Kind::OpenAiCompatible => {
             let key = match &route.credential {
@@ -301,7 +308,7 @@ pub fn build(
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.trim_end_matches('/'));
             }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(provider.with_stream_idle_timeout(route.stream_idle_timeout)))
         }
     }
 }

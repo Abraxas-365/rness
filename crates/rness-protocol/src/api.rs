@@ -16,6 +16,8 @@ use crate::events::{ContentPart, Envelope, SessionId, ToolCallId, UserIntent};
 pub enum ClientRequest {
     /// Send user content into a session (intent decides queueing).
     Send { session: SessionId, intent: UserIntent, content: Vec<ContentPart> },
+    /// Continue an idle session whose final event is a failed turn, without new user content.
+    Retry { session: SessionId },
     /// Cancel the running turn, if any.
     Cancel { session: SessionId },
 }

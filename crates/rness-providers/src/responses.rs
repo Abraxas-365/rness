@@ -31,6 +31,7 @@ pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const ORIGINATOR: &str = "rness";
 
 pub struct ResponsesProvider {
+    idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     base_url: String,
     source: CodexCredentialSource,
@@ -40,11 +41,17 @@ pub struct ResponsesProvider {
 impl ResponsesProvider {
     pub fn new(source: CodexCredentialSource, model: impl Into<String>) -> Self {
         Self {
+            idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             source,
             model: model.into(),
         }
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     /// Point at a mock server (tests).
@@ -55,7 +62,7 @@ impl ResponsesProvider {
 
     fn build_body(&self, request: &StepRequest<'_>) -> Result<Value, ProviderError> {
         if matches!(request.context.config.reasoning, Some(Reasoning::BudgetTokens { .. })) {
-            return Err(ProviderError {
+            return Err(ProviderError { code: "PROVIDER", retry_after: None,
                 message: "reasoning budget tokens are unsupported by OpenAI Responses; use effort".into(),
                 retryable: false,
             });
@@ -349,7 +356,7 @@ impl Provider for ResponsesProvider {
             Ok(c) => c,
             Err(e) => {
                 return StepOutcome::Failed {
-                    error: ProviderError {
+                    error: ProviderError { code: "PROVIDER", retry_after: None,
                         message: auth_message(e),
                         retryable: false,
                     },
@@ -363,13 +370,14 @@ impl Provider for ResponsesProvider {
             let sent = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
+                _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
                 r = self.request_for(&credential, &body).send() => r,
             };
             let response = match sent {
                 Ok(r) => r,
                 Err(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { message: format!("transport: {e}"), retryable: true },
+                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("transport: {e}"), retryable: true },
                         partial: vec![],
                     }
                 }
@@ -385,13 +393,14 @@ impl Provider for ResponsesProvider {
                     }
                     Err(e) => {
                         return StepOutcome::Failed {
-                            error: ProviderError { message: auth_message(e), retryable: false },
+                            error: ProviderError { code: "PROVIDER", retry_after: None, message: auth_message(e), retryable: false },
                             partial: vec![],
                         }
                     }
                 }
             }
             if !status.is_success() {
+                let retry_after = crate::sse::retry_after(response.headers());
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 let text = response.text().await.unwrap_or_default();
                 let message = serde_json::from_str::<Value>(&text)
@@ -404,14 +413,14 @@ impl Provider for ResponsesProvider {
                     })
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { message, retryable },
+                    error: ProviderError { code: "HTTP", retry_after, message, retryable },
                     partial: vec![],
                 };
             }
             break response;
         };
 
-        let mut reader = SseReader::new(response.bytes_stream());
+        let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator::default();
         let mut emitted = 0usize;
         loop {
@@ -428,17 +437,18 @@ impl Provider for ResponsesProvider {
                     if acc.done {
                         if let Some(message) = acc.error {
                             return StepOutcome::Failed {
-                                error: ProviderError { message, retryable: true },
+                                error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
                                 partial: acc.chunks,
                             };
                         }
                         return StepOutcome::Committed(acc.finish(&self.model));
                     }
                 }
+                SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
                 SsePull::Done => {
                     if let Some(message) = acc.error {
                         return StepOutcome::Failed {
-                            error: ProviderError { message, retryable: true },
+                            error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
                             partial: acc.chunks,
                         };
                     }
@@ -447,7 +457,7 @@ impl Provider for ResponsesProvider {
                 SsePull::Cancelled => return StepOutcome::Cancelled { partial: acc.chunks },
                 SsePull::Error(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { message: format!("stream: {e}"), retryable: true },
+                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("stream: {e}"), retryable: true },
                         partial: acc.chunks,
                     }
                 }

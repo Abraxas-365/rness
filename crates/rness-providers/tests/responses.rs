@@ -187,6 +187,7 @@ async fn history_replays_as_function_call_items() {
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
+                    tasks: None,
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),

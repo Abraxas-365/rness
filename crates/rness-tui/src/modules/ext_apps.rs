@@ -53,7 +53,7 @@ struct Inner {
     views: std::collections::HashMap<String, Vec<String>>,
     /// slot → content rows available at last render (viewport hint the
     /// host passes to apps as `ctx.rows` so they can window long lists).
-    viewports: std::collections::HashMap<String, u16>,
+    viewports: std::collections::HashMap<String, (u16, u16)>,
     /// The one visible app per slot kind (single-active keeps focus sane).
     active: Option<String>,
 }
@@ -128,7 +128,13 @@ impl AppsState {
     pub fn rows_for(&self, name: &str) -> Option<u16> {
         let inner = self.inner.read().expect("apps lock");
         let app = inner.apps.iter().find(|a| a.name == name)?;
-        inner.viewports.get(&app.slot).copied()
+        inner.viewports.get(&app.slot).map(|&(rows, _)| rows)
+    }
+
+    pub fn cols_for(&self, name: &str) -> Option<u16> {
+        let inner = self.inner.read().expect("apps lock");
+        let app = inner.apps.iter().find(|a| a.name == name)?;
+        inner.viewports.get(&app.slot).map(|&(_, cols)| cols)
     }
 
     /// Hide the active app (host applies this after a "close" outcome).
@@ -224,6 +230,10 @@ fn key_string(key: &KeyEvent) -> Option<String> {
         KeyCode::Down => s.push_str("down"),
         KeyCode::Left => s.push_str("left"),
         KeyCode::Right => s.push_str("right"),
+        KeyCode::PageUp => s.push_str("pageup"),
+        KeyCode::PageDown => s.push_str("pagedown"),
+        KeyCode::Home => s.push_str("home"),
+        KeyCode::End => s.push_str("end"),
         KeyCode::Tab => s.push_str("tab"),
         KeyCode::Backspace => s.push_str("backspace"),
         _ => return None,
@@ -263,12 +273,10 @@ impl Component for ExtApp {
         let Some(app) = self.state.active_in_slot(self.slot) else { return };
         // Record the viewport (content rows inside borders) so the host
         // can hand it to the app's next view as `ctx.rows`.
-        self.state
-            .inner
-            .write()
-            .expect("apps lock")
-            .viewports
-            .insert(self.slot.into(), area.height.saturating_sub(2));
+        let viewport = (area.height.saturating_sub(2), area.width.saturating_sub(2));
+        let previous = self.state.inner.write().expect("apps lock")
+            .viewports.insert(self.slot.into(), viewport);
+        if previous != Some(viewport) { self.state.send(AppEvent::Shown(app.name.clone())); }
         let lines: Vec<Line> =
             self.state.view_of(&app.name).into_iter().map(Line::from).collect();
         // Solid background: overlays float over the chat.
@@ -361,6 +369,13 @@ mod tests {
 
     fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn task_navigation_keys_reach_apps() {
+        for (code, expected) in [(KeyCode::PageUp, "pageup"), (KeyCode::PageDown, "pagedown"), (KeyCode::Home, "home"), (KeyCode::End, "end")] {
+            assert_eq!(key_string(&KeyEvent::new(code, KeyModifiers::NONE)).as_deref(), Some(expected));
+        }
     }
 
     fn roster() -> Vec<AppInfo> {

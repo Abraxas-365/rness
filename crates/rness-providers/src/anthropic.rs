@@ -46,6 +46,7 @@ enum Auth {
 }
 
 pub struct AnthropicProvider {
+    idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     base_url: String,
     auth: Auth,
@@ -54,8 +55,14 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
+    pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
+    }
+
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
+            idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::ApiKey(api_key.into()),
@@ -68,6 +75,7 @@ impl AnthropicProvider {
     /// Pro/Max tokens with transparent refresh).
     pub fn with_credentials(source: CredentialSource, model: impl Into<String>) -> Self {
         Self {
+            idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::Source(source),
@@ -98,7 +106,7 @@ impl AnthropicProvider {
         let max_tokens = request.context.config.max_output_tokens.unwrap_or(self.max_tokens);
         if let Some(Reasoning::BudgetTokens { tokens }) = &request.context.config.reasoning {
             if *tokens < 1024 || *tokens >= max_tokens {
-                return Err(ProviderError {
+                return Err(ProviderError { code: "PROVIDER", retry_after: None,
                     message: format!(
                         "Anthropic reasoning budget must satisfy 1024 <= budget < max_output_tokens ({max_tokens})"
                     ),
@@ -376,7 +384,7 @@ impl Provider for AnthropicProvider {
             Err(e) => {
                 let retryable = !matches!(e, AuthError::NoCredentials);
                 return StepOutcome::Failed {
-                    error: ProviderError { message: e.to_string(), retryable },
+                    error: ProviderError { code: "PROVIDER", retry_after: None, message: e.to_string(), retryable },
                     partial: vec![],
                 };
             }
@@ -391,6 +399,7 @@ impl Provider for AnthropicProvider {
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
+                _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
                 r = self.request_for(&credential, &body).send() => r,
             };
 
@@ -398,7 +407,7 @@ impl Provider for AnthropicProvider {
                 Ok(r) => r,
                 Err(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError {
+                        error: ProviderError { code: "PROVIDER", retry_after: None,
                             message: format!("transport: {e}"),
                             retryable: true,
                         },
@@ -421,6 +430,7 @@ impl Provider for AnthropicProvider {
                         }
                     }
                 }
+                let retry_after = crate::sse::retry_after(response.headers());
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 let body = response.text().await.unwrap_or_default();
                 let message = serde_json::from_str::<Value>(&body)
@@ -428,12 +438,12 @@ impl Provider for AnthropicProvider {
                     .and_then(|v| v["error"]["message"].as_str().map(String::from))
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { message, retryable },
+                    error: ProviderError { code: "HTTP", retry_after, message, retryable },
                     partial: vec![],
                 };
             }
 
-            let mut reader = SseReader::new(response.bytes_stream());
+            let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
             let mut acc = Accumulator::default();
             let mut emitted = 0usize;
             loop {
@@ -442,7 +452,7 @@ impl Provider for AnthropicProvider {
                         let at_ms = started.elapsed().as_millis() as u64;
                         if let Err(message) = acc.apply(&event, &data, at_ms) {
                             return StepOutcome::Failed {
-                                error: ProviderError { message, retryable: true },
+                                error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
                                 partial: acc.chunks,
                             };
                         }
@@ -454,8 +464,9 @@ impl Provider for AnthropicProvider {
                         }
                         if event == "message_stop" { return StepOutcome::Committed(acc.finish(&self.model)); }
                     }
-                    SsePull::Done => return StepOutcome::Failed {
-                        error: ProviderError { message: "anthropic: stream ended before message_stop (connection closed or incomplete response)".into(), retryable: true },
+                    SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
+                SsePull::Done => return StepOutcome::Failed {
+                        error: ProviderError { code: "PROVIDER", retry_after: None, message: "anthropic: stream ended before message_stop (connection closed or incomplete response)".into(), retryable: true },
                         partial: acc.chunks,
                     },
                     SsePull::Cancelled => {
@@ -463,7 +474,7 @@ impl Provider for AnthropicProvider {
                     }
                     SsePull::Error(e) => {
                         return StepOutcome::Failed {
-                            error: ProviderError {
+                            error: ProviderError { code: "PROVIDER", retry_after: None,
                                 message: format!("stream: {e}"),
                                 retryable: true,
                             },

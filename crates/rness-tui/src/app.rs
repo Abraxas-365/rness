@@ -109,6 +109,7 @@ impl Model {
         }
         // Tool names live on the assistant ToolUse parts; map call → name.
         let mut names: std::collections::HashMap<ToolCallId, String> = Default::default();
+        let mut failed_attempts = 0;
         for env in &history.envelopes {
             if shadowed.contains(env.id.as_str()) {
                 if let Some(span) = anchors.get(env.id.as_str()) {
@@ -122,7 +123,13 @@ impl Model {
                 SessionEvent::UserMessage(m) => {
                     self.entries.push(Entry::User { content: m.content.clone() })
                 }
+                SessionEvent::TurnStarted { .. } => failed_attempts = 0,
+                SessionEvent::TurnEnded { outcome: rness_protocol::events::TurnOutcome::Failed, .. } => {
+                    let detail = if failed_attempts > 0 { format!(" after {failed_attempts} failed provider attempt(s); no automatic retries remain") } else { String::new() };
+                    self.entries.push(Entry::Notice(format!("Turn failed{detail}. Use /retry to continue from saved context.")));
+                }
                 SessionEvent::AssistantMessage(m) => {
+                    failed_attempts = 0;
                     for part in &m.content {
                         if let ContentPart::ToolUse { call, name, .. } = part {
                             names.insert(call.clone(), name.clone());
@@ -134,8 +141,10 @@ impl Model {
                     });
                 }
                 SessionEvent::AssistantAttempt(attempt) => {
-                    if let rness_protocol::events::AttemptOutcome::Error { message, .. } = &attempt.outcome {
-                        self.entries.push(Entry::Notice(format!("Provider error ({}): {}", attempt.model, message)));
+                    if let rness_protocol::events::AttemptOutcome::Error { message, code, retry_in_ms, .. } = &attempt.outcome {
+                        failed_attempts += 1;
+                        let recovery = retry_in_ms.map(|ms| format!("; retry {} scheduled after {ms} ms", failed_attempts + 1)).unwrap_or_default();
+                        self.entries.push(Entry::Notice(format!("Provider error ({}), attempt {} [{}]: {}{}", attempt.model, failed_attempts, code.as_deref().unwrap_or("PROVIDER"), message, recovery)));
                     }
                 }
                 SessionEvent::ToolResult(r) => self.entries.push(Entry::ToolResult {
@@ -333,6 +342,21 @@ impl App {
         match action {
             Action::Submit(text) => {
                 if text.trim().is_empty() {
+                    return;
+                }
+                if text.trim() == "/help retry" || text.trim() == "/retry --help" {
+                    self.model.entries.push(Entry::Notice("/retry — Continue the last failed turn from saved context without another user message. Requires an idle session; configuration changes are allowed.".into()));
+                    return;
+                }
+                if text.split_whitespace().next() == Some("/retry") && text.trim() != "/retry" {
+                    self.model.entries.push(Entry::Notice("Usage: /retry".into()));
+                    return;
+                }
+                if text.trim() == "/retry" {
+                    match self.backend.submit(ClientRequest::Retry { session: self.model.session.clone() }) {
+                        Ok(_) => { self.model.busy = true; self.model.scroll_from_bottom = 0; }
+                        Err(error) => self.model.entries.push(Entry::Notice(error)),
+                    }
                     return;
                 }
                 if text.split_whitespace().next() == Some("/colorscheme") {
@@ -596,7 +620,7 @@ mod tests {
         use rness_protocol::events::{AssistantAttempt, AttemptOutcome};
         let mut model = Model::new("s".into(), "fake".into());
         let history = History { session: "s".into(), envelopes: vec![env(SessionEvent::AssistantAttempt(AssistantAttempt {
-            model: "fake".into(), chunks: vec![], outcome: AttemptOutcome::Error { message: "connection closed before message_stop".into(), retryable: true },
+            model: "fake".into(), chunks: vec![], outcome: AttemptOutcome::Error { code: None, retry_in_ms: None, message: "connection closed before message_stop".into(), retryable: true },
         }))] };
         model.load_history(&history);
         assert!(matches!(&model.entries[0], Entry::Notice(text) if text.contains("Provider error (fake)") && text.contains("connection closed")));
@@ -632,6 +656,7 @@ mod tests {
                     chunks: vec![],
                 })),
                 env(SessionEvent::ToolResult(ToolResult {
+                    tasks: None,
                     call: "c1".into(),
                     name: "Write".into(),
                     output: "wrote foo.txt".into(),

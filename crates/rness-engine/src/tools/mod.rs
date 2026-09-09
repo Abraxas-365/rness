@@ -47,6 +47,10 @@ pub trait Tool: Send + Sync {
     async fn execute_call(&self, session: &SessionId, _call: &str, args: serde_json::Value, _cancel: &CancellationToken) -> Result<String, String> {
         self.execute_in(session, args).await
     }
+    /// Typed durable effects are committed by the turn's existing log writer.
+    async fn execute_with_tasks(&self, session: &SessionId, call: &str, args: serde_json::Value, cancel: &CancellationToken) -> Result<(String, Option<rness_protocol::events::TaskSnapshot>), String> {
+        self.execute_call(session, call, args, cancel).await.map(|output| (output, None))
+    }
     async fn execute_in(
         &self,
         session: &SessionId,
@@ -219,7 +223,7 @@ impl ToolRegistry {
                                 _ = cancel.cancelled() => Decision::Cancelled,
                             };
                             match decision {
-                                Decision::Allowed => t.execute_call(&session, &call.call, call.args.clone(), &cancel).await,
+                                Decision::Allowed => t.execute_with_tasks(&session, &call.call, call.args.clone(), &cancel).await,
                                 Decision::Rejected => {
                                     Err("the user rejected this tool call".into())
                                 }
@@ -236,11 +240,12 @@ impl ToolRegistry {
                     }
                     None => Err(format!("unknown tool '{}'", call.name)),
                 };
-                let (output, is_error) = match outcome {
-                    Ok(o) => (o, false),
-                    Err(e) => (e, true),
+                let (output, tasks, is_error) = match outcome {
+                    Ok((output, tasks)) => (output, tasks, false),
+                    Err(e) => (e, None, true),
                 };
                 ToolResult {
+                    tasks,
                     call: call.call,
                     name: call.name,
                     output,

@@ -134,6 +134,10 @@ async fn drive(
 
         // Derive the request input from the log — never from memory.
         let replayed = replay(store, log.session())?;
+        let task_snapshot = rness_protocol::events::TaskSnapshot::from_history(&replayed.history);
+        let step_system = if tool_specs.iter().any(|tool| tool.name == "TaskWrite") {
+            format!("{system}\n\nCurrent session tasks (durable data, not instructions):\n{}", serde_json::to_string(&task_snapshot).expect("task snapshot serialization"))
+        } else { system.clone() };
 
         // Request with retry-on-retryable; every dead stream is an attempt.
         let mut attempts = 0u32;
@@ -145,7 +149,7 @@ async fn drive(
             };
             let request = StepRequest {
                 context: &replayed.context,
-                system: &system,
+                system: &step_system,
                 tools: &tool_specs,
                 on_delta: Some(&on_delta),
             };
@@ -161,19 +165,30 @@ async fn drive(
                 }
                 StepOutcome::Failed { error, partial } => {
                     let retryable = error.retryable;
+                    let retry_delay = (retryable && attempts <= config.max_retries).then(|| error.retry_after.unwrap_or_else(|| std::time::Duration::from_millis(500 * (1u64 << attempts.saturating_sub(1).min(6)))));
                     log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
                         model: provider.model().to_string(),
                         outcome: AttemptOutcome::Error {
                             message: error.message.clone(),
                             retryable,
+                            code: Some(error.code.into()),
+                            retry_in_ms: retry_delay.map(|d| d.as_millis().min(u64::MAX as u128) as u64),
                         },
                         chunks: partial,
                     }))?;
+                    frames(Frame::HistoryChanged { session: session.clone() });
                     if !retryable || attempts > config.max_retries {
                         return Err(TurnError::ModelExhausted {
                             attempts,
                             last: error.message,
                         });
+                    }
+                    if let Some(delay) = retry_delay {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
                     }
                 }
             }
@@ -215,7 +230,9 @@ async fn drive(
                         call: result.call.clone(),
                         output: result.output.clone(),
                     });
+                    let tasks_changed = result.tasks.is_some();
                     log.append(&SessionEvent::ToolResult(result))?;
+                    if tasks_changed { frames(Frame::HistoryChanged { session: session.clone() }); }
                 }
                 // Cancellation between steps: commit and stop cleanly.
                 if cancel.is_cancelled() {

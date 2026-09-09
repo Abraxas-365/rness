@@ -49,7 +49,7 @@ fn all_event_kinds_roundtrip() {
         }),
         SessionEvent::AssistantAttempt(AssistantAttempt {
             model: "test-model".into(),
-            outcome: AttemptOutcome::Error { message: "overloaded".into(), retryable: true },
+            outcome: AttemptOutcome::Error { code: None, retry_in_ms: None, message: "overloaded".into(), retryable: true },
             chunks: vec![TimedChunk { ms: 50, delta: ChunkDelta::Text { t: "par".into() } }],
         }),
         SessionEvent::AssistantAttempt(AssistantAttempt {
@@ -58,6 +58,7 @@ fn all_event_kinds_roundtrip() {
             chunks: vec![],
         }),
         SessionEvent::ToolResult(ToolResult {
+            tasks: None,
             call: "c1".into(),
             name: "Read".into(),
             output: "contents".into(),

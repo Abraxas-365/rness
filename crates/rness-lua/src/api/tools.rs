@@ -41,6 +41,14 @@ impl Tool for LuaTool {
         self.spec.sensitive
     }
 
+    async fn execute_with_tasks(&self, session: &String, call: &str, args: serde_json::Value, cancel: &tokio_util::sync::CancellationToken) -> Result<(String, Option<rness_protocol::events::TaskSnapshot>), String> {
+        if let Some(config) = &self.spec.tasks {
+            rness_engine::tasks::TaskWrite(config.clone()).execute_with_tasks(session, call, args, cancel).await
+        } else {
+            self.execute_call(session, call, args, cancel).await.map(|output| (output, None))
+        }
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         self.host.call_tool_context(&self.spec.name, args, self.context.clone()).await
     }
@@ -72,6 +80,31 @@ mod ownership_tests {
     impl Tool for Native {
         fn name(&self) -> &str { "owned" }
         async fn execute(&self, _: serde_json::Value) -> Result<String, String> { Ok("native".into()) }
+    }
+
+    #[tokio::test]
+    async fn native_tasks_lifecycle_and_validation() {
+        let host = LuaHost::spawn().unwrap();
+        let registry = rness_engine::tools::ToolRegistry::default();
+        assert!(host.load("broken", "rness.tasks.enable(); error('broken')").await.is_err());
+        assert!(host.tool_specs().await.is_empty());
+        host.load("tasks", "rness.tasks.enable { allow_parallel_in_progress=false }").await.unwrap();
+        let installed = sync_lua_tools(&registry, &host, &[]).await;
+        let args = serde_json::json!({"tasks":[{"id":"1","content":"test","status":"in_progress"}]});
+        let call = rness_engine::tools::ToolCall { call: "c".into(), name: "TaskWrite".into(), args: args.clone() };
+        let result = registry.dispatch(&"s".into(), &[call.clone()], 1, &tokio_util::sync::CancellationToken::new()).await;
+        assert!(result[0].tasks.is_some());
+        let cancel = tokio_util::sync::CancellationToken::new(); cancel.cancel();
+        let result = registry.dispatch(&"s".into(), &[call], 1, &cancel).await;
+        assert!(result[0].is_error);
+        assert!(result[0].tasks.is_none());
+        host.unload("tasks").await.unwrap();
+        assert!(sync_lua_tools(&registry, &host, &installed).await.is_empty());
+        assert!(registry.get("TaskWrite").is_none());
+        host.load("again", "rness.tasks.enable()").await.unwrap();
+        let installed = sync_lua_tools(&registry, &host, &[]).await;
+        host.load("off", "rness.tasks.disable()").await.unwrap();
+        assert!(sync_lua_tools(&registry, &host, &installed).await.is_empty());
     }
 
     #[tokio::test]

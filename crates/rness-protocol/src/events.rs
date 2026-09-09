@@ -97,6 +97,34 @@ pub enum SessionEvent {
     RequestConfig(CallConfig),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus { Pending, InProgress, Completed }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskItem {
+    pub id: String,
+    pub content: String,
+    pub status: TaskStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskSnapshot {
+    pub tasks: Vec<TaskItem>,
+}
+
+impl TaskSnapshot {
+    /// Latest successful snapshot in full fork-resolved history, including compacted events.
+    pub fn from_history(history: &[Envelope]) -> Self {
+        history.iter().rev().find_map(|env| match &env.event {
+            SessionEvent::ToolResult(result) if !result.is_error => result.tasks.clone(),
+            _ => None,
+        }).unwrap_or_default()
+    }
+}
+
 /// A durable provider route and model selection. Credentials never belong
 /// here: composition roots resolve this public identifier at request time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,7 +295,14 @@ pub struct AssistantAttempt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum AttemptOutcome {
-    Error { message: String, retryable: bool },
+    Error {
+        message: String,
+        retryable: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_in_ms: Option<u64>,
+    },
     Cancelled,
 }
 
@@ -302,6 +337,9 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Milliseconds the tool ran (wall clock).
     pub duration_ms: u64,
+    /// State and successful tool result commit in the same JSONL envelope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<TaskSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

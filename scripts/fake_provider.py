@@ -3,6 +3,7 @@
 import argparse
 import json
 import socket
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -11,6 +12,10 @@ class Provider(BaseHTTPRequestHandler):
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length", "0")))
         scenario = self.path.strip("/").split("/")[0]
+        if scenario == "recover":
+            with self.server.counter_lock:
+                self.server.recovery_requests += 1
+                scenario = "http-401" if self.server.recovery_requests == 1 else "ok"
         if scenario == "disconnect":
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
@@ -38,6 +43,11 @@ class Provider(BaseHTTPRequestHandler):
             event("message_start", {"message": {"usage": {"input_tokens": 1}}})
             event("content_block_start", {"index": 0, "content_block": {"type": "text", "text": ""}})
             event("content_block_delta", {"index": 0, "delta": {"type": "text_delta", "text": "Partial response from fake provider."}})
+            if scenario == "heartbeat":
+                for _ in range(20):
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(0.1)
             if scenario == "stall":
                 time.sleep(self.server.stall_seconds)
                 return
@@ -54,11 +64,13 @@ class Provider(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Use base URL http://127.0.0.1:PORT/SCENARIO. Scenarios: ok, cut, disconnect, stall, malformed, stream-error, http-401, http-429, http-500. Unknown scenarios return success.")
+    parser = argparse.ArgumentParser(description="Use base URL http://127.0.0.1:PORT/SCENARIO. Scenarios: ok, recover (first request 401, then success), heartbeat (2 seconds of comments), cut, disconnect, stall, malformed, stream-error, http-401, http-429, http-500. Unknown scenarios return success.")
     parser.add_argument("--port", type=int, default=8769)
     parser.add_argument("--stall-seconds", type=float, default=30)
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Provider)
+    server.counter_lock = threading.Lock()
+    server.recovery_requests = 0
     server.stall_seconds = args.stall_seconds
     print(f"Fake provider on http://127.0.0.1:{server.server_port}", flush=True)
     server.serve_forever()

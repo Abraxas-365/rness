@@ -29,6 +29,7 @@ use crate::sse::{SsePull, SseReader};
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 pub struct OpenAiProvider {
+    idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
@@ -40,12 +41,18 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
+            idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
             base_url: OPENAI_BASE_URL.to_string(),
             api_key: Some(api_key.into()),
             model: model.into(),
             extra_body: json!({}),
         }
+    }
+
+    pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = timeout;
+        self
     }
 
     pub fn without_auth(mut self) -> Self {
@@ -68,7 +75,7 @@ impl OpenAiProvider {
 
     fn build_body(&self, request: &StepRequest<'_>) -> Result<Value, ProviderError> {
         if matches!(request.context.config.reasoning, Some(Reasoning::BudgetTokens { .. })) {
-            return Err(ProviderError {
+            return Err(ProviderError { code: "PROVIDER", retry_after: None,
                 message: "reasoning budget tokens are unsupported by OpenAI-compatible providers; use effort".into(),
                 retryable: false,
             });
@@ -298,6 +305,7 @@ impl Provider for OpenAiProvider {
         let response = tokio::select! {
             biased;
             _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
+            _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
             r = http_request.send() => r,
         };
 
@@ -305,7 +313,7 @@ impl Provider for OpenAiProvider {
             Ok(r) => r,
             Err(e) => {
                 return StepOutcome::Failed {
-                    error: ProviderError { message: format!("transport: {e}"), retryable: true },
+                    error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("transport: {e}"), retryable: true },
                     partial: vec![],
                 }
             }
@@ -313,6 +321,7 @@ impl Provider for OpenAiProvider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after = crate::sse::retry_after(response.headers());
             let retryable = status.as_u16() == 429 || status.is_server_error();
             let body = response.text().await.unwrap_or_default();
             let message = serde_json::from_str::<Value>(&body)
@@ -320,12 +329,12 @@ impl Provider for OpenAiProvider {
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
                 .unwrap_or_else(|| format!("http {status}"));
             return StepOutcome::Failed {
-                error: ProviderError { message, retryable },
+                error: ProviderError { code: "HTTP", retry_after, message, retryable },
                 partial: vec![],
             };
         }
 
-        let mut reader = SseReader::new(response.bytes_stream());
+        let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator::default();
         let mut emitted = 0usize;
         loop {
@@ -337,7 +346,7 @@ impl Provider for OpenAiProvider {
                     let at_ms = started.elapsed().as_millis() as u64;
                     if let Err(message) = acc.apply(&data, at_ms) {
                         return StepOutcome::Failed {
-                            error: ProviderError { message, retryable: true },
+                            error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
                             partial: acc.chunks,
                         };
                     }
@@ -348,11 +357,12 @@ impl Provider for OpenAiProvider {
                         emitted = acc.chunks.len();
                     }
                 }
+                SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
                 SsePull::Done => return StepOutcome::Committed(acc.finish(&self.model)),
                 SsePull::Cancelled => return StepOutcome::Cancelled { partial: acc.chunks },
                 SsePull::Error(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { message: format!("stream: {e}"), retryable: true },
+                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("stream: {e}"), retryable: true },
                         partial: acc.chunks,
                     }
                 }

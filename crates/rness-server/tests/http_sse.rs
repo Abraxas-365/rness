@@ -52,6 +52,41 @@ async fn questions_http_sse_validation_resolution_and_cancellation() {
     server.abort();
 }
 
+struct TaskAnswer(std::sync::atomic::AtomicBool);
+#[async_trait]
+impl Provider for TaskAnswer {
+    fn model(&self) -> &str { "tasks-test" }
+    async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+        let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if !first { assert!(request.system.contains("test persisted tasks")); }
+        StepOutcome::Committed(AssistantMessage {
+            model: self.model().into(),
+            content: if first { vec![ContentPart::ToolUse { call: "task-call".into(), name: "TaskWrite".into(), args: serde_json::json!({"tasks":[{"id":"test","content":"test persisted tasks","status":"pending"}]}) }] } else { vec![ContentPart::Text { text: "done".into() }] },
+            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), chunks: vec![],
+        })
+    }
+}
+
+#[tokio::test]
+async fn tasks_http_snapshot_and_sse_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ToolRegistry::default());
+    tools.register(Arc::new(rness_engine::tasks::TaskWrite(Default::default())));
+    let (base, sessions, _kernel) = serve_with(dir.path(), Arc::new(TaskAnswer(Default::default())), tools).await;
+    let id = sessions.create(None).unwrap();
+    let client = reqwest::Client::new();
+    let mut stream = client.get(format!("{base}/api/events/{id}")).send().await.unwrap();
+    assert_eq!(get_json(&format!("{base}/api/sessions/{id}/tasks")).await, serde_json::json!({"tasks":[]}));
+    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "track".into() }]).unwrap();
+    sessions.join(&id).await;
+    let snapshot = get_json(&format!("{base}/api/sessions/{id}/tasks")).await;
+    assert_eq!(snapshot["tasks"][0]["content"], "test persisted tasks");
+    let mut received = String::new();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !received.contains("history_changed") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); }
+    }).await.unwrap();
+}
+
 struct OneAnswer;
 
 #[async_trait]

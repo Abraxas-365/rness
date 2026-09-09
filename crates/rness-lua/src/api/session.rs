@@ -39,6 +39,10 @@ pub fn install(
 ) -> Result<(), mlua::Error> {
     let session = lua.create_table()?;
     let s = Arc::clone(&sessions);
+    session.set("tasks", lua.create_function(move |lua, id: String| {
+        lua.to_value(&s.tasks(&id).map_err(err)?)
+    })?)?;
+    let s = Arc::clone(&sessions);
     session.set("agent", lua.create_function(move |lua, (id, name): (String, Option<String>)| {
         if let Some(name) = name { s.select_agent(&id, &name).map_err(err)?; }
         lua.to_value(&s.config(&id).map_err(err)?.agent)

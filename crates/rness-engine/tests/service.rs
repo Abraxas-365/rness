@@ -56,6 +56,26 @@ async fn workspace_survives_resume_and_controls_instructions_and_input() {
     assert!(resumed.create(Some(project.path().join("missing").to_string_lossy().into_owned())).is_err());
 }
 
+#[tokio::test]
+async fn retry_resumes_failed_context_without_duplicate_user_message() {
+    let logs = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![
+        StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "PROVIDER", retry_after: None, message: "offline".into(), retryable: false }, partial: vec![] },
+        StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
+    ]);
+    let service = SessionService::new(SessionStore::new(logs.path()), provider, Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()));
+    let id = service.create(None).unwrap();
+    assert!(service.retry(&id).is_err());
+    service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }]).unwrap();
+    service.join(&id).await;
+    service.retry(&id).unwrap();
+    service.join(&id).await;
+    let history = service.store().history(&id).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 1);
+    assert!(matches!(history.last().unwrap().event, SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }));
+    assert!(service.retry(&id).is_err());
+}
+
 struct PanicCommand;
 impl rness_engine::interaction::Command for PanicCommand {
     fn name(&self) -> &str { "panic" }
@@ -202,6 +222,57 @@ impl Provider for Scripted {
         }
         outcome
     }
+}
+
+#[tokio::test]
+async fn retry_preserves_committed_tool_results_and_allows_config_change() {
+    struct Count(Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait]
+    impl Tool for Count {
+        fn name(&self) -> &str { "Count" }
+        async fn execute(&self, _: serde_json::Value) -> Result<String, String> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("done".into())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tools = Arc::new(ToolRegistry::default());
+    tools.register(Arc::new(Count(count.clone())));
+    let provider = Scripted::new(vec![
+        StepOutcome::Committed(AssistantMessage { model: "test".into(), content: vec![ContentPart::ToolUse { call: "once".into(), name: "Count".into(), args: serde_json::json!({}) }], stop: StopReason::ToolUse, usage: Usage::default(), chunks: vec![] }),
+        StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "HTTP", retry_after: None, message: "offline".into(), retryable: false }, partial: vec![] },
+        StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
+    ]);
+    let svc = SessionService::new(SessionStore::new(dir.path()), provider, tools, TurnConfig::default(), Arc::new(EventBus::default()));
+    let sid = svc.create(None).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("execute once")).unwrap();
+    svc.join(&sid).await;
+    svc.set_config(&sid, svc.config(&sid).unwrap()).unwrap();
+    svc.retry(&sid).unwrap();
+    assert!(svc.retry(&sid).is_err());
+    svc.join(&sid).await;
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(svc.store().history(&sid).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::ToolResult(_))).count(), 1);
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_retry_after_without_another_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "HTTP", retry_after: Some(std::time::Duration::from_secs(60)), message: "rate limited".into(), retryable: true }, partial: vec![] }]);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("go")).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if svc.store().history(&sid).unwrap().iter().any(|e| matches!(e.event, SessionEvent::AssistantAttempt(_))) { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    svc.cancel(&sid);
+    tokio::time::timeout(std::time::Duration::from_secs(2), svc.join(&sid)).await.unwrap();
+    assert_eq!(provider.seen().len(), 1);
+    assert!(matches!(svc.store().history(&sid).unwrap().last().unwrap().event, SessionEvent::TurnEnded { outcome: TurnOutcome::Cancelled, .. }));
 }
 
 struct Echo;

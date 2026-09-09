@@ -17,6 +17,7 @@ pub struct StartupConfig {
     pub colorscheme: Option<String>,
     pub models: ModelRegistry,
     pub providers: BTreeMap<String, ProviderDeclaration>,
+    pub stream_idle_timeouts: BTreeMap<String, u64>,
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
     pub question_overlay: QuestionOverlayConfig,
@@ -26,6 +27,21 @@ pub struct StartupConfig {
 
 #[cfg(test)]
 mod permission_tests {
+    #[test]
+    fn stream_timeouts_are_opt_in_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        assert!(super::load(&path).unwrap().stream_idle_timeouts.is_empty());
+        for source in ["rness.providers.set_stream_idle_timeout('anthropic', -1)", "rness.providers.set_stream_idle_timeout('anthropic', 2147483648)", "rness.providers.set_stream_idle_timeout('', 500)"] {
+            std::fs::write(&path, source).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+        std::fs::write(&path, "rness.providers.set_stream_idle_timeout('anthropic', 500)").unwrap();
+        assert_eq!(super::load(&path).unwrap().stream_idle_timeouts["anthropic"], 500);
+        std::fs::write(&path, "rness.providers.set_stream_idle_timeout('anthropic', 0)").unwrap();
+        assert_eq!(super::load(&path).unwrap().stream_idle_timeouts["anthropic"], 0);
+    }
+
     #[test]
     fn rules_are_explicit_validated_and_replace_atomically() {
         let dir = tempfile::tempdir().unwrap();
@@ -139,6 +155,14 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     rness.set("profiles", profiles)?;
     let providers = lua.create_table()?;
     let s = state.clone();
+    providers.set("set_stream_idle_timeout", lua.create_function(move |_, (name, milliseconds): (String, u64)| {
+        if name.trim().is_empty() || milliseconds > 2_147_483_647 {
+            return Err(mlua::Error::runtime("provider name must be nonempty and timeout must be 0..2147483647 milliseconds"));
+        }
+        s.lock().unwrap().stream_idle_timeouts.insert(name, milliseconds);
+        Ok(())
+    })?)?;
+    let s = state.clone();
     providers.set("register", lua.create_function(move |lua, (name, value): (String, Table)| {
         let declaration: ProviderDeclaration = lua.from_value(mlua::Value::Table(value))?;
         if name.is_empty() || name.contains('/') { return Err(mlua::Error::runtime("invalid provider name")); }
@@ -173,7 +197,7 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     if path.is_file() {
         lua.load(std::fs::read_to_string(path)?).set_name(path.to_string_lossy()).exec()?;
     }
-    for (table, method) in [("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
+    for (table, method) in [("providers", "set_stream_idle_timeout"), ("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
         let table: Table = rness.get(table)?;
         table.set(method, lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
             Err(mlua::Error::runtime("startup declarations are closed; edit init.lua and restart"))

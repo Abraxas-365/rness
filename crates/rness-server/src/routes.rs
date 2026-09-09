@@ -15,6 +15,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(history))
+        .route("/api/sessions/:id/tasks", get(tasks))
         .route("/api/sessions/:id/phase", get(phase))
         .route("/api/sessions/:id/fork", post(fork))
         .route("/api/sessions/:id/compact", post(compact))
@@ -79,6 +80,13 @@ async fn history(State(s): State<ServerState>, Path(id): Path<String>) -> Respon
     match s.sessions.store().history(&id) {
         Ok(envelopes) => Json(History { session: id, envelopes }).into_response(),
         Err(e) => err_response(e),
+    }
+}
+
+async fn tasks(State(s): State<ServerState>, Path(id): Path<String>) -> Response {
+    match s.sessions.tasks(&id) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(error) => err_response(error),
     }
 }
 
@@ -192,6 +200,10 @@ async fn request(State(s): State<ServerState>, Json(req): Json<ClientRequest>) -
                 Err(e) => err_response(e),
             }
         }
+        ClientRequest::Retry { session } => match s.sessions.retry(&session) {
+            Ok(_) => Json(json!({ "status": "started" })).into_response(),
+            Err(e) => err_response(e),
+        },
         ClientRequest::Cancel { session } => {
             s.sessions.cancel(&session);
             Json(json!({ "status": "cancelled" })).into_response()

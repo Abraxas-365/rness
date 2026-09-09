@@ -22,6 +22,8 @@ pub type DeltaSink<'a> = &'a (dyn Fn(&ChunkDelta) + Send + Sync);
 
 #[derive(Debug, Clone)]
 pub struct ProviderError {
+    pub code: &'static str,
+    pub retry_after: Option<std::time::Duration>,
     pub message: String,
     pub retryable: bool,
 }
