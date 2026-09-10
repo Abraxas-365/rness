@@ -27,6 +27,19 @@ impl Editor {
         self.lines.join("\n")
     }
 
+    pub fn before_cursor(&self) -> String {
+        let (row, col) = self.cursor;
+        let mut parts = self.lines[..row].to_vec();
+        parts.push(self.lines[row][..col].to_owned());
+        parts.join("\n")
+    }
+
+    pub fn replace_before_cursor(&mut self, bytes: usize, replacement: &str) {
+        let chars = self.before_cursor()[self.before_cursor().len() - bytes..].chars().count();
+        for _ in 0..chars { self.backspace(); }
+        self.insert_str(replacement);
+    }
+
     pub fn line_count(&self) -> usize {
         self.lines.len()
     }

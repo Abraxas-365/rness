@@ -15,6 +15,28 @@ use rness_server::{router, ServerState};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn file_reference_http_is_path_only_and_workspace_scoped() {
+    let logs = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("日本語 notes.txt"), "SECRET CONTENT NOT ATTACHED").unwrap();
+    let mut kernel = Kernel::new();
+    kernel.mount(SessionsPlugin { root: logs.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), agents: Default::default(), models: Default::default(), tools: Arc::new(ToolRegistry::default()), config: TurnConfig::default() }).unwrap();
+    let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
+    sessions.reference_service().configure(Some(Default::default()));
+    let id = sessions.create(Some(workspace.path().to_string_lossy().into_owned())).unwrap();
+    let state = ServerState::new(sessions.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/api/sessions/{id}/file-references", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap(); });
+    let client = reqwest::Client::new();
+    let paths: serde_json::Value = client.post(&endpoint).json(&serde_json::json!({"query":"日本語"})).send().await.unwrap().json().await.unwrap();
+    assert_eq!(paths, serde_json::json!([{"path":"日本語 notes.txt", "directory":false}]));
+    assert_eq!(client.post(&endpoint).json(&serde_json::json!({"query":"../"})).send().await.unwrap().status(), 400);
+    assert_eq!(sessions.store().history(&id).unwrap().len(), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn questions_http_sse_validation_resolution_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(ToolRegistry::default());

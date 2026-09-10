@@ -153,6 +153,7 @@ async fn drive(
         let mut step_system = if tool_specs.iter().any(|tool| tool.name == "TaskWrite") {
             format!("{system}\n\nCurrent session tasks (durable data, not instructions):\n{}", serde_json::to_string(&task_snapshot).expect("task snapshot serialization"))
         } else { system.clone() };
+        if tools.file_references.enabled() { step_system.push_str(&format!("\n\n{}", crate::file_references::GUIDANCE)); }
 
         if rness_protocol::events::PlanState::from_history(&replayed.history).active {
             if let Some(config) = &plan_config { step_system.push_str(&format!("\n\n{}", config.guidance)); }
@@ -251,6 +252,7 @@ async fn drive(
                         output: result.output.clone(),
                     });
                     let tasks_changed = result.tasks.is_some();
+                    tools.file_references.invalidate();
                     log.append(&SessionEvent::ToolResult(result))?;
                     if tasks_changed { frames(Frame::HistoryChanged { session: session.clone() }); }
                 }

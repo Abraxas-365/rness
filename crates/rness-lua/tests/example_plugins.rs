@@ -27,6 +27,31 @@ async fn custom_tools_receive_session_workspace_without_chdir() {
     assert_eq!(b.get("where").unwrap().execute(serde_json::json!({})).await.unwrap(), "b:/project-b");
 }
 
+#[tokio::test]
+async fn references_enable_disable_failed_reload_and_ownership() {
+    let root = tempfile::tempdir().unwrap();
+    let host = LuaHost::spawn().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(root.path()), Arc::new(Silent), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into()).await.unwrap();
+    host.load("references", "rness.file_references.enable { max_results = 3, respect_gitignore = false }").await.unwrap();
+    assert!(sessions.reference_service().enabled());
+    let generation = sessions.reference_service().generation();
+    assert!(host.load("bad", "rness.file_references.disable(); error('rollback')").await.is_err());
+    assert_eq!(sessions.reference_service().generation(), generation);
+    assert!(sessions.reference_service().enabled());
+    assert!(host.reload(vec![rness_lua::loader::PluginSource { name: "broken".into(), source: "rness.file_references.disable(); error('broken')".into() }]).await.is_err());
+    assert!(sessions.reference_service().enabled());
+    host.load("replacement", "rness.file_references.enable()").await.unwrap();
+    host.unload_coordinated("references", vec![], |_| {}).await.unwrap();
+    assert!(sessions.reference_service().enabled());
+    host.unload_coordinated("replacement", vec![], |_| {}).await.unwrap();
+    assert!(!sessions.reference_service().enabled());
+    host.load("on", "rness.file_references.enable()").await.unwrap();
+    host.load("off", "rness.file_references.disable()").await.unwrap();
+    assert!(!sessions.reference_service().enabled());
+}
+
 #[test]
 fn command_example_registers_help_and_arguments() {
     let mut runtime = rness_lua::runtime::LuaRuntime::new().unwrap();

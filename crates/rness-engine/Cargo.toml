@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 jiff.workspace = true
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

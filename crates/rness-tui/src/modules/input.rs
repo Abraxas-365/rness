@@ -26,6 +26,8 @@ const MAX_ROWS: usize = 8;
 const PREFIX_CELLS: u16 = 2;
 
 pub struct Input {
+    references: Vec<(String, String)>,
+    reference_query: String,
     editor: Editor,
     /// First wrapped row currently shown (scrollport offset).
     scroll_top: usize,
@@ -45,14 +47,28 @@ pub fn install(slots: &mut Slots) {
 
 impl Input {
     pub fn new() -> Self {
-        Self { commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: String::new() }
+        Self { references: Vec::new(), reference_query: String::new(), commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: String::new() }
     }
 
     pub fn with_candidates(candidates: Vec<(String, String)>) -> Self {
         Self { candidates, ..Self::new() }
     }
 
+    fn at_token(&self) -> Option<String> {
+        let prefix = self.editor.before_cursor();
+        if prefix.starts_with('/') { return None; }
+        let start = prefix.rfind('@')?;
+        if start > 0 && !prefix[..start].ends_with(char::is_whitespace) { return None; }
+        let token = &prefix[start..];
+        let query = &token[1..];
+        if let Some(quoted) = query.strip_prefix('"') {
+            if quoted.contains(['"', '\n']) { return None; }
+        } else if query.contains(char::is_whitespace) { return None; }
+        Some(token.to_owned())
+    }
+
     fn matches(&self) -> Vec<&(String, String)> {
+        if !self.dismissed && self.at_token().as_deref() == Some(self.reference_query.as_str()) { return self.references.iter().collect(); }
         let text = self.editor.text();
         if self.dismissed || !text.starts_with('/') || text.contains('\n') { return Vec::new(); }
         let query = text[1..].to_lowercase();
@@ -75,6 +91,29 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_picker_quotes_paths_preserves_suffix_and_drills() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.editor.insert_str("Read @日 later");
+        for _ in 0..6 { input.editor.move_left(); }
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"Read @old", "values":["wrong"]}));
+        assert!(input.matches().is_empty());
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"Read @日", "values":["日本語/a b.txt"]}));
+        let result = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(result.actions.is_empty());
+        assert_eq!(input.editor.text(), "Read @\"日本語/a b.txt\"  later");
+        input.editor.take();
+        input.editor.insert_str("@");
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"@", "values":["docs/"]}));
+        let result = input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(result.actions.as_slice(), [Action::Complete(text)] if text == "@docs/"));
+        input.editor.take(); input.editor.insert_str("mail@host");
+        assert!(input.at_token().is_none());
+    }
 
     #[test]
     fn dynamic_completion_ignores_stale_queries() {
@@ -172,7 +211,20 @@ impl Default for Input {
 
 impl Component for Input {
     fn on_action(&mut self, _ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "input:references" {
+            self.references.clear(); self.reference_query.clear(); self.dismissed = true;
+            return;
+        }
         if name == "input:completion" {
+            if let Some(token) = self.at_token() {
+                if payload["text"].as_str() == Some(self.editor.before_cursor().as_str()) {
+                    if let Ok(values) = serde_json::from_value::<Vec<String>>(payload["values"].clone()) {
+                        self.reference_query = token;
+                        self.references = values.into_iter().map(|p| (p, String::new())).collect();
+                    }
+                }
+                return;
+            }
             if payload["text"].as_str() != Some(self.editor.text().as_str()) { return; }
             if let (Some(text), Ok(values)) = (payload["text"].as_str(), serde_json::from_value::<Vec<String>>(payload["values"].clone())) {
                 let command = text.trim_start_matches('/').split_whitespace().next().unwrap_or_default();
@@ -314,6 +366,16 @@ impl Component for Input {
                     return KeyOutcome::consumed();
                 }
                 (KeyCode::Tab | KeyCode::Enter, KeyModifiers::NONE) => {
+                    if let Some(token) = self.at_token() {
+                        let path = matches[selected].0.clone();
+                        let drill = key.code == KeyCode::Tab && path.ends_with('/');
+                        let quoted = path.contains(char::is_whitespace);
+                        let replacement = if quoted { format!("@\"{path}{}", if drill { "" } else { "\" " }) } else { format!("@{path}{}", if drill { "" } else { " " }) };
+                        self.editor.replace_before_cursor(token.len(), &replacement);
+                        self.references.clear();
+                        self.selected = 0;
+                        return if drill { KeyOutcome::act(vec![Action::Complete(self.editor.before_cursor())]) } else { KeyOutcome::consumed() };
+                    }
                     let replacement = format!("/{} ", matches[selected].0);
                     self.editor.take();
                     self.editor.insert_str(&replacement);
@@ -358,7 +420,7 @@ impl Component for Input {
             self.dismissed = false;
             self.selected = 0;
         }
-        match (key.code, key.modifiers) {
+        let outcome = match (key.code, key.modifiers) {
             (KeyCode::Enter, m)
                 if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::SHIFT) =>
             {
@@ -419,6 +481,10 @@ impl Component for Input {
                 KeyOutcome::consumed()
             }
             _ => KeyOutcome::pass(),
+        };
+        if self.at_token().is_some() && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) {
+            return KeyOutcome::act(vec![Action::Complete(self.editor.before_cursor())]);
         }
+        outcome
     }
 }

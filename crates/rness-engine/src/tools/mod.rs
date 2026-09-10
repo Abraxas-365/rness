@@ -86,6 +86,7 @@ pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Composition-owned approval seam. Default policy is `Allow`, which
     /// behaves exactly as if the seam didn't exist.
+    pub file_references: Arc<crate::file_references::FileReferences>,
     pub plan_selections: Arc<crate::plan::PlanSelections>,
     approvals: Arc<Approvals>,
 }
@@ -95,14 +96,14 @@ impl ToolRegistry {
         let tools = self.tools.read().expect("registry lock").iter()
             .map(|(name, tool)| (name.clone(), tool.for_workspace(session, workspace).unwrap_or_else(|| Arc::clone(tool))))
             .collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone() }
+        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
     }
 
     pub fn restricted(&self, allowed: &[String]) -> Self {
         let tools = self.tools.read().expect("registry lock").iter()
             .filter(|(name, _)| allowed.contains(name))
             .map(|(name, tool)| (name.clone(), Arc::clone(tool))).collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone() }
+        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {

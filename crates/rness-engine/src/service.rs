@@ -208,6 +208,13 @@ impl SessionService {
 
     pub fn plan_store(&self) -> Arc<SessionStore> { self.store.clone() }
 
+    pub fn file_references(&self, session: &SessionId, query: &crate::file_references::Query, cancel: &CancellationToken) -> Result<Vec<crate::file_references::Candidate>, ServiceError> {
+        let workspace = self.store.workspace(session)?.ok_or_else(|| ServiceError::InvalidConfig("session has no workspace".into()))?;
+        self.tools.file_references.list(std::path::Path::new(&workspace), query, cancel).map_err(ServiceError::InvalidConfig)
+    }
+
+    pub fn reference_service(&self) -> &Arc<crate::file_references::FileReferences> { &self.tools.file_references }
+
     pub fn tasks(&self, session: &SessionId) -> Result<rness_protocol::events::TaskSnapshot, ServiceError> {
         Ok(rness_protocol::events::TaskSnapshot::from_history(&self.store.history(session)?))
     }

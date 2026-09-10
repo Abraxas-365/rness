@@ -15,6 +15,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(history))
+        .route("/api/sessions/:id/file-references", post(file_references))
         .route("/api/sessions/:id/tasks", get(tasks))
         .route("/api/sessions/:id/phase", get(phase))
         .route("/api/sessions/:id/fork", post(fork))
@@ -51,6 +52,16 @@ fn err_response(e: impl std::fmt::Display) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, msg).into_response()
+}
+
+async fn file_references(State(s): State<ServerState>, Path(id): Path<String>, Json(query): Json<rness_engine::file_references::Query>) -> Response {
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let _guard = cancel.clone().drop_guard();
+    match tokio::task::spawn_blocking(move || s.sessions.file_references(&id, &query, &cancel)).await {
+        Ok(Ok(paths)) => Json(paths).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => err_response(error),
+    }
 }
 
 async fn list_sessions(State(s): State<ServerState>) -> Response {

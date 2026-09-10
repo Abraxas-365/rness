@@ -50,6 +50,7 @@ pub struct LuaRuntime {
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
+    references: Option<(String, rness_engine::file_references::Config)>,
     plan_store: Option<std::sync::Arc<rness_engine::session::branch::SessionStore>>,
     questions: Option<std::sync::Arc<rness_engine::questions::Questions>>,
 }
@@ -95,6 +96,7 @@ impl LuaRuntime {
             command_metadata: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
+            references: None,
             plan_store: None,
             questions: None,
         })
@@ -174,6 +176,7 @@ impl LuaRuntime {
             pending.set("statusline", LuaValue::Nil)?;
             pending.set("questions", LuaValue::Nil)?;
             pending.set("tasks_disabled", LuaValue::Nil)?;
+            pending.set("references", LuaValue::Nil)?;
             pending.set("plan_disabled", LuaValue::Nil)?;
             for (category, values) in snapshots {
                 let table: Table = declarations.get(category)?;
@@ -213,6 +216,12 @@ impl LuaRuntime {
             }
             pending.set("plan_disabled", LuaValue::Nil)?;
         }
+        match pending.get::<LuaValue>("references")? {
+            LuaValue::Table(table) => self.references = Some((name.to_owned(), self.lua.from_value(LuaValue::Table(table))?)),
+            LuaValue::Boolean(false) => self.references = None,
+            _ => {},
+        }
+        pending.set("references", LuaValue::Nil)?;
         pending.set("questions", LuaValue::Nil)?;
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
         Ok(())
@@ -233,6 +242,7 @@ impl LuaRuntime {
                 command_completers: self.command_completers.iter().map(|(n, k)| Ok((n.clone(), copy_key(k)?))).collect::<mlua::Result<_>>()?,
                 command_metadata: self.command_metadata.clone(),
                 commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
+                references: None,
                 plugin_hooks: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
             };
             let declarations: Table = self.lua.globals().get("__rness_declarations")?;
@@ -328,8 +338,11 @@ impl LuaRuntime {
         names
     }
 
+    pub(crate) fn reference_config(&self) -> Option<rness_engine::file_references::Config> { self.references.as_ref().map(|(_, c)| c.clone()) }
+
     pub fn unload(&mut self, name: &str) -> Result<bool, LuaError> {
         let Some(hooks) = self.plugin_hooks.remove(name) else { return Ok(false) };
+        if self.references.as_ref().is_some_and(|(owner, _)| owner == name) { self.references = None; }
         for unsubscribe in hooks.clone().sequence_values::<Function>() {
             unsubscribe?.call::<bool>(())?;
         }
@@ -822,6 +835,22 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     }
     rness.set("tool", tool)?;
 
+    let references = lua.create_table()?;
+    references.set("enable", lua.create_function(|lua, options: Option<Table>| {
+        if !lua.globals().get::<Option<bool>>("__rness_loading_plugin")?.unwrap_or(false) { return Err(mlua::Error::runtime("file references must be declared in a runtime plugin")); }
+        let config: rness_engine::file_references::Config = match options { Some(t) => lua.from_value(LuaValue::Table(t))?, None => Default::default() };
+        config.validate().map_err(mlua::Error::runtime)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        if !pending.get::<LuaValue>("references")?.is_nil() { return Err(mlua::Error::runtime("duplicate file reference declaration")); }
+        pending.set("references", lua.to_value(&config)?)
+    })?)?;
+    references.set("disable", lua.create_function(|lua, ()| {
+        if !lua.globals().get::<Option<bool>>("__rness_loading_plugin")?.unwrap_or(false) { return Err(mlua::Error::runtime("file references must be declared in a runtime plugin")); }
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        if !pending.get::<LuaValue>("references")?.is_nil() { return Err(mlua::Error::runtime("duplicate file reference declaration")); }
+        pending.set("references", false)
+    })?)?;
+    rness.set("file_references", references)?;
     let plan = lua.create_table()?;
     plan.set("enable", lua.create_function(|lua, options: Option<Table>| {
         require_declaration_phase(lua)?;

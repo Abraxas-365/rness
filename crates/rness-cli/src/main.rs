@@ -679,6 +679,7 @@ fn print_parts(who: &str, parts: &[ContentPart]) {
 mod questions;
 
 struct LocalBackend {
+    reference_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
 }
@@ -775,6 +776,27 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
 
 impl rness_tui::app::Backend for LocalBackend {
     fn complete(&self, session: &SessionId, text: String) {
+        if let Some(start) = text.rfind('@').filter(|_| !text.starts_with('/')) {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            self.reference_cancel.lock().unwrap().cancel();
+            *self.reference_cancel.lock().unwrap() = cancel.clone();
+            let query = text[start + 1..].trim_start_matches('"').to_owned();
+            let sessions = self.sessions.clone();
+            let session = session.clone();
+            let tx = self.results.clone();
+            let generation = sessions.reference_service().generation();
+            let service = sessions.reference_service().clone();
+            tokio::spawn(async move {
+                let target = session.clone();
+                let worker_cancel = cancel.clone();
+                let values = tokio::task::spawn_blocking(move || sessions.file_references(&target, &rness_engine::file_references::Query { query, limit: 50 }, &worker_cancel)).await;
+                if cancel.is_cancelled() || service.generation() != generation { return; }
+                if let Ok(Ok(paths)) = values {
+                    let _ = tx.send(rness_tui::app::Action::CompletionResult(session, text, paths.into_iter().map(|p| p.path).collect()));
+                }
+            });
+            return;
+        }
         let prepared = self.sessions.prepare_command(session, &text);
         let tx = self.results.clone();
         let session = session.clone();
@@ -1034,7 +1056,7 @@ async fn run_tui(
     let _ = card_tx.send(session.clone());
 
     let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
-    let backend = Arc::new(LocalBackend { sessions: Arc::clone(&sessions), results: host_tx.clone() });
+    let backend = Arc::new(LocalBackend { reference_cancel: Default::default(), sessions: Arc::clone(&sessions), results: host_tx.clone() });
 
     // Drive view/key round-trips for the mounted apps from a host task.
     // The TUI stays Lua-agnostic — it renders published lines and
@@ -1049,6 +1071,7 @@ async fn run_tui(
         let workspace_fallback = std::env::current_dir()?;
         tokio::spawn(async move {
             let mut previous = None;
+            let mut previous_references = None;
             let mut previous_commands = None;
             let mut previous_session = None;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
@@ -1063,6 +1086,11 @@ async fn run_tui(
                         if tx.send(rness_tui::app::Action::Custom("input:skills".into(), serde_json::json!(skills))).is_err() { break; }
                     }
                     previous_session = Some(session);
+                }
+                let generation = sessions.reference_service().generation();
+                if previous_references != Some(generation) {
+                    let _ = tx.send(rness_tui::app::Action::Custom("input:references".into(), serde_json::json!(generation)));
+                    previous_references = Some(generation);
                 }
                 let commands = sessions.commands().completions();
                 if previous_commands.as_ref() != Some(&commands) {

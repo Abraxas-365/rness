@@ -300,6 +300,7 @@ impl LuaHost {
                                     qs.set_available(staged.is_available());
                                 }
                             }
+                            if r.is_ok() { if let Some(binding) = &session_binding { binding.sessions.reference_service().configure(rt.reference_config()); } }
                             let _ = reply.send(r);
                         }
                         Cmd::CoordinatedUnload { name, installed, apply_ui, reply } => {
@@ -308,6 +309,7 @@ impl LuaHost {
                                 let _maintenance = binding.sessions.try_extension_maintenance().map_err(|e| e.to_string())?;
                                 let removed = rt.unload(&name).map_err(|e| e.to_string())?;
                                 if removed {
+                                    binding.sessions.reference_service().configure(rt.reference_config());
                                     sync_commands(&rt, binding, &command_tx, &mut installed_commands)?;
                                     let remaining = rt.tool_specs();
                                     for tool in installed {
@@ -379,6 +381,7 @@ impl LuaHost {
                                 )
                                 .map_err(|e| e.to_string());
                             let r = r.and_then(|()| sync_commands(&rt, &binding, &command_tx, &mut installed_commands));
+                            if r.is_ok() { binding.sessions.reference_service().configure(rt.reference_config()); }
                             session_binding = Some(binding);
                             let _ = reply.send(r);
                         }
@@ -416,6 +419,7 @@ impl LuaHost {
                                 }
                             }
                             if r.is_ok() {
+                                if let Some(binding) = &session_binding { binding.sessions.reference_service().configure(rt.reference_config()); }
                                 if let Some(reconcile) = reconcile { reconcile(rt.tool_specs()); }
                             }
                             let _ = reply.send(r.map(|()| Vec::new()));

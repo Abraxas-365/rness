@@ -2,6 +2,56 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Path references in terminal and HTTP
+
+Declare in a selected runtime plugin (off by default), loaded through
+`rness.plugins.load('references')` in init.lua:
+
+```lua
+rness.file_references.enable {
+  max_results = 20,
+  max_entries = 50000,
+  respect_gitignore = true,
+  -- Optional replacement for the default directory exclusion list:
+  -- excluded_directories = { '.git', 'node_modules', 'target' },
+}
+```
+
+`rness.file_references.disable()` or unloading the owning plugin cancels indexes,
+removes guidance on subsequent steps and clears the terminal picker. Runtime
+reload applies changed declarations without restart; failed loads retain the
+previous service configuration. An old owner's unload cannot disable a replacement.
+In the terminal, type `@` at the beginning
+of a token, including within a sentence. Arrows select, Tab drills into a folder,
+Enter inserts without sending, and Escape closes the picker. Paths with spaces
+are quoted as `@"docs/design notes.txt"`. Only a path is inserted: no file bytes
+are attached. Model guidance requires reading files or listing directories when
+needed, without claiming they have already been inspected.
+
+Web clients use `POST /api/sessions/:id/file-references` with JSON
+`{"query":"src/","limit":50}`. Responses are arrays of `{path,directory}`; no SSE
+subscription is needed. The same service uses the session's persisted workspace.
+Limits are 1..200. A disabled feature returns an empty array. Queries must be
+relative workspace paths; this discovery boundary does not change tool permissions.
+
+An empty query and slash-containing queries list a directory live. Bare queries
+use a shared bounded fuzzy path index with deterministic prefix/gap/path ranking.
+Only the initial query waits for indexing; stale entries answer while refresh
+runs in the background. Tool results invalidate caches; external edits are picked
+up by a refresh triggered by queries after 30 seconds. At most eight workspaces
+are retained. The entry limit can omit files; raise it if needed.
+
+Default exclusions cover version-control, dependency, cache and build directory
+names (including `.git`, `node_modules`, `target`, and `dist`). The optional
+`excluded_directories` replaces that list. `respect_gitignore` enables the ignore
+crate's Git/global/exclude and `.ignore` rules, including nested rules. Neither
+these discovery filters nor relative-path validation change tool permissions.
+Directory symlinks are not traversed. Non-UTF-8 paths, quotes and control characters
+are omitted. Canceling one caller does not cancel an index another caller shares;
+disable/reload cancels its lifetime. Terminal queries reject stale responses.
+HTTP workers receive cancellation if their handler is dropped; disconnect
+propagation depends on the HTTP server. This exposes a web API, not a web UI.
+
 ## Plan mode (initial implementation)
 
 `examples/plugins/plan.lua` enables `exit_plan_mode` and registers
