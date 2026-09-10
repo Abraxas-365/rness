@@ -261,6 +261,19 @@ mod tests {
         assert!(config.default_profile.is_none());
     }
 
+    #[test]
+    fn additional_providers_module_loads_without_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lua")).unwrap();
+        std::fs::write(dir.path().join("lua/additional-providers.lua"),
+            include_str!("../../../../examples/lua/additional-providers.lua")).unwrap();
+        let init = dir.path().join("init.lua");
+        std::fs::write(&init, "require('additional-providers')").unwrap();
+        let config = load(&init).unwrap();
+        assert_eq!(config.providers.len(), 5);
+        assert!(config.default_profile.is_none());
+    }
+
     #[tokio::test]
     async fn init_runs_once_preserves_callbacks_and_loads_modules() {
         let dir = tempfile::tempdir().unwrap();

@@ -110,6 +110,12 @@ impl ModelRegistry {
         Ok(())
     }
 
+    pub fn model_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.models.keys().map(|(provider, model)| format!("{provider}/{model}")).collect();
+        names.sort();
+        names
+    }
+
     pub fn capabilities(&self, selection: &ModelSelection) -> Option<&ModelCapabilities> {
         self.models.get(&(selection.route.clone(), selection.model.clone()))
     }

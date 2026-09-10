@@ -108,11 +108,11 @@ always-visible Plan status widget.
 Copy selected files from `examples/lua/` into `~/.rness/lua/` and require them from `init.lua`:
 
 ```lua
-require("local-model")
+require("additional-providers")
 require("roles")
 ```
 
-- `local-model.lua`: an unauthenticated local endpoint and a profile with an explicit output limit. Requires the server and model to be available.
+- `additional-providers.lua`: explicit OpenCode Go (Chat Completions and Messages), Ollama, OpenRouter, and Groq connections. Remote credentials come from environment variables; Ollama requires a running server and installed model. No profiles or defaults are imposed. Remove duplicate provider registrations when combining with `examples/init.lua`.
 - `roles.lua`: a tool-free principal planner and a delegable implementer. No mandatory profile and no implicit default selection.
 - `examples/init.lua`: broader connection, profile, authentication, and agent configuration examples. Merge selected declarations instead of overwriting your configuration.
 
@@ -223,9 +223,11 @@ viewport. Its keybinding and presentation remain Lua policy.
 The HTTP endpoint is read-only; task mutations occur through model tool dispatch.
 Plan mode is a separate feature and is not enabled by tasks.
 
-## Legacy examples
+## Model capabilities
 
-The legacy `plugins/models.lua` uses an older declaration API and must not be selected as a post-mount plugin under frozen startup configuration. Move capability declarations into a startup module using the current `rness.models.declare { provider=..., model=..., capabilities=... }` form. Old spinner/autocompact examples also need their legacy model queries updated before use with that registry.
+Copy `examples/lua/models.lua` to `~/.rness/lua/models.lua` and call `require("models")` from `init.lua`. Do not select it with `rness.plugins.load`: capabilities are startup declarations and changes require restart. The example uses `rness.models.declare { provider=..., model=..., capabilities=... }`, with `max_output_tokens` and structured `reasoning.efforts` / `reasoning.budget_tokens`.
+
+Runtime readers `rness.models.get("provider/model")`, `rness.models.list()`, and `rness.models.capabilities(provider, model)` use the same startup registry as request validation. `get` returns nil for unknown models, `list` returns sorted names, and returned tables are copies. Spinner/autocompact therefore use the declared context window, retaining their fallback for unknown models. Runtime plugin reload does not change these facts. Declarations do not register providers, authenticate accounts, or set request defaults; verify gateway/account limits before enabling the catalog.
 
 These recipes cover several extension patterns, not every built-in tool or Lua namespace. No new examples are enabled in personal configuration automatically.
 

@@ -67,6 +67,20 @@ impl LuaRuntime {
         let rness: Table = self.lua.globals().get("rness")?;
         let models: Table = rness.get("models")?;
         let registry = config.models.clone();
+        models.set("get", self.lua.create_function(move |lua, name: String| {
+            let caps = name.split_once('/').and_then(|(provider, model)| {
+                registry.capabilities(&rness_protocol::events::ModelSelection {
+                    route: provider.into(), model: model.into(),
+                })
+            });
+            match caps {
+                Some(caps) => lua.to_value(caps),
+                None => Ok(LuaValue::Nil),
+            }
+        })?)?;
+        let names = config.models.model_names();
+        models.set("list", self.lua.create_function(move |lua, ()| lua.to_value(&names))?)?;
+        let registry = config.models.clone();
         models.set("capabilities", self.lua.create_function(move |lua, (provider, model): (String, String)| {
             lua.to_value(&registry.capabilities(&rness_protocol::events::ModelSelection { route: provider, model }))
         })?)?;
@@ -1000,47 +1014,13 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     )?;
     rness.set("events", events)?;
 
-    // rness.models — declared model capabilities (dsh: contextWindow is
-    // HUMAN-declared adapter config; pi-ai is just someone else's
-    // declaration). Pure in-VM state: plugins declare the models THEY
-    // use, plugins consume the facts. rness ships ZERO model data — an
-    // undeclared model returns nil, callers keep their own fallback.
-    //   rness.models.declare("anthropic/claude-x", { context_window = 200000, ... })
-    //   rness.models.get("anthropic/claude-x") -> table|nil
-    //   rness.models.list() -> { name, ... } sorted
+    // Model facts belong to startup configuration, shared with request validation.
     let models = lua.create_table()?;
-    lua.globals().set("__rness_models", lua.create_table()?)?;
-    models.set(
-        "declare",
-        lua.create_function(|lua, (name, caps): (String, Table)| {
-            let store: Table = lua.globals().get("__rness_models")?;
-            store.set(name, caps)?;
-            Ok(())
-        })?,
-    )?;
-    models.set(
-        "get",
-        lua.create_function(|lua, name: String| {
-            let store: Table = lua.globals().get("__rness_models")?;
-            store.get::<Option<Table>>(name)
-        })?,
-    )?;
-    models.set(
-        "list",
-        lua.create_function(|lua, ()| {
-            let store: Table = lua.globals().get("__rness_models")?;
-            let mut names: Vec<String> = Vec::new();
-            for pair in store.pairs::<String, Table>() {
-                names.push(pair?.0);
-            }
-            names.sort();
-            let out = lua.create_table()?;
-            for n in names {
-                out.push(n)?;
-            }
-            Ok(out)
-        })?,
-    )?;
+    models.set("declare", lua.create_function(|_, _: mlua::MultiValue| {
+        Err::<(), _>(mlua::Error::runtime("models are startup declarations; require the model module from init.lua and restart"))
+    })?)?;
+    models.set("get", lua.create_function(|_, _: String| Ok(LuaValue::Nil))?)?;
+    models.set("list", lua.create_function(|lua, ()| lua.create_table())?)?;
     rness.set("models", models)?;
 
     // rness.ui.statusline(provider) — provider() -> string|nil
@@ -1310,26 +1290,59 @@ mod tests {
     }
 
     #[test]
-    fn models_registry_declares_gets_and_lists() {
+    fn models_registry_is_empty_without_startup() {
         let mut rt = LuaRuntime::new().unwrap();
         rt.load(
             "test",
             r#"
             -- Undeclared -> nil (rness ships zero model data).
             assert(rness.models.get("anthropic/claude-x") == nil)
-            rness.models.declare("b/two", { context_window = 100 })
-            rness.models.declare("a/one", { context_window = 200000, reasoning = { "high" } })
-            local caps = rness.models.get("a/one")
-            assert(caps.context_window == 200000)
-            assert(caps.reasoning[1] == "high")
-            -- Redeclaration replaces (hot reload rebuilds the registry).
-            rness.models.declare("b/two", { context_window = 999 })
-            assert(rness.models.get("b/two").context_window == 999)
-            local names = rness.models.list()
-            assert(#names == 2 and names[1] == "a/one" and names[2] == "b/two")
+            assert(#rness.models.list() == 0)
+            assert(not pcall(rness.models.declare, "b/two", { context_window = 100 }))
             "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn example_models_startup_and_runtime_share_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("lua")).unwrap();
+        std::fs::write(dir.path().join("lua/models.lua"), include_str!("../../../examples/lua/models.lua")).unwrap();
+        let init = dir.path().join("init.lua");
+        std::fs::write(&init, "require('models')").unwrap();
+        let mut rt = LuaRuntime::new().unwrap();
+        let config = rt.startup(&init).unwrap();
+        assert_eq!(config.models.model_names().len(), 27);
+        rt.load("check", r#"
+            local names = rness.models.list()
+            assert(#names == 27)
+            for i, name in ipairs(names) do
+                if i > 1 then assert(names[i-1] < name) end
+                local p, m = name:match('^([^/]+)/(.+)$')
+                local a = rness.models.get(name)
+                local b = rness.models.capabilities(p, m)
+                assert(a.context_window == b.context_window)
+                assert(a.max_output_tokens == b.max_output_tokens)
+                a.context_window = 1
+                assert(rness.models.get(name).context_window > 1)
+            end
+            assert(rness.models.get('unknown/model') == nil)
+            assert(rness.models.get('invalid') == nil)
+            assert(rness.models.get('anthropic/claude-sonnet-5').context_window == 1000000)
+            assert(rness.models.get('anthropic/claude-haiku-4-5-20251001').reasoning.budget_tokens.min == 1024)
+            assert(not pcall(rness.models.declare, {provider='x', model='y', capabilities={}}))
+        "#).unwrap();
+        let before = config.models.model_names();
+        rt.reload_plugins(&[], |_| Ok(())).unwrap();
+        rt.load("after", "assert(#rness.models.list() == 27)").unwrap();
+        assert_eq!(config.models.model_names(), before);
+        let mut invalid = rness_protocol::events::CallConfig::default();
+        invalid.selection = Some(rness_protocol::events::ModelSelection { route: "anthropic".into(), model: "claude-sonnet-5".into() });
+        invalid.max_output_tokens = Some(128001);
+        assert!(config.models.validate(&invalid).is_err());
+        invalid.max_output_tokens = Some(128000);
+        assert!(config.models.validate(&invalid).is_ok());
     }
 
     #[test]
