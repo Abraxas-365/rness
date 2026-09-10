@@ -190,6 +190,24 @@ pub struct SessionService {
 }
 
 impl SessionService {
+    pub fn plan(&self, session: &SessionId) -> Result<rness_protocol::events::PlanState, ServiceError> {
+        let mut state = rness_protocol::events::PlanState::from_history(&self.store.history(session)?);
+        if let Some(active) = self.tools.plan_selections.pending(session) { state.pending = Some(active); }
+        Ok(state)
+    }
+
+    pub fn select_plan(&self, session: &SessionId, active: bool) -> Result<(), ServiceError> {
+        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        self.store.history(session)?;
+        if self.tools.get("exit_plan_mode").and_then(|tool| tool.plan_config()).is_none() {
+            return Err(ServiceError::InvalidConfig("plan plugin is not enabled".into()));
+        }
+        self.tools.plan_selections.select(session, active);
+        Ok(())
+    }
+
+    pub fn plan_store(&self) -> Arc<SessionStore> { self.store.clone() }
+
     pub fn tasks(&self, session: &SessionId) -> Result<rness_protocol::events::TaskSnapshot, ServiceError> {
         Ok(rness_protocol::events::TaskSnapshot::from_history(&self.store.history(session)?))
     }

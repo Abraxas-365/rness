@@ -61,6 +61,25 @@ Use `require("connections")` for modules that must execute during startup, inclu
 
 A plugin can use ordinary `require` for its own helpers when it runs. That uses Lua's existing module search and caching semantics, not a second plugin-selection pass.
 
-Production reload remains restart-only. File-watcher activity does not enable unselected files, and adding a declaration during a running process does not update its captured selection.
+## Runtime reload
+
+Edits under `plugins/` reload the captured selection in declaration order without
+restarting or reexecuting `init.lua`. The existing VM retains startup callbacks,
+globals and module caches. Changing `init.lua`, startup modules, or the selected
+plugin list still requires restart; unselected files are never activated.
+
+Reload stages tools, commands (including help and completion metadata), apps,
+cards, keymaps, statusline and hook ownership. If a selected plugin fails, the
+previous runtime registrations remain usable. Successful reload removes old
+runtime hooks and invalidates native Plan tokens, retaining the shared Questions
+broker and durable session state. The watcher reconciles engine tools while the
+maintenance reservation is still held. The TUI polls presentation declarations.
+Active engine work rejects reload; save again after it becomes idle to retry.
+
+This is a registration transaction, not a sandbox or rollback of arbitrary Lua:
+filesystem/network effects, mutations of shared globals or captured state,
+explicit listener cancellation and `package.loaded` changes cannot be undone.
+Helpers loaded through `require` remain cached. Keep reloadable declarations in
+the selected plugin files and avoid top-level external side effects.
 
 See [init.lua loading rules](../configuration/init-lua.md) for migration and module organization.

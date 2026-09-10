@@ -82,6 +82,38 @@ async fn native_and_lua_text_providers_share_the_contract() {
 }
 
 #[tokio::test]
+async fn runtime_reload_preserves_init_and_rolls_back_commands_and_hooks() {
+    let dir = tempfile::tempdir().unwrap();
+    let init = dir.path().join("init.lua");
+    std::fs::write(&init, "boots = (boots or 0) + 1; rness.ui.statusline(function() return tostring(boots) end)").unwrap();
+    let (host, _) = LuaHost::spawn_from_init(init).unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path().join("sessions")), Arc::new(Silent), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into()).await.unwrap();
+    let source = |version: &str| rness_lua::loader::PluginSource { name: "live".into(), source: format!("rness.commands.register{{name='live', description='{version}', arguments={{'{version}'}}, run=function() return '{version}' end}}; rness.hook.on('tick', function() ticks=(ticks or 0)+1 end)") };
+    host.load("live", &source("v1").source).await.unwrap();
+    let widgets = rness_lua::loader::PluginSource { name: "widgets".into(), source: "rness.tool.register{name='widget', run=function() return 'new' end}; rness.ui.app{name='widget', view=function() return {'new'} end}; rness.ui.tool_card('widget', function() return {'new'} end)".into() };
+    host.load("widgets", &widgets.source).await.unwrap();
+    let guard = sessions.try_extension_maintenance().unwrap();
+    assert!(host.reload(vec![source("v2")]).await.is_err());
+    drop(guard);
+    host.reload(vec![source("v2"), widgets]).await.unwrap();
+    assert_eq!(host.call_tool("widget", serde_json::json!({})).await.unwrap(), "new");
+    assert_eq!(host.app_view("widget", serde_json::json!({})).await.unwrap(), vec!["new"]);
+    assert!(sessions.commands().completions().iter().any(|(name, _)| name == "live v2"));
+    assert!(!sessions.commands().completions().iter().any(|(name, _)| name == "live v1"));
+    let mut broken = source("broken"); broken.source.push_str("; error('broken')");
+    assert!(host.reload(vec![broken]).await.is_err());
+    assert!(sessions.commands().completions().iter().any(|(name, _)| name == "live v2"));
+    host.fire_hook("tick", serde_json::json!({}));
+    host.load("check", "assert(boots == 1); assert(ticks == 1)").await.unwrap();
+    assert_eq!(host.statusline().await.as_deref(), Some("1"));
+    host.reload(vec![]).await.unwrap();
+    assert!(sessions.commands().resolve("/live").is_none());
+    assert_eq!(host.statusline().await.as_deref(), Some("1"));
+}
+
+#[tokio::test]
 async fn coordinated_unload_holds_engine_reservation_through_ui_update() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(ToolRegistry::default());
@@ -154,7 +186,35 @@ async fn booted_host(dir: &std::path::Path) -> LuaHost {
     )
     .await
     .unwrap();
+    host.install_questions(Arc::new(rness_engine::questions::Questions::default())).await.unwrap();
     host
+}
+
+#[tokio::test]
+async fn plan_lifecycle_uses_live_questions_and_preserves_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = booted_host(dir.path()).await;
+    let questions = Arc::new(rness_engine::questions::Questions::default());
+    questions.set_available(true);
+    host.install_questions(questions.clone()).await.unwrap();
+    host.load("plan", "rness.plan.enable()").await.unwrap();
+    let spec = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap();
+    let original = spec.plan.unwrap();
+    assert!(Arc::ptr_eq(&original.questions, &questions));
+    assert!(host.load("broken", "rness.plan.disable(); error('fail')").await.is_err());
+    assert!(!original.alive.is_cancelled());
+    host.load("off", "rness.plan.disable()").await.unwrap();
+    assert!(original.alive.is_cancelled());
+    assert!(!host.tool_specs().await.iter().any(|s| s.name == "exit_plan_mode"));
+    host.load("replacement", "rness.plan.enable()").await.unwrap();
+    host.unload_coordinated("plan", vec![], |_| {}).await.unwrap();
+    assert!(host.tool_specs().await.iter().any(|s| s.name == "exit_plan_mode"));
+    let old = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap().plan.unwrap();
+    host.reload(vec![rness_lua::loader::PluginSource { name: "fresh".into(), source: "rness.plan.enable()".into() }]).await.unwrap();
+    assert!(old.alive.is_cancelled());
+    let fresh = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap().plan.unwrap();
+    assert!(Arc::ptr_eq(&fresh.questions, &questions));
+    assert!(!fresh.alive.is_cancelled());
 }
 
 fn examples() -> Vec<rness_lua::loader::PluginSource> {

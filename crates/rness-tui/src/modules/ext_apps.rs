@@ -81,6 +81,10 @@ impl AppsState {
         }
         inner.views.retain(|name, _| apps.iter().any(|app| &app.name == name));
         inner.apps = apps;
+        let active = inner.active.clone();
+        drop(inner);
+        // Refresh visible content even when a reload keeps identical metadata.
+        if let Some(active) = active { self.send(AppEvent::Shown(active)); }
     }
 
     pub fn generation(&self) -> u64 {
@@ -335,6 +339,22 @@ mod tests {
     use super::*;
     use crate::app::Model;
     use crate::theme::Theme;
+
+    #[test]
+    fn roster_refresh_requests_visible_content_even_with_same_metadata() {
+        let state = AppsState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.connect(tx);
+        let app = AppInfo { name: "probe".into(), slot: "overlay".into(), title: "Before".into(), keymap: Some("ctrl+y".into()) };
+        state.set_apps(vec![app.clone()]);
+        state.toggle_by_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
+        state.set_apps(vec![app.clone()]);
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
+        state.set_apps(vec![AppInfo { title: "After".into(), ..app }]);
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
+        assert_eq!(state.active().as_deref(), Some("probe"));
+    }
 
     #[test]
     fn generations_reject_views_after_same_name_remount() {

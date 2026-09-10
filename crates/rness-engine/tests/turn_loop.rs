@@ -217,6 +217,7 @@ async fn tool_roundtrip_turn_commits_and_replays() {
             SessionEvent::AssistantAttempt(_) => "attempt",
             SessionEvent::Compaction(_) => "compaction",
             SessionEvent::Prune(_) => "prune",
+            SessionEvent::PlanMode { .. } => "plan",
             SessionEvent::RequestConfig(_) => "config",
         })
         .collect();

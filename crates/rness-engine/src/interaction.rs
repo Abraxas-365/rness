@@ -53,6 +53,26 @@ impl CommandRegistry {
         Ok(())
     }
 
+    /// Validate and replace one owner's complete command set atomically.
+    pub fn replace_owned(&self, previous: &[Arc<dyn Command>], replacements: &[Arc<dyn Command>]) -> Result<(), String> {
+        let mut commands = self.commands.write().expect("command registry lock");
+        for command in replacements {
+            let name = command.name();
+            if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-') {
+                return Err("invalid command name".into());
+            }
+            if commands.get(name).is_some_and(|current| !previous.iter().any(|old| Arc::ptr_eq(old, current))) {
+                return Err(format!("command '{name}' is already registered"));
+            }
+        }
+        for old in previous {
+            if commands.get(old.name()).is_some_and(|current| Arc::ptr_eq(old, current)) { commands.remove(old.name()); }
+        }
+        for command in replacements { commands.insert(command.name().to_owned(), command.clone()); }
+        Ok(())
+    }
+
     pub fn unregister_if_current(&self, command: &Arc<dyn Command>) -> bool {
         let mut commands = self.commands.write().expect("command registry lock");
         if commands.get(command.name()).is_some_and(|current| Arc::ptr_eq(current, command)) {

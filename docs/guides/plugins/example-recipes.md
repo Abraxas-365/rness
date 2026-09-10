@@ -2,6 +2,57 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Plan mode (initial implementation)
+
+`examples/plugins/plan.lua` enables `exit_plan_mode` and registers
+`/plan [on|off|status]`. Copy and explicitly load it as a runtime plugin,
+after session services and the Questions broker have been installed. A
+Questions frontend must be enabled to review plans; missing availability never
+implies approval. Tasks is not required and permissions are unchanged.
+
+`rness.plan.enable { guidance = "..." }` accepts optional planning guidance;
+omitting it uses the native default. `rness.session.plan(id)` reads `{active,
+pending}` and `rness.session.plan(id, true_or_false)` selects the next mode.
+Selections remain in memory until the next uncancelled step boundary, where
+`plan/mode` is appended through the turn writer. A selection alone does not
+start a turn, survive restart, or enter a fork. Committed mode does survive.
+
+The review requires a complete Markdown plan starting with `# `. Exactly one
+Approve selection without custom feedback produces a durable approved tool
+result. At the following step boundary the engine logs the exit and continues
+without another user message. Keep planning returns feedback and retains the
+mode. Dismissing review ends the turn without another model request. Already
+running sibling tools are not rolled back or blocked. Cancelled reviews do not
+approve. A fork after approval but before the next step inherits the pending
+exit from the durable result. Same-step provider retries reuse their prompt.
+
+`rness.plan.disable()` is a transactional load-time declaration: it removes the
+native review tool and cancels its live review token without erasing session
+history. A failed plugin chunk does not apply the disable. Enable and disable
+cannot be combined in one load. An old owner's unload cannot remove a newer
+registration. Disabling the mechanism does not remove commands owned separately
+by another plugin; unload the example to remove its `/plan` command too.
+
+Runtime plugin edits reload while idle, including the `/plan` command, without
+reexecuting init.lua. Successful reload invalidates old Plan tokens and uses the
+live Questions broker; failed declarations preserve the prior registrations.
+Startup configuration and module changes still require restart. See
+[reload guarantees and limits](loading-and-lifecycle.md#runtime-reload).
+
+The Questions frontend opens Plan reviews in a Markdown reader, using the same
+styled renderer as chat (headings, lists, emphasis, and code blocks). The native
+request carries the complete source in the optional `markdown` field, separate
+from the approval question, including over HTTP/SSE.
+
+Up/Down or j/k scroll one line, PgUp/PgDn scroll a page, and Home/End jump to the
+bounds. Resizing reflows the document and clamps scrolling. Enter or Tab opens
+the choices without approving; select Approve and submit explicitly to proceed.
+Choose Request changes / feedback to type a revision request. PgDn from choices
+reopens the document. Escape dismisses from either view; Ctrl+C cancels the turn.
+The reader and explicit approval were checked in real tmux at 80x24 and 40x12.
+`/plan status` reports active and pending state; there is no separate
+always-visible Plan status widget.
+
 ## Startup modules
 
 Copy selected files from `examples/lua/` into `~/.rness/lua/` and require them from `init.lua`:

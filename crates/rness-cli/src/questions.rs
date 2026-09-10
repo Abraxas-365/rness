@@ -50,6 +50,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markdown_review_scroll_resize_and_explicit_choices() {
+        let questions = Arc::new(Questions::default());
+        questions.set_available(true);
+        let registry = ToolRegistry::default();
+        registry.register(Arc::new(rness_engine::questions::AskUser(questions.clone())));
+        let markdown = format!("# Review title\n\n## Changes\n\n{}\n```rust\nlet ready = true;\n```\n\nEND-OF-PLAN", "- **Important** 日本語 café details\n".repeat(40));
+        let task = tokio::spawn(async move {
+            registry.dispatch(&"s".into(), &[ToolCall { call: "review".into(), name: "AskUser".into(), args: serde_json::json!({"questions":[{"id":"review","question":"Approve this plan?","markdown":markdown,"options":[{"label":"Approve"},{"label":"Keep planning"}]}]}) }], 1, &tokio_util::sync::CancellationToken::new()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async { while questions.pending().is_empty() { tokio::task::yield_now().await; } }).await.unwrap();
+        let mut overlay = QuestionOverlay::new(questions.clone());
+        let model = rness_tui::app::Model::new("s".into(), "m".into());
+        let theme = rness_tui::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        for (width, height) in [(80, 24), (40, 12), (120, 35)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            overlay.render(&ctx, area, &mut buf);
+            overlay.on_key(&ctx, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            overlay.render(&ctx, area, &mut buf);
+            let snapshot = |buf: &Buffer| (0..height).map(|y| (0..width).map(|x| buf[(x,y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+            assert!(snapshot(&buf).contains("Review title"));
+            assert!(!snapshot(&buf).contains("# Review title"));
+            overlay.on_key(&ctx, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+            assert_eq!(overlay.scroll, (1 + overlay.page_rows).min(overlay.max_scroll + 1));
+            overlay.on_key(&ctx, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            overlay.render(&ctx, area, &mut buf);
+            assert!(snapshot(&buf).contains("END-OF-PLAN"));
+        }
+        overlay.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!questions.pending().is_empty(), "reading must not approve");
+        overlay.on_key(&ctx, KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(overlay.scroll > 0);
+        overlay.on_key(&ctx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(questions.pending().is_empty());
+        assert!(task.await.unwrap()[0].is_error);
+    }
+
+    #[tokio::test]
     async fn visual_selection_custom_text_and_render() {
         let questions = Arc::new(Questions::default()); questions.set_available(true);
         let registry = ToolRegistry::default(); registry.register(Arc::new(rness_engine::questions::AskUser(questions.clone())));
@@ -119,11 +158,13 @@ pub struct QuestionOverlay {
     editing: bool,
     error: String,
     scroll: u16,
+    page_rows: u16,
+    max_scroll: u16,
     drafts: std::collections::HashMap<(String, String), (usize, usize, Vec<Answer>, bool)>,
     pub apps: Option<rness_tui::modules::ext_apps::AppsState>,
 }
 impl QuestionOverlay {
-    pub fn new(questions: Arc<Questions>) -> Self { Self { questions, key: None, page: 0, cursor: 0, answers: vec![], editing: false, error: String::new(), scroll: 0, drafts: Default::default(), apps: None } }
+    pub fn new(questions: Arc<Questions>) -> Self { Self { questions, key: None, page: 0, cursor: 0, answers: vec![], editing: false, error: String::new(), scroll: 0, page_rows: 1, max_scroll: 0, drafts: Default::default(), apps: None } }
     fn sync(&mut self, request: &Request) {
         let key = (request.session.clone(), request.call.clone());
         if self.key.as_ref() != Some(&key) {
@@ -133,7 +174,7 @@ impl QuestionOverlay {
             let pending = self.questions.pending();
             self.drafts.retain(|key, _| pending.iter().any(|r| r.session == key.0 && r.call == key.1));
             let saved = self.drafts.remove(&key);
-            self.key = Some(key); self.page = 0; self.cursor = 0; self.editing = false; self.error.clear(); self.scroll = 0;
+            self.key = Some(key); self.page = 0; self.cursor = 0; self.editing = false; self.error.clear(); self.scroll = if request.questions[0].markdown.is_some() { 1 } else { 0 };
             self.answers = request.questions.iter().map(|q| Answer { id: q.id.clone(), selected: vec![], custom: None }).collect();
             if let Some((page, cursor, answers, editing)) = saved {
                 self.page = page; self.cursor = cursor; self.answers = answers; self.editing = editing;
@@ -164,6 +205,16 @@ impl Component for QuestionOverlay {
         let config = self.questions.overlay_config();
         let block = Block::default().borders(Borders::ALL).title(format!(" {}  {}/{}  {} ", config.title, self.page + 1, request.questions.len(), q.header)).style(ctx.theme.overlay).border_style(ctx.theme.overlay_border);
         let inner = block.inner(area); block.render(area, buf);
+        if self.scroll > 0 && q.markdown.is_some() {
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+            let lines = rness_tui::core::render::render_markdown(q.markdown.as_deref().unwrap(), chunks[0].width, ctx.theme);
+            self.page_rows = chunks[0].height.max(1);
+            self.max_scroll = lines.len().saturating_sub(chunks[0].height as usize).min((u16::MAX - 1) as usize) as u16;
+            self.scroll = self.scroll.min(self.max_scroll + 1);
+            Paragraph::new(lines).scroll((self.scroll - 1, 0)).render(chunks[0], buf);
+            Paragraph::new("Up/Down PgUp/PgDn Home/End\nEnter: choices  Esc: dismiss").style(ctx.theme.dim).render(chunks[1], buf);
+            return;
+        }
         let compact = inner.height < 14;
         let chunks = Layout::vertical([Constraint::Length(if compact { 2 } else { 3 }), Constraint::Min(1), Constraint::Length(if compact { 1 } else { 2 }), Constraint::Length(2)]).split(inner);
         Paragraph::new(q.question.as_str()).style(ctx.theme.heading).wrap(Wrap { trim: false }).render(chunks[0], buf);
@@ -190,7 +241,7 @@ impl Component for QuestionOverlay {
                 }
                 ListItem::new(lines)
             }).collect();
-            items.push(ListItem::new("[+] Other / write an answer"));
+            items.push(ListItem::new(if q.markdown.is_some() { "[+] Request changes / feedback" } else { "[+] Other / write an answer" }));
             let mut state = ListState::default().with_selected(Some(self.cursor));
             StatefulWidget::render(List::new(items).highlight_symbol("> ").highlight_style(ctx.theme.statusline_accent), chunks[1], buf, &mut state);
         }
@@ -213,6 +264,20 @@ impl Component for QuestionOverlay {
         self.sync(&request);
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { return KeyOutcome::act(vec![rness_tui::app::Action::Cancel]); }
         self.error.clear();
+        if !self.editing && self.scroll > 0 && request.questions[self.page].markdown.is_some() {
+            match key.code {
+                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1).min(self.max_scroll + 1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1).max(1),
+                KeyCode::PageDown => self.scroll = self.scroll.saturating_add(self.page_rows).min(self.max_scroll + 1),
+                KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(self.page_rows).max(1),
+                KeyCode::Home => self.scroll = 1,
+                KeyCode::End => self.scroll = self.max_scroll + 1,
+                KeyCode::Enter | KeyCode::Tab => self.scroll = 0,
+                KeyCode::Esc => { self.questions.dismiss(&request.session, &request.call); }
+                _ => {},
+            }
+            return KeyOutcome::consumed();
+        }
         if !self.editing {
             match key.code {
                 KeyCode::PageDown => { self.scroll = self.scroll.saturating_add(1); return KeyOutcome::consumed(); }

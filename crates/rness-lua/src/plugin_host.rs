@@ -131,11 +131,11 @@ enum Cmd {
         questions: std::sync::Arc<rness_engine::questions::Questions>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
-    /// Build a FRESH VM, load `sources` into it, and swap it in. Broken
-    /// plugins are skipped (reported in the reply) — same policy as boot.
-    /// If the fresh VM itself can't be built, the old VM stays.
+    /// Reload runtime declarations in the retained VM. Failures preserve the
+    /// previous registrations; startup is never evaluated again.
     Reload {
         sources: Vec<crate::loader::PluginSource>,
+        reconcile: Option<Box<dyn FnOnce(Vec<LuaToolSpec>) + Send>>,
         reply: tokio::sync::oneshot::Sender<Result<Vec<(String, String)>, String>>,
     },
 }
@@ -387,69 +387,38 @@ impl LuaHost {
                             let r = rt.install_questions(questions).map_err(|e| e.to_string());
                             let _ = reply.send(r);
                         }
-                        Cmd::Reload { sources, reply } => {
-                            if init.is_some() || !installed_commands.is_empty() {
-                                let _ = reply.send(Err("Lua files changed; restart rness to reload without re-executing init.lua".into()));
-                                continue;
-                            }
+                        Cmd::Reload { sources, reconcile, reply } => {
                             let _maintenance = match session_binding.as_ref().map(|b| b.sessions.try_extension_maintenance()).transpose() {
                                 Ok(guard) => guard,
                                 Err(error) => { let _ = reply.send(Err(error.to_string())); continue; }
                             };
-                            let r = match LuaRuntime::new() {
-                                Ok(mut fresh) => {
-                                    if let Err(e) = fresh.install_config(&config) {
-                                        let _ = reply.send(Err(e.to_string()));
-                                        continue;
-                                    }
-                                    // Same injections as the old VM, BEFORE
-                                    // plugins load (they may use rness.session
-                                    // at load time).
-                                    if let Some(b) = &session_binding {
-                                        if let Err(e) = fresh.install_session(
-                                            std::sync::Arc::clone(&b.sessions),
-                                            std::sync::Arc::clone(&b.subagents),
-                                            std::sync::Arc::clone(&b.registry),
-                                            std::sync::Arc::clone(&b.mcp),
-                                            b.rt.clone(),
-                                            b.model.clone(),
-                                        ) {
-                                            let _ = reply.send(Err(e.to_string()));
-                                            continue;
-                                        }
-                                    }
-                                    let staged_questions = std::sync::Arc::new(rness_engine::questions::Questions::default());
-                                    if questions_ref.is_some() {
-                                        if let Err(e) = fresh.install_questions(staged_questions.clone()) {
-                                            let _ = reply.send(Err(e.to_string()));
-                                            continue;
-                                        }
-                                    }
-                                    let mut errors = Vec::new();
-                                    for p in &sources {
-                                        if let Err(e) = fresh.load(&p.name, &p.source) {
-                                            errors.push((p.name.clone(), e.to_string()));
-                                        }
-                                    }
-                                    if session_binding.is_some() && !fresh.command_specs().is_empty() {
-                                        let _ = reply.send(Err("restart rness to activate commands during reload".into()));
-                                        continue;
-                                    }
-                                    // Swap: old VM (and every stale
-                                    // registration) drops here.
-                                    if let Some(qs) = &questions_ref {
-                                        fresh.install_questions(qs.clone()).expect("questions API installation");
-                                        qs.set_available(false);
-                                        qs.set_overlay_config(staged_questions.overlay_config());
-                                        qs.set_owner(staged_questions.owner());
-                                        qs.set_available(staged_questions.is_available());
-                                    }
-                                    rt = fresh;
-                                    Ok(errors)
+                            let staged_questions = std::sync::Arc::new(rness_engine::questions::Questions::default());
+                            if questions_ref.is_some() {
+                                rt.install_questions(staged_questions.clone()).expect("questions API installation");
+                            }
+                            let r = rt.reload_plugins(&sources, |fresh| {
+                                if let Some(binding) = &session_binding {
+                                    let replacements = fresh.command_specs().into_iter().map(|(name, description)| {
+                                        let (usage, arguments) = fresh.command_metadata(&name);
+                                        std::sync::Arc::new(LuaCommand { name, description, usage, arguments, tx: command_tx.clone() }) as std::sync::Arc<dyn rness_engine::interaction::Command>
+                                    }).collect::<Vec<_>>();
+                                    binding.sessions.commands().replace_owned(&installed_commands, &replacements)?;
+                                    installed_commands = replacements;
                                 }
-                                Err(e) => Err(e.to_string()),
-                            };
-                            let _ = reply.send(r);
+                                Ok(())
+                            });
+                            if let Some(qs) = &questions_ref {
+                                rt.install_questions(qs.clone()).expect("questions API installation");
+                                if r.is_ok() {
+                                    qs.set_overlay_config(staged_questions.overlay_config());
+                                    qs.set_owner(staged_questions.owner());
+                                    qs.set_available(staged_questions.is_available());
+                                }
+                            }
+                            if r.is_ok() {
+                                if let Some(reconcile) = reconcile { reconcile(rt.tool_specs()); }
+                            }
+                            let _ = reply.send(r.map(|()| Vec::new()));
                         }
                     }
                 }
@@ -594,16 +563,21 @@ impl LuaHost {
         rx.await.map_err(|_| "lua vm gone")?
     }
 
-    /// Replace the VM with a fresh one loaded from `sources`. Per-plugin
-    /// errors come back like [`crate::loader::load_all`]; `Err` means the
-    /// reload didn't happen and the old VM is still live.
-    pub async fn reload(        &self,
+    /// Replace runtime registrations from `sources`, preserving startup state.
+    /// Any load failure leaves the old registrations live.
+    pub async fn reload(&self,
         sources: Vec<crate::loader::PluginSource>,
     ) -> Result<Vec<(String, String)>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::Reload { sources, reply })
+            .send(Cmd::Reload { sources, reconcile: None, reply })
             .map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
+    }
+
+    pub(crate) async fn reload_reconciled(&self, sources: Vec<crate::loader::PluginSource>, reconcile: impl FnOnce(Vec<LuaToolSpec>) + Send + 'static) -> Result<Vec<(String, String)>, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::Reload { sources, reconcile: Some(Box::new(reconcile)), reply }).map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 

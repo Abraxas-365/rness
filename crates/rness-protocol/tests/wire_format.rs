@@ -58,7 +58,7 @@ fn all_event_kinds_roundtrip() {
             chunks: vec![],
         }),
         SessionEvent::ToolResult(ToolResult {
-            tasks: None,
+            tasks: None, plan_review: None,
             call: "c1".into(),
             name: "Read".into(),
             output: "contents".into(),

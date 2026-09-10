@@ -63,7 +63,7 @@ fn full_turn_with_attempt_projects_and_replays() {
     // Retry succeeds with a tool call, tool result commits, final answer.
     log.append(&assistant_tool_use()).unwrap();
     log.append(&SessionEvent::ToolResult(ToolResult {
-        tasks: None,
+        tasks: None, plan_review: None,
         call: "c1".into(),
         name: "Read".into(),
         output: "127.0.0.1 localhost".into(),

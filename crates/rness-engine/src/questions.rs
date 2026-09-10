@@ -12,6 +12,7 @@ pub struct OptionItem { pub label: String, #[serde(default)] pub description: St
 pub struct Question {
     pub id: String,
     pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")] pub markdown: Option<String>,
     #[serde(default)] pub header: String,
     #[serde(default)] pub options: Vec<OptionItem>,
     #[serde(default)] pub multi_select: bool,
@@ -119,7 +120,7 @@ impl Questions {
         if removed { self.resolved(session, call); }
         removed
     }
-    async fn ask(&self, request: Request, cancel: &CancellationToken) -> Result<String, String> {
+    pub(crate) async fn ask(&self, request: Request, cancel: &CancellationToken) -> Result<String, String> {
         let (tx, rx) = oneshot::channel();
         let key = (request.session.clone(), request.call.clone());
         {

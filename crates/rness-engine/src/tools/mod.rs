@@ -21,6 +21,8 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    fn plan_config(&self) -> Option<crate::plan::PlanConfig> { None }
+    async fn review_plan(&self, _session: &str, _call: &str, _args: serde_json::Value, _cancel: &CancellationToken) -> Result<(String, rness_protocol::events::PlanReview), String> { Err("not a plan tool".into()) }
     /// Bind workspace-dependent tools without mutating shared registrations.
     fn for_workspace(&self, _session: &SessionId, _workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
         None
@@ -84,6 +86,7 @@ pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Composition-owned approval seam. Default policy is `Allow`, which
     /// behaves exactly as if the seam didn't exist.
+    pub plan_selections: Arc<crate::plan::PlanSelections>,
     approvals: Arc<Approvals>,
 }
 
@@ -92,14 +95,14 @@ impl ToolRegistry {
         let tools = self.tools.read().expect("registry lock").iter()
             .map(|(name, tool)| (name.clone(), tool.for_workspace(session, workspace).unwrap_or_else(|| Arc::clone(tool))))
             .collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals) }
+        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone() }
     }
 
     pub fn restricted(&self, allowed: &[String]) -> Self {
         let tools = self.tools.read().expect("registry lock").iter()
             .filter(|(name, _)| allowed.contains(name))
             .map(|(name, tool)| (name.clone(), Arc::clone(tool))).collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals) }
+        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone() }
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {
@@ -204,6 +207,7 @@ impl ToolRegistry {
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await.expect("semaphore open");
                 let started = Instant::now();
+                let mut plan_review = None;
                 let outcome = match tool {
                     Some(t) => {
                         {
@@ -223,6 +227,9 @@ impl ToolRegistry {
                                 _ = cancel.cancelled() => Decision::Cancelled,
                             };
                             match decision {
+                                Decision::Allowed if t.plan_config().is_some() => {
+                                    t.review_plan(&session, &call.call, call.args.clone(), &cancel).await.map(|(output, review)| { plan_review = Some(review); (output, None) })
+                                }
                                 Decision::Allowed => t.execute_with_tasks(&session, &call.call, call.args.clone(), &cancel).await,
                                 Decision::Rejected => {
                                     Err("the user rejected this tool call".into())
@@ -245,6 +252,7 @@ impl ToolRegistry {
                     Err(e) => (e, None, true),
                 };
                 ToolResult {
+                    plan_review,
                     tasks,
                     call: call.call,
                     name: call.name,

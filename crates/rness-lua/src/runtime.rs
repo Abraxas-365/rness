@@ -29,6 +29,7 @@ pub struct LuaToolSpec {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub sensitive: bool,
+    pub plan: Option<std::sync::Arc<rness_engine::plan::ExitPlan>>,
     pub tasks: Option<rness_engine::tasks::TasksConfig>,
 }
 
@@ -49,6 +50,7 @@ pub struct LuaRuntime {
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
+    plan_store: Option<std::sync::Arc<rness_engine::session::branch::SessionStore>>,
     questions: Option<std::sync::Arc<rness_engine::questions::Questions>>,
 }
 
@@ -93,6 +95,7 @@ impl LuaRuntime {
             command_metadata: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
+            plan_store: None,
             questions: None,
         })
     }
@@ -101,6 +104,16 @@ impl LuaRuntime {
     /// `rness.questions.enable()` / `disable()` at load time.
     pub fn install_questions(&mut self, questions: std::sync::Arc<rness_engine::questions::Questions>) -> Result<(), LuaError> {
         self.questions = Some(questions.clone());
+        for (spec, _) in self.tools.values_mut() {
+            if let Some(plan) = &mut spec.plan {
+                if !std::sync::Arc::ptr_eq(&plan.questions, &questions) {
+                    *plan = std::sync::Arc::new(rness_engine::plan::ExitPlan {
+                        config: plan.config.clone(), store: plan.store.clone(),
+                        questions: questions.clone(), alive: plan.alive.clone(),
+                    });
+                }
+            }
+        }
         let rness: Table = self.lua.globals().get("rness")?;
         let q_table = self.lua.create_table()?;
         q_table.set("enable", self.lua.create_function(move |lua, options: Option<Table>| {
@@ -148,6 +161,7 @@ impl LuaRuntime {
         self.lua.globals().set("__rness_loading_hooks", LuaValue::Nil)?;
         self.lua.globals().set("__rness_load_owner", LuaValue::Nil)?;
         self.lua.globals().set("__rness_loading_plugin", LuaValue::Nil)?;
+        let execution = execution.and_then(|()| self.drain_registrations(Some(name)).map_err(|e| mlua::Error::runtime(e.to_string())));
         if let Err(error) = execution {
             for unsubscribe in hook_cleanup.sequence_values::<Function>() {
                 unsubscribe?.call::<bool>(())?;
@@ -160,6 +174,7 @@ impl LuaRuntime {
             pending.set("statusline", LuaValue::Nil)?;
             pending.set("questions", LuaValue::Nil)?;
             pending.set("tasks_disabled", LuaValue::Nil)?;
+            pending.set("plan_disabled", LuaValue::Nil)?;
             for (category, values) in snapshots {
                 let table: Table = declarations.get(category)?;
                 table.clear()?;
@@ -167,7 +182,6 @@ impl LuaRuntime {
             }
             return Err(error.into());
         }
-        self.drain_registrations(Some(name))?;
         let pending: Table = self.lua.globals().get("__rness_pending")?;
         let declaration: LuaValue = pending.get("questions")?;
         if let Some(qs) = &self.questions {
@@ -189,13 +203,92 @@ impl LuaRuntime {
             }
             pending.set("tasks_disabled", LuaValue::Nil)?;
         }
+        if pending.get::<Option<bool>>("plan_disabled")?.unwrap_or(false) {
+            if self.tools.get("exit_plan_mode").is_some_and(|(spec, _)| spec.plan.is_some()) {
+                if let Some((spec, callback)) = self.tools.remove("exit_plan_mode") {
+                    spec.plan.unwrap().alive.cancel();
+                    self.lua.remove_registry_value(callback)?;
+                }
+                self.registration_owners.remove(&("tools", "exit_plan_mode".into()));
+            }
+            pending.set("plan_disabled", LuaValue::Nil)?;
+        }
         pending.set("questions", LuaValue::Nil)?;
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
         Ok(())
     }
 
+    /// Stage runtime declarations in the existing VM, preserving startup closures.
+    /// Lua globals and external side effects are not transactional.
+    pub(crate) fn reload_plugins(&mut self, sources: &[crate::loader::PluginSource], validate: impl FnOnce(&Self) -> Result<(), String>) -> Result<(), String> {
+        let run = || -> Result<Self, LuaError> {
+            let copy_key = |key: &RegistryKey| self.lua.create_registry_value(self.lua.registry_value::<LuaValue>(key)?);
+            let mut staged = Self {
+                lua: self.lua.clone(),
+                tools: self.tools.iter().map(|(n, (s, k))| Ok((n.clone(), (s.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
+                apps: self.apps.iter().map(|(n, (s, v, k))| Ok((n.clone(), (s.clone(), copy_key(v)?, k.as_ref().map(&copy_key).transpose()?)))).collect::<mlua::Result<_>>()?,
+                statusline: self.statusline.as_ref().map(&copy_key).transpose()?,
+                tool_cards: self.tool_cards.iter().map(|(n, k)| Ok((n.clone(), copy_key(k)?))).collect::<mlua::Result<_>>()?,
+                keymap_binds: self.keymap_binds.clone(), registration_owners: self.registration_owners.clone(),
+                command_completers: self.command_completers.iter().map(|(n, k)| Ok((n.clone(), copy_key(k)?))).collect::<mlua::Result<_>>()?,
+                command_metadata: self.command_metadata.clone(),
+                commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
+                plugin_hooks: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
+            };
+            let declarations: Table = self.lua.globals().get("__rness_declarations")?;
+            let fresh = self.lua.create_table()?;
+            for category in ["tools", "apps", "cards", "commands"] {
+                let table = self.lua.create_table()?;
+                for pair in declarations.get::<Table>(category)?.pairs::<String, bool>() {
+                    let (key, value) = pair?;
+                    if !self.registration_owners.contains_key(&(category, key.clone())) { table.set(key, value)?; }
+                }
+                fresh.set(category, table)?;
+            }
+            self.lua.globals().set("__rness_declarations", fresh)?;
+            for (category, name) in self.registration_owners.keys() {
+                match *category {
+                    "tools" => { staged.tools.remove(name); }
+                    "apps" => { staged.apps.remove(name); }
+                    "cards" => { staged.tool_cards.remove(name); }
+                    "commands" => { staged.commands.remove(name); staged.command_metadata.remove(name); staged.command_completers.remove(name); }
+                    "statusline" => staged.statusline = None,
+                    _ => unreachable!(),
+                }
+            }
+            staged.registration_owners.clear();
+            staged.keymap_binds.retain(|(_, _, owner)| owner.is_none());
+            Ok(staged)
+        };
+        let declarations: Table = self.lua.globals().get("__rness_declarations").map_err(|e| e.to_string())?;
+        let mut staged = run().map_err(|e| e.to_string())?;
+        let result = sources.iter().try_for_each(|source| staged.load(&source.name, &source.source).map_err(|e| format!("{}: {e}", source.name)))
+            .and_then(|()| validate(&staged));
+        if let Err(error) = result {
+            for name in staged.plugin_names() { let _ = staged.unload(&name); }
+            self.lua.globals().set("__rness_declarations", declarations).map_err(|e| e.to_string())?;
+            return Err(error);
+        }
+        // Unsubscribe old owners only after all replacements have validated.
+        for hooks in self.plugin_hooks.values() {
+            for unsubscribe in hooks.clone().sequence_values::<Function>() {
+                unsubscribe.and_then(|f| f.call::<bool>(())).map_err(|e| e.to_string())?;
+            }
+            hooks.clear().map_err(|e| e.to_string())?;
+        }
+        self.cancel_plan_tools();
+        *self = staged;
+        Ok(())
+    }
+
     /// Remove a loaded chunk's current VM registrations, without restoring
     /// implementations it replaced. Hosts must reconcile their own caches.
+    pub(crate) fn cancel_plan_tools(&self) {
+        for (spec, _) in self.tools.values() {
+            if let Some(plan) = &spec.plan { plan.alive.cancel(); }
+        }
+    }
+
     pub(crate) fn lua(&self) -> &Lua { &self.lua }
 
     pub fn command_metadata(&self, name: &str) -> (String, Vec<(String, String)>) {
@@ -256,7 +349,8 @@ impl LuaRuntime {
                     declarations.get::<Table>("commands")?.set(key.as_str(), LuaValue::Nil)?;
                 }
                 "tools" => {
-                    if let Some((_, callback)) = self.tools.remove(&key) {
+                    if let Some((spec, callback)) = self.tools.remove(&key) {
+                        if let Some(plan) = spec.plan { plan.alive.cancel(); }
                         self.lua.remove_registry_value(callback)?;
                     }
                 }
@@ -413,7 +507,7 @@ impl LuaRuntime {
     /// Surface the engine's SessionService as `rness.session`. Called
     /// after mount and again on every fresh VM (hot reload).
     pub fn install_session(
-        &self,
+        &mut self,
         sessions: std::sync::Arc<rness_engine::service::SessionService>,
         subagents: std::sync::Arc<rness_engine::subagent::SubagentRuntime>,
         registry: std::sync::Arc<rness_engine::tools::ToolRegistry>,
@@ -422,6 +516,7 @@ impl LuaRuntime {
         model: String,
     ) -> Result<(), LuaError> {
         let rness: Table = self.lua.globals().get("rness")?;
+        self.plan_store = Some(sessions.plan_store());
         // rness.model — the active "<provider>/<model>" selection, the
         // key plugins pass to rness.models.get. Composition-root fact.
         rness.set("model", model)?;
@@ -525,6 +620,14 @@ impl LuaRuntime {
                 } else {
                     self.lua.from_value(schema)?
                 },
+                plan: entry.get::<Option<Table>>("plan_config")?.map(|table| -> mlua::Result<_> {
+                    Ok(std::sync::Arc::new(rness_engine::plan::ExitPlan {
+                        config: self.lua.from_value(LuaValue::Table(table))?,
+                        store: self.plan_store.clone().ok_or_else(|| mlua::Error::runtime("Plan requires session services"))?,
+                        questions: self.questions.clone().ok_or_else(|| mlua::Error::runtime("Plan requires Questions broker"))?,
+                        alive: tokio_util::sync::CancellationToken::new(),
+                    }))
+                }).transpose()?,
                 tasks: entry.get::<Option<Table>>("tasks_config")?.map(|table| self.lua.from_value(LuaValue::Table(table))).transpose()?,
                 sensitive: entry.get::<Option<bool>>("sensitive")?.unwrap_or(false),
             };
@@ -661,6 +764,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             || ["agent", "help", "skill", "unload", "colorscheme"].contains(&name.as_str()) {
             return Err(mlua::Error::runtime("invalid or reserved command name"));
         }
+        let names: Table = lua.globals().get::<Table>("__rness_declarations")?.get("commands")?;
         if names.contains_key(name.as_str())? { return Err(mlua::Error::runtime("command already registered")); }
         let entry = lua.create_table()?;
         entry.set("name", name.clone())?;
@@ -681,10 +785,11 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let declared = lua.create_table()?;
     declarations.set("tools", declared.clone())?;
     for (method, replacing) in [("register", false), ("replace", true)] {
-        let declared = declared.clone();
         tool.set(method, lua.create_function(move |lua, spec: Table| {
+            let declared: Table = lua.globals().get::<Table>("__rness_declarations")?.get("tools")?;
             require_declaration_phase(lua)?;
             let name: String = spec.get("name").map_err(|_| mlua::Error::runtime("tool 'name' (string) is required"))?;
+            if name == "exit_plan_mode" { return Err(mlua::Error::runtime("exit_plan_mode is reserved; use rness.plan.enable")); }
             if name == "TaskWrite" { return Err(mlua::Error::runtime("TaskWrite is reserved; use rness.tasks.enable")); }
             if name.trim().is_empty() { return Err(mlua::Error::runtime("tool name must not be empty")); }
             let run: Function = spec.get("run").map_err(|_| mlua::Error::runtime("tool 'run' (function) is required"))?;
@@ -716,6 +821,43 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         })?)?;
     }
     rness.set("tool", tool)?;
+
+    let plan = lua.create_table()?;
+    plan.set("enable", lua.create_function(|lua, options: Option<Table>| {
+        require_declaration_phase(lua)?;
+        let config: rness_engine::plan::PlanConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_default();
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        if pending.get::<Option<bool>>("plan_disabled")?.unwrap_or(false) { return Err(mlua::Error::runtime("enable or disable plan once per plugin load")); }
+        let rness: Table = lua.globals().get("rness")?;
+        if !rness.contains_key("session")? || !rness.contains_key("questions")? {
+            return Err(mlua::Error::runtime("Plan requires installed session services and Questions broker"));
+        }
+        let declarations: Table = lua.globals().get("__rness_declarations")?;
+        let declared: Table = declarations.get("tools")?;
+        if declared.contains_key("exit_plan_mode")? { return Err(mlua::Error::runtime("exit_plan_mode already registered")); }
+        let entry = lua.create_table()?;
+        entry.set("name", "exit_plan_mode")?;
+        entry.set("description", "In plan mode, present the COMPLETE Markdown plan starting with a # heading for review. Approval allows execution from the next step; otherwise revise using feedback.")?;
+        entry.set("schema", lua.to_value(&serde_json::json!({"type":"object","additionalProperties":false,"required":["plan"],"properties":{"plan":{"type":"string"}}}))?)?;
+        entry.set("plan_config", lua.to_value(&config)?)?;
+        entry.set("run", lua.create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("exit_plan_mode requires agent dispatch")))?)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        pending.get::<Table>("tools")?.push(entry)?;
+        declared.set("exit_plan_mode", true)?;
+        Ok(())
+    })?)?;
+    plan.set("disable", lua.create_function(|lua, ()| {
+        require_declaration_phase(lua)?;
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        for entry in pending.get::<Table>("tools")?.sequence_values::<Table>() {
+            if entry?.get::<String>("name")? == "exit_plan_mode" { return Err(mlua::Error::runtime("enable or disable plan once per plugin load")); }
+        }
+        let declarations: Table = lua.globals().get("__rness_declarations")?;
+        declarations.get::<Table>("tools")?.set("exit_plan_mode", LuaValue::Nil)?;
+        pending.set("plan_disabled", true)?;
+        Ok(())
+    })?)?;
+    rness.set("plan", plan)?;
 
     let tasks = lua.create_table()?;
     tasks.set("enable", lua.create_function(|lua, options: Option<Table>| {
@@ -895,8 +1037,8 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let declared_cards = lua.create_table()?;
     declarations.set("cards", declared_cards.clone())?;
     for (method, replacing) in [("tool_card", false), ("replace_tool_card", true)] {
-        let declared = declared_cards.clone();
         ui.set(method, lua.create_function(move |lua, (name, render): (String, Function)| {
+            let declared: Table = lua.globals().get::<Table>("__rness_declarations")?.get("cards")?;
             require_declaration_phase(lua)?;
             if name.trim().is_empty() { return Err(mlua::Error::runtime("card name must not be empty")); }
             let exists = declared.get::<Option<bool>>(name.as_str())?.unwrap_or(false);
@@ -920,8 +1062,8 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let declared_apps = lua.create_table()?;
     declarations.set("apps", declared_apps.clone())?;
     for (method, replacing) in [("app", false), ("replace_app", true)] {
-        let declared = declared_apps.clone();
         ui.set(method, lua.create_function(move |lua, spec: Table| {
+            let declared: Table = lua.globals().get::<Table>("__rness_declarations")?.get("apps")?;
             require_declaration_phase(lua)?;
             let name: String = spec.get("name").map_err(|_| mlua::Error::runtime("app 'name' (string) is required"))?;
             if name.trim().is_empty() { return Err(mlua::Error::runtime("app name must not be empty")); }

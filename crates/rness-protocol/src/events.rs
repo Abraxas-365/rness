@@ -95,6 +95,32 @@ pub enum SessionEvent {
     /// restores the last explicit choice; the latest event wins.
     #[serde(rename = "request/config")]
     RequestConfig(CallConfig),
+
+    #[serde(rename = "plan/mode")]
+    PlanMode { active: bool },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanReview { Approved, KeepPlanning, Dismissed }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanState {
+    pub active: bool,
+    pub pending: Option<bool>,
+}
+impl PlanState {
+    pub fn from_history(history: &[Envelope]) -> Self {
+        let mut state = Self::default();
+        for env in history {
+            match &env.event {
+                SessionEvent::PlanMode { active } => { state.active = *active; state.pending = None; }
+                SessionEvent::ToolResult(result) if !result.is_error && result.plan_review == Some(PlanReview::Approved) => state.pending = Some(false),
+                _ => {}
+            }
+        }
+        state
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +366,8 @@ pub struct ToolResult {
     /// State and successful tool result commit in the same JSONL envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks: Option<TaskSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_review: Option<PlanReview>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

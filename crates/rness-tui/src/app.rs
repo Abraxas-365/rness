@@ -656,7 +656,7 @@ mod tests {
                     chunks: vec![],
                 })),
                 env(SessionEvent::ToolResult(ToolResult {
-                    tasks: None,
+                    tasks: None, plan_review: None,
                     call: "c1".into(),
                     name: "Write".into(),
                     output: "wrote foo.txt".into(),

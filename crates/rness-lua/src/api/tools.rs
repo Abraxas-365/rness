@@ -37,6 +37,12 @@ impl Tool for LuaTool {
         self.spec.input_schema.clone()
     }
 
+    fn plan_config(&self) -> Option<rness_engine::plan::PlanConfig> {
+        self.spec.plan.as_ref().filter(|plan| !plan.alive.is_cancelled()).map(|plan| plan.config.clone())
+    }
+    async fn review_plan(&self, session: &str, call: &str, args: serde_json::Value, cancel: &tokio_util::sync::CancellationToken) -> Result<(String, rness_protocol::events::PlanReview), String> {
+        self.spec.plan.as_ref().ok_or("not a plan tool")?.review(session, call, args, cancel).await
+    }
     fn sensitive(&self) -> bool {
         self.spec.sensitive
     }
@@ -137,7 +143,15 @@ pub async fn sync_lua_tools(
     host: &LuaHost,
     previous: &[std::sync::Arc<dyn Tool>],
 ) -> InstalledTools {
-    let specs = host.tool_specs().await;
+    sync_lua_tool_specs(registry, host, previous, host.tool_specs().await)
+}
+
+pub(crate) fn sync_lua_tool_specs(
+    registry: &rness_engine::tools::ToolRegistry,
+    host: &LuaHost,
+    previous: &[std::sync::Arc<dyn Tool>],
+    specs: Vec<LuaToolSpec>,
+) -> InstalledTools {
     let current: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     for tool in previous {
         if !current.iter().any(|name| name == tool.name()) {

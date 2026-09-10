@@ -1,12 +1,6 @@
-//! Hot reload: watch the plugin root, rebuild the VM on change.
-//!
-//! Strategy is swap-the-world, not patch-in-place: any *.lua change
-//! under the root re-discovers all sources and loads them into a FRESH
-//! VM (see [`crate::plugin_host::LuaHost::reload`]). No stale state, no
-//! per-plugin disposer bookkeeping — the VM is the disposer.
-//!
-//! The engine's `Arc<ToolRegistry>` is re-synced after each swap so the
-//! next turn advertises exactly the reloaded tool set.
+//! Watch selected runtime plugins and reconcile registrations without rerunning startup.
+//! Failed reloads preserve the previous registration set; arbitrary Lua side effects
+//! and module caches are not rolled back.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,13 +43,16 @@ pub fn watch(
     initial_tools: crate::api::tools::InstalledTools,
     on_reload: impl Fn(ReloadReport) + Send + 'static,
 ) -> Result<ReloadWatcher, String> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    let runtime_root = root.join("plugins");
 
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let lua_change = event.paths.iter().any(|p| p.extension().is_some_and(|x| x == "lua"));
         if lua_change && !event.kind.is_access() {
-            let _ = tx.send(());
+            let startup = event.paths.iter().any(|p| p.extension().is_some_and(|x| x == "lua") && !p.starts_with(&runtime_root));
+            let _ = tx.send(startup);
         }
     })
     .map_err(|e| e.to_string())?;
@@ -65,10 +62,14 @@ pub fn watch(
 
     let task = tokio::spawn(async move {
         let mut lua_tools = initial_tools;
-        while rx.recv().await.is_some() {
+        while let Some(mut startup_changed) = rx.recv().await {
             // Debounce: editors fire bursts (write + rename + chmod).
             tokio::time::sleep(Duration::from_millis(150)).await;
-            while rx.try_recv().is_ok() {}
+            while let Ok(startup) = rx.try_recv() { startup_changed |= startup; }
+            if startup_changed {
+                on_reload(ReloadReport::Failed("startup Lua changed; restart rness to apply init.lua or module changes".into()));
+                continue;
+            }
 
             let sources = match crate::loader::discover(&root, &plugin_names) {
                 Ok(s) => s,
@@ -78,10 +79,16 @@ pub fn watch(
                 }
             };
             let plugins = sources.len();
-            match host.reload(sources).await {
+            let (synced, receive) = tokio::sync::oneshot::channel();
+            let registry = registry.clone();
+            let previous = lua_tools.clone();
+            let adapter = host.clone();
+            match host.reload_reconciled(sources, move |specs| {
+                let tools = crate::api::tools::sync_lua_tool_specs(&registry, &adapter, &previous, specs);
+                let _ = synced.send(tools);
+            }).await {
                 Ok(errors) => {
-                    lua_tools =
-                        crate::api::tools::sync_lua_tools(&registry, &host, &lua_tools).await;
+                    lua_tools = receive.await.expect("reload reconciliation completed");
                     on_reload(ReloadReport::Reloaded {
                         plugins,
                         tools: lua_tools.iter().map(|tool| tool.name().to_owned()).collect(),
@@ -160,10 +167,9 @@ mod tests {
         assert_eq!(host.call_tool("new_tool", json!({})).await, Ok("v2".into()));
     }
 
-    /// A broken rewrite still swaps (boot policy: skip broken plugins),
-    /// but the error is reported and its tools drop out of the registry.
+    /// A broken rewrite preserves the previous tool registrations.
     #[tokio::test]
-    async fn broken_rewrite_reports_error_and_drops_its_tools() {
+    async fn broken_rewrite_preserves_its_tools() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         std::fs::create_dir_all(root.join("plugins")).unwrap();
@@ -199,14 +205,8 @@ mod tests {
             .await
             .expect("watcher fired")
             .expect("report");
-        match report {
-            ReloadReport::Reloaded { tools, errors, .. } => {
-                assert!(tools.is_empty());
-                assert_eq!(errors.len(), 1);
-                assert_eq!(errors[0].0, "plugins/tool.lua");
-            }
-            ReloadReport::Failed(e) => panic!("expected skip-and-report, got: {e}"),
-        }
-        assert!(registry.names().is_empty());
+        assert!(matches!(report, ReloadReport::Failed(_)));
+        assert_eq!(registry.names(), vec!["t"]);
+        assert_eq!(host.call_tool("t", json!({})).await.unwrap(), "ok");
     }
 }

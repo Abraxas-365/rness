@@ -277,7 +277,8 @@ mod tests {
         assert_eq!(host.statusline().await.as_deref(), Some("booting"));
         host.fire_hook("ready", serde_json::json!({}));
         assert_eq!(host.statusline().await.as_deref(), Some("ready"));
-        assert!(host.reload(vec![]).await.is_err());
+        assert!(host.reload(vec![]).await.unwrap().is_empty());
+        assert_eq!(host.statusline().await.as_deref(), Some("ready"));
         host.load("check", "assert(executions == 1); assert(ready)").await.unwrap();
     }
 
