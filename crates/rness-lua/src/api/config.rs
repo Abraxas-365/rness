@@ -11,6 +11,7 @@ impl Default for QuestionOverlayConfig { fn default() -> Self { Self { enabled: 
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub promptbox: serde_json::Value,
     pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
     pub plugins: Vec<String>,
     pub colorschemes: BTreeMap<String, serde_json::Value>,
@@ -197,6 +198,27 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     if path.is_file() {
         lua.load(std::fs::read_to_string(path)?).set_name(path.to_string_lossy()).exec()?;
     }
+    if let Some(promptbox) = rness.get::<Table>("ui")?.get::<Option<Table>>("promptbox")? {
+        let value: serde_json::Value = lua.from_value(mlua::Value::Table(promptbox))?;
+        let valid_keys = |field: &serde_json::Value, name: &str| field.as_object().is_some_and(|keys| keys.iter().all(|(key, chord)| key == name && (chord == &serde_json::Value::Bool(false) || chord.as_str().is_some_and(|s| !s.is_empty()))));
+        for (key, field) in value.as_object().ok_or("ui.promptbox must be a table")? {
+            match key.as_str() {
+                "editor" if field.as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|s| s.as_str().is_some_and(|s| !s.is_empty()))) => {},
+                "keys" if valid_keys(field, "edit") => {},
+                "paste" => {
+                    for (key, field) in field.as_object().ok_or("ui.promptbox.paste must be a table")? {
+                        match key.as_str() {
+                            "lines" | "chars" if field.as_u64().is_some() => {},
+                            "keys" if valid_keys(field, "preview") => {},
+                            _ => return Err(format!("invalid ui.promptbox.paste option: {key}").into()),
+                        }
+                    }
+                }
+                _ => return Err(format!("invalid ui.promptbox option: {key}").into()),
+            }
+        }
+        state.lock().unwrap().promptbox = value;
+    }
     for (table, method) in [("providers", "set_stream_idle_timeout"), ("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
         let table: Table = rness.get(table)?;
         table.set(method, lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
@@ -262,15 +284,31 @@ mod tests {
     }
 
     #[test]
-    fn additional_providers_module_loads_without_credentials() {
+    fn paste_configuration_is_validated_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.ui.promptbox = { paste={lines=5, chars=500, keys={preview=false}}, keys={edit='ctrl+x'}, editor={'nvim','--clean'} }").unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.promptbox["editor"][0], "nvim");
+        for source in ["rness.ui.promptbox = { paste={lines=-1} }", "rness.ui.promptbox = { editor='nvim' }", "rness.ui.promptbox = { keys={preview='ctrl+g'} }", "rness.ui.promptbox = { paste={keys={edit='ctrl+e'}} }"] {
+            std::fs::write(&path, source).unwrap();
+            assert!(load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn providers_module_loads_without_credentials() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("lua")).unwrap();
-        std::fs::write(dir.path().join("lua/additional-providers.lua"),
-            include_str!("../../../../examples/lua/additional-providers.lua")).unwrap();
+        std::fs::write(dir.path().join("lua/providers.lua"),
+            include_str!("../../../../examples/lua/providers.lua")).unwrap();
         let init = dir.path().join("init.lua");
-        std::fs::write(&init, "require('additional-providers')").unwrap();
+        std::fs::write(&init, "require('providers')").unwrap();
         let config = load(&init).unwrap();
-        assert_eq!(config.providers.len(), 5);
+        assert_eq!(config.providers.len(), 9);
+        assert_eq!(config.providers["chatgpt"].protocol, "chatgpt-responses");
+        assert!(matches!(&config.providers["chatgpt"].auth,
+            ProviderAuth::OAuth { oauth } if oauth == "openai-chatgpt"));
         assert!(config.default_profile.is_none());
     }
 
@@ -333,6 +371,8 @@ mod tests {
 
     #[test]
     fn missing_file_is_empty() {
-        assert!(load(std::path::Path::new("/nonexistent/rness/config.lua")).unwrap().default_profile.is_none());
+        let config = load(std::path::Path::new("/nonexistent/rness/config.lua")).unwrap();
+        assert!(config.default_profile.is_none());
+        assert!(config.providers.is_empty());
     }
 }

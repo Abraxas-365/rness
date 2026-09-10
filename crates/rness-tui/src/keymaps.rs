@@ -134,6 +134,8 @@ mod tests {
     #[test]
     fn stock_bindings_resolve() {
         let km = KeymapState::stock();
+        assert_eq!(km.lookup(&KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL)), None);
+        assert_eq!(km.lookup(&KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)), None);
         let pgup = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
         assert_eq!(km.lookup(&pgup), Some(HostAction::ScrollUpPage));
         let none = KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE);

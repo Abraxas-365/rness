@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
     let (lua, startup) = rness_lua::plugin_host::LuaHost::spawn_from_init(
         dirs::home_dir().context("no home directory")?.join(".rness/init.lua")
     ).map_err(|e| anyhow::anyhow!("startup configuration: {e}"))?;
-    let mut route_table = routes::builtin_routes();
+    let mut route_table = std::collections::HashMap::new();
     let mut auth_env = std::collections::HashMap::<String, String>::new();
     let mut auth_oauth = std::collections::HashMap::<String, String>::new();
     let mut auth_store = std::collections::HashMap::<String, String>::new();
@@ -631,7 +631,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         // Run the TUI over protocol frames.
-        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone())
+        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone())
             .await;
     };
 
@@ -884,6 +884,7 @@ async fn run_tui(
     installed_lua_tools: rness_lua::api::tools::InstalledTools,
     schemes: std::collections::BTreeMap<String, serde_json::Value>,
     selected_scheme: Option<String>,
+    promptbox_config: serde_json::Value,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -1238,6 +1239,7 @@ async fn run_tui(
     };
 
     let mut app = App::new(Model::new(session.clone(), model_name), slots, backend);
+    app.apply(rness_tui::app::Action::Custom("input:promptbox-config".into(), promptbox_config));
     app.colorschemes = colorschemes;
     if let Some(name) = selected_scheme { app.theme = app.colorschemes.get(&name).context("unknown initial colorscheme")?.clone(); }
     app.apps = Some(apps_state);
@@ -1305,21 +1307,26 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             println!("{provider} API key saved to {}", store.path().display());
         }
         AuthAction::Status => {
-            // Every provider we know about: built-in routes + stored records.
-            let mut names: Vec<String> = routes::builtin_routes()
-                .into_iter()
-                .filter_map(|(_, r)| r.credential)
-                .collect();
-            names.extend(store.list()?);
+            let config = rness_lua::api::config::load(
+                &dirs::home_dir().context("no home directory")?.join(".rness/init.lua")
+            ).map_err(|e| anyhow::anyhow!("startup configuration: {e}"))?;
+            let mut names = store.list()?;
+            for (name, declaration) in &config.providers {
+                match &declaration.auth {
+                    rness_lua::api::config::ProviderAuth::Store { credential } => names.push(credential.clone()),
+                    rness_lua::api::config::ProviderAuth::OAuth { oauth } => names.push(oauth.clone()),
+                    rness_lua::api::config::ProviderAuth::Env { env } => {
+                        let state = if std::env::var(env).is_ok_and(|v| !v.is_empty()) { "set" } else { "not set" };
+                        println!("{name:<16}env {env} ({state})");
+                    }
+                    _ => {}
+                }
+            }
             names.sort();
             names.dedup();
 
             for name in names {
                 let mut states = Vec::new();
-                let env = routes::env_var_for(&name);
-                if std::env::var(&env).is_ok_and(|v| !v.is_empty()) {
-                    states.push(format!("env {env} (takes priority)"));
-                }
                 if store.api_key(&name)?.is_some() {
                     states.push("api key stored".into());
                 }

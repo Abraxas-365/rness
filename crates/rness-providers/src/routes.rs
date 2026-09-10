@@ -1,9 +1,8 @@
 //! Provider routes: name → how to build a [`Provider`].
 //!
 //! A route is plain data (kind + endpoint + credential key), so a new
-//! OpenAI-compatible gateway is configuration, not code. Built-ins cover
-//! the common providers; composition roots (CLI now, Lua config later)
-//! may insert or override entries before building.
+//! OpenAI-compatible gateway is configuration, not code. The composition
+//! root supplies explicitly configured routes; none are registered here.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,66 +31,6 @@ pub struct Route {
     /// `<KEY>_API_KEY` env var. `None` = unauthenticated (local servers).
     pub credential: Option<String>,
     pub stream_idle_timeout: Option<std::time::Duration>,
-}
-
-/// The routes rness ships with.
-pub fn builtin_routes() -> HashMap<String, Route> {
-    HashMap::from([
-        (
-            "anthropic".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::Anthropic,
-                base_url: None,
-                credential: Some("anthropic".into()),
-            },
-        ),
-        (
-            "openai".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::OpenAiCompatible,
-                base_url: Some("https://api.openai.com/v1".into()),
-                credential: Some("openai".into()),
-            },
-        ),
-        (
-            "deepseek".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::OpenAiCompatible,
-                base_url: Some("https://api.deepseek.com/v1".into()),
-                credential: Some("deepseek".into()),
-            },
-        ),
-        (
-            "groq".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::OpenAiCompatible,
-                base_url: Some("https://api.groq.com/openai/v1".into()),
-                credential: Some("groq".into()),
-            },
-        ),
-        (
-            "openai-chatgpt".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::ChatGptResponses,
-                base_url: None,
-                credential: Some(crate::auth::openai::STORE_KEY.into()),
-            },
-        ),
-        (
-            "ollama".into(),
-            Route {
-                stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-                kind: Kind::OpenAiCompatible,
-                base_url: Some(crate::ollama::DEFAULT_BASE_URL.into()),
-                credential: None,
-            },
-        ),
-    ])
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +66,7 @@ pub enum RouteError {
 /// (anthropic-wire or responses-wire gateways would be new kinds — code,
 /// not configuration). Omitted credential defaults to the route name
 /// (`<NAME>_API_KEY` env or the store); `none` = unauthenticated
-/// (local servers). Inserting over a builtin name replaces it.
+/// (local servers). Inserting over an existing name replaces it.
 pub fn validate_base_url(value: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(value).map_err(|_| "invalid provider URL".to_string())?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
@@ -361,7 +300,7 @@ mod tests {
     fn selection_keeps_slashes_in_model_names() {
         // OpenRouter-style model ids contain '/': the FIRST segment is
         // the route, the rest is the model verbatim.
-        let mut table = builtin_routes();
+        let mut table = HashMap::new();
         table.insert(
             "openrouter".into(),
             parse_route_spec("openrouter=https://openrouter.ai/api/v1").unwrap().1,

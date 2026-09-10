@@ -108,13 +108,35 @@ always-visible Plan status widget.
 Copy selected files from `examples/lua/` into `~/.rness/lua/` and require them from `init.lua`:
 
 ```lua
-require("additional-providers")
+require("providers")
 require("roles")
 ```
 
-- `additional-providers.lua`: explicit OpenCode Go (Chat Completions and Messages), Ollama, OpenRouter, and Groq connections. Remote credentials come from environment variables; Ollama requires a running server and installed model. No profiles or defaults are imposed. Remove duplicate provider registrations when combining with `examples/init.lua`.
+- `providers.lua`: explicit Anthropic, OpenAI API, ChatGPT OAuth (named `chatgpt`), DeepSeek, OpenCode Go (Chat Completions and Messages), Ollama, OpenRouter, and Groq connections. There are no built-in provider registrations: load this module, register your own connections, or pass `--route`. Remote credentials come from environment variables or explicit credential-store references; Ollama requires a running server and installed model. No profiles or defaults are imposed. Remove duplicate provider registrations when combining with `examples/init.lua`.
 - `roles.lua`: a tool-free principal planner and a delegable implementer. No mandatory profile and no implicit default selection.
 - `examples/init.lua`: broader connection, profile, authentication, and agent configuration examples. Merge selected declarations instead of overwriting your configuration.
+
+## Pasted text in the terminal
+
+Bracketed pastes preserve their content and never submit automatically. More than five lines or 500 characters collapse into an atomic draft block. Move the caret beside a block and press Ctrl+G to preview; arrows, PageUp/PageDown and Home/End scroll. Escape closes the read-only preview. Ctrl+E opens the entire prompt in an external editor, including from preview or an empty draft. All paste blocks expand in order with surrounding text. Save and exit replaces the draft with plain text, discarding the old block boundaries without sending; nonzero exit or invalid UTF-8 leaves the original draft intact. Backspace beside a block removes it as a unit. Draft history retains blocks; submission expands the original text, not labels.
+
+Optional startup configuration in `init.lua`:
+
+```lua
+rness.ui.promptbox = {
+  editor = { "nvim", "--clean" },
+  keys = { edit = "ctrl+e" },
+  paste = {
+    lines = 5,
+    chars = 500,
+    keys = { preview = "ctrl+g" },
+  },
+}
+```
+
+Editor configuration is an argument vector, not a shell command. If omitted, `$VISUAL`, then `$EDITOR`, supplies an executable name (use the explicit vector for arguments). A private temporary `.txt` file is removed after editing. The TUI suspends terminal input while the editor owns stdin and restores the screen afterward. Both shortcuts belong to this component configuration, not `rness.keymaps`. Set either shortcut to `false` to disable it. Ctrl+E takes precedence over the composer's end-of-line binding; disabling or moving it restores that binding. Alt+Enter inserts a newline. Multiple large pastes remain independent blocks until full-prompt editing replaces the draft. Startup configuration changes require restart.
+
+Currently previews are plain text, and the durable transcript receives expanded text rather than persisted paste metadata.
 
 ## Runtime plugins
 

@@ -247,6 +247,7 @@ pub struct App {
     /// Rebindable host bindings (chord → named action). Lua rewrites
     /// this via rness.keymaps; the shell only reads.
     pub keymap: crate::keymaps::KeymapState,
+    edit_prompt: Option<serde_json::Value>,
     command_results: std::collections::HashMap<SessionId, Vec<String>>,
     backend: Arc<dyn Backend>,
 }
@@ -260,6 +261,7 @@ impl App {
             colorschemes: [("default".into(), Theme::default())].into(),
             apps: None,
             keymap: crate::keymaps::KeymapState::stock(),
+            edit_prompt: None,
             command_results: Default::default(),
             backend,
         }
@@ -283,6 +285,11 @@ impl App {
     /// Route a terminal event; apply resulting actions.
     pub fn on_term_event(&mut self, event: TermEvent) {
         match event {
+            TermEvent::Paste(text) => {
+                let ctx = Ctx { model: &self.model, theme: &self.theme };
+                let actions = self.slots.focused_mut(&ctx).map(|c| c.on_paste(&ctx, &text).actions).unwrap_or_default();
+                for action in actions { self.apply(action); }
+            }
             TermEvent::Key(key) => {
                 let actions = self.route_key(key);
                 for action in actions {
@@ -424,6 +431,7 @@ impl App {
             }
             Action::Notice(text) => self.model.entries.push(Entry::Notice(text)),
             Action::Custom(name, payload) => {
+                if name == "terminal:edit-prompt" { self.edit_prompt = Some(payload); return; }
                 let ctx = Ctx { model: &self.model, theme: &self.theme };
                 self.slots.broadcast(&ctx, &name, &payload);
             }
@@ -441,6 +449,20 @@ impl App {
     }
 }
 
+fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
+    use std::io::Write;
+    let argv = serde_json::from_value::<Vec<String>>(payload["editor"].clone()).ok()
+        .or_else(|| std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")).ok().map(|s| vec![s]));
+    let argv = argv.ok_or("Configure an editor argv or set VISUAL/EDITOR to an executable")?;
+    let program = argv.first().filter(|s| !s.is_empty()).ok_or("Editor command is empty")?;
+    let mut file = tempfile::Builder::new().prefix("rness-prompt-").suffix(".txt").tempfile().map_err(|e| e.to_string())?;
+    file.write_all(payload["text"].as_str().ok_or("Missing prompt text")?.as_bytes()).map_err(|e| e.to_string())?;
+    file.flush().map_err(|e| e.to_string())?;
+    let status = std::process::Command::new(program).args(&argv[1..]).arg(file.path()).status().map_err(|e| e.to_string())?;
+    if !status.success() { return Err(format!("editor exited with {status}")); }
+    std::fs::read_to_string(file.path()).map_err(|e| e.to_string())
+}
+
 /// Run the full-screen TUI until quit. Owns the terminal.
 /// `host_actions`: actions injected by the composition root (e.g. a Lua
 /// app driver applying "session:switch") — same apply path as key-borne
@@ -454,12 +476,23 @@ pub async fn run(
     let mut terminal = ratatui::init();
     // Wheel scroll for the transcript. Best-effort: a terminal without
     // mouse support just keeps keyboard scrolling.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
     app.reconcile();
 
     // Crossterm events on a blocking thread → channel.
     let (tx, mut term_events) = mpsc::unbounded_channel();
+    let terminal_input = Arc::new(std::sync::Mutex::new(()));
+    let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = reader_done.clone();
+    let reader_lock = terminal_input.clone();
     std::thread::spawn(move || loop {
+        if reader_stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
+        let _guard = reader_lock.lock().unwrap();
+        match crossterm::event::poll(Duration::from_millis(20)) {
+            Ok(false) => continue,
+            Err(_) => return,
+            Ok(true) => {}
+        }
         match crossterm::event::read() {
             Ok(ev) => {
                 if tx.send(ev).is_err() {
@@ -506,6 +539,19 @@ pub async fn run(
             }
             _ = tokio::time::sleep(tick) => {}
         }
+        if let Some(payload) = app.edit_prompt.take() {
+            // The reader must relinquish stdin before handing it to an editor.
+            let _guard = terminal_input.lock().unwrap();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
+            ratatui::restore();
+            let edited = edit_prompt(&payload);
+            terminal = ratatui::init();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture, crossterm::event::EnableBracketedPaste);
+            match edited {
+                Ok(text) => app.apply(Action::Custom("input:prompt-edited".into(), serde_json::json!({"text":text}))),
+                Err(error) => app.apply(Action::Notice(format!("Editor failed; prompt unchanged: {error}"))),
+            }
+        }
         if app.model.should_quit {
             break Ok(());
         }
@@ -518,6 +564,9 @@ pub async fn run(
         }
     };
 
+    reader_done.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _guard = terminal_input.lock().unwrap();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste, crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -613,6 +662,15 @@ mod tests {
 
     fn env(event: SessionEvent) -> Envelope {
         Envelope { id: "01TEST".into(), at: "2026-01-01T00:00:00.000Z".into(), event }
+    }
+
+    #[test]
+    fn editor_failure_preserves_original_and_success_reads_saved_file() {
+        let payload = serde_json::json!({"text":"original\n", "editor":["/bin/sh", "-c", "printf 'edited\\n' > \"$1\"", "rness-editor"]});
+        assert_eq!(edit_prompt(&payload).unwrap(), "edited\n");
+        let failure = serde_json::json!({"text":"original", "editor":["/bin/sh", "-c", "exit 7"]});
+        assert!(edit_prompt(&failure).unwrap_err().contains("7"));
+        assert_eq!(failure["text"], "original");
     }
 
     #[test]

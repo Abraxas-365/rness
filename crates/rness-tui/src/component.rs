@@ -46,6 +46,10 @@ pub trait Component: Send {
         KeyOutcome::pass()
     }
 
+    fn on_paste(&mut self, _ctx: &Ctx<'_>, _text: &str) -> KeyOutcome {
+        KeyOutcome::consumed()
+    }
+
     /// Receive a broadcast [`Action::Custom`]. Components ignore
     /// everything they don't recognize.
     fn on_action(&mut self, _ctx: &Ctx<'_>, _name: &str, _payload: &serde_json::Value) {}

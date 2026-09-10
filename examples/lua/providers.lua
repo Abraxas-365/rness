@@ -1,9 +1,44 @@
--- Copy to ~/.rness/lua/additional-providers.lua and add
--- require("additional-providers") to init.lua. Restart after changes.
+-- Copy to ~/.rness/lua/providers.lua and add
+-- require("providers") to init.lua. Restart after changes.
 -- Keep only the connections you use. Do not also register the same names in
 -- init.lua: provider names must be unique (examples/init.lua includes some).
 -- Registration does not contact providers, install models, or choose a default.
--- Supply credentials through environment variables; never paste keys here.
+-- No providers are registered implicitly. Names below are your connection names.
+-- Supply credentials through environment variables or the credential store.
+
+-- Anthropic subscription: log in with `rness auth login --provider anthropic`.
+rness.providers.register("anthropic", {
+  protocol = "anthropic",
+  base_url = "https://api.anthropic.com",
+  -- Reads the "anthropic" OAuth credentials saved by:
+  -- rness auth login --provider anthropic
+  -- Default store: ~/.rness/credentials.json (or $RNESS_HOME/credentials.json).
+  auth = { oauth = "anthropic" },
+  -- Instead of OAuth, choose ONE:
+  -- auth = { credential = "anthropic" }, -- stored API key
+  -- auth = { env = "ANTHROPIC_API_KEY" }, -- API key from environment
+})
+
+rness.providers.register("openai", {
+  protocol = "openai-chat",
+  base_url = "https://api.openai.com/v1",
+  auth = { env = "OPENAI_API_KEY" },
+  -- auth = { credential = "openai" }, -- stored API key instead
+})
+
+-- ChatGPT subscription: log in with `rness auth login --provider openai-chatgpt`.
+-- The connection name is independent of the OAuth credential-store key.
+rness.providers.register("chatgpt", {
+  protocol = "chatgpt-responses",
+  base_url = "https://chatgpt.com/backend-api/codex",
+  auth = { oauth = "openai-chatgpt" },
+})
+
+rness.providers.register("deepseek", {
+  protocol = "openai-chat",
+  base_url = "https://api.deepseek.com/v1",
+  auth = { env = "DEEPSEEK_API_KEY" },
+})
 
 -- OpenCode Go: OpenAI-compatible Chat Completions models.
 -- Examples: kimi-k2.7-code, glm-5.2, deepseek-v4-pro, mimo-v2.5.

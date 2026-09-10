@@ -26,6 +26,14 @@ const MAX_ROWS: usize = 8;
 const PREFIX_CELLS: u16 = 2;
 
 pub struct Input {
+    edit_key: Option<crate::keys::Chord>,
+    preview_key: Option<crate::keys::Chord>,
+    preview: Option<(usize, String)>,
+    preview_scroll: usize,
+    preview_max: usize,
+    paste_lines: usize,
+    paste_chars: usize,
+    external_editor: Option<Vec<String>>,
     references: Vec<(String, String)>,
     reference_query: String,
     editor: Editor,
@@ -35,9 +43,9 @@ pub struct Input {
     candidates: Vec<(String, String)>,
     selected: usize,
     dismissed: bool,
-    history: Vec<String>,
+    history: Vec<Editor>,
     history_index: Option<usize>,
-    draft: String,
+    draft: Editor,
 }
 
 /// Mount the module (composition-root seam, same as future Lua installs).
@@ -47,7 +55,7 @@ pub fn install(slots: &mut Slots) {
 
 impl Input {
     pub fn new() -> Self {
-        Self { references: Vec::new(), reference_query: String::new(), commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: String::new() }
+        Self { edit_key: crate::keys::Chord::parse("ctrl+e"), preview_key: crate::keys::Chord::parse("ctrl+g"), preview: None, preview_scroll: 0, preview_max: 0, paste_lines: 5, paste_chars: 500, external_editor: None, references: Vec::new(), reference_query: String::new(), commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: Editor::new() }
     }
 
     pub fn with_candidates(candidates: Vec<(String, String)>) -> Self {
@@ -55,6 +63,7 @@ impl Input {
     }
 
     fn at_token(&self) -> Option<String> {
+        if self.editor.selected_paste().is_some() { return None; }
         let prefix = self.editor.before_cursor();
         if prefix.starts_with('/') { return None; }
         let start = prefix.rfind('@')?;
@@ -69,6 +78,7 @@ impl Input {
 
     fn matches(&self) -> Vec<&(String, String)> {
         if !self.dismissed && self.at_token().as_deref() == Some(self.reference_query.as_str()) { return self.references.iter().collect(); }
+        if self.editor.has_pastes() { return Vec::new(); }
         let text = self.editor.text();
         if self.dismissed || !text.starts_with('/') || text.contains('\n') { return Vec::new(); }
         let query = text[1..].to_lowercase();
@@ -91,6 +101,56 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_preview_keys_are_configurable_and_modifier_sensitive() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:promptbox-config", &serde_json::json!({"keys": {"edit": "ctrl+x"}, "paste": {"keys": {"preview": "alt+p"}}}));
+        let first = "first\n".repeat(10);
+        let second = "second\n".repeat(10);
+        input.on_paste(&ctx, &first);
+        input.editor.insert_str("between");
+        input.on_paste(&ctx, &second);
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(input.preview.is_none());
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_eq!(input.preview.as_ref().unwrap().1, second);
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(matches!(&outcome.actions[..], [Action::Custom(name, payload)] if name == "terminal:edit-prompt" && payload["text"] == format!("{first}between{second}")));
+        input.on_action(&ctx, "input:prompt-edited", &serde_json::json!({"text": "edited draft"}));
+        assert_eq!(input.editor.text(), "edited draft");
+        assert!(!input.editor.has_pastes());
+        assert!(input.preview.is_none());
+        input.on_action(&ctx, "input:promptbox-config", &serde_json::json!({"keys": {"edit": false}, "paste": {"keys": {"preview": false}}}));
+        assert!(input.edit_key.is_none());
+        assert!(input.preview_key.is_none());
+    }
+
+    #[test]
+    fn paste_preview_never_submits_and_send_expands_content() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        let content = "  日本語\n".repeat(43);
+        assert!(input.on_paste(&ctx, &content).actions.is_empty());
+        input.on_action(&ctx, "input:paste-preview", &serde_json::Value::Null);
+        for (width, height) in [(80, 18), (40, 8), (12, 4)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buf = Buffer::empty(area);
+            input.render(&ctx, area, &mut buf);
+            input.on_key(&ctx, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            input.render(&ctx, area, &mut buf);
+            assert_eq!(input.preview_scroll, input.preview_max);
+        }
+        assert!(input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).actions.is_empty());
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&outcome.actions[..], [Action::Submit(text)] if text == &content));
+    }
 
     #[test]
     fn reference_picker_quotes_paths_preserves_suffix_and_drills() {
@@ -210,7 +270,46 @@ impl Default for Input {
 }
 
 impl Component for Input {
+    fn on_paste(&mut self, _ctx: &Ctx<'_>, text: &str) -> KeyOutcome {
+        if self.preview.is_none() {
+            self.editor.paste(text, self.paste_lines, self.paste_chars);
+            self.dismissed = true;
+        }
+        KeyOutcome::consumed()
+    }
+
     fn on_action(&mut self, _ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "input:promptbox-config" {
+            for (value, target) in [(&payload["keys"]["edit"], &mut self.edit_key), (&payload["paste"]["keys"]["preview"], &mut self.preview_key)] {
+                if value == &serde_json::Value::Bool(false) { *target = None; }
+                else if let Some(key) = value.as_str() {
+                    if let Some(chord) = crate::keys::Chord::parse(key) { *target = Some(chord); }
+                    else { tracing::warn!(key, "invalid promptbox shortcut; retaining default"); }
+                }
+            }
+            if let Some(n) = payload["paste"]["lines"].as_u64() { self.paste_lines = n as usize; }
+            if let Some(n) = payload["paste"]["chars"].as_u64() { self.paste_chars = n as usize; }
+            if let Ok(argv) = serde_json::from_value::<Vec<String>>(payload["editor"].clone()) { self.external_editor = Some(argv); }
+            return;
+        }
+        if name == "input:paste-preview" {
+            self.preview = self.editor.selected_paste().map(|(id, text)| (id, text.to_owned()));
+            self.preview_scroll = 0;
+            return;
+        }
+        if name == "input:prompt-edited" {
+            if let Some(text) = payload["text"].as_str() {
+                self.editor = Editor::new();
+                self.editor.insert_str(text);
+                self.preview = None;
+                self.scroll_top = 0;
+                self.history_index = None;
+                self.references.clear();
+                self.reference_query.clear();
+                self.dismissed = true;
+            }
+            return;
+        }
         if name == "input:references" {
             self.references.clear(); self.reference_query.clear(); self.dismissed = true;
             return;
@@ -269,6 +368,7 @@ impl Component for Input {
     }
 
     fn height(&self, _ctx: &Ctx<'_>, width: u16) -> Option<u16> {
+        if self.preview.is_some() { return Some(18); }
         let rows = self.editor.wrapped_rows(Self::wrap_width(width)).len();
         // +1: blank margin row above the box, separating it from the
         // conversation body.
@@ -276,6 +376,24 @@ impl Component for Input {
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
+        if let Some((id, content)) = &self.preview {
+            use ratatui::widgets::{Block, Borders, Paragraph};
+            let block = Block::default().borders(Borders::ALL).title(format!(" Paste #{id} ")).title_bottom(" Esc: close · arrows/PageUp/PageDown: scroll ");
+            let inner = block.inner(area);
+            block.render(area, buf);
+            let mut display = Editor::new();
+            display.insert_str(&content.replace('\t', "    ").chars().filter(|c| *c == '\n' || !c.is_control()).collect::<String>());
+            let rows = display.wrapped_rows(inner.width as usize);
+            self.preview_max = rows.len().saturating_sub(inner.height as usize);
+            self.preview_scroll = self.preview_scroll.min(self.preview_max);
+            let lines: Vec<_> = rows.iter().skip(self.preview_scroll).take(inner.height as usize)
+                .map(|r| Line::raw(display.display_lines()[r.line][r.start..r.end].to_owned())).collect();
+            Paragraph::new(lines).render(inner, buf);
+            return;
+        }
+        if self.editor.selected_paste().is_some() && area.height > 0 {
+            Line::styled("Paste selected", ctx.theme.editor_prompt).render(Rect::new(area.x, area.y, area.width, 1), buf);
+        }
         let picker_height = self.picker_height().min(area.height.saturating_sub(2));
         if picker_height > 0 {
             use ratatui::widgets::{Block, Borders, Paragraph};
@@ -346,6 +464,27 @@ impl Component for Input {
     }
 
     fn on_key(&mut self, _ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
+        if self.edit_key.is_some_and(|chord| chord.matches(&key)) {
+            return KeyOutcome::act(vec![Action::Custom("terminal:edit-prompt".into(), serde_json::json!({"text": self.editor.text(), "editor": self.external_editor}))]);
+        }
+        if self.preview_key.is_some_and(|chord| chord.matches(&key)) {
+            self.preview = self.editor.selected_paste().map(|(id, text)| (id, text.to_owned()));
+            self.preview_scroll = 0;
+            return KeyOutcome::consumed();
+        }
+        if self.preview.is_some() {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, KeyModifiers::NONE) => self.preview = None,
+                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_sub(1),
+                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => self.preview_scroll = (self.preview_scroll + 1).min(self.preview_max),
+                (KeyCode::PageUp, KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_sub(10),
+                (KeyCode::PageDown, KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_add(10).min(self.preview_max),
+                (KeyCode::Home, KeyModifiers::NONE) => self.preview_scroll = 0,
+                (KeyCode::End, KeyModifiers::NONE) => self.preview_scroll = self.preview_max,
+                _ => {}
+            }
+            return KeyOutcome::consumed();
+        }
         let text = self.editor.text();
         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL
             && text.starts_with('/') && text.contains(' ')
@@ -395,20 +534,20 @@ impl Component for Input {
             if key.code == KeyCode::Up && !self.history.is_empty() {
                 let index = match self.history_index {
                     Some(index) => index.saturating_sub(1),
-                    None => { self.draft = self.editor.text(); self.history.len() - 1 }
+                    None => { self.draft = self.editor.clone(); self.history.len() - 1 }
                 };
                 self.history_index = Some(index);
                 self.editor.take();
-                self.editor.insert_str(&self.history[index]);
+                self.editor = self.history[index].clone();
             } else if key.code == KeyCode::Down {
                 if let Some(index) = self.history_index {
                     self.editor.take();
                     if index + 1 < self.history.len() {
                         self.history_index = Some(index + 1);
-                        self.editor.insert_str(&self.history[index + 1]);
+                        self.editor = self.history[index + 1].clone();
                     } else {
                         self.history_index = None;
-                        self.editor.insert_str(&self.draft);
+                        self.editor = self.draft.clone();
                     }
                 }
             }
@@ -433,12 +572,13 @@ impl Component for Input {
                 }
                 // Submitting while busy queues a followup (inbox semantics).
                 self.scroll_top = 0;
+                let snapshot = self.editor.clone();
                 let text = self.editor.take();
-                if !text.trim().is_empty() && self.history.last() != Some(&text) {
-                    self.history.push(text.clone());
+                if !text.trim().is_empty() && self.history.last().map(Editor::text).as_ref() != Some(&text) {
+                    self.history.push(snapshot);
                 }
                 self.history_index = None;
-                self.draft.clear();
+                self.draft = Editor::new();
                 self.dismissed = false;
                 KeyOutcome::act(vec![Action::Submit(text)])
             }
