@@ -1,6 +1,5 @@
-//! The example runtime/ plugins must actually load and register their
-//! apps — this is the M5 dogfood check in CI form. (They are NOT
-//! embedded or auto-loaded; users copy them into ~/.rness/plugins.)
+//! Example plugins load through explicit file declarations after engine mount.
+//! They are not embedded or auto-loaded; copying alone never activates them.
 
 use std::sync::Arc;
 
@@ -279,6 +278,69 @@ async fn booted_host(dir: &std::path::Path) -> LuaHost {
     host
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn region_confirmation_reuses_only_its_own_command_reservation() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let session = log.session().clone();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+        content: vec![ContentPart::Text { text: "source ".repeat(100) }], source: None })).unwrap();
+    drop(log);
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(store, Arc::new(Silent), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    let host = LuaHost::spawn().unwrap();
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into()).await.unwrap();
+    host.load("region", r#"
+        rness.commands.register{name='region', run=function(ctx)
+            local view = rness.session.compaction_view(ctx.session)
+            local changed = rness.session.compact_region(ctx.session, {
+                start=1, ['end']=1, sources=view.sources,
+                policy={threshold_tokens=24000,retain_tokens=4000,summary_tokens=200,
+                    max_overflow_retries=1,max_compactions=2,prune_threshold=8192,prune_head=4096,prune_tail=1024}
+            })
+            return {message=changed and 'changed' or 'unchanged'}
+        end}
+    "#).await.unwrap();
+    let prepared = sessions.prepare_command(&session, "/region").unwrap().unwrap();
+    assert!(sessions.prepare_command(&session, "/region").is_err());
+    assert!(sessions.try_extension_maintenance().is_err());
+    let policy: rness_engine::turn::compaction::Policy = serde_json::from_value(serde_json::json!({
+        "threshold_tokens":24000,"retain_tokens":4000,"summary_tokens":200,"max_overflow_retries":1,
+        "max_compactions":2,"prune_threshold":8192,"prune_head":4096,"prune_tail":1024
+    })).unwrap();
+    let sources = sessions.replay(&session).unwrap().context.sources;
+    assert!(sessions.compact_region(&session, 0, 1, sources, policy).await.is_err());
+    let service = sessions.clone();
+    let outcome = tokio::task::spawn_blocking(move || prepared.execute(&service)).await.unwrap().unwrap();
+    assert!(matches!(outcome, rness_engine::inbox::Disposition::Command(result) if result.message == "unchanged"));
+    assert!(!sessions.command_running(&session));
+    assert!(sessions.try_extension_maintenance().is_ok());
+    assert!(sessions.store().history(&session).unwrap().iter().any(|e| matches!(e.event, SessionEvent::CompactionStarted { .. })));
+}
+
+#[tokio::test]
+async fn usage_reports_latest_request_and_durable_turn_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let session = log.session().clone();
+    for turn in 1..=3 {
+        log.append(&SessionEvent::TurnStarted { turn }).unwrap();
+        log.append(&SessionEvent::AssistantMessage(AssistantMessage {
+            model: "fake-1".into(), content: vec![], stop: StopReason::EndTurn,
+            usage: Usage { input_tokens: u64::from(turn) * 100, output_tokens: 10, ..Default::default() },
+            chunks: vec![],
+        })).unwrap();
+        log.append(&SessionEvent::TurnEnded { turn, outcome: TurnOutcome::Completed }).unwrap();
+    }
+    drop(log);
+    let host = booted_host(dir.path()).await;
+    host.load("usage-check", &format!(
+        "local usage = rness.session.usage({session:?}); assert(usage.input == 300); assert(usage.output == 10); assert(usage.turns == 3)"
+    )).await.unwrap();
+}
+
 #[tokio::test]
 async fn plan_lifecycle_uses_live_questions_and_preserves_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -316,13 +378,81 @@ fn examples() -> Vec<rness_lua::loader::PluginSource> {
         .filter(|n| n.ends_with(".lua"))
         .collect();
     names.sort();
-    for n in names {
-        sources.push(rness_lua::loader::PluginSource {
-            name: n.clone(),
-            source: std::fs::read_to_string(format!("{root}/plugins/{n}")).unwrap(),
-        });
-    }
+    let specs: Vec<_> = names.into_iter().map(|n| rness_lua::loader::PluginSpec {
+        name: n.trim_end_matches(".lua").to_string(),
+        source: rness_lua::loader::PluginLocation::File(std::path::Path::new(root).join("plugins").join(n)),
+        enabled: true,
+        watch: false,
+        opts: serde_json::json!({}),
+        keys: serde_json::json!({}),
+    }).collect();
+    sources.extend(rness_lua::loader::discover_specs(std::path::Path::new(root), &specs).unwrap());
     sources
+}
+
+#[test]
+fn specialist_roles_load_explicitly_with_bounded_tool_permissions() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("lua")).unwrap();
+    std::fs::write(root.path().join("lua/roles.lua"), include_str!("../../../examples/lua/roles.lua")).unwrap();
+    let init = root.path().join("init.lua");
+    std::fs::write(&init, "require('roles')").unwrap();
+    let config = rness_lua::api::config::load(&init).unwrap();
+    assert_eq!(config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["context-builder", "delegate", "oracle", "planner", "researcher", "reviewer", "scout", "worker"]);
+    for (name, agent) in &config.agents {
+        assert!(agent.subagent);
+        assert!(agent.profile.is_none(), "examples inherit settings without invented models");
+        assert!(!agent.instructions.is_empty());
+        let tools = agent.tools.as_ref().unwrap();
+        assert!(!tools.iter().any(|t| t == "subagent" || t == "*"));
+        if !matches!(name.as_str(), "worker" | "delegate") {
+            assert_eq!(tools, &["Glob", "Grep", "Read"]);
+        } else {
+            assert_eq!(tools, &["Glob", "Grep", "Read", "Edit", "Write", "Bash"]);
+        }
+    }
+}
+
+#[test]
+fn example_init_loads_without_implicitly_enabling_plugins() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/init.lua");
+    let config = rness_lua::api::config::load(&path).unwrap();
+    assert!(config.plugin_specs.is_empty());
+    assert!(config.plugins.is_empty());
+    assert!(config.mappings.is_empty());
+}
+
+#[tokio::test]
+async fn keymaps_example_supports_options_remapping_disable_and_unload() {
+    let root = tempfile::tempdir().unwrap();
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/plugins/keymaps.lua");
+    for (keys, expected) in [
+        (serde_json::json!({}), vec!["<F6>"]),
+        (serde_json::json!({"insert_review": ["<F8>", "<F9>"]}), vec!["<F8>", "<F9>"]),
+        (serde_json::json!({"insert_review": false}), vec![]),
+        (serde_json::json!(false), vec![]),
+    ] {
+        let init = root.path().join("init.lua");
+        std::fs::write(&init, format!(
+            "rness.plugins.setup({{{{name='keymaps', file={:?}, opts={{text='Custom review'}}, keys=rness.json.decode({:?})}}}})",
+            path.to_str().unwrap(), keys.to_string(),
+        )).unwrap();
+        let (host, config) = LuaHost::spawn_from_init(init).unwrap();
+        let sources = rness_lua::loader::discover_specs(root.path(), &config.plugin_specs).unwrap();
+        assert!(rness_lua::loader::load_all(&host, &sources).await.is_empty());
+        host.validate_bindings().await.unwrap();
+        let bindings = host.binding_specs().await;
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].keys, expected);
+        assert_eq!(bindings[0].action, "keymaps.insert_review");
+        assert_eq!(host.call_action("keymaps.insert_review", "promptbox", serde_json::json!({})).await.unwrap(),
+            vec![rness_lua::runtime::UiActionOperation::InsertPrompt("Custom review".into())]);
+        assert!(host.unload("keymaps").await.unwrap());
+        assert!(host.binding_specs().await.is_empty());
+        assert!(host.action_specs().await.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -361,7 +491,7 @@ async fn task_overlay_scrolls_and_isolates_sessions() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn example_plugins_load_and_register_four_apps() {
+async fn example_plugins_load_and_register_five_apps() {
     let dir = tempfile::tempdir().unwrap();
     let host = booted_host(dir.path()).await;
     let errors = rness_lua::loader::load_all(&host, &examples()).await;
@@ -369,7 +499,9 @@ async fn example_plugins_load_and_register_four_apps() {
 
     let apps = host.app_specs().await;
     let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
-    assert_eq!(names, vec!["branches", "sessions", "tasks", "tree"]);
+    assert_eq!(names, vec!["branches", "compact-region", "sessions", "tasks", "tree"]);
+    let region = apps.iter().find(|a| a.name == "compact-region").unwrap();
+    assert_eq!(region.key_help, vec!["j/k: move", "space: anchor", "enter: review", "r: refresh", "esc: close"]);
 
     let tree = apps.iter().find(|a| a.name == "tree").unwrap();
     assert_eq!(tree.slot, "sidebar");

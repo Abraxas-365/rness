@@ -1,6 +1,10 @@
--- autocompact.lua — keep session context bounded, the dsh way.
+-- autocompact.lua — legacy idle-only, turn-end compaction policy.
+-- Prefer rness.compaction in init.lua for pre-step checks and overflow recovery.
+-- Do not enable both policies for the same route. This example uses reported
+-- usage and cannot immediately remeasure after pruning.
 --
--- Copyable example (zero magic): cp to ~/.rness/plugins/ to use it.
+-- Copy this file, then add { name = "autocompact", file = "plugins/autocompact.lua" }
+-- to init.lua's single rness.plugins.setup list. Copying alone does not enable it.
 --
 -- Two layers, cheapest first (dsh compaction stack):
 --   1. prune  — deterministic, instant, model-free: oversized tool

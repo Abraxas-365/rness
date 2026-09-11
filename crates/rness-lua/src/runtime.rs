@@ -21,6 +21,18 @@ pub enum LuaError {
 
 pub use rness_kernel::presentation::{AppKeyOutcome, AppSpec as LuaAppSpec, StyledLine};
 
+fn app_key_help(spec: &Table) -> mlua::Result<Vec<String>> {
+    let Some(table) = spec.get::<Option<Table>>("key_help")? else { return Ok(Vec::new()); };
+    let mut help = Vec::new();
+    // mlua 0.10.5's TableSequence reserves one stack slot but pushes two.
+    // Indexed reads reserve enough space, including inside Lua callbacks.
+    for index in 1.. {
+        let Some(value) = table.raw_get::<Option<String>>(index)? else { break; };
+        help.push(value);
+    }
+    Ok(help)
+}
+
 /// What a Lua plugin registered via `rness.tool.register{...}` — the
 /// engine-facing spec (the callable stays in the VM registry).
 #[derive(Debug, Clone)]
@@ -991,7 +1003,7 @@ impl LuaRuntime {
             let view: Function = entry.get("view")?;
             let on_key: Option<Function> = entry.get("on_key")?;
             let spec = LuaAppSpec {
-                key_help: entry.get::<Option<Vec<String>>>("key_help")?.unwrap_or_default(),
+                key_help: app_key_help(&entry)?,
                 name: name.clone(),
                 slot: entry.get::<Option<String>>("slot")?.unwrap_or_else(|| "overlay".into()),
                 title: entry.get::<Option<String>>("title")?.unwrap_or_else(|| name.clone()),
@@ -1538,7 +1550,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             let apps: Table = pending.get("apps")?;
             let entry = lua.create_table()?;
             entry.set("name", name.clone())?;
-            entry.set("key_help", spec.get::<Option<Vec<String>>>("key_help")?)?;
+            entry.set("key_help", app_key_help(&spec)?)?;
             entry.set("view", owned_callback(lua, view)?)?;
             entry.set("on_key", on_key.map(|f| owned_callback(lua, f)).transpose()?)?;
             entry.set("title", title)?;
@@ -1713,6 +1725,28 @@ mod tests {
             assert!(rt.load("review", &source).is_err(), "accepted {overrides}");
             assert!(rt.binding_specs().is_empty());
             assert!(rt.action_specs().is_empty());
+        }
+    }
+
+    #[test]
+    fn app_key_help_metadata_handles_callback_stack_pressure_and_replacement() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("help", r#"
+            for count = 0, 64 do
+                local help = {}
+                for i = 1, count do help[i] = 'key ' .. i end
+                rness.ui.app{name='help-' .. count, key_help=help, view=function() return {} end}
+                rness.ui.replace_app{name='help-' .. count, key_help=help, view=function() return {} end}
+            end
+        "#).unwrap();
+        for spec in rt.app_specs() {
+            let count: usize = spec.name.strip_prefix("help-").unwrap().parse().unwrap();
+            assert_eq!(spec.key_help, (1..=count).map(|i| format!("key {i}")).collect::<Vec<_>>());
+        }
+        assert_eq!(rt.app_specs().len(), 65);
+        for value in ["false", "'invalid'", "{function() end}"] {
+            assert!(rt.load("invalid-help", &format!("rness.ui.app{{name='invalid', key_help={value}, view=function() return {{}} end}}")).is_err());
+            assert_eq!(rt.app_specs().len(), 65);
         }
     }
 

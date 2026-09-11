@@ -459,6 +459,7 @@ async fn main() -> anyhow::Result<()> {
             models: startup.models.clone(),
             tools: Arc::clone(&tools),
             config: TurnConfig {
+                compaction: startup.compaction.clone(),
                 system: "You are rness, a coding agent. Be concise.".into(),
                 ..Default::default()
             },

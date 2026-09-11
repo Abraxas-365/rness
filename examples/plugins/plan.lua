@@ -1,3 +1,4 @@
+-- Add { name = "plan", file = "plugins/plan.lua" } to init.lua's setup list.
 -- Opt-in plan collaboration. Questions must have an available frontend to review.
 rness.plan.enable()
 rness.commands.register {

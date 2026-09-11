@@ -1,6 +1,7 @@
 -- spinner.lua — busy indicator + context budget in the statusline.
 --
--- Copyable example (zero magic): cp to ~/.rness/plugins/ to use it.
+-- Copy this file, then add { name = "spinner", file = "plugins/spinner.lua" }
+-- to init.lua's single rness.plugins.setup list. Copying alone does not enable it.
 --
 -- While a turn runs, shadows the built-in statusline with a spinner,
 -- WHAT the agent is doing right now (thinking… / writing… / the tool

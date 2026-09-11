@@ -13,6 +13,32 @@ use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[tokio::test]
+async fn wire_capture_matches_transmitted_bytes_and_audit_failure_blocks_send() {
+    for accept in [false, true] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(sse_response(&stream_happy("done")))
+            .expect(if accept { 1 } else { 0 }).mount(&server).await;
+        let provider = OpenAiProvider::new("secret-api-key", "test").with_base_url(server.uri());
+        let context = user_context("source");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
+        let capture = async {
+            let record = receiver.recv().await.unwrap();
+            assert!(server.received_requests().await.unwrap().is_empty());
+            assert!(!record.body.contains("secret-api-key"));
+            record.ack.send(if accept { Ok(()) } else { Err("disk full".into()) }).unwrap();
+            record.body
+        };
+        let (outcome, body) = tokio::join!(rness_engine::turn::provider::WIRE_CAPTURE.scope(sender, step(&provider, &context, "system", &[])), capture);
+        if accept {
+            assert!(matches!(outcome, StepOutcome::Committed(_)));
+            assert_eq!(server.received_requests().await.unwrap()[0].body, body.as_bytes());
+        } else {
+            assert!(matches!(outcome, StepOutcome::Failed { error, .. } if error.code == "AUDIT"));
+        }
+    }
+}
+
 fn sse(chunks: &[serde_json::Value]) -> String {
     let mut out: String = chunks.iter().map(|d| format!("data: {d}\n\n")).collect();
     out.push_str("data: [DONE]\n\n");
@@ -54,6 +80,23 @@ async fn step(
             &CancellationToken::new(),
         )
         .await
+}
+
+#[tokio::test]
+async fn streaming_overflow_preserves_partial_chunks() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(sse_response(&[
+            json!({"choices":[{"delta":{"content":"partial"}}]}),
+            json!({"error":{"code":"context_length_exceeded","message":"too long"}}),
+        ])).expect(1).mount(&server).await;
+    let provider = OpenAiProvider::new("key", "test").with_base_url(server.uri());
+    let StepOutcome::Failed { error, partial } = step(&provider, &user_context("hello"), "", &[]).await else {
+        panic!("stream overflow must fail, not commit");
+    };
+    assert_eq!(error.code, "CONTEXT_OVERFLOW");
+    assert!(!error.retryable);
+    assert!(partial.iter().any(|c| matches!(&c.delta, ChunkDelta::Text { t } if t == "partial")));
 }
 
 #[tokio::test]

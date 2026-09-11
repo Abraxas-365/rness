@@ -19,6 +19,7 @@ pub struct UserMapping {
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub compaction: BTreeMap<String, rness_engine::turn::compaction::Policy>,
     pub mappings: Vec<UserMapping>,
     pub images: rness_engine::images::ImagePolicy,
     pub promptbox: serde_json::Value,
@@ -40,6 +41,19 @@ pub struct StartupConfig {
 
 #[cfg(test)]
 mod permission_tests {
+    #[test]
+    fn boundary_compaction_requires_explicit_valid_route_budgets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        let valid = "threshold_tokens=1000, retain_tokens=160, summary_tokens=100, max_overflow_retries=1, max_compactions=2, prune_threshold=8192, prune_head=4096, prune_tail=1024";
+        std::fs::write(&path, format!("rness.compaction = {{['test/model']={{{valid}}}}}")).unwrap();
+        assert_eq!(super::load(&path).unwrap().compaction["test/model"].retain_tokens, 160);
+        for bad in [valid.replace("retain_tokens=160", "retain_tokens=1000"), valid.replace("summary_tokens=100", "summary_tokens=0"), format!("{valid}, typo=1")] {
+            std::fs::write(&path, format!("rness.compaction = {{['test/model']={{{bad}}}}}")).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+    }
+
     #[test]
     fn stream_timeouts_are_opt_in_and_validated() {
         let dir = tempfile::tempdir().unwrap();
@@ -411,6 +425,16 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     keymap.set("setup", lua.create_function(|_, _: mlua::Value| -> mlua::Result<()> {
         Err(mlua::Error::runtime("keymap.setup is startup-only; restart to change mappings"))
     })?)?;
+    if let Some(policies) = rness.get::<Option<Table>>("compaction")? {
+        let policies: BTreeMap<String, rness_engine::turn::compaction::Policy> = lua.from_value(mlua::Value::Table(policies))?;
+        for (route, policy) in &policies {
+            if !route.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()) {
+                return Err("compaction keys must be provider/model".into());
+            }
+            policy.validate().map_err(std::io::Error::other)?;
+        }
+        state.lock().unwrap().compaction = policies;
+    }
     if let Some(images) = rness.get::<Option<Table>>("images")? {
         let policy: rness_engine::images::ImagePolicy = lua.from_value(mlua::Value::Table(images))?;
         policy.validate().map_err(std::io::Error::other)?;

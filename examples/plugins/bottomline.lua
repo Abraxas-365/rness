@@ -1,4 +1,5 @@
--- Enable with rness.plugins.load("bottomline") in init.lua.
+-- Add { name = "bottomline", file = "plugins/bottomline.lua" } to init.lua's
+-- single rness.plugins.setup list after copying this file.
 -- Alternative to spinner.lua, not a second simultaneous statusline.
 -- Displays the latest event's session, not necessarily the selected TUI session.
 local active = {}

@@ -10,6 +10,35 @@ pub mod responses;
 pub mod routes;
 pub mod sse;
 
+fn request_error_code(status: u16, body: &str) -> &'static str {
+    if !matches!(status, 400 | 413 | 422) { return "HTTP"; }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else { return "HTTP"; };
+    if is_context_overflow(&value["error"]) { "CONTEXT_OVERFLOW" } else { "HTTP" }
+}
+
+fn is_context_overflow(error: &serde_json::Value) -> bool {
+    let code = error["code"].as_str().or(error["type"].as_str()).unwrap_or("");
+    let message = error["message"].as_str().unwrap_or("").to_lowercase();
+    matches!(code, "context_length_exceeded" | "context_window_exceeded")
+        || (code == "invalid_request_error" && message.starts_with("prompt is too long"))
+}
+
+fn stream_overflow(event: &str, data: &str) -> Option<rness_engine::turn::provider::ProviderError> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let kind = value["type"].as_str().unwrap_or(event);
+    let error = if kind == "response.failed" {
+        &value["response"]["error"]
+    } else if value["error"].is_object() {
+        &value["error"]
+    } else if kind == "error" {
+        &value
+    } else { return None; };
+    is_context_overflow(error).then(|| rness_engine::turn::provider::ProviderError {
+        code: "CONTEXT_OVERFLOW", retry_after: None, retryable: false,
+        message: error["message"].as_str().unwrap_or("provider context window exceeded").into(),
+    })
+}
+
 fn rejected_uploads(detail: &str, used: &[(String, String)]) -> Vec<(String, String)> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(detail) else { return Vec::new(); };
     let detail = ["code", "type", "message"].iter().filter_map(|key| value["error"][key].as_str()).collect::<Vec<_>>().join(" ");
@@ -79,6 +108,37 @@ mod upload_tests {
     use super::*;
     use wiremock::{Mock, MockServer, ResponseTemplate, matchers::{method, path}};
     use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    #[test]
+    fn streaming_overflow_envelopes_are_classified_without_matching_normal_text() {
+        for (event, data) in [
+            ("", r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#),
+            ("error", r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 100 > 50"}}"#),
+            ("response.failed", r#"{"response":{"error":{"code":"context_window_exceeded","message":"too long"}}}"#),
+            ("error", r#"{"type":"error","code":"context_length_exceeded","message":"too long"}"#),
+        ] {
+            let error = stream_overflow(event, data).unwrap();
+            assert_eq!(error.code, "CONTEXT_OVERFLOW");
+            assert!(!error.retryable);
+        }
+        for data in ["invalid JSON", r#"{"type":"response.output_text.delta","delta":"context_length_exceeded"}"#,
+            r#"{"error":{"code":"rate_limit_exceeded","message":"too long"}}"#] {
+            assert!(stream_overflow("", data).is_none());
+        }
+    }
+
+    #[test]
+    fn overflow_classification_requires_specific_provider_evidence() {
+        for body in [r#"{"error":{"code":"context_length_exceeded"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 100 tokens > 50 maximum"}}"#] {
+            assert_eq!(request_error_code(400, body), "CONTEXT_OVERFLOW");
+            assert_eq!(request_error_code(500, body), "HTTP");
+        }
+        for body in ["context too large", r#"{"error":{"message":"quota exceeded"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"invalid tools"}}"#] {
+            assert_eq!(request_error_code(400, body), "HTTP");
+        }
+    }
 
     #[tokio::test]
     async fn quota_recovery_reclaims_unexpired_owned_uploads_and_protects_selected_files() {

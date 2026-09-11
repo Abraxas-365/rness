@@ -40,6 +40,27 @@ pub struct StepRequest<'a> {
     pub on_delta: Option<DeltaSink<'a>>,
 }
 
+/// A prepared JSON body awaits durable acknowledgement before transmission.
+pub struct WireCapture {
+    pub body: String,
+    pub ack: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+tokio::task_local! {
+    pub static WIRE_CAPTURE: tokio::sync::mpsc::Sender<WireCapture>;
+}
+
+/// Called by adapters for each actual model request, including transport retries.
+/// Auth headers, URLs, and credential exchange requests are never captured.
+pub async fn capture_wire(body: &serde_json::Value) -> Result<(), ProviderError> {
+    let Ok(sender) = WIRE_CAPTURE.try_with(Clone::clone) else { return Ok(()); };
+    let (ack, done) = tokio::sync::oneshot::channel();
+    let failure = |message: String| ProviderError { code: "AUDIT", retry_after: None, message, retryable: false };
+    let body = serde_json::to_string(body).map_err(|e| failure(e.to_string()))?;
+    sender.send(WireCapture { body, ack }).await.map_err(|_| failure("request audit receiver closed".into()))?;
+    done.await.map_err(|_| failure("request audit acknowledgement lost".into()))?
+        .map_err(failure)
+}
+
 /// Result of one model request.
 pub enum StepOutcome {
     /// Stream completed; the message embeds its exact chunk record.
@@ -95,6 +116,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_wrapper_uses_only_explicit_summary_provider() {
+        struct Tagged(&'static str);
+        #[async_trait]
+        impl Provider for Tagged {
+            fn model(&self) -> &str { self.0 }
+            async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+                StepOutcome::Failed { error: ProviderError { code: self.0, retry_after: None,
+                    message: self.0.into(), retryable: false }, partial: vec![] }
+            }
+        }
+        let provider = SummaryProvider { main: std::sync::Arc::new(Tagged("main")), summary: std::sync::Arc::new(Tagged("summary")) };
+        let context = ModelContext::default();
+        let request = || StepRequest { context: &context, system: "", tools: &[], on_delta: None };
+        let cancel = CancellationToken::new();
+        let StepOutcome::Failed { error, .. } = provider.step(request(), &cancel).await else { panic!() };
+        assert_eq!(error.code, "main");
+        let StepOutcome::Failed { error, .. } = provider.summarize_step(request(), &cancel).await else { panic!() };
+        assert_eq!(error.code, "summary");
+        assert_eq!(provider.summary_model(), "summary");
+    }
+
+    #[tokio::test]
     async fn tool_images_are_rejected_before_provider_request() {
         let provider = ImageCapabilityProvider { inner: std::sync::Arc::new(NeverCalled) };
         let context = ModelContext { turns: vec![ModelTurn::ToolResults { results: vec![ToolResult {
@@ -114,6 +157,22 @@ mod tests {
     }
 }
 
+pub(crate) struct SummaryProvider {
+    pub main: std::sync::Arc<dyn Provider>,
+    pub summary: std::sync::Arc<dyn Provider>,
+}
+#[async_trait]
+impl Provider for SummaryProvider {
+    fn model(&self) -> &str { self.main.model() }
+    fn summary_model(&self) -> &str { self.summary.model() }
+    async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+        self.main.step(request, cancel).await
+    }
+    async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+        self.summary.step(request, cancel).await
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Model identifier recorded on messages and attempts.
@@ -121,6 +180,12 @@ pub trait Provider: Send + Sync {
 
     /// Configure attachment resolution before the provider is shared.
     fn configure_images(&mut self, _store: std::sync::Arc<crate::images::ImageStore>, _policy: crate::images::ImagePolicy) {}
+
+    /// Separate summarization route, when explicitly configured by the host.
+    fn summary_model(&self) -> &str { self.model() }
+    async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+        self.step(request, cancel).await
+    }
 
     /// Execute one model request.
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome;

@@ -400,6 +400,9 @@ impl Provider for ResponsesProvider {
 
         let mut refreshed = false;
         let response = loop {
+            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
+                return StepOutcome::Failed { error, partial: vec![] };
+            }
             let sent = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
@@ -446,7 +449,7 @@ impl Provider for ResponsesProvider {
                     })
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { code: "HTTP", retry_after, message, retryable },
+                    error: ProviderError { code: crate::request_error_code(status.as_u16(), &text), retry_after, message, retryable },
                     partial: vec![],
                 };
             }
@@ -459,6 +462,9 @@ impl Provider for ResponsesProvider {
         loop {
             match reader.pull(cancel).await {
                 SsePull::Event { event, data } => {
+                    if let Some(error) = crate::stream_overflow(&event, &data) {
+                        return StepOutcome::Failed { error, partial: acc.chunks };
+                    }
                     let at_ms = started.elapsed().as_millis() as u64;
                     acc.apply(&event, &data, at_ms);
                     if let Some(sink) = request.on_delta {

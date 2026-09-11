@@ -19,7 +19,9 @@ These pages describe the current source checkout, not a versioned stable release
 | Use slash commands and input history | [TUI commands](guides/configuration/tui-commands.md) |
 | Configure and switch colors | [Colorschemes](guides/configuration/colorschemes.md) |
 | Install Lua packages | [Plugin packages](guides/plugins/packages.md) |
-| Load and unload plugins | [Plugin lifecycle](guides/plugins/loading-and-lifecycle.md) |
+| Load, reload, and unload plugins | [Plugin lifecycle](guides/plugins/loading-and-lifecycle.md) |
+| Define actions, remap keys, and inspect help | [Scoped mappings](guides/plugins/loading-and-lifecycle.md#scoped-mappings-and-help) |
+| Customize messages and tool cards | [Messagebox presentation](guides/plugins/example-recipes.md#messagebox-presentation) |
 | Register commands and use session context | [Lua commands](reference/lua/commands.md) |
 | Write native extensions | [Native extension contracts](contributing/native-extensions.md) |
 | Contribute to the codebase | [Contributor documentation](contributing/README.md) |

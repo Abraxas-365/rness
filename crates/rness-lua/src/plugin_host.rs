@@ -78,7 +78,7 @@ enum Cmd {
     BindingSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>> },
     Action { guard: Box<dyn FnOnce() -> bool + Send>, generation: u64, name: String, scope: String, context: serde_json::Value, reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>> },
     Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<String>, String>> },
-    Command { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
+    Command { name: String, context: serde_json::Value, permit: rness_engine::service::CommandPermit, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
     CoordinatedUnload {
         name: String,
@@ -197,7 +197,7 @@ impl rness_engine::interaction::Command for LuaCommand {
         }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
-        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), cancel: input.cancel, reply })
+        self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), permit: input.permit, cancel: input.cancel, reply })
             .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
         receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
             .map_err(ServiceError::InvalidConfig)
@@ -283,7 +283,8 @@ impl LuaHost {
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);
                         }
-                        Cmd::Command { name, context, cancel, reply } => {
+                        Cmd::Command { name, context, permit, cancel, reply } => {
+                            rt.lua().set_app_data(permit);
                             rt.lua().set_app_data(cancel.clone());
                             let token = cancel.clone();
                             rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
@@ -292,6 +293,7 @@ impl LuaHost {
                             let result = if cancel.is_cancelled() { Err("command cancelled".into()) } else { rt.call_command(&name, context) };
                             rt.lua().remove_hook();
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
+                            rt.lua().remove_app_data::<rness_engine::service::CommandPermit>();
                             let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
                         }
                         Cmd::Load { name, source, reply } => {

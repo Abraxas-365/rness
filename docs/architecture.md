@@ -200,7 +200,8 @@ ui-feature-as-plugin pattern is right, so we apply it *inside one crate*:
 
 File tree, branch tree view, session picker live in `examples/plugins/*.lua`
 as copyable examples (copy into `~/.rness/plugins/`, then explicitly select
-with `rness.plugins.load("name")` in `init.lua`; see [plugin lifecycle](guides/plugins/loading-and-lifecycle.md)):
+with a `{name="name", file="./plugins/name.lua"}` entry in the single
+`rness.plugins.setup({...})` list in `init.lua`; see [plugin lifecycle](guides/plugins/loading-and-lifecycle.md)):
 
 1. **Dogfood proof** — if a stateful, interactive, event-driven app like the
    file tree can be pure Lua, the plugin API is real; gaps surface before

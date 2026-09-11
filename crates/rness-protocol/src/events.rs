@@ -90,6 +90,19 @@ pub enum SessionEvent {
     #[serde(rename = "compaction/summary")]
     Compaction(Compaction),
 
+    /// Audit only: never inserted into model-visible history.
+    #[serde(rename = "compaction/started")]
+    CompactionStarted { model: String, sources: Vec<EventId>, estimated_input: u64, request: serde_json::Value },
+    #[serde(rename = "compaction/request")]
+    CompactionRequest { started: EventId, body: String },
+    #[serde(rename = "compaction/finished")]
+    CompactionFinished {
+        started: EventId,
+        outcome: String,
+        usage: Usage,
+        chunks: Vec<TimedChunk>,
+    },
+
     /// Request-header state changed (dsh request/header model): call
     /// config applied to every LATER model request. Durable so resume
     /// restores the last explicit choice; the latest event wins.

@@ -1,3 +1,5 @@
+-- Add { name = "mcp-clima", file = "plugins/mcp-clima.lua" } to init.lua's
+-- single rness.plugins.setup list after copying this file.
 -- Ejemplo: conectar un server MCP desde un plugin (0 magia: esto ES la config)
 --
 -- Idempotente a proposito: el hot reload re-ejecuta el top level de cada

@@ -9,7 +9,7 @@ rness evaluates `~/.rness/init.lua` before constructing model providers. This is
 | `~/.rness/init.lua` | Evaluated once in the production Lua VM at startup |
 | `~/.rness/lua/?.lua` | Available through explicit `require` |
 | `~/.rness/lua/?/init.lua` | Available through explicit `require` |
-| `~/.rness/plugins/*.lua` | Loaded only when selected with `rness.plugins.load`, after engine mount, in declaration order |
+| Explicit `file`, `package`, or inline `config` source | Selected with `rness.plugins.setup`, executed after engine mount in declaration order |
 | Repository `examples/` | Copyable material; not automatically loaded |
 | `~/.rness/config.lua` | Not a second automatic startup entry point |
 
@@ -42,13 +42,24 @@ Do not move startup-only declarations into the post-mount `plugins/` directory: 
 
 ```lua
 require("connections") -- executes now, during startup
-rness.plugins.load("spinner") -- queues ~/.rness/plugins/spinner.lua
-rness.plugins.load("sessions") -- runs after spinner, after engine mount
+rness.plugins.setup({
+  { name = "spinner", file = "./plugins/spinner.lua", watch = true },
+  { name = "sessions", file = "./plugins/sessions.lua" },
+})
 ```
 
 Copy the selected files into `~/.rness/plugins/` first. No directory is scanned for automatic activation. With no load declarations, no plugin files run. Removing a declaration disables that plugin on the next restart without deleting its file.
 
-`rness.plugins.load(name)` is startup-only and returns no value. Names accept ASCII letters, digits, underscores, and hyphens; omit the `.lua` extension. Paths, empty names, and duplicate declarations are rejected. Calls may also live in modules required by `init.lua`; their execution order determines the plugin order.
+Call `rness.plugins.setup` once with a dense ordered list. Each entry has exactly one
+source: `file`, installed `package`, or inline `config` function. File/inline entries
+require a name; package identity comes from its manifest. Names accept ASCII letters,
+digits, underscores, and hyphens. Relative files resolve against the configuration
+directory, not the shell working directory. Optional `enabled=false` skips a source;
+`opts` supplies JSON-compatible setup options; `keys` overrides plugin binding slots.
+See [plugin lifecycle](../plugins/loading-and-lifecycle.md) for the full contract.
+
+Legacy `rness.plugins.load(name)` remains supported for existing configurations but
+cannot be mixed with `plugins.setup`. Migrate all entries together.
 
 A missing selected file fails startup with its path. A Lua execution error is reported as a warning and later selected plugins are still attempted; plugin execution is not transactional, so earlier side effects are not rolled back.
 
@@ -56,7 +67,7 @@ This is not equivalent to `require`: `require` executes immediately and uses Lua
 
 ### Migration from automatic loading
 
-Add one explicit load call per desired file previously placed in `plugins/`, in your chosen order. Restart rness. Merely copying a file into that directory no longer activates it. See [plugin lifecycle](../plugins/loading-and-lifecycle.md).
+Add an explicit setup entry per desired source in your chosen order. Restart rness. Merely copying a file into a directory does not activate it. See [plugin lifecycle](../plugins/loading-and-lifecycle.md).
 
 ## Startup versus runtime
 
@@ -73,11 +84,11 @@ rness.hook.on("ready", function()
 end)
 ```
 
-The `ready` callback is not a guarantee that every Lua-defined tool has already been synchronized into the engine registry. Avoid relying on that ordering for immediate named-agent tool validation.
+The CLI synchronizes loaded Lua tools into the engine registry before firing `ready`. A current frontend session is not guaranteed at that point.
 
 ## Applying changes
 
-Restart the process after editing production Lua configuration or plugins. The production host currently rejects reload instead of reexecuting `init.lua` and potentially duplicating registrations. Legacy internal host modes used by tests have different reload behavior; they are not a promise of production hot reload.
+Restart after editing startup declarations, plugin selection, options, or central mappings. Explicit file/linked-package sources with `watch=true` reload registrations without reexecuting `init.lua`; managed Git packages and inline sources are not watchable. Busy engine maintenance is retried automatically. See [reload guarantees](../plugins/loading-and-lifecycle.md#runtime-reload).
 
 ## Troubleshooting
 

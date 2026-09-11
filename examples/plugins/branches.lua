@@ -1,3 +1,5 @@
+-- Add { name = "branches", file = "plugins/branches.lua" } to init.lua's setup list.
+-- This app uses legacy keymap/on_key controls, not plugin.keys slots.
 -- Branch tree — ctrl+b. Visualize the session DAG around the current
 -- session: ancestry up to the root, children fanning out below.
 --

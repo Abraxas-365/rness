@@ -433,6 +433,9 @@ impl Provider for OpenAiProvider {
             if cancel.is_cancelled() { return StepOutcome::Cancelled { partial: vec![] }; }
             return StepOutcome::Failed { error, partial: vec![] };
         }
+        if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
+            return StepOutcome::Failed { error, partial: vec![] };
+        }
         let mut http_request = self.client.post(format!("{}/chat/completions", self.base_url)).json(&body);
         if let Some(key) = &self.api_key { http_request = http_request.bearer_auth(key); }
         let response = tokio::select! {
@@ -470,7 +473,7 @@ impl Provider for OpenAiProvider {
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
                 .unwrap_or_else(|| format!("http {status}"));
             return StepOutcome::Failed {
-                error: ProviderError { code: "HTTP", retry_after, message, retryable },
+                error: ProviderError { code: crate::request_error_code(status.as_u16(), &body), retry_after, message, retryable },
                 partial: vec![],
             };
         }
@@ -483,6 +486,9 @@ impl Provider for OpenAiProvider {
         loop {
             match reader.pull(cancel).await {
                 SsePull::Event { data, .. } => {
+                    if let Some(error) = crate::stream_overflow("", &data) {
+                        return StepOutcome::Failed { error, partial: acc.chunks };
+                    }
                     if data.trim() == "[DONE]" {
                         return StepOutcome::Committed(acc.finish(&self.model));
                     }

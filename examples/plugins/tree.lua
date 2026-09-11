@@ -1,3 +1,5 @@
+-- Add { name = "tree", file = "plugins/tree.lua" } to init.lua's setup list.
+-- This app uses legacy keymap/on_key controls, not plugin.keys slots.
 -- File tree — ctrl+e. The dogfood proof: a stateful, interactive,
 -- event-driven app in pure Lua over rness.fs + rness.ui.app.
 --

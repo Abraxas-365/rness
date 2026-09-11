@@ -113,6 +113,41 @@ async fn live_sonnet_5_image_inference() {
     }
 }
 
+#[tokio::test]
+async fn wire_capture_matches_bytes_and_failed_audit_blocks_send() {
+    for mode in ["accept", "reject", "drop_ack", "drop_receiver"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/v1/messages"))
+            .respond_with(sse_response(&stream_happy("done")))
+            .expect(if mode == "accept" { 1 } else { 0 }).mount(&server).await;
+        let provider = AnthropicProvider::new("secret-api-key", "test").with_base_url(server.uri());
+        let context = user_context("source \"quoted\"\n日本語");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
+        let capture = async {
+            if mode == "drop_receiver" { drop(receiver); return None; }
+            let record = receiver.recv().await.unwrap();
+            assert!(server.received_requests().await.unwrap().is_empty());
+            assert!(!record.body.contains("secret-api-key"));
+            match mode {
+                "accept" => record.ack.send(Ok(())).unwrap(),
+                "reject" => record.ack.send(Err("disk full".into())).unwrap(),
+                _ => drop(record.ack),
+            }
+            Some(record.body)
+        };
+        let (outcome, body) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(rness_engine::turn::provider::WIRE_CAPTURE.scope(sender, step(&provider, &context, "system", &[])), capture)
+        }).await.expect("capture must not hang");
+        if mode == "accept" {
+            assert!(matches!(outcome, StepOutcome::Committed(_)));
+            assert_eq!(server.received_requests().await.unwrap()[0].body, body.unwrap().as_bytes());
+        } else {
+            assert!(matches!(outcome, StepOutcome::Failed { error, .. } if error.code == "AUDIT"));
+        }
+        server.verify().await;
+    }
+}
+
 fn user_context(text: &str) -> ModelContext {
     ModelContext {
         turns: vec![ModelTurn::User {

@@ -216,9 +216,14 @@ pub fn install(
         lua.create_function(move |lua, id: String| {
             let replayed = s.replay(&id).map_err(err)?;
             let t = lua.create_table()?;
-            t.set("input", replayed.context.usage.input_tokens)?;
-            t.set("output", replayed.context.usage.output_tokens)?;
-            t.set("turns", replayed.context.turns.len())?;
+            let latest = replayed.history.iter().rev().find_map(|event| match &event.event {
+                rness_protocol::events::SessionEvent::AssistantMessage(message) => Some(message.usage),
+                _ => None,
+            }).unwrap_or_default();
+            t.set("input", latest.input_tokens)?;
+            t.set("output", latest.output_tokens)?;
+            t.set("turns", replayed.history.iter().filter(|event| matches!(event.event,
+                rness_protocol::events::SessionEvent::TurnStarted { .. })).count())?;
             Ok(t)
         })?,
     )?;
@@ -258,6 +263,30 @@ pub fn install(
             Ok(t)
         })?,
     )?;
+
+    let s = Arc::clone(&sessions);
+    session.set("compaction_view", lua.create_function(move |lua, id: String| {
+        let view = s.replay(&id).map_err(err)?.context;
+        lua.to_value(&serde_json::json!({"messages": view.turns, "sources": view.sources}))
+    })?)?;
+    let s = Arc::clone(&sessions);
+    let block_rt = rt.clone();
+    session.set("compact_region", lua.create_function(move |lua, (id, opts): (String, Table)| {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Options {
+            start: usize, end: usize,
+            sources: Vec<rness_protocol::events::EventId>,
+            policy: rness_engine::turn::compaction::Policy,
+        }
+        let opts: Options = lua.from_value(mlua::Value::Table(opts))?;
+        if opts.start == 0 || opts.end < opts.start {
+            return Err(err("region uses one-based inclusive message indices"));
+        }
+        let permit = lua.app_data_ref::<rness_engine::service::CommandPermit>().map(|permit| permit.clone());
+        let cancel = lua.app_data_ref::<tokio_util::sync::CancellationToken>().map(|cancel| cancel.clone()).unwrap_or_default();
+        block_rt.block_on(s.compact_region_with_permit(&id, opts.start - 1, opts.end, opts.sources, opts.policy, permit, cancel)).map_err(err)
+    })?)?;
 
     let s = Arc::clone(&sessions);
     session.set(

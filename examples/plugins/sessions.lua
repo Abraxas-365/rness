@@ -1,3 +1,5 @@
+-- Add { name = "sessions", file = "plugins/sessions.lua" } to init.lua's setup list.
+-- This app uses legacy keymap/on_key controls, not plugin.keys slots.
 -- Session picker — ctrl+s. List sessions, jump between them, fork.
 --
 -- Pure Lua over rness.session + rness.ui.app. The "session:switch"

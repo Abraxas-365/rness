@@ -66,12 +66,27 @@ The actual write and model-visible result are unchanged by capture limits.
 Do not shorten `call.output` before returning a card if expansion should expose
 the full output. Use messagebox preview settings instead. Custom renderers own
 the whole card, including its header; built-in header options are not injected
-into custom cards. Messagebox configuration is startup-only.
+into custom cards. Messagebox configuration is startup-only. Renderer selection is user exact, user
+wildcard, plugin exact, then plugin wildcard; style-only overrides preserve the
+selected renderer. Structured cards may return `{header={left={...},right={...}},
+body={...}}` with styled spans, or legacy line arrays. Code/diff blocks use captured
+presentation data rather than live file reads. Callback execution has a 100 ms Lua
+instruction deadline and 16 MiB incremental VM allocation budget; blocking native
+calls are not covered by that deadline.
+
+Tool states `running`, `success`, `error`, and `cancelled` can override presentation.
+`collapsed`, `preview`, and `expanded` affect retained output only; expansion cannot
+restore output discarded during execution. View state is session-local. Width,
+theme, compaction, and height-changing updates can invalidate layout or adjust
+suffix indexes; the visual-row budget is not a bound on total transcript memory.
+
+Core messagebox actions also support [scoped user mappings](loading-and-lifecycle.md#scoped-mappings-and-help).
+Use `/help bindings` to inspect declared shortcuts and scoped overrides.
 
 ## Path references in terminal and HTTP
 
 Declare in a selected runtime plugin (off by default), loaded through
-`rness.plugins.load('references')` in init.lua:
+a `{name='references', file='./plugins/references.lua', watch=true}` entry in the single `rness.plugins.setup({...})` list in init.lua:
 
 ```lua
 rness.file_references.enable {
@@ -262,9 +277,11 @@ Evicted cached IDs are detected by metadata lookup and re-uploaded when next nee
 Copy desired files from `examples/plugins/` into `~/.rness/plugins/`, then select them:
 
 ```lua
-rness.plugins.load("text-tools")
-rness.plugins.load("bottomline")
-rness.plugins.load("session-log")
+rness.plugins.setup({
+  {name='text-tools', file='./plugins/text-tools.lua', watch=true},
+  {name='bottomline', file='./plugins/bottomline.lua', watch=true},
+  {name='session-log', file='./plugins/session-log.lua', watch=true},
+})
 ```
 
 | Recipe | Demonstrates |
@@ -272,7 +289,7 @@ rness.plugins.load("session-log")
 | `text-tools.lua` | A pure `text_stats` tool with JSON Schema, runtime input validation, and deterministic output |
 | `bottomline.lua` | A statusline callback with event-driven running-session counts |
 | `session-log.lua` | Turn hooks that log metadata without logging prompts or tool arguments |
-| `keymaps.lua` | Host action keybindings |
+| `keymaps.lua` | Deferred setup options, an owned prompt action, and a remappable/disableable binding slot |
 | `diffcards.lua` | Custom tool-result presentation |
 | `tree.lua` | Stateful sidebar application |
 | `sessions.lua` | Session-selection overlay |
@@ -286,7 +303,7 @@ Use `bottomline` as an alternative to the spinner, not as a second independent b
 ## Persistent tasks
 
 Copy `examples/plugins/tasks.lua` into `~/.rness/plugins/tasks.lua` and add
-`rness.plugins.load("tasks")` to `init.lua`. It enables the Rust `TaskWrite`
+`{name='tasks', file='./plugins/tasks.lua', watch=true}` to the existing setup list in `init.lua`. It enables the Rust `TaskWrite`
 tool and an optional Ctrl+T overlay. Nothing is enabled automatically.
 
 A minimal tool-only plugin is:
@@ -386,7 +403,7 @@ The original plan is not fully accepted.
 
 ## Model capabilities
 
-Copy `examples/lua/models.lua` to `~/.rness/lua/models.lua` and call `require("models")` from `init.lua`. Do not select it with `rness.plugins.load`: capabilities are startup declarations and changes require restart. The example uses `rness.models.declare { provider=..., model=..., capabilities=... }`, with `max_output_tokens` and structured `reasoning.efforts` / `reasoning.budget_tokens`.
+Copy `examples/lua/models.lua` to `~/.rness/lua/models.lua` and call `require("models")` from `init.lua`. Do not select it with `rness.plugins.setup`: capabilities are startup declarations and changes require restart. The example uses `rness.models.declare { provider=..., model=..., capabilities=... }`, with `max_output_tokens` and structured `reasoning.efforts` / `reasoning.budget_tokens`.
 
 Runtime readers `rness.models.get("provider/model")`, `rness.models.list()`, and `rness.models.capabilities(provider, model)` use the same startup registry as request validation. `get` returns nil for unknown models, `list` returns sorted names, and returned tables are copies. Spinner/autocompact therefore use the declared context window, retaining their fallback for unknown models. Runtime plugin reload does not change these facts. Declarations do not register providers, authenticate accounts, or set request defaults; verify gateway/account limits before enabling the catalog.
 

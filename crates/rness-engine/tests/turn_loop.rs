@@ -15,6 +15,234 @@ use rness_engine::turn::{run_turn, TurnConfig, TurnError};
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn middle_region_preserves_neighbors_and_rejects_invalid_endpoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    for text in ["before".into(), "middle ".repeat(3000), "after".into()] {
+        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text }], source: None })).unwrap();
+    }
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("summary", StopReason::EndTurn, vec![]))]);
+    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
+        &compact_policy(100000), false, Some(1..2), &CancellationToken::new()).await.unwrap());
+    let context = replay(&store, log.session()).unwrap().context;
+    assert_eq!(context.turns.len(), 3);
+    let rendered = serde_json::to_value(&context.turns).unwrap();
+    assert_eq!(rendered[0]["User"]["content"][0]["text"], "before");
+    assert!(rendered[1]["User"]["content"][0]["text"].as_str().unwrap().ends_with("summary"));
+    assert_eq!(rendered[2]["User"]["content"][0]["text"], "after");
+    assert!(!rendered.to_string().contains("middle middle"));
+    let invalid = rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
+        &compact_policy(100000), false, Some(2..4), &CancellationToken::new()).await;
+    assert!(invalid.is_err());
+}
+
+#[tokio::test]
+async fn failed_empty_and_nonshrinking_summaries_preserve_region_after_reopen() {
+    for (outcome, expected) in [
+        (StepOutcome::Failed { error: ProviderError { code: "TEST", message: "failed".into(), retryable: false, retry_after: None }, partial: vec![] }, "failed: TEST: failed"),
+        (StepOutcome::Committed(assistant("", StopReason::EndTurn, vec![])), "empty"),
+        (StepOutcome::Committed(assistant(&"long".repeat(5000), StopReason::EndTurn, vec![])), "non_shrinking"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "original".repeat(1000) }], source: None })).unwrap();
+        let session = log.session().clone();
+        let original = replay(&store, &session).unwrap().context;
+        let provider = Scripted::new(vec![outcome]);
+        assert!(!rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
+            &compact_policy(100000), false, Some(0..1), &CancellationToken::new()).await.unwrap());
+        drop(log);
+        let mut log = store.open(&session).unwrap();
+        let size = log.read_all().unwrap().len();
+        rness_engine::turn::compaction::recover(&mut log).unwrap();
+        assert_eq!(log.read_all().unwrap().len(), size);
+        assert_eq!(replay(&store, &session).unwrap().context, original);
+        assert!(log.read_all().unwrap().iter().any(|e| matches!(&e.event,
+            SessionEvent::CompactionFinished { outcome, .. } if outcome == expected)));
+    }
+}
+
+#[test]
+fn interrupted_compaction_recovery_is_idempotent_and_preserves_checkpoint() {
+    for committed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        let start = log.append(&SessionEvent::CompactionStarted { model: "test".into(),
+            sources: vec![], estimated_input: 10, request: serde_json::json!({"system":"summary", "turns":[]}) }).unwrap();
+        if committed {
+            log.append(&SessionEvent::Compaction(Compaction { replaces: vec![], summary: "retained".into(), model: "test".into() })).unwrap();
+        }
+        let session = log.session().clone();
+        drop(log);
+        let mut log = store.open(&session).unwrap();
+        rness_engine::turn::compaction::recover(&mut log).unwrap();
+        let recovered_len = log.read_all().unwrap().len();
+        drop(log);
+        let mut log = store.open(&session).unwrap();
+        rness_engine::turn::compaction::recover(&mut log).unwrap();
+        assert_eq!(log.read_all().unwrap().len(), recovered_len);
+        let history = log.read_all().unwrap();
+        let finishes: Vec<_> = history.iter().filter_map(|e| match &e.event {
+            SessionEvent::CompactionFinished { started, outcome, .. } => Some((started, outcome.as_str())), _ => None,
+        }).collect();
+        assert_eq!(finishes, vec![(&start.id, if committed { "committed_before_interruption" } else { "interrupted" })]);
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::Compaction(_))).count(), usize::from(committed));
+    }
+}
+
+#[test]
+fn route_meter_changes_estimate_without_changing_context() {
+    let context = rness_engine::session::projection::ModelContext {
+        turns: vec![rness_engine::session::projection::ModelTurn::User {
+            content: vec![ContentPart::Text { text: "test".repeat(200) }],
+        }], ..Default::default()
+    };
+    let original = context.clone();
+    let default = rness_engine::turn::compaction::Meter::default();
+    let dense = rness_engine::turn::compaction::Meter { bytes_per_token: 2, ..default.clone() };
+    assert!(dense.measure(&context, "system", &[]) > default.measure(&context, "system", &[]));
+    assert_eq!(context, original);
+    let mut invalid = compact_policy(1000);
+    invalid.meter.bytes_per_token = 0;
+    assert!(invalid.validate().is_err());
+    invalid.meter.bytes_per_token = 4;
+    invalid.meter.output_reserve = 1000;
+    assert!(invalid.validate().is_err());
+}
+
+fn compact_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
+    rness_engine::turn::compaction::Policy {
+        meter: Default::default(),
+        summary_selection: None,
+        threshold_tokens: threshold, retain_tokens: 40, summary_tokens: 100,
+        max_overflow_retries: 1, max_compactions: 2,
+        prune_threshold: 8192, prune_head: 4096, prune_tail: 1024,
+    }
+}
+
+#[tokio::test]
+async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
+    for overflow in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::RequestConfig(CallConfig {
+            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            ..Default::default()
+        })).unwrap();
+        for text in ["old ".repeat(3000), "recent".into()] {
+            log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+                content: vec![ContentPart::Text { text }], source: None })).unwrap();
+        }
+        let mut steps = vec![];
+        if overflow { steps.push(StepOutcome::Failed { error: ProviderError {
+            code: "CONTEXT_OVERFLOW", retryable: false, retry_after: None, message: "too long".into(),
+        }, partial: vec![] }); }
+        steps.push(StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![])));
+        steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+        let provider = Scripted::new(steps);
+        let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(if overflow { 100000 } else { 1000 }))].into(), ..Default::default() };
+        // Keep only the latest message in this fixture.
+        let mut config = config;
+        config.compaction.get_mut("test/fake-1").unwrap().retain_tokens = 1;
+        let outcome = run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
+            &CancellationToken::new(), &mut Vec::new, 1, &|_| {}).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let history = store.history(log.session()).unwrap();
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::Compaction(_))).count(), 1);
+        let started = history.iter().find(|e| matches!(e.event, SessionEvent::CompactionStarted { .. })).unwrap();
+        assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::CompactionFinished { started: id, outcome, usage, chunks }
+            if id == &started.id && outcome == "committed" && usage.input_tokens == 1 && !chunks.is_empty())));
+        let context = replay(&store, log.session()).unwrap().context;
+        assert!(!context.sources.contains(&started.id));
+        let texts = provider.seen_texts.lock().unwrap();
+        assert!(texts.last().unwrap().contains("brief"));
+        assert!(texts.last().unwrap().contains("recent"));
+        assert!(!texts.last().unwrap().contains("old old"));
+        assert!(provider.steps.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn overflowing_indivisible_request_does_not_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    log.append(&SessionEvent::RequestConfig(CallConfig { selection: Some(ModelSelection {
+        route: "test".into(), model: "fake-1".into(),
+    }), ..Default::default() })).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+        content: vec![ContentPart::Text { text: "huge".repeat(10000) }], source: None })).unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Failed { error: ProviderError {
+        code: "CONTEXT_OVERFLOW", retryable: false, retry_after: None, message: "too long".into(),
+    }, partial: vec![] }]);
+    let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(1000))].into(), ..Default::default() };
+    assert!(run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
+        &CancellationToken::new(), &mut Vec::new, 1, &|_| {}).await.is_err());
+    assert_eq!(provider.seen_contexts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn boundary_pruning_remeasures_without_summarizing_or_splitting_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    log.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+        content: vec![ContentPart::Text { text: "work".into() }], source: None })).unwrap();
+    log.append(&SessionEvent::AssistantMessage(assistant("", StopReason::ToolUse, vec![("c", "Echo")]))).unwrap();
+    let output = "x".repeat(16000);
+    log.append(&SessionEvent::ToolResult(ToolResult { call: "c".into(), name: "Echo".into(),
+        output: output.clone(), content: vec![ToolResultContentPart::Text { text: output }],
+        is_error: false, duration_ms: 0, tasks: None, plan_review: None, presentation: None,
+    })).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Steer,
+        content: vec![ContentPart::Text { text: "continue".into() }], source: None })).unwrap();
+    let provider = Scripted::new(vec![]); // Pruning alone must avoid any model call.
+    let mut policy = compact_policy(2000);
+    policy.retain_tokens = 1;
+    assert!(rness_engine::turn::compaction::reduce(&store, &mut log, &provider, "", &[], &policy,
+        false, &CancellationToken::new()).await.unwrap());
+    let replayed = replay(&store, log.session()).unwrap();
+    assert!(rness_engine::turn::compaction::measure(&replayed.context, "", &[]) < 2000);
+    assert_eq!(replayed.history.iter().filter(|e| matches!(e.event, SessionEvent::Prune(_))).count(), 1);
+    assert!(!replayed.history.iter().any(|e| matches!(e.event, SessionEvent::Compaction(_))));
+    // No TurnEnded was required: the existing writer reduced a closed step mid-turn.
+    assert!(!replayed.history.iter().any(|e| matches!(e.event, SessionEvent::TurnEnded { .. })));
+}
+
+#[tokio::test]
+async fn cancelled_summary_does_not_write_a_checkpoint() {
+    struct Cancels;
+    #[async_trait]
+    impl Provider for Cancels {
+        fn model(&self) -> &str { "test" }
+        async fn step(&self, _: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+            cancel.cancel();
+            StepOutcome::Committed(assistant("short", StopReason::EndTurn, vec![]))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    for text in ["old".repeat(3000), "keep".into()] {
+        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text }], source: None })).unwrap();
+    }
+    let mut policy = compact_policy(1000);
+    policy.retain_tokens = 1;
+    let cancel = CancellationToken::new();
+    assert!(!rness_engine::turn::compaction::reduce(&store, &mut log, &Cancels, "", &[], &policy, false, &cancel).await.unwrap());
+    assert!(cancel.is_cancelled());
+    assert!(!store.history(log.session()).unwrap().iter().any(|e| matches!(e.event, SessionEvent::Compaction(_))));
+}
+
 // -- scripted provider -----------------------------------------------------
 
 /// Plays a fixed sequence of step outcomes; records the contexts it saw.
@@ -215,6 +443,9 @@ async fn tool_roundtrip_turn_commits_and_replays() {
             SessionEvent::ToolResult(_) => "tool",
             SessionEvent::TurnEnded { .. } => "turn-",
             SessionEvent::AssistantAttempt(_) => "attempt",
+            SessionEvent::CompactionRequest { .. } => "compaction-request",
+            SessionEvent::CompactionStarted { .. } => "compaction+",
+            SessionEvent::CompactionFinished { .. } => "compaction-",
             SessionEvent::Compaction(_) => "compaction",
             SessionEvent::Prune(_) => "prune",
             SessionEvent::PlanMode { .. } => "plan",

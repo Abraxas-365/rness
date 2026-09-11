@@ -125,10 +125,18 @@ impl Default for Live {
 
 /// An admitted command holds session and extension reservations even before execution.
 /// Dropping it (including during unwinding) releases both reservations.
-pub struct PreparedCommand {
+struct CommandReservation {
     live: Arc<Live>,
     _operation: tokio::sync::OwnedMutexGuard<()>,
     _activity: tokio::sync::OwnedRwLockReadGuard<()>,
+}
+
+#[derive(Clone)]
+pub struct CommandPermit(std::sync::Weak<CommandReservation>);
+
+pub struct PreparedCommand {
+    live: Arc<Live>,
+    reservation: Arc<CommandReservation>,
     command: Arc<dyn crate::interaction::Command>,
     session: SessionId,
     raw_input: String,
@@ -140,6 +148,7 @@ impl PreparedCommand {
         if self.cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("completion cancelled".into())); }
         self.command.complete(service, crate::interaction::CommandInvocation {
             session: &self.session, raw_input: &self.raw_input, cancel: self.cancel.clone(),
+            permit: CommandPermit(Arc::downgrade(&self.reservation)),
         })
     }
 
@@ -151,6 +160,7 @@ impl PreparedCommand {
             session: &self.session,
             raw_input: &self.raw_input,
             cancel: self.cancel.clone(),
+            permit: CommandPermit(Arc::downgrade(&self.reservation)),
         }).map(Disposition::Command)
     }
 }
@@ -703,8 +713,16 @@ impl SessionService {
                 // an unavailable selected provider must not leave a session
                 // running with an input it cannot process.
                 let request_config = self.config(session)?;
-                let provider = self.provider_for(&request_config)?;
+                let mut provider = self.provider_for(&request_config)?;
+                if let Some(selection) = request_config.selection.as_ref()
+                    .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
+                    .and_then(|p| p.summary_selection.clone()) {
+                    let summary_config = CallConfig { selection: Some(selection), ..Default::default() };
+                    let summary = self.provider_for(&summary_config)?;
+                    provider = Arc::new(crate::turn::provider::SummaryProvider { main: provider, summary });
+                }
                 let mut log = self.store.open(session)?;
+                crate::turn::compaction::recover(&mut log)?;
                 // Workspace instructions precede the prompt that opens
                 // the turn (dsh baseline order).
                 self.ensure_instructions(&mut log, session)?;
@@ -762,7 +780,8 @@ impl SessionService {
         *active = Some(cancel.clone());
         drop(active);
         Ok(Some(PreparedCommand {
-            live, _operation: operation, _activity: activity, command, session: session.clone(),
+            reservation: Arc::new(CommandReservation { live: live.clone(), _operation: operation, _activity: activity }),
+            live, command, session: session.clone(),
             raw_input: text[offset..].to_owned(), cancel,
         }))
     }
@@ -881,6 +900,54 @@ impl SessionService {
 
         self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() });
         Ok(CompactReport { shadowed, summary })
+    }
+
+    /// Compact a zero-based half-open model-message region, rejecting stale snapshots.
+    pub async fn compact_region(&self, session: &SessionId, start: usize, end: usize,
+        expected_sources: Vec<rness_protocol::events::EventId>,
+        policy: crate::turn::compaction::Policy,
+    ) -> Result<bool, ServiceError> {
+        self.compact_region_with_permit(session, start, end, expected_sources, policy, None, CancellationToken::new()).await
+    }
+
+    pub async fn compact_region_with_permit(&self, session: &SessionId, start: usize, end: usize,
+        expected_sources: Vec<rness_protocol::events::EventId>, policy: crate::turn::compaction::Policy,
+        permit: Option<CommandPermit>, cancel: CancellationToken,
+    ) -> Result<bool, ServiceError> {
+        policy.validate().map_err(ServiceError::InvalidConfig)?;
+        let live = self.live(session);
+        let reservation = match permit {
+            Some(permit) => {
+                let reservation = permit.0.upgrade().ok_or(ServiceError::Busy)?;
+                if !Arc::ptr_eq(&reservation.live, &live) { return Err(ServiceError::Busy); }
+                Some(reservation)
+            }
+            None => None,
+        };
+        let _activity = if reservation.is_none() {
+            Some(self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?)
+        } else { None };
+        let _operation = if reservation.is_none() {
+            Some(live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?)
+        } else { None };
+        if cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("command cancelled".into())); }
+        if self.phase(session) != Phase::Idle { return Err(ServiceError::Busy); }
+        let replayed = replay(&self.store, session)?;
+        if replayed.context.sources != expected_sources {
+            return Err(ServiceError::InvalidConfig("stale compaction region".into()));
+        }
+        let mut provider = self.provider_for(&replayed.context.config)?;
+        if let Some(selection) = &policy.summary_selection {
+            let summary = self.provider_for(&CallConfig { selection: Some(selection.clone()), ..Default::default() })?;
+            provider = Arc::new(crate::turn::provider::SummaryProvider { main: provider, summary });
+        }
+        let mut log = self.store.open(session)?;
+        crate::turn::compaction::recover(&mut log)?;
+        let changed = crate::turn::compaction::reduce_region(&self.store, &mut log, provider.as_ref(),
+            "", &[], &policy, false, Some(start..end), &cancel).await
+            .map_err(|e| ServiceError::Summarizer(e.to_string()))?;
+        if changed { self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() }); }
+        Ok(changed)
     }
 
     /// Deterministically prune oversized tool results (dsh

@@ -1,4 +1,5 @@
--- Enable with rness.plugins.load("text-tools") in init.lua.
+-- Add { name = "text-tools", file = "plugins/text-tools.lua" } to init.lua's
+-- single rness.plugins.setup list after copying this file.
 -- A pure tool: no filesystem, network, or shell side effects.
 rness.tool.register {
   name = "text_stats",

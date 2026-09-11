@@ -1,26 +1,22 @@
--- keymaps.lua — rebind the HOST's keys (the Neovim model).
---
--- The engine ships a stock keymap (see rness-tui/src/keymaps.rs — the
--- ONE place the defaults live); this plugin rewrites entries at load
--- time and on every hot reload. Removing the plugin reverts everything:
--- the host recomputes stock+binds each sync.
---
--- Actions available today (host-side, fail-loud on typos):
---   scroll_up / scroll_down             one transcript line
---   scroll_up_page / scroll_down_page   ten lines
---   cancel_or_quit                      cancel a running turn, else quit
---   quit                                quit immediately
---
--- Chord language is shared with rness.ui.app{keymap=}: "ctrl+k",
--- "shift+up", "pageup", "alt+f2"…
---
--- NOTE: these are the keys the host handles AFTER the focused component
--- (editor, overlay) passes on a key. The editor's own bindings and app
--- toggle keys are separate seams.
+-- Add { name = "keymaps", file = "plugins/keymaps.lua" } to the single
+-- rness.plugins.setup list in init.lua after copying this file.
+-- opts.text customizes the inserted prompt; keys.insert_review remaps the
+-- stable slot to a chord/list, false disables it, and keys=false disables all
+-- plugin defaults. Central core mappings belong in init.lua's keymap.setup,
+-- not here: that API is startup-only. See examples/init.lua.
 
--- vim-flavored scrolling without leaving the home row:
-rness.keymaps.set("ctrl+k", "scroll_up")
-rness.keymaps.set("ctrl+j", "scroll_down")
+return function(opts, plugin)
+  local text = opts.text or "Review the current changes."
+  assert(type(text) == "string", "opts.text must be a string")
 
--- Disable a stock binding entirely (false = unbind):
--- rness.keymaps.set("ctrl+d", false)
+  plugin.action("insert_review", {
+    scope = "promptbox",
+    description = "Insert a review request without submitting",
+    run = function(ctx)
+      ctx.promptbox.insert(text)
+    end,
+  })
+  plugin.keys({
+    insert_review = { action = "insert_review", key = "<F6>" },
+  })
+end

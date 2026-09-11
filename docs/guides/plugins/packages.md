@@ -46,10 +46,12 @@ return "Hello"
 Then link the directory and explicitly activate it:
 
 ```lua
-rness.plugins.load("greeting")
+rness.plugins.setup({
+  { package = "greeting", watch = true }, -- watch only linked development packages
+})
 ```
 
-Restart rness to load it. `/unload greeting` unloads the running extension; it does not uninstall the package.
+Restart rness to load it. Omit `watch` for managed Git packages (watching them is rejected). Add this entry to your existing single setup list rather than calling setup again. Package entries must omit `name`; identity comes from the manifest. `/unload greeting` unloads the running extension; it does not uninstall the package. Stop affected sessions before updating or removing managed packages.
 
 ## Module resolution
 

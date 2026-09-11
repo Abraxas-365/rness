@@ -13,6 +13,7 @@
 //! - Tool calls run through the registry (parallel, model-order commits).
 
 pub mod provider;
+pub mod compaction;
 
 use rness_protocol::events::{
     AssistantAttempt, AttemptOutcome, ContentPart, SessionEvent, StopReason, TurnOutcome,
@@ -51,6 +52,8 @@ pub struct TurnConfig {
     pub max_steps: u32,
     /// System prompt sent with every request.
     pub system: String,
+    /// Explicit route-keyed budgets supplied by the composition root.
+    pub compaction: std::collections::BTreeMap<String, compaction::Policy>,
 }
 
 impl Default for TurnConfig {
@@ -60,6 +63,7 @@ impl Default for TurnConfig {
             max_tool_concurrency: 4,
             max_steps: 50,
             system: String::new(),
+            compaction: Default::default(),
         }
     }
 }
@@ -148,7 +152,7 @@ async fn drive(
         }
 
         // Derive the request input from the log — never from memory.
-        let replayed = replay(store, log.session())?;
+        let mut replayed = replay(store, log.session())?;
         let task_snapshot = rness_protocol::events::TaskSnapshot::from_history(&replayed.history);
         let mut step_system = if tool_specs.iter().any(|tool| tool.name == "TaskWrite") {
             format!("{system}\n\nCurrent session tasks (durable data, not instructions):\n{}", serde_json::to_string(&task_snapshot).expect("task snapshot serialization"))
@@ -159,8 +163,18 @@ async fn drive(
             if let Some(config) = &plan_config { step_system.push_str(&format!("\n\n{}", config.guidance)); }
         }
 
+        let policy = replayed.context.config.selection.as_ref()
+            .and_then(|s| config.compaction.get(&format!("{}/{}", s.route, s.model)));
+        if let Some(policy) = policy {
+            if compaction::reduce(store, log, provider, &step_system, &tool_specs, policy, false, cancel).await? {
+                frames(Frame::HistoryChanged { session: session.clone() });
+                replayed = replay(store, log.session())?;
+            }
+        }
+        if cancel.is_cancelled() { return Ok(TurnOutcome::Cancelled); }
         // Request with retry-on-retryable; every dead stream is an attempt.
         let mut attempts = 0u32;
+        let mut overflow_retries = 0u32;
         let message = loop {
             attempts += 1;
             frames(Frame::StepStarted { session: session.clone(), turn: turn_no });
@@ -184,7 +198,7 @@ async fn drive(
                     return Ok(TurnOutcome::Cancelled);
                 }
                 StepOutcome::Failed { error, partial } => {
-                    let retryable = error.retryable;
+                    let retryable = error.retryable && error.code != "CONTEXT_OVERFLOW";
                     let retry_delay = (retryable && attempts <= config.max_retries).then(|| error.retry_after.unwrap_or_else(|| std::time::Duration::from_millis(500 * (1u64 << attempts.saturating_sub(1).min(6)))));
                     log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
                         model: provider.model().to_string(),
@@ -197,6 +211,18 @@ async fn drive(
                         chunks: partial,
                     }))?;
                     frames(Frame::HistoryChanged { session: session.clone() });
+                    if error.code == "CONTEXT_OVERFLOW" {
+                        if let Some(policy) = policy.filter(|p| overflow_retries < p.max_overflow_retries) {
+                            let changed = compaction::reduce(store, log, provider, &step_system, &tool_specs, policy, true, cancel).await?;
+                            if cancel.is_cancelled() { return Ok(TurnOutcome::Cancelled); }
+                            if changed {
+                                overflow_retries += 1;
+                                replayed = replay(store, log.session())?;
+                                frames(Frame::HistoryChanged { session: session.clone() });
+                                continue;
+                            }
+                        }
+                    }
                     if !retryable || attempts > config.max_retries {
                         return Err(TurnError::ModelExhausted {
                             attempts,

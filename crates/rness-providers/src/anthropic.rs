@@ -522,6 +522,9 @@ impl Provider for AnthropicProvider {
                 if cancel.is_cancelled() { return StepOutcome::Cancelled { partial: vec![] }; }
                 return StepOutcome::Failed { error, partial: vec![] };
             }
+            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
+                return StepOutcome::Failed { error, partial: vec![] };
+            }
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
@@ -572,7 +575,7 @@ impl Provider for AnthropicProvider {
                     .and_then(|v| v["error"]["message"].as_str().map(String::from))
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { code: "HTTP", retry_after, message, retryable },
+                    error: ProviderError { code: crate::request_error_code(status.as_u16(), &body), retry_after, message, retryable },
                     partial: vec![],
                 };
             }
@@ -583,6 +586,9 @@ impl Provider for AnthropicProvider {
             loop {
                 match reader.pull(cancel).await {
                     SsePull::Event { event, data } => {
+                        if let Some(error) = crate::stream_overflow(&event, &data) {
+                            return StepOutcome::Failed { error, partial: acc.chunks };
+                        }
                         let at_ms = started.elapsed().as_millis() as u64;
                         if let Err(message) = acc.apply(&event, &data, at_ms) {
                             return StepOutcome::Failed {

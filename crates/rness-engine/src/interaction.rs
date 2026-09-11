@@ -20,6 +20,7 @@ pub struct CommandInvocation<'a> {
     /// Original arguments, including separator whitespace.
     pub raw_input: &'a str,
     pub cancel: tokio_util::sync::CancellationToken,
+    pub permit: crate::service::CommandPermit,
 }
 
 pub trait Command: Send + Sync {

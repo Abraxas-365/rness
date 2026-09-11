@@ -276,6 +276,69 @@ mod tests {
     }
 
     #[test]
+    fn compaction_lifecycle_recovers_at_every_torn_byte_boundary() {
+        use rness_protocol::events::{Compaction, Usage};
+        let root = tempfile::tempdir().unwrap();
+        let sid = "crash-matrix".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        log.append(&user_msg("original 日本語")).unwrap();
+        let prefix = fs::read(log.path()).unwrap();
+        let events = [
+            SessionEvent::CompactionStarted { model: "test".into(), sources: vec![], estimated_input: 100,
+                request: serde_json::json!({"text":"日本語"}) },
+            SessionEvent::CompactionRequest { started: "start".into(), body: "{\"text\":\"日本語\"}".into() },
+            SessionEvent::Compaction(Compaction { replaces: vec![], summary: "summary".into(), model: "test".into() }),
+            SessionEvent::CompactionFinished { started: "start".into(), outcome: "committed".into(), usage: Usage::default(), chunks: vec![] },
+        ];
+        let mut durable = prefix;
+        let path = log.path().to_path_buf();
+        drop(log);
+        for (stage, event) in events.into_iter().enumerate() {
+            let envelope = Envelope { id: if stage == 0 { "start".into() } else { format!("event-{stage}") }, at: now_rfc3339(), event };
+            let mut bytes = serde_json::to_vec(&envelope).unwrap();
+            bytes.push(b'\n');
+            for cut in 0..=bytes.len() {
+                let mut crash = durable.clone();
+                crash.extend_from_slice(&bytes[..cut]);
+                fs::write(&path, &crash).unwrap();
+                let mut reopened = SessionLog::open(root.path(), &sid).unwrap();
+                assert_eq!(fs::read(&path).unwrap(), if cut == bytes.len() { crash } else { durable.clone() });
+                crate::turn::compaction::recover(&mut reopened).unwrap();
+                let history = reopened.read_all().unwrap();
+                let has_start = stage > 0 || cut == bytes.len();
+                let has_checkpoint = stage > 2 || (stage == 2 && cut == bytes.len());
+                let finishes: Vec<_> = history.iter().filter_map(|e| match &e.event {
+                    SessionEvent::CompactionFinished { started, outcome, .. } => Some((started.as_str(), outcome.as_str())), _ => None,
+                }).collect();
+                if has_start {
+                    assert_eq!(finishes, vec![("start", if stage == 3 && cut == bytes.len() { "committed" }
+                        else if has_checkpoint { "committed_before_interruption" } else { "interrupted" })]);
+                } else { assert!(finishes.is_empty()); }
+                drop(reopened);
+                let mut reopened = SessionLog::open(root.path(), &sid).unwrap();
+                crate::turn::compaction::recover(&mut reopened).unwrap();
+                assert_eq!(history, reopened.read_all().unwrap());
+            }
+            durable.extend_from_slice(&bytes);
+        }
+    }
+
+    #[test]
+    fn failed_disk_write_does_not_acknowledge_or_change_committed_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "read-only-writer".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let before = log.read_all().unwrap();
+        // A real OS write error, independent of permissions or running as root.
+        log.file = File::open(log.path()).unwrap();
+        let result = log.append(&SessionEvent::CompactionRequest { started: "start".into(), body: "{}".into() });
+        assert!(matches!(result, Err(LogError::Io(_))));
+        assert_eq!(log.read_all().unwrap(), before);
+        drop(log);
+        assert_eq!(SessionLog::open(root.path(), &sid).unwrap().read_all().unwrap(), before);
+    }
+
+    #[test]
     fn incremental_reader_retries_torn_tail_without_rereading_prefix() {
         let root = tempfile::tempdir().unwrap();
         let sid = "incremental".to_string();

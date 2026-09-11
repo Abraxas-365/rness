@@ -1,12 +1,54 @@
 -- Single entry point. Copy to ~/.rness/init.lua and edit.
--- This file is NOT loaded from examples/. Lua changes currently require restart.
+-- This file is NOT loaded from examples/. Restart after changing startup config.
 -- Register providers, profiles, hooks and UI here. Hooks run after startup.
 -- Optional modules: require('providers') loads ~/.rness/lua/providers.lua.
--- Plugins are opt-in: selected files execute after engine mount, in this order.
--- Copy each desired example into ~/.rness/plugins/ before uncommenting:
--- rness.plugins.load("spinner")
--- rness.plugins.load("sessions")
--- Files in plugins/ are never activated automatically.
+-- Plugins are opt-in: setup runs after engine mount, in declaration order.
+-- Paths below are relative to the directory containing init.lua; plugins/ is
+-- only a suggested location. Copy selected files there before enabling them.
+-- Use ONE setup list. Copying or installing a plugin never activates it.
+rness.plugins.setup({
+  -- { name = "spinner", file = "plugins/spinner.lua", watch = true },
+  -- { name = "sessions", file = "plugins/sessions.lua", watch = true },
+  -- { name = "text-tools", file = "plugins/text-tools.lua" },
+  -- { name = "keymaps", file = "plugins/keymaps.lua",
+  --   opts = { text = "Review the current changes." },
+  --   keys = { insert_review = { "<F6>", "<F7>" } } },
+  -- Use keys = { insert_review = false } to disable one slot, or keys = false
+  -- to disable all defaults declared by plugin.keys (not legacy app handlers).
+  -- Installed package: identity comes from its manifest; do not add name.
+  -- { package = "my-plugin" },
+  -- Inline setup runs at the same deferred stage as file/package setup.
+  -- { name = "references", config = function(opts, plugin)
+  --     rness.file_references.enable(opts)
+  --   end, opts = { max_results = 20 } },
+})
+-- watch = true reloads selected files; init.lua/startup modules require restart.
+-- Managed Git packages cannot be watched; linked development packages can.
+-- Plain registration chunks remain valid with empty opts; options require a
+-- returned setup function. See plugins/keymaps.lua for actions and stable slots.
+
+-- Central mappings are startup-only. Add entries to this ONE mapping list.
+rness.keymap.setup({
+  -- { scope = "global", key = "ctrl+k", action = "core.scroll_up" },
+  -- { scope = "global", key = "ctrl+j", action = "core.scroll_down" },
+  -- { scope = "promptbox", key = "enter", action = "core.promptbox.noop" },
+  -- { scope = "promptbox", key = "f8", action = "core.promptbox.submit" },
+  -- { scope = "app:sessions", key = "f10", action = "core.app.close" },
+})
+-- Automatic boundary compaction is opt-in, configured here (restart required).
+-- Use verified model budgets; these numbers are illustrative, not capabilities.
+-- Do not also enable the legacy turn-end autocompact plugin for the same route.
+-- rness.compaction = {
+--   ["ollama/qwen3:14b"] = {
+--     threshold_tokens = 24000, retain_tokens = 4800, summary_tokens = 2048,
+--     max_overflow_retries = 1, max_compactions = 2,
+--     prune_threshold = 8192, prune_head = 4096, prune_tail = 1024,
+--   },
+-- }
+-- Budgets use heuristic request estimates, not exact provider token counts.
+-- System/tool definitions are included in pressure but cannot be compacted.
+
+-- /help bindings shows effective bindings; focused editors/modals capture input.
 -- Engine calls during startup belong inside rness.hook.on('ready', function() ... end).
 -- No credentials are stored here: auth references environment or credential store.
 
@@ -79,6 +121,11 @@ rness.profiles.declare("router-sonnet", {
 
 -- Roles are selectable as the principal agent; delegation requires opt-in.
 -- You can move these declarations to ~/.rness/lua/agents.lua and require('agents').
+-- For scout, planner, worker, reviewer, researcher, context-builder, oracle,
+-- and delegate examples, copy examples/lua/roles.lua to ~/.rness/lua/roles.lua.
+-- Remove the worker declaration below before enabling require("roles").
+-- Prefer spawn + a focused prompt for exploration; profiles can select a cheaper model.
+-- require("roles")
 rness.agents.declare("architect", {
   description = "Designs architecture with the user.",
   instructions = "Discuss requirements and tradeoffs before proposing implementation.",

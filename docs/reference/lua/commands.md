@@ -2,7 +2,7 @@
 
 ## Opt-in structured questions
 
-Enable the built-in question tool in `~/.rness/plugins/questions.lua`, loaded explicitly with `rness.plugins.load("questions")` from `init.lua`:
+Enable the built-in question tool in `~/.rness/plugins/questions.lua`, loaded explicitly with a `{name='questions', file='./plugins/questions.lua', watch=true}` entry in `rness.plugins.setup({...})` from `init.lua`:
 
 ```lua
 rness.questions.enable {
@@ -13,7 +13,7 @@ rness.questions.enable {
 }
 ```
 
-Calling `enable()` without arguments uses these defaults. No tool is registered unless explicitly enabled. `enable` and `disable` are plugin-load declarations, not callback APIs. The last successful enabling plugin owns the configuration; unloading that owner removes the tool and dismisses pending questions. For a loose plugin file, use `/unload plugins/questions.lua`. Unloading another plugin does not disable questions. Failed loads and failed reloads do not apply question changes. Successful reload replaces the owner/configuration from the new plugin set. Startup declarations in `init.lua` remain supported.
+Calling `enable()` without arguments uses these defaults. No tool is registered unless explicitly enabled. `enable` and `disable` are plugin-load declarations, not callback APIs. The last successful enabling plugin owns the configuration; unloading that owner removes the tool and dismisses pending questions. For the explicitly named source above, use `/unload questions`. Unloading another plugin does not disable questions. Failed loads and failed reloads do not apply question changes. Successful reload replaces the owner/configuration from the new plugin set. Startup declarations in `init.lua` remain supported.
 
 The stock renderer remains mounted but inactive without pending questions. It reads title, height and priority dynamically and uses the active theme. An explicitly opened Lua overlay (such as the session picker) temporarily takes focus; closing it restores the question. Drafts are preserved per session/call. Closing the local frontend dismisses pending questions and removes the tool. Headless prompt mode removes AskUser because it has no human answer frontend.
 
@@ -42,7 +42,7 @@ Explicit rules override the global `--approval` setting for that tool. Unmatched
 These permissions cannot broaden agent tool ceilings. They do not sandbox plugins or intercept direct tool calls, command callbacks, `rness.process`, filesystem access, or network calls inside plugins. No filesystem/network restriction is enabled automatically.
 
 
-Load the plugin explicitly with `rness.plugins.load("commands")` from init.lua. Registration occurs during plugin loading, not inside callbacks.
+Load the plugin with a `{name='commands', file='./plugins/commands.lua'}` entry in the existing `rness.plugins.setup({...})` list in init.lua. Registration occurs during plugin loading, not inside callbacks.
 
 ```lua
 rness.commands.register {

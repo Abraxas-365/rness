@@ -1,6 +1,7 @@
 -- diffcards.lua — rich cards for edit/write tool calls.
 --
--- Copyable example (zero magic): cp to ~/.rness/plugins/ to use it.
+-- Copy this file, then add { name = "diffcards", file = "plugins/diffcards.lua" }
+-- to init.lua's single rness.plugins.setup list. Copying alone does not enable it.
 --
 -- rness.ui.tool_card(name, render) registers a renderer for one tool
 -- ("*" = catch-all). render(call) gets { name=, args=, output=,

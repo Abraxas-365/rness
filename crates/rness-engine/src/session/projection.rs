@@ -15,7 +15,7 @@ use rness_protocol::events::{
 };
 
 /// One entry of the conversation as the model will see it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum ModelTurn {
     User { content: Vec<ContentPart> },
     Assistant { content: Vec<ContentPart> },
@@ -166,6 +166,9 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
             SessionEvent::RequestConfig(c) => ctx.config = c.clone(),
             // Structure and trace events never reach the model.
             SessionEvent::Header(_)
+            | SessionEvent::CompactionRequest { .. }
+            | SessionEvent::CompactionStarted { .. }
+            | SessionEvent::CompactionFinished { .. }
             | SessionEvent::PlanMode { .. }
             | SessionEvent::AssistantAttempt(_)
             | SessionEvent::TurnStarted { .. }
@@ -217,6 +220,9 @@ pub fn transcript(history: &[Envelope]) -> Transcript {
             SessionEvent::Compaction(_) => {} // replayed at its anchor
             SessionEvent::Prune(_) => {} // replayed at its target
             SessionEvent::Header(_)
+            | SessionEvent::CompactionRequest { .. }
+            | SessionEvent::CompactionStarted { .. }
+            | SessionEvent::CompactionFinished { .. }
             | SessionEvent::PlanMode { .. }
             | SessionEvent::RequestConfig(_)
             | SessionEvent::TurnStarted { .. }

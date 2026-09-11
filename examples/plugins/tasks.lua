@@ -1,3 +1,5 @@
+-- Add { name = "tasks", file = "plugins/tasks.lua" } to init.lua's setup list.
+-- This app uses legacy keymap/on_key controls, not plugin.keys slots.
 -- Rust owns durable tasks; Lua owns activation, layout, and navigation.
 rness.tasks.enable { allow_parallel_in_progress = true }
 
