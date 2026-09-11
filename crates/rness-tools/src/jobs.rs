@@ -141,7 +141,7 @@ impl Default for JobRegistry {
 }
 
 /// Consume the unread output window (bounded), advancing the read cursor.
-fn drain_output(job: &Job) -> (String, JobStatus) {
+fn drain_output(job: &Job) -> (String, JobStatus, Value) {
     let mut state = job.state.lock().expect("job lock");
     let unread = &state.output[state.read_from..];
     // Keep the TAIL of an oversized window: the newest output is what the
@@ -155,8 +155,13 @@ fn drain_output(job: &Job) -> (String, JobStatus) {
     if skipped > 0 {
         text = format!("… {skipped} bytes skipped …\n{text}");
     }
+    let presentation = json!({
+        "version":1,"kind":"job_output","status":state.status.marker(),
+        "start_byte":state.read_from + skipped,"end_byte":state.output.len(),
+        "skipped_bytes":skipped,"truncated":skipped > 0,
+    });
     state.read_from = state.output.len();
-    (text, state.status)
+    (text, state.status, presentation)
 }
 
 // -- job_output --------------------------------------------------------------
@@ -196,19 +201,30 @@ impl Tool for JobOutputTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.read_presented(args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.read_presented(args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl JobOutputTool {
+    async fn read_presented(&self, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get(id)?;
         let wait = args["wait"].as_bool().unwrap_or(false);
         let timeout = std::time::Duration::from_millis(args["timeout_ms"].as_u64().unwrap_or(30_000));
 
-        let (mut text, mut status) = drain_output(&job);
+        let (mut text, mut status, mut metadata) = drain_output(&job);
         if wait && text.is_empty() && status == JobStatus::Running {
             // Subscribe BEFORE re-checking to avoid a lost wakeup, then wait
             // for change or timeout; a still-running job stays alive.
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 let notified = job.changed.notified();
-                (text, status) = drain_output(&job);
+                (text, status, metadata) = drain_output(&job);
                 if !text.is_empty() || status != JobStatus::Running {
                     break;
                 }
@@ -217,11 +233,12 @@ impl Tool for JobOutputTool {
                 }
             }
         }
-        Ok(if text.is_empty() {
+        metadata["job_id"] = json!(id);
+        Ok((if text.is_empty() {
             format!("(no new output)\n{}", status.marker())
         } else {
             format!("{text}\n{}", status.marker())
-        })
+        }, metadata))
     }
 }
 
@@ -252,20 +269,37 @@ impl Tool for JobListTool {
     }
 
     async fn execute(&self, _args: Value) -> Result<String, String> {
+        self.list_presented().map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, _session: &String, _call: &String, _args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.list_presented()?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl JobListTool {
+    fn list_presented(&self) -> Result<(String, Value), String> {
         let jobs = self.jobs.inner.jobs.lock().expect("jobs lock");
+        let mut records = Vec::new();
+        let mut metadata_bytes = 0;
         if jobs.is_empty() {
-            return Ok("No background jobs".into());
+            return Ok(("No background jobs".into(), json!({"version":1,"kind":"job_list","jobs":[],"truncated":false})));
         }
         let mut lines: Vec<(u64, String)> = jobs
             .iter()
             .map(|(id, job)| {
                 let state = job.state.lock().expect("job lock");
                 let n: u64 = id[1..].parse().unwrap_or(0);
+                let record = json!({"job_id":id,"kind":state.kind,"status":state.status.marker(),"label":state.label});
+                metadata_bytes += serde_json::to_vec(&record).unwrap().len();
+                if metadata_bytes <= 48 * 1024 { records.push(record); }
                 (n, format!("{id} [{}] {} — {}", state.kind, state.status.marker(), state.label))
             })
             .collect();
         lines.sort();
-        Ok(lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
+        let metadata = json!({"version":1,"kind":"job_list","total":jobs.len(),"truncated":records.len()<jobs.len(),"jobs":records});
+        Ok((lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"), metadata))
     }
 }
 
@@ -303,6 +337,17 @@ impl Tool for JobKillTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.kill_presented(args).map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.kill_presented(args)?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl JobKillTool {
+    fn kill_presented(&self, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get(id)?;
         let already = {
@@ -317,10 +362,10 @@ impl Tool for JobKillTool {
         };
         if already {
             let state = job.state.lock().expect("job lock");
-            return Ok(format!("job {id} already finished {}", state.status.marker()));
+            return Ok((format!("job {id} already finished {}", state.status.marker()), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":false,"status":state.status.marker()})));
         }
         job.cancel.cancel();
         job.changed.notify_waiters();
-        Ok(format!("cancellation requested for job {id}"))
+        Ok((format!("cancellation requested for job {id}"), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":true})))
     }
 }

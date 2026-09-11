@@ -375,7 +375,12 @@ async fn main() -> anyhow::Result<()> {
     let credential_store = CredentialStore::new(CredentialStore::default_path());
     let resolver_routes = route_table.clone();
     let resolver_store = credential_store.clone();
+    let image_policy = startup.images.clone();
+    let image_root = CredentialStore::default_path().parent().context("credential store has no parent")?.join("images");
+    let image_store = Arc::new(rness_engine::images::ImageStore::new(image_root, image_policy.clone()).map_err(anyhow::Error::msg)?);
+    let resolver_images = image_store.clone();
     let provider_resolver: Arc<rness_engine::service::ProviderResolver> = Arc::new(move |selection| {
+        let mut provider = (|| {
         if let Some(credential) = auth_oauth.get(&selection.route) {
             let route = resolver_routes.get(&selection.route).ok_or("unknown provider")?;
             return routes::build_with_oauth(route, &selection.model, resolver_store.clone(), credential.clone());
@@ -398,6 +403,10 @@ async fn main() -> anyhow::Result<()> {
             resolver_store.clone(),
         )
         .map_err(|e| e.to_string())
+        })()?;
+        Arc::get_mut(&mut provider).ok_or("new provider unexpectedly shared")?
+            .configure_images(resolver_images.clone(), image_policy.clone());
+        Ok(provider)
     });
 
     let provider = provider_resolver(creation_seed.selection.as_ref().unwrap())
@@ -459,6 +468,7 @@ async fn main() -> anyhow::Result<()> {
         .services()
         .get::<SessionService>("sessions")
         .context("sessions service missing")?;
+    sessions.set_images(image_store)?;
     sessions.set_default_workspace(cwd.to_string_lossy().into_owned())?;
     let legacy_skill_roots = rness_tools::skills::default_roots(&cwd);
     sessions.set_input_resolver(Arc::new(move |workspace, content| {
@@ -631,7 +641,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         // Run the TUI over protocol frames.
-        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone())
+        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone(), startup.messagebox.clone())
             .await;
     };
 
@@ -668,6 +678,7 @@ async fn main() -> anyhow::Result<()> {
 fn print_parts(who: &str, parts: &[ContentPart]) {
     for part in parts {
         match part {
+            ContentPart::Image { attachment } => println!("{who}: [Image {} × {} · {} bytes]", attachment.width, attachment.height, attachment.bytes),
             ContentPart::Text { text } => println!("{who}: {text}"),
             ContentPart::Thinking { .. } => {}
             ContentPart::ToolUse { name, .. } => eprintln!("[{who} calls {name}]"),
@@ -775,6 +786,12 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
 }
 
 impl rness_tui::app::Backend for LocalBackend {
+    fn read_image(&self, session: &SessionId, id: &str) -> Result<Vec<u8>, String> {
+        self.sessions.read_image(session, id).map(|(_, bytes)| bytes).map_err(|e| e.to_string())
+    }
+    fn admit_image(&self, session: &SessionId, data: &[u8], media_type: &str) -> Result<rness_protocol::events::ImageRef, String> {
+        self.sessions.admit_image(session, data, media_type).map_err(|e| e.to_string())
+    }
     fn complete(&self, session: &SessionId, text: String) {
         if let Some(start) = text.rfind('@').filter(|_| !text.starts_with('/')) {
             let cancel = tokio_util::sync::CancellationToken::new();
@@ -864,6 +881,10 @@ impl rness_tui::app::Backend for LocalBackend {
         }
     }
 
+    fn history_after(&self, session: &SessionId, after: &str) -> Option<Vec<rness_protocol::events::Envelope>> {
+        self.sessions.store().history_after(session, after).ok().flatten()
+    }
+
     fn history(&self, session: &SessionId) -> History {
         let envelopes = self.sessions.store().history(session).unwrap_or_default();
         History { session: session.clone(), envelopes }
@@ -885,32 +906,17 @@ async fn run_tui(
     schemes: std::collections::BTreeMap<String, serde_json::Value>,
     selected_scheme: Option<String>,
     promptbox_config: serde_json::Value,
+    messagebox_config: serde_json::Value,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
     use rness_tui::slots::Slots;
 
-    // Frames for the ACTIVE session flow bus → channel → TUI loop. The
-    // watched id is shared: switching sessions (Lua picker) retargets it.
+    // Keep background streams flowing so switching sessions cannot lose deltas.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let watched = Arc::new(std::sync::RwLock::new(session.clone()));
-    let watched_sub = Arc::clone(&watched);
     let _frame_sub = kernel.bus().on::<FrameEv>(move |frame| {
-        use rness_protocol::frames::Frame;
-        let s = match frame {
-            Frame::StepStarted { session, .. }
-            | Frame::Delta { session, .. }
-            | Frame::ToolStarted { session, .. }
-            | Frame::ToolOutput { session, .. }
-            | Frame::StepCommitted { session, .. }
-            | Frame::TurnIdle { session }
-            | Frame::HistoryChanged { session }
-            | Frame::ApprovalRequested { session, .. }
-            | Frame::ApprovalResolved { session, .. } => session,
-        };
-        if *s == *watched_sub.read().unwrap() {
-            let _ = tx.send(frame.clone());
-        }
+        let _ = tx.send(frame.clone());
     });
 
     // Built-in modules self-install through the same slot seam Lua
@@ -998,19 +1004,26 @@ async fn run_tui(
 
     // Lua tool cards: when a step commits, render any NEW tool results
     // through the Lua card seam off the render path. Miss (no renderer,
-    // nil, error) = no cache entry = built-in card. Cheap: re-reads the
-    // watched session's history per commit, skips already-cached calls.
+    // nil, error) = no cache entry = built-in card. Cursor deltas avoid
+    // reassembling prior history until the session or plugin generation changes.
     let (card_tx, mut card_rx) = tokio::sync::mpsc::unbounded_channel::<SessionId>();
     let card_task = {
         let lua = lua.clone();
         let cache = card_cache.clone();
         let sessions = Arc::clone(&sessions);
         tokio::spawn(async move {
+            let mut cursor: Option<(SessionId, String, u64)> = None;
+            let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> = Default::default();
             while let Some(sid) = card_rx.recv().await {
-                let Ok(history) = sessions.store().history(&sid) else { continue };
-                // call id → (name, args) from assistant ToolUse parts.
-                let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> =
-                    Default::default();
+                let generation = cache.generation();
+                let delta = cursor.as_ref().filter(|(session, _, epoch)| session == &sid && *epoch == generation)
+                    .and_then(|(_, after, _)| sessions.store().history_after(&sid, after).ok().flatten());
+                let history = if let Some(delta) = delta { delta } else {
+                    calls.clear();
+                    let Ok(history) = sessions.store().history(&sid) else { continue };
+                    history
+                };
+                if let Some(last) = history.last() { cursor = Some((sid.clone(), last.id.clone(), generation)); }
                 for env in &history {
                     match &env.event {
                         rness_protocol::events::SessionEvent::AssistantMessage(m) => {
@@ -1024,9 +1037,9 @@ async fn run_tui(
                             if cache.contains(&r.call) {
                                 continue;
                             }
-                            let Some((name, args)) = calls.get(&r.call) else { continue };
+                            let Some((_name, args)) = calls.get(&r.call) else { continue };
                             let generation = cache.generation();
-                            if let Some(lines) = rness_engine::presentation::ToolCards::tool_card(&lua, name, args.clone(), &r.output, r.is_error).await
+                            if let Some(lines) = rness_engine::presentation::ToolCards::tool_card_result(&lua, args.clone(), r).await
                             {
                                 cache.insert_if_current(
                                     generation,
@@ -1240,6 +1253,8 @@ async fn run_tui(
 
     let mut app = App::new(Model::new(session.clone(), model_name), slots, backend);
     app.apply(rness_tui::app::Action::Custom("input:promptbox-config".into(), promptbox_config));
+    app.theme.validate_messagebox(&messagebox_config).map_err(anyhow::Error::msg)?;
+    app.apply(rness_tui::app::Action::Custom("chat:messagebox-config".into(), messagebox_config));
     app.colorschemes = colorschemes;
     if let Some(name) = selected_scheme { app.theme = app.colorschemes.get(&name).context("unknown initial colorscheme")?.clone(); }
     app.apps = Some(apps_state);

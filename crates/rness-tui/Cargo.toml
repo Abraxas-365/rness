@@ -13,6 +13,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 pulldown-cmark.workspace = true
 syntect.workspace = true
+similar.workspace = true
 unicode-width.workspace = true
 textwrap.workspace = true
 serde.workspace = true
@@ -20,6 +21,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
+arboard = "3.6"
+image.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

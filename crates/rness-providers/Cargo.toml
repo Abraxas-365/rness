@@ -12,7 +12,7 @@ rness-engine.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 eventsource-stream.workspace = true
 futures-core.workspace = true
 futures-util.workspace = true
@@ -29,5 +29,6 @@ jiff.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 wiremock.workspace = true
 tempfile.workspace = true

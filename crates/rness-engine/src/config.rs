@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelCapabilities {
+    /// None leaves support unknown; false explicitly forbids image input.
+    pub image_input: Option<bool>,
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<ReasoningCapabilities>,

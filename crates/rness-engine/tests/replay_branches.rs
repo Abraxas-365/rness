@@ -63,7 +63,9 @@ fn full_turn_with_attempt_projects_and_replays() {
     // Retry succeeds with a tool call, tool result commits, final answer.
     log.append(&assistant_tool_use()).unwrap();
     log.append(&SessionEvent::ToolResult(ToolResult {
-        tasks: None, plan_review: None,
+        content: vec![], tasks: None, plan_review: None, presentation: Some(serde_json::json!({
+            "version":1,"kind":"read","text":"127.0.0.1 localhost","start_line":1,
+        })),
         call: "c1".into(),
         name: "Read".into(),
         output: "127.0.0.1 localhost".into(),
@@ -75,8 +77,15 @@ fn full_turn_with_attempt_projects_and_replays() {
     log.append(&SessionEvent::TurnEnded { turn: 1, outcome: TurnOutcome::Completed }).unwrap();
     drop(log);
 
-    // Replay: invariant-checked derivation.
+    // Reopen through a fresh store, not an in-memory event cache.
+    let store = SessionStore::new(dir.path());
     let replayed = replay(&store, &sid).unwrap();
+    let result = replayed.history.iter().find_map(|env| match &env.event {
+        SessionEvent::ToolResult(result) => Some(result),
+        _ => None,
+    }).unwrap();
+    assert_eq!(result.presentation.as_ref().unwrap()["text"], "127.0.0.1 localhost");
+    assert_eq!(result.output, "127.0.0.1 localhost");
 
     // Model context: user -> assistant(tool_use) -> tool_results -> assistant.
     // The attempt is NOT there; turn markers are NOT there.

@@ -95,6 +95,13 @@ impl Slots {
         self.winner_mut(INPUT_FOOTER, ctx)
     }
 
+    pub fn message_key(&mut self, ctx: &Ctx<'_>, key: crossterm::event::KeyEvent) -> crate::component::KeyOutcome {
+        if self.overlay_active(ctx) || self.winner(SIDEBAR, ctx).is_some() {
+            return crate::component::KeyOutcome::pass();
+        }
+        self.winner_mut(MESSAGE_BODY, ctx).map(|c| c.on_key(ctx, key)).unwrap_or_else(crate::component::KeyOutcome::pass)
+    }
+
     /// Deliver a custom action to every mounted component.
     pub fn broadcast(&mut self, ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
         for list in self.slots.values_mut() {

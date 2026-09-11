@@ -25,6 +25,94 @@ fn sse_response(events: &[(&str, serde_json::Value)]) -> ResponseTemplate {
         .set_body_string(sse(events))
 }
 
+#[tokio::test]
+async fn files_are_reused_and_missing_files_reuploaded() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"}))).expect(1).mount(&server).await;
+    Mock::given(method("GET")).and(path("/v1/files/file_image")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(sse_response(&[])).expect(2).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy { anthropic_files:true, ..Default::default() };
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext { turns:vec![ModelTurn::User { content:vec![ContentPart::Image { attachment }] }], ..Default::default() };
+    let provider = AnthropicProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy);
+    for _ in 0..2 {
+        let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+    }
+    for request in server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/v1/messages") {
+        let body:serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["source"], json!({"type":"file","file_id":"file_image"}));
+    }
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_reuploaded"}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/messages")).and(body_partial_json(json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_reuploaded"}}]}]}))).respond_with(sse_response(&[])).expect(1).mount(&server).await;
+    let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_recovered"}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(|request: &wiremock::Request| {
+        let body: serde_json::Value = request.body_json().unwrap();
+        if body["messages"][0]["content"][0]["source"]["file_id"] == "file_reuploaded" {
+            ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"file_reuploaded file expired"}}))
+        } else { sse_response(&stream_happy("recovered")) }
+    }).expect(2).mount(&server).await;
+    let outcome = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+    assert!(matches!(outcome, StepOutcome::Committed(_)));
+}
+
+#[tokio::test]
+#[ignore = "live Anthropic OAuth call; explicitly run with --ignored --nocapture"]
+async fn live_sonnet_5_image_inference() {
+    use rness_providers::auth::{CredentialSource, CredentialStore};
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy::default();
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let pixels = image::RgbImage::from_fn(128, 64, |x, _| {
+        if x < 64 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) }
+    });
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(pixels).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let mut context = ModelContext {
+        turns: vec![ModelTurn::User { content: vec![
+            ContentPart::Text { text: "Name the two colors in this image from left to right. Reply with only the color names.".into() },
+            ContentPart::Image { attachment },
+        ] }],
+        ..Default::default()
+    };
+    let credentials = CredentialSource::new(CredentialStore::new(CredentialStore::default_path()))
+        .oauth_only("anthropic".into());
+    let provider = AnthropicProvider::with_credentials(credentials, "claude-sonnet-5")
+        .with_max_tokens(128).with_images(store, policy);
+    for attempt in 0..2 {
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(120),
+            step(&provider, &context, "", &[])).await.expect("live request timed out");
+        match outcome {
+            StepOutcome::Committed(message) => {
+                let text = message.content.iter().filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join(" ");
+                println!("live claude-sonnet-5 request {}: {}", attempt + 1, text);
+                let lower = text.to_lowercase();
+                assert!(lower.find("red").zip(lower.find("blue")).is_some_and(|(red, blue)| red < blue), "incorrect image interpretation");
+                context.turns.push(ModelTurn::Assistant { content: message.content });
+                context.turns.push(ModelTurn::User { content: vec![ContentPart::Text {
+                    text: "Using the earlier image, repeat its colors from left to right. Only the names.".into()
+                }] });
+            }
+            StepOutcome::Failed { error, .. } => panic!("live request failed: {} {}", error.code, error.message),
+            StepOutcome::Cancelled { .. } => panic!("live request cancelled"),
+        }
+    }
+}
+
 fn user_context(text: &str) -> ModelContext {
     ModelContext {
         turns: vec![ModelTurn::User {
@@ -237,7 +325,7 @@ async fn tool_results_map_to_tool_result_messages() {
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
-                    tasks: None, plan_review: None,
+                    content: vec![], tasks: None, plan_review: None, presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),
@@ -252,6 +340,13 @@ async fn tool_results_map_to_tool_result_messages() {
     let provider = AnthropicProvider::new("k", "claude-test-1").with_base_url(server.uri());
     let outcome = step(&provider, &context, "", &[]).await;
     assert!(matches!(outcome, StepOutcome::Committed(_)));
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body = String::from_utf8(request.body).unwrap();
+        assert!(!body.contains("UI_ONLY_SENTINEL"));
+        assert!(!body.contains("presentation"));
+    }
 }
 
 #[tokio::test]

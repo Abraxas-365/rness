@@ -168,6 +168,7 @@ pub type ProviderResolver = dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>,
 pub type InputResolver = dyn Fn(Option<&std::path::Path>, Vec<ContentPart>) -> Result<Vec<ContentPart>, String> + Send + Sync;
 
 pub struct SessionService {
+    images: Arc<std::sync::OnceLock<Arc<crate::images::ImageStore>>>,
     store: Arc<SessionStore>,
     /// Legacy/default provider retained for direct construction in tests and
     /// embeddings that deliberately do not resolve durable selections.
@@ -303,6 +304,7 @@ impl SessionService {
         bus: Arc<EventBus>,
     ) -> Self {
         Self {
+            images: tools.images.clone(),
             store: Arc::new(store),
             provider,
             resolver: None,
@@ -326,6 +328,66 @@ impl SessionService {
         }
     }
 
+    pub fn set_images(&self, images: Arc<crate::images::ImageStore>) -> Result<(), ServiceError> {
+        self.images.set(images).map_err(|_| ServiceError::InvalidConfig("image store already configured".into()))
+    }
+
+    pub fn set_image_processor(&self, processor: Option<(String, Arc<crate::images::ImageProcessor>)>) -> Result<(), ServiceError> {
+        self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+            .set_processor(processor).map_err(ServiceError::InvalidConfig)
+    }
+
+    pub fn image_policy(&self, update: Option<serde_json::Value>) -> Result<crate::images::ImagePolicy, ServiceError> {
+        let store = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?;
+        if let Some(update) = update {
+            let mut value = serde_json::to_value(store.effective_request_policy(store.policy())).map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
+            let fields = update.as_object().ok_or_else(|| ServiceError::InvalidConfig("image policy must be an object".into()))?;
+            for (key, field) in fields { value[key] = field.clone(); }
+            let policy = serde_json::from_value(value).map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
+            store.set_request_policy(Some(policy)).map_err(ServiceError::InvalidConfig)?;
+        }
+        Ok(store.effective_request_policy(store.policy()))
+    }
+
+    pub fn admit_image(&self, session: &SessionId, data: &[u8], media_type: &str) -> Result<rness_protocol::events::ImageRef, ServiceError> {
+        self.store.history(session)?;
+        self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+            .admit_for_session(session, data, media_type).map_err(ServiceError::InvalidConfig)
+    }
+
+    /// Only session-referenced images may be retrieved through this boundary.
+    pub fn read_image(&self, session: &SessionId, id: &str) -> Result<(String, Vec<u8>), ServiceError> {
+        let history = self.store.history(session)?;
+        for envelope in history {
+            if let SessionEvent::ToolResult(result) = &envelope.event {
+                for part in &result.content {
+                    if let rness_protocol::events::ToolResultContentPart::Image { attachment } = part {
+                        if attachment.id == id {
+                            let data = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+                                .read(attachment).map_err(ServiceError::InvalidConfig)?;
+                            return Ok((attachment.media_type.clone(), data));
+                        }
+                    }
+                }
+            }
+            let content = match &envelope.event {
+                SessionEvent::UserMessage(message) => &message.content,
+                SessionEvent::AssistantMessage(message) => &message.content,
+                _ => continue,
+            };
+            for part in content {
+                if let ContentPart::Image { attachment } = part {
+                    if attachment.id == id {
+                        let data = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+                            .read(attachment).map_err(ServiceError::InvalidConfig)?;
+                        return Ok((attachment.media_type.clone(), data));
+                    }
+                }
+            }
+        }
+        Err(ServiceError::InvalidConfig("image is not referenced by this session".into()))
+    }
+
     /// Configure the composition-root resolver for durable model selections.
     /// The resolver owns route tables and credentials; neither enters logs.
     pub fn with_provider_resolver(
@@ -346,11 +408,14 @@ impl SessionService {
             route: selection.route.clone(),
             model: selection.model.clone(),
         })?;
-        resolver(selection).map_err(|message| ServiceError::ProviderResolution {
+        let provider = resolver(selection).map_err(|message| ServiceError::ProviderResolution {
             route: selection.route.clone(),
             model: selection.model.clone(),
             message,
-        })
+        })?;
+        if self.models.capabilities(selection).is_some_and(|caps| caps.image_input == Some(false)) {
+            Ok(Arc::new(crate::turn::provider::ImageCapabilityProvider { inner: provider }))
+        } else { Ok(provider) }
     }
 
     fn validate_config(config: &CallConfig) -> Result<(), ServiceError> {
@@ -586,11 +651,35 @@ impl SessionService {
             Some(resolve) => resolve(workspace.as_deref(), content).map_err(ServiceError::InvalidConfig)?,
             None => content,
         };
+        for part in &content {
+            if let ContentPart::Image { attachment } = part {
+                let images = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?;
+                if !images.admitted_for_session(session, &attachment.id) && self.read_image(session, &attachment.id).is_err() {
+                    return Err(ServiceError::InvalidConfig("image was not uploaded to this session".into()));
+                }
+                images.read(attachment).map_err(ServiceError::InvalidConfig)?;
+            }
+        }
         let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
         let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         let command = live.command.lock().unwrap();
         if command.is_some() { return Err(ServiceError::Busy); }
+        let request_config = self.config(session)?;
+        let images_forbidden = request_config.selection.as_ref()
+            .and_then(|selection| self.models.capabilities(selection))
+            .is_some_and(|caps| caps.image_input == Some(false));
+        if images_forbidden {
+            let contains_image = |parts: &[ContentPart]| parts.iter().any(|part| matches!(part, ContentPart::Image { .. }));
+            let context = crate::session::projection::model_context(&self.store.history(session)?);
+            let history_has_images = context.turns.iter().any(|turn| match turn {
+                crate::session::projection::ModelTurn::User { content } | crate::session::projection::ModelTurn::Assistant { content } => contains_image(content),
+                crate::session::projection::ModelTurn::ToolResults { results } => results.iter().any(|r| r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. }))),
+            });
+            if contains_image(&content) || history_has_images {
+                return Err(ServiceError::InvalidConfig("selected model explicitly disables image input".into()));
+            }
+        }
         let mut inbox = live.inbox.lock().unwrap();
         if retry {
             if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
@@ -845,6 +934,8 @@ impl SessionService {
             if !cited.contains(env.id.as_str()) {
                 continue;
             }
+            // Do not reorder mixed text/image output using the text-only pruner.
+            if r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) { continue; }
             let chars = r.output.chars().count();
             if chars <= opts.threshold_chars {
                 continue;
@@ -857,6 +948,7 @@ impl SessionService {
             result.output = format!(
                 "{head}\n\n[... tool result middle pruned: {removed} chars removed ...]\n\n{tail}"
             );
+            result.content.clear();
             let log = match &mut log {
                 Some(l) => l,
                 None => log.insert(self.store.open(session)?),

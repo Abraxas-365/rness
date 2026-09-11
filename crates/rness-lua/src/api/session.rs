@@ -37,6 +37,48 @@ pub fn install(
     sessions: Arc<SessionService>,
     rt: tokio::runtime::Handle,
 ) -> Result<(), mlua::Error> {
+    let images = lua.create_table()?;
+    let image_service = sessions.clone();
+    images.set("configure", lua.create_function(move |lua, options: Table| {
+        let update: serde_json::Value = lua.from_value(mlua::Value::Table(options))?;
+        let policy = image_service.image_policy(Some(update)).map_err(err)?;
+        lua.to_value(&policy)
+    })?)?;
+    let image_service = sessions.clone();
+    images.set("policy", lua.create_function(move |lua, ()| {
+        lua.to_value(&image_service.image_policy(None).map_err(err)?)
+    })?)?;
+    let image_service = sessions.clone();
+    images.set("processor", lua.create_function(move |_, (version, source): (String, Option<String>)| {
+        let Some(source) = source else { return image_service.set_image_processor(None).map_err(err); };
+        // A separate bounded VM avoids re-entering the retained plugin VM from
+        // provider workers. Source evaluates to function(metadata, encoded_bytes).
+        let vm = Lua::new();
+        vm.set_memory_limit(128 * 1024 * 1024)?;
+        vm.set_hook(mlua::HookTriggers::new().every_nth_instruction(10000), {
+            let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            move |_, _| {
+                if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 1000 { return Err(err("image processor instruction limit exceeded")); }
+                Ok(mlua::VmState::Continue)
+            }
+        });
+        let _: mlua::Function = vm.load(&source).eval()?;
+        image_service.set_image_processor(Some((version, Arc::new(move |reference, bytes| {
+            let vm = Lua::new();
+            vm.set_memory_limit(128 * 1024 * 1024).map_err(|e| e.to_string())?;
+            let started = std::time::Instant::now();
+            vm.set_hook(mlua::HookTriggers::new().every_nth_instruction(10000), move |_, _| {
+                if started.elapsed() > std::time::Duration::from_secs(2) { return Err(err("image processor deadline exceeded")); }
+                Ok(mlua::VmState::Continue)
+            });
+            let callback: mlua::Function = vm.load(&source).eval().map_err(|e| e.to_string())?;
+            let metadata = vm.to_value(reference).map_err(|e| e.to_string())?;
+            let data = vm.create_string(bytes).map_err(|e| e.to_string())?;
+            let output: mlua::String = callback.call((metadata, data)).map_err(|e| e.to_string())?;
+            Ok(output.as_bytes().to_vec())
+        })))).map_err(err)
+    })?)?;
+    rness.set("images", images)?;
     let session = lua.create_table()?;
     let s = Arc::clone(&sessions);
     session.set("plan", lua.create_function(move |lua, (id, active): (String, Option<bool>)| {

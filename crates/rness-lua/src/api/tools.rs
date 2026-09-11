@@ -55,6 +55,17 @@ impl Tool for LuaTool {
         }
     }
 
+    async fn execute_presented(&self, session: &String, call: &String, args: serde_json::Value, cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<serde_json::Value>), String> {
+        if self.spec.tasks.is_some() {
+            return self.execute_rich(session, call, args, cancel).await.map(|(content, tasks, error)| (content, tasks, error, None));
+        }
+        let mut context = self.context.clone();
+        context["session"] = serde_json::json!(session);
+        context["call"] = serde_json::json!(call);
+        let (output, presentation) = self.host.call_tool_presented(&self.spec.name, args, context).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, presentation))
+    }
+
     async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
         self.host.call_tool_context(&self.spec.name, args, self.context.clone()).await
     }
@@ -86,6 +97,25 @@ mod ownership_tests {
     impl Tool for Native {
         fn name(&self) -> &str { "owned" }
         async fn execute(&self, _: serde_json::Value) -> Result<String, String> { Ok("native".into()) }
+    }
+
+    #[tokio::test]
+    async fn plugin_second_return_is_presentation_not_model_output() {
+        let host = LuaHost::spawn().unwrap();
+        host.load("presented", r#"
+            rness.tool.register {name='snapshot', run=function(args, ctx)
+                return 'model output', {version=1, before='private snapshot', call=ctx.call}
+            end}
+        "#).await.unwrap();
+        let registry = rness_engine::tools::ToolRegistry::default();
+        register_lua_tools(&registry, &host).await;
+        let results = registry.dispatch(&"s".into(), &[rness_engine::tools::ToolCall {
+            call:"c".into(), name:"snapshot".into(), args:serde_json::json!({}),
+        }], 1, &tokio_util::sync::CancellationToken::new()).await;
+        assert_eq!(results[0].output, "model output");
+        assert_eq!(results[0].presentation.as_ref().unwrap()["before"], "private snapshot");
+        assert_eq!(results[0].presentation.as_ref().unwrap()["call"], "c");
+        assert_eq!(host.call_tool("snapshot", serde_json::json!({})).await.unwrap(), "model output");
     }
 
     #[tokio::test]

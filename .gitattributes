@@ -1,0 +1,2 @@
+# Upstream Crossterm sources retain CRLF line endings.
+vendor/crossterm/** whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

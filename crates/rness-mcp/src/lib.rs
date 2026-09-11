@@ -231,6 +231,7 @@ impl McpConnection {
                 let Some(raw) = t["name"].as_str() else { continue };
                 let public = public_tool_name(&self.server, raw);
                 registry.register(Arc::new(McpTool {
+                    images: registry.images.clone(),
                     conn: Arc::clone(self),
                     raw: raw.to_string(),
                     public: public.clone(),
@@ -266,6 +267,7 @@ impl McpConnection {
 /// One bridged MCP tool. Text content blocks are joined; `isError`
 /// results become is_error tool results (turns never abort).
 struct McpTool {
+    images: Arc<std::sync::OnceLock<Arc<rness_engine::images::ImageStore>>>,
     conn: Arc<McpConnection>,
     raw: String,
     public: String,
@@ -287,6 +289,41 @@ impl Tool for McpTool {
         self.schema.clone()
     }
 
+    async fn execute_rich(
+        &self,
+        session: &rness_protocol::events::SessionId,
+        _call: &str,
+        args: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
+        self.execute_presented(session, &_call.to_owned(), args, cancel).await.map(|(content, tasks, error, _)| (content, tasks, error))
+    }
+
+    async fn execute_presented(
+        &self, session: &rness_protocol::events::SessionId, _call: &String, args: Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let result = tokio::select! {
+            _ = cancel.cancelled() => return Err("MCP call cancelled".into()),
+            result = self.conn.request("tools/call", json!({ "name": self.raw, "arguments": args })) => result.map_err(|e| e.to_string())?,
+        };
+        let mut metadata = json!({"version":1,"kind":"mcp","tool":self.raw});
+        if let Some(structured) = result.get("structuredContent") {
+            if serde_json::to_vec(structured).is_ok_and(|bytes| bytes.len() <= 48 * 1024) {
+                metadata["structured_content"] = structured.clone();
+                metadata["truncated"] = json!(false);
+            } else {
+                metadata["truncated"] = json!(true);
+            }
+        }
+        let images = self.images.get().cloned();
+        let session = session.clone();
+        let token = cancel.clone();
+        tokio::task::spawn_blocking(move || decode_content(result, images.as_deref(), &session, &token))
+            .await.map_err(|e| e.to_string())?
+            .map(|(content, tasks, error)| (content, tasks, error, Some(metadata)))
+    }
+
     async fn execute(&self, args: Value) -> Result<String, String> {
         let result = self
             .conn
@@ -305,6 +342,9 @@ impl Tool for McpTool {
                     .join("\n")
             })
             .unwrap_or_default();
+        if result["content"].as_array().is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image")) {
+            return Err(format!("MCP returned image content, but rich tool-image delivery is not configured. Images were not forwarded.\n{text}"));
+        }
         if result["isError"].as_bool() == Some(true) {
             Err(if text.is_empty() { "tool reported an error".into() } else { text })
         } else {
@@ -313,9 +353,73 @@ impl Tool for McpTool {
     }
 }
 
+fn decode_content(
+    result: Value,
+    images: Option<&rness_engine::images::ImageStore>,
+    session: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
+    use base64::Engine;
+    use rness_protocol::events::ToolResultContentPart;
+    let blocks = result["content"].as_array().ok_or("MCP result has no content array")?;
+    let mut content = Vec::new();
+    for block in blocks {
+        if cancel.is_cancelled() { return Err("MCP call cancelled".into()); }
+        match block["type"].as_str() {
+            Some("text") => content.push(ToolResultContentPart::Text {
+                text: block["text"].as_str().ok_or("MCP text block has no text")?.into(),
+            }),
+            Some("image") => {
+                let store = images.ok_or("MCP image storage is not configured")?;
+                let encoded = block["data"].as_str().ok_or("MCP image has no data")?;
+                if encoded.len() > store.policy().max_input_bytes.saturating_add(2).saturating_div(3).saturating_mul(4) { return Err("MCP encoded image exceeds input limit".into()); }
+                let data = base64::engine::general_purpose::STANDARD.decode(encoded)
+                    .map_err(|e| format!("invalid MCP image base64: {e}"))?;
+                let mime = block["mimeType"].as_str().ok_or("MCP image has no mimeType")?;
+                let attachment = store.admit_for_session(session, &data, mime)?;
+                content.push(ToolResultContentPart::Image { attachment });
+            }
+            other => return Err(format!("unsupported MCP content type: {other:?}")),
+        }
+    }
+    if cancel.is_cancelled() { return Err("MCP call cancelled".into()); }
+    Ok((content, None, result["isError"].as_bool().unwrap_or(false)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rich_results_preserve_order_errors_and_durable_images() {
+        use base64::Engine;
+        use rness_protocol::events::ToolResultContentPart;
+        let dir = tempfile::tempdir().unwrap();
+        let store = rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
+        let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let result = json!({"isError":true, "content":[{"type":"text","text":"before"},{"type":"image","mimeType":"image/png","data":image},{"type":"text","text":"after"}]});
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (parts, _, error) = decode_content(result.clone(), Some(&store), "session", &cancel).unwrap();
+        assert!(error);
+        assert!(matches!(&parts[0], ToolResultContentPart::Text { text } if text == "before"));
+        let ToolResultContentPart::Image { attachment } = &parts[1] else { panic!("missing image") };
+        assert_eq!(store.read(attachment).unwrap(), base64::engine::general_purpose::STANDARD.decode(image).unwrap());
+        assert!(store.admitted_for_session("session", &attachment.id));
+        assert!(matches!(&parts[2], ToolResultContentPart::Text { text } if text == "after"));
+        assert!(decode_content(result.clone(), None, "session", &cancel).is_err());
+        cancel.cancel();
+        assert!(decode_content(result, Some(&store), "session", &cancel).unwrap_err().contains("cancelled"));
+    }
+
+    #[test]
+    fn rich_results_reject_invalid_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        for data in ["%%%", "bm90IGFuIGltYWdl"] {
+            assert!(decode_content(json!({"content":[{"type":"image","mimeType":"image/png","data":data}]}), Some(&store), "s", &cancel).is_err());
+        }
+    }
 
     #[test]
     fn public_names_are_verbatim_when_clean() {

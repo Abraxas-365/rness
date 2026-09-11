@@ -187,7 +187,7 @@ async fn history_replays_as_function_call_items() {
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
-                    tasks: None, plan_review: None,
+                    content: vec![], tasks: None, plan_review: None, presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),
@@ -201,6 +201,13 @@ async fn history_replays_as_function_call_items() {
 
     let provider = provider_for(&server, store_with_tokens(&dir, "at-1"));
     assert!(matches!(step(&provider, &context, "").await, StepOutcome::Committed(_)));
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body = String::from_utf8(request.body).unwrap();
+        assert!(!body.contains("UI_ONLY_SENTINEL"));
+        assert!(!body.contains("presentation"));
+    }
 }
 
 #[tokio::test]

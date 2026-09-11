@@ -108,6 +108,17 @@ impl Tool for SubagentTool {
     }
 
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
+        self.run_presented(session, args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.run_presented(session, args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl SubagentTool {
+    async fn run_presented(&self, session: &SessionId, args: Value) -> Result<(String, Value), String> {
         let provider = crate::required_str(&args, "provider")?.to_string();
         let prompt = crate::required_str(&args, "prompt")?.to_string();
         let background = args["run_in_background"].as_bool().unwrap_or(false);
@@ -127,11 +138,11 @@ impl Tool for SubagentTool {
                 .runtime
                 .start_continuable(&provider, request)
                 .map_err(|e| e.to_string())?;
-            return Ok(format!(
+            return Ok((format!(
                 "started continuable agent {child} — message it with \
                  send_message, stop its turn with interrupt_agent; its \
                  results arrive here as settle notices"
-            ));
+            ), json!({"version":1,"kind":"subagent","mode":"continuable","session":child,"accepted":true})));
         }
 
         if !background {
@@ -140,7 +151,7 @@ impl Tool for SubagentTool {
                 .start(&provider, request)
                 .await
                 .map_err(|e| e.to_string())?;
-            return render(&run);
+            return render(&run).map(|output| (output, json!({"version":1,"kind":"subagent","mode":"foreground","session":run.session,"status":"completed"})));
         }
 
         let label = format!(
@@ -167,8 +178,8 @@ impl Tool for SubagentTool {
                 }
             }
         });
-        Ok(format!(
+        Ok((format!(
             "started background subagent as job {id} — read with job_output, cancel with job_kill"
-        ))
+        ), json!({"version":1,"kind":"subagent","mode":"background","job_id":id,"accepted":true})))
     }
 }

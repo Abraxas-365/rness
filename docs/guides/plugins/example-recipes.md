@@ -2,6 +2,72 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Messagebox presentation
+
+Startup configuration in `init.lua` can style messages and built-in tool cards:
+
+`cache_bytes` sets the retained visual-row allocation budget (default 8 MiB,
+range 0–1 GiB; zero disables row retention). Rows farthest from the viewport
+are evicted first and regenerated on demand, preserving IDs and heights.
+This accounts for vector/string capacities, not allocator overhead. It does
+not bound transient rendering of a giant entry, Markdown/card caches, the
+history model, or the lightweight per-entry indexes. For example,
+`rness.ui.messagebox = { cache_bytes = 2 * 1024 * 1024 }` retains at most
+2 MiB of accounted transcript row allocations after each render.
+
+```lua
+rness.ui.messagebox = {
+  message = { padding = { left = 1, right = 1 } },
+  assistant = { style = { fg = '#ebdbb2', bg = '#282828' } },
+  tool = {
+    display = 'preview', preview_lines = 6,
+    header = { show_name = true, show_status = true, show_duration = true },
+    arguments = { visible = true, style = 'dim' },
+    output = { visible = true, wrap = true },
+    states = { running = { style = 'dim' }, error = { style = 'error' } },
+  },
+  keys = {
+    previous_tool = 'alt+up', next_tool = 'alt+down', toggle_tool = 'ctrl+o',
+    previous_thinking = 'alt+p', next_thinking = 'alt+n', toggle_thinking = 'alt+t',
+  },
+}
+```
+
+Each key accepts `false` to disable it. Tool output wrapping affects presentation
+only; it never truncates the durable result or changes provider requests.
+Styles accept theme group names or direct `fg`, `bg`, `bold`, `italic`,
+`underline`, and `reverse` fields. Direct fields patch inherited styles.
+
+Plugins register renderers with `rness.ui.messagebox.tool_card(name, function(call)
+... end)`. Legacy `rness.ui.tool_card` registrations still work. The callback gets
+`name`, `args`, `output`, `is_error`, and optional `presentation`. Return `nil` to
+use the built-in card. Exceptions, cyclic results, excessive nesting, and results
+exceeding the 256 KiB structural budget fall back rather than breaking chat.
+
+Presentation metadata is execution-time data, not a request to reread files.
+Small Edit/Write snapshots expose `before` and `after`; large Edit results may
+contain bounded `hunks` with `old_start`, `new_start`, and `fragment`.
+When the byte budget permits, each hunk contains complete affected source lines
+(`fragment=false`). Overlapping complete-line windows are merged; replacement
+coverage is tracked separately from the resulting hunk count. Otherwise,
+`fragment=true` identifies exact replacement substrings, **not complete source lines**.
+`truncated=true` means the complete file snapshot was not captured; compare
+`captured_replacements` with `replacements` for replacement coverage. Renderers
+must handle missing snapshots and old histories without metadata.
+
+Write reads at most 2 MiB + one sentinel byte of the previous file for presentation.
+For larger-than-inline snapshots, it removes the common prefix/suffix and captures
+a complete-line changed window if its serialized size fits 48 KiB. Such results
+have `hunks` and `changes_complete=true`, while `truncated=true` still indicates
+that the entire file was not retained. Oversized or unreadable snapshots/ranges
+report `changes_complete=false` and `capture_reason`; they are not empty diffs.
+The actual write and model-visible result are unchanged by capture limits.
+
+Do not shorten `call.output` before returning a card if expansion should expose
+the full output. Use messagebox preview settings instead. Custom renderers own
+the whole card, including its header; built-in header options are not injected
+into custom cards. Messagebox configuration is startup-only.
+
 ## Path references in terminal and HTTP
 
 Declare in a selected runtime plugin (off by default), loaded through
@@ -138,6 +204,59 @@ Editor configuration is an argument vector, not a shell command. If omitted, `$V
 
 Currently previews are plain text, and the durable transcript receives expanded text rather than persisted paste metadata.
 
+## Image attachments (partial implementation)
+
+Ctrl+V pastes from the local OS clipboard: images become attachments; otherwise text uses the same insertion and large-paste collapsing as terminal bracketed paste. Neither sends the prompt. Configure this shared action with `ui.promptbox.keys.paste` (or `false` to disable); there is no separate image-paste binding. Alt+Right cycles the selected image (dimensions and byte size are shown). Alt+Backspace removes the selected image. Enter submits all attached images with the prompt; Ctrl+E edits only text and preserves attachments. Rejected submissions retain the draft. Clipboard access refers to the machine running rness, not the SSH client's clipboard. Alt+P toggles a raster thumbnail of the selected clipboard attachment; Esc closes it. The preview uses truecolor half-block cells (no Kitty/Sixel requirement), composites transparency over black, and never sends the draft. Preview and close bindings are configurable below.
+
+```lua
+rness.ui.promptbox = {
+  editor = { "nvim" },
+  keys = { paste = "ctrl+v", edit = "ctrl+e" },
+  images = { keys = { next = "alt+right", remove = "alt+backspace", preview = "alt+p", close = "esc", history = "alt+h" } },
+}
+rness.images = {
+  normalize_srgb = true,
+  animation = "first_frame", -- or "reject"
+  deepseek_files = false, -- opt-in remote upload reuse on api.deepseek.com
+  anthropic_files = false,
+  max_request_images = 20,
+  max_request_bytes = 20971520,
+  max_input_bytes = 20971520,
+  max_input_pixels = 40000000,
+  max_pixels = 4000000,
+  max_dimension = 4096,
+  max_bytes = 5242880,
+  lossless = true,
+  quality = 85,
+}
+```
+
+Images are stored alongside credentials in the `images` directory, with durable content-addressed references in session history. Sources are preserved; request variants apply orientation, resize without upscaling, and strip metadata through re-encoding. Lossless images use PNG; lossy transparent images use WebP and opaque images use JPEG. Results over the byte limit are rejected. Variant caching avoids repeated transformation/encoding, not retransmission: by default adapters inline retained images in each request. By default, request processing converts supported embedded ICC profiles or decoded color-space metadata to sRGB. Invalid/unsupported profiles fail explicitly; `normalize_srgb = false` disables conversion. Animation defaults to the decoded first frame; `animation = "reject"` rejects animated GIF, APNG, and WebP requests. Source animation and metadata remain intact in storage. Cached variants skip transformation/encoding, but sources are still read and validated.
+
+Before serialization, all three adapters apply `max_request_images` and `max_request_bytes` to image occurrences (including MCP tool results). The byte budget counts base64-encoded processed images, not the entire JSON request or tokens. Oldest occurrences become explicit text placeholders until both budgets fit; original session history and files are unchanged. Identical image references count separately when repeated. A budget smaller than one image can omit every image. Reattach an omitted image when it is needed again. Retained images still appear in each request; this is bounded context, not send-once semantics.
+
+HTTP clients POST raw bytes with an image Content-Type to `/api/sessions/:id/images` (20 MiB transport cap), then submit `{kind="image", attachment=<returned reference>}` as content. GET `/api/sessions/:id/images/:image` retrieves images already referenced in that session. Upload ownership and stored bytes are validated before submission. As with the existing server, deployment authentication must protect the API.
+
+Model declarations may set `capabilities.image_input = false` to forbid images at submission; absent declarations remain unknown. Resolved text-only providers also reject image-bearing context before every request, including images returned by tools during an active turn. The rejection is non-retryable and tool results remain in durable history.
+
+MCP dispatcher calls preserve ordered text/image blocks and `isError`, admitting decoded images through the shared store off the async executor. Invalid base64, MIME, image data, and configured input limits produce tool errors. Session history stores references, not base64; referenced tool images are retrievable through the same HTTP endpoint. Anthropic nests rich content inside `tool_result`; Responses uses rich `function_call_output`; Chat Completions retains tool replies and adds a call-ID-labelled user image message after the tool-result group. Direct text-only MCP execution still rejects image results. The text-only pruner skips mixed image results to preserve ordering.
+
+Runtime plugins can call `rness.images.policy()` and `rness.images.configure({ quality = 70, lossless = false, max_request_images = 5 })`. Updates are validated and affect subsequent requests, including already-created providers. This is a process-wide policy update, not a per-session transform callback. Admission byte/pixel limits remain startup-only; unknown fields and invalid values are rejected.
+
+Set `anthropic_files = true` in the startup image policy or runtime configure call to opt into Anthropic Files API reuse with API-key authentication. Other adapters stay inline; Anthropic OAuth rejects this option explicitly. Uploads request a one-hour remote expiration; cached IDs are reused within the process for less than that duration and scoped by endpoint, credential digest, MIME, and processed bytes. A metadata 404 causes re-upload. Restarting reloads unexpired IDs from the atomic on-disk upload cache under the image store; keys contain only digests, never raw credentials. Uploads are workspace-visible and not eligible for ZDR; file references still incur image input tokens. See [Anthropic Files API](https://platform.claude.com/docs/en/build-with-claude/files). No live cloud upload was performed during QA.
+
+Alt+H opens historical images (including HTTP-submitted and MCP images); Alt+Right cycles and Esc closes. This viewer is read-only and does not attach history images to the draft. Real macOS clipboard text/image intake, preview rendering, and closing were exercised in the `image-qa` tmux window using an isolated local configuration; prior clipboard contents were restored. Automated tests cover rendering, draft preservation, provider serialization, budgets, runtime policy validation, and upload reuse/404 recovery.
+
+Set `deepseek_files = true` to use DeepSeek's multipart Files API (`purpose=user_data`, one-hour expiry) and `type=file` message parts. Enabled only for `api.deepseek.com` and localhost test endpoints; other compatible endpoints remain inline. IDs are cached by endpoint, credential digest, and processed image, expire according to the provider response, and are re-uploaded after metadata 404. Tests verify repeated requests upload once and recover missing files. No live DeepSeek request was made.
+
+Runtime plugins may register encoded-byte processors using `rness.images.processor("my-transform-v1", [[return function(metadata, bytes) return bytes end]])`. The source evaluates to a callback in a separate Lua VM, receives the image reference metadata and original encoded bytes, and returns encoded image bytes. The output is validated and goes through normal color/resize/encoding limits. Increment the version whenever behavior changes; it participates in the variant cache key. `rness.images.processor("", nil)` removes the callback. This is a source-defined callback, not a closure over plugin state; no `rness` services are installed in its VM. Lua allocations are limited to 128 MiB and instruction hooks enforce execution limits (not a hard sandbox for blocking native library calls).
+
+With `lossless = false`, transparent images use WebP at effort 0 and qualities 85/75/60 (capped by configured quality); opaque images use JPEG with the same ladder. `lossless = true` retains PNG. The byte limit remains hard.
+
+Both Files adapters recover once from recognized storage/file-quota errors. Successful new uploads create atomic ownership records scoped by endpoint and credential digest. Cleanup inspects at most 4096 local records and deletes at most 16 oldest eligible owned uploads, even before expiration. Ownership-record modification time (written at upload, not reuse) determines age, independent of expiration. Files already selected for the current request are protected; unrelated account files and legacy caches without ownership records are never deleted. No remote listing or pagination is needed. DELETE 404 retires stale ownership; other cleanup failures stop recovery. Cancellation and HTTP timeouts apply. If every candidate is protected, the request reports quota exhaustion. Local image originals and variants are untouched.
+
+Evicted cached IDs are detected by metadata lookup and re-uploaded when next needed. Both Files adapters also recover once when the model endpoint returns a recognized stale-file HTTP error (400/404/410/422), before streaming begins. The retry invalidates matching cache-key/file-ID generations, resolves/uploads the images again, and resends. If the error names no used ID, all used mappings are treated as stale. A concurrently replaced cache generation is preserved. Repeated rejection fails normally; stream errors are not automatically replayed, preventing duplicated output. Upload deduplication remains process-local and there are no cross-process leases: eviction races remain possible, but now have bounded model-request recovery as in DSH.
+
 ## Runtime plugins
 
 Copy desired files from `examples/plugins/` into `~/.rness/plugins/`, then select them:
@@ -244,6 +363,26 @@ viewport. Its keybinding and presentation remain Lua policy.
 
 The HTTP endpoint is read-only; task mutations occur through model tool dispatch.
 Plan mode is a separate feature and is not enabled by tasks.
+
+## Messagebox reconciliation and rendering limits
+
+The TUI requests only envelopes after its last durable event ID. The reader caches
+complete JSONL lines and retries incomplete tails. Unknown cursors and compaction
+reload history; provider context construction still uses full history where required.
+Append-only visual updates reuse cached rows and extend the height index without
+walking the cached entry prefix. Changes to width, theme, card publications, or view
+state can still cause a full cache check. The transcript row cache is not memory-bounded.
+
+Structured cards may omit `header` and supply only `body`. Newlines in body spans
+split into separate rows while retaining span styles. Custom card callbacks still
+run in the Lua host: output size/depth limits are not execution-time limits.
+
+Large-file snapshots are intentionally bounded and may be incomplete. Inspect
+`truncated`, `changes_complete`, and capture metadata rather than treating displayed
+hunks as a complete file diff. Write captures separated changed ranges within its
+48 KiB budget using a time-bounded diff when a single changed window is too large.
+Edit merges overlapping complete-line windows; fragment captures remain explicit.
+The original plan is not fully accepted.
 
 ## Model capabilities
 

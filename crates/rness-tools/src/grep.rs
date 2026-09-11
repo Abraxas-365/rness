@@ -72,6 +72,20 @@ impl Tool for GrepTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.grep_presented(args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(
+        &self, _session: &String, _call: &String, args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, presentation) = self.grep_presented(args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+    }
+}
+
+impl GrepTool {
+    async fn grep_presented(&self, args: Value) -> Result<(String, Value), String> {
         let pattern = required_str(&args, "pattern")?.to_string();
         let base = self.ws.resolve(args["path"].as_str().unwrap_or("."));
         let mode = args["output_mode"].as_str().unwrap_or("files_with_matches").to_string();
@@ -95,6 +109,7 @@ impl Tool for GrepTool {
             let mut searcher = SearcherBuilder::new().line_number(true).build();
 
             // (file, hits) accumulated per file, walk order.
+            let mut previews_truncated = false;
             let mut per_file: Vec<(String, Vec<(u64, String)>)> = Vec::new();
             for entry in WalkBuilder::new(&base).hidden(false).require_git(false).build().flatten()
             {
@@ -113,6 +128,7 @@ impl Tool for GrepTool {
                     entry.path(),
                     UTF8(|line_no, line| {
                         if matcher.is_match(line.as_bytes()).unwrap_or(false) {
+                            previews_truncated |= line.trim_end().len() > MAX_LINE_BYTES;
                             hits.push((line_no, preview(line.trim_end())));
                         }
                         Ok(true)
@@ -123,8 +139,24 @@ impl Tool for GrepTool {
                 }
             }
 
+            let mut records = Vec::new();
+            let mut bytes = 0;
+            let mut total_records = 0;
+            for (file, hits) in &per_file {
+                let items = if mode == "content" {
+                    hits.iter().map(|(line, text)| json!({"path":file,"line":line,"text":text})).collect::<Vec<_>>()
+                } else {
+                    vec![json!({"path":file,"count":hits.len()})]
+                };
+                total_records += items.len();
+                for item in items {
+                    bytes += serde_json::to_vec(&item).unwrap().len();
+                    if bytes <= 48 * 1024 && records.len() < MAX_OUTPUT_LINES { records.push(item); }
+                }
+            }
+            let presentation = json!({"version":1,"kind":"grep","path":base,"pattern":pattern,"mode":mode,"total":total_records,"truncated":previews_truncated || records.len()<total_records,"records":records});
             if per_file.is_empty() {
-                return Ok("No matches".to_string());
+                return Ok(("No matches".to_string(), presentation));
             }
             let mut lines: Vec<String> = Vec::new();
             match mode.as_str() {
@@ -159,7 +191,7 @@ impl Tool for GrepTool {
                     total - MAX_OUTPUT_LINES
                 ));
             }
-            Ok(out)
+            Ok((out, presentation))
         })
         .await
         .map_err(|e| format!("grep task: {e}"))?

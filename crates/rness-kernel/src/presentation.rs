@@ -7,10 +7,21 @@ pub trait TextProvider: Send + Sync {
     async fn text(&self) -> Option<String>;
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StyledLine {
     pub text: String,
     pub style: String,
+    pub spans: Vec<StyledSpan>,
+    pub right: Vec<StyledSpan>,
+    pub block: Option<serde_json::Value>,
+    pub is_header: bool,
+    pub structured: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StyledSpan {
+    pub text: String,
+    pub style: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]

@@ -24,6 +24,12 @@ use crate::theme::Theme;
 /// The engine seam. In-process today (CLI wraps SessionService), remote
 /// later — the TUI only ever sees protocol types.
 pub trait Backend: Send + Sync {
+    fn admit_image(&self, _session: &SessionId, _data: &[u8], _media_type: &str) -> Result<rness_protocol::events::ImageRef, String> {
+        Err("image uploads are not supported by this backend".into())
+    }
+    fn read_image(&self, _session: &SessionId, _id: &str) -> Result<Vec<u8>, String> {
+        Err("image retrieval is not supported by this backend".into())
+    }
     fn request(&self, request: ClientRequest);
     fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         self.request(request);
@@ -32,6 +38,8 @@ pub trait Backend: Send + Sync {
     fn complete(&self, _session: &SessionId, _text: String) {}
     fn command_running(&self, _session: &SessionId) -> bool { false }
     fn history(&self, session: &SessionId) -> History;
+    /// None requests a full reload (unsupported cursor or backend).
+    fn history_after(&self, _session: &SessionId, _after: &str) -> Option<Vec<rness_protocol::events::Envelope>> { None }
     fn prepare_input(&self, _session: &SessionId, text: &str) -> Result<Option<Vec<ContentPart>>, String> {
         Ok(Some(vec![ContentPart::Text { text: text.into() }]))
     }
@@ -62,6 +70,25 @@ pub struct LiveStep {
 pub struct Model {
     pub session: SessionId,
     pub entries: Vec<Entry>,
+    pub entry_ids: Vec<String>,
+    pub history_revision: u64,
+    pub history_epoch: u64,
+    projected_session: Option<SessionId>,
+    projected_events: usize,
+    projected_tail: Option<String>,
+    projected_entries: usize,
+    projected_names: std::collections::HashMap<ToolCallId, String>,
+    projected_failed_attempts: usize,
+    #[cfg(test)]
+    projection_visits: usize,
+    pub assistant_ids: std::collections::HashMap<usize, usize>,
+    pub tool_durations: std::collections::HashMap<ToolCallId, u64>,
+    pub error_entries: std::collections::HashSet<usize>,
+    pub cancelled_tools: std::collections::HashSet<ToolCallId>,
+    durable_assistant_ids: std::collections::HashMap<String, usize>,
+    pub next_assistant_id: usize,
+    pub live_assistant_id: Option<usize>,
+
     pub live: Option<LiveStep>,
     pub busy: bool,
     pub model_name: String,
@@ -79,6 +106,25 @@ impl Model {
         Self {
             session,
             entries: Vec::new(),
+            entry_ids: Vec::new(),
+            history_revision: 0,
+            history_epoch: 0,
+            projected_session: None,
+            projected_events: 0,
+            projected_tail: None,
+            projected_entries: 0,
+            projected_names: Default::default(),
+            projected_failed_attempts: 0,
+            #[cfg(test)]
+            projection_visits: 0,
+            assistant_ids: Default::default(),
+            tool_durations: Default::default(),
+            error_entries: Default::default(),
+            cancelled_tools: Default::default(),
+            durable_assistant_ids: Default::default(),
+            next_assistant_id: 0,
+            live_assistant_id: None,
+
             live: None,
             busy: false,
             model_name,
@@ -88,9 +134,31 @@ impl Model {
         }
     }
 
-    /// Rebuild entries from durable history (the reconcile point).
+    /// Project an immutable, append-only session log. Session changes, shortened
+    /// histories and compaction checkpoints require a full projection.
     pub fn load_history(&mut self, history: &History) {
-        self.entries.clear();
+        let append = self.projected_session.as_ref() == Some(&history.session)
+            && self.projected_events > 0
+            && history.envelopes.len() >= self.projected_events
+            && history.envelopes[self.projected_events - 1].id.as_str()
+                == self.projected_tail.as_deref().unwrap_or_default()
+            && self.entries.len() >= self.projected_entries
+            && !history.envelopes[self.projected_events..].iter()
+                .any(|env| matches!(env.event, SessionEvent::Compaction(_)));
+        if append {
+            self.append_history(&history.envelopes[self.projected_events..]);
+            return;
+        }
+        self.history_epoch = self.history_epoch.wrapping_add(1);
+        self.cancelled_tools.clear();
+        let old_entries = std::mem::take(&mut self.entries);
+        let old_ids = std::mem::take(&mut self.entry_ids);
+        let old_durations = std::mem::take(&mut self.tool_durations);
+        let old_errors = std::mem::take(&mut self.error_entries);
+        let old_assistant_ids = std::mem::take(&mut self.assistant_ids);
+        self.assistant_ids.clear();
+        self.tool_durations.clear();
+        self.error_entries.clear();
         // Compaction shadowing: events named by a live checkpoint's
         // `replaces` are hidden; a notice renders where the folded span
         // began (anchor = first shadowed id).
@@ -110,31 +178,83 @@ impl Model {
         // Tool names live on the assistant ToolUse parts; map call → name.
         let mut names: std::collections::HashMap<ToolCallId, String> = Default::default();
         let mut failed_attempts = 0;
-        for env in &history.envelopes {
+        self.project_events(&history.envelopes, &shadowed, &anchors, &mut names, &mut failed_attempts);
+        self.projected_names = names;
+        self.projected_failed_attempts = failed_attempts;
+        if self.history_revision == 0 || self.entries != old_entries || self.entry_ids != old_ids
+            || self.tool_durations != old_durations || self.error_entries != old_errors || self.assistant_ids != old_assistant_ids {
+            self.history_revision = self.history_revision.wrapping_add(1);
+        }
+        self.remember_projection(history);
+    }
+
+    fn append_history(&mut self, events: &[rness_protocol::events::Envelope]) {
+        let removed_local = self.entries.len() != self.projected_entries;
+        self.entries.truncate(self.projected_entries);
+        let mut names = std::mem::take(&mut self.projected_names);
+        let mut failed_attempts = self.projected_failed_attempts;
+        self.project_events(events, &Default::default(), &Default::default(), &mut names, &mut failed_attempts);
+        self.projected_names = names;
+        self.projected_failed_attempts = failed_attempts;
+        if removed_local || self.entries.len() != self.projected_entries {
+            self.history_revision = self.history_revision.wrapping_add(1);
+        }
+        self.projected_events += events.len();
+        self.projected_entries = self.entries.len();
+        if let Some(last) = events.last() { self.projected_tail = Some(last.id.clone()); }
+    }
+
+    fn remember_projection(&mut self, history: &History) {
+        self.projected_session = Some(history.session.clone());
+        self.projected_events = history.envelopes.len();
+        self.projected_tail = history.envelopes.last().map(|env| env.id.clone());
+        self.projected_entries = self.entries.len();
+    }
+
+    fn project_events(
+        &mut self,
+        events: &[rness_protocol::events::Envelope],
+        shadowed: &std::collections::HashSet<&str>,
+        anchors: &std::collections::HashMap<&str, usize>,
+        names: &mut std::collections::HashMap<ToolCallId, String>,
+        failed_attempts: &mut usize,
+    ) {
+        for env in events {
+            #[cfg(test)]
+            { self.projection_visits += 1; }
             if shadowed.contains(env.id.as_str()) {
                 if let Some(span) = anchors.get(env.id.as_str()) {
+                    self.entry_ids.push(format!("compaction:{}", env.id));
                     self.entries.push(Entry::Notice(format!(
                         "── {span} earlier events compacted into a summary ──"
                     )));
                 }
                 continue;
             }
+            let previous_len = self.entries.len();
             match &env.event {
                 SessionEvent::UserMessage(m) => {
                     self.entries.push(Entry::User { content: m.content.clone() })
                 }
-                SessionEvent::TurnStarted { .. } => failed_attempts = 0,
+                SessionEvent::TurnStarted { .. } => *failed_attempts = 0,
                 SessionEvent::TurnEnded { outcome: rness_protocol::events::TurnOutcome::Failed, .. } => {
-                    let detail = if failed_attempts > 0 { format!(" after {failed_attempts} failed provider attempt(s); no automatic retries remain") } else { String::new() };
+                    let detail = if *failed_attempts > 0 { format!(" after {failed_attempts} failed provider attempt(s); no automatic retries remain") } else { String::new() };
+                    self.error_entries.insert(self.entries.len());
                     self.entries.push(Entry::Notice(format!("Turn failed{detail}. Use /retry to continue from saved context.")));
                 }
                 SessionEvent::AssistantMessage(m) => {
-                    failed_attempts = 0;
+                    *failed_attempts = 0;
                     for part in &m.content {
                         if let ContentPart::ToolUse { call, name, .. } = part {
                             names.insert(call.clone(), name.clone());
                         }
                     }
+                    let identity = *self.durable_assistant_ids.entry(env.id.clone()).or_insert_with(|| {
+                        let id = self.next_assistant_id;
+                        self.next_assistant_id += 1;
+                        id
+                    });
+                    self.assistant_ids.insert(self.entries.len(), identity);
                     self.entries.push(Entry::Assistant {
                         model: m.model.clone(),
                         content: m.content.clone(),
@@ -142,19 +262,32 @@ impl Model {
                 }
                 SessionEvent::AssistantAttempt(attempt) => {
                     if let rness_protocol::events::AttemptOutcome::Error { message, code, retry_in_ms, .. } = &attempt.outcome {
-                        failed_attempts += 1;
-                        let recovery = retry_in_ms.map(|ms| format!("; retry {} scheduled after {ms} ms", failed_attempts + 1)).unwrap_or_default();
+                        *failed_attempts += 1;
+                        let recovery = retry_in_ms.map(|ms| format!("; retry {} scheduled after {ms} ms", *failed_attempts + 1)).unwrap_or_default();
+                        self.error_entries.insert(self.entries.len());
                         self.entries.push(Entry::Notice(format!("Provider error ({}), attempt {} [{}]: {}{}", attempt.model, failed_attempts, code.as_deref().unwrap_or("PROVIDER"), message, recovery)));
                     }
                 }
-                SessionEvent::ToolResult(r) => self.entries.push(Entry::ToolResult {
+                SessionEvent::ToolResult(r) => {
+                    if r.presentation.as_ref().and_then(|p| p.get("outcome")).and_then(|v| v.as_str()) == Some("approval_cancelled") {
+                        self.cancelled_tools.insert(r.call.clone());
+                    }
+                    self.tool_durations.insert(r.call.clone(), r.duration_ms);
+                    self.entries.push(Entry::ToolResult {
                     call: r.call.clone(),
                     name: names.get(&r.call).cloned().unwrap_or_default(),
-                    output: r.output.clone(),
+                    output: if r.content.is_empty() { r.output.clone() } else {
+                        r.content.iter().map(|part| match part {
+                            rness_protocol::events::ToolResultContentPart::Text { text } => text.clone(),
+                            rness_protocol::events::ToolResultContentPart::Image { attachment } => format!("[Image · {} × {} · {} bytes]", attachment.width, attachment.height, attachment.bytes),
+                        }).collect::<Vec<_>>().join("\n")
+                    },
                     is_error: r.is_error,
-                }),
+                });
+                },
                 _ => {}
             }
+            if self.entries.len() > previous_len { self.entry_ids.push(env.id.clone()); }
         }
     }
 
@@ -162,6 +295,8 @@ impl Model {
     pub fn apply_frame(&mut self, frame: &Frame) -> FrameEffect {
         match frame {
             Frame::StepStarted { .. } => {
+                self.live_assistant_id = Some(self.next_assistant_id);
+                self.next_assistant_id += 1;
                 self.busy = true;
                 self.live = Some(LiveStep::default());
                 FrameEffect::None
@@ -186,12 +321,16 @@ impl Model {
                 FrameEffect::None
             }
             Frame::ToolOutput { .. } => FrameEffect::None,
-            Frame::StepCommitted { .. } => {
+            Frame::StepCommitted { event, .. } => {
                 // Durable now — reload from the log and drop the stream state.
+                if let Some(id) = self.live_assistant_id.take() {
+                    self.durable_assistant_ids.insert(event.clone(), id);
+                }
                 self.live = None;
                 FrameEffect::Reconcile
             }
             Frame::TurnIdle { .. } => {
+                self.live_assistant_id = None;
                 self.busy = false;
                 self.live = None;
                 FrameEffect::Reconcile
@@ -217,6 +356,9 @@ pub enum FrameEffect {
 #[derive(Debug)]
 pub enum Action {
     Submit(String),
+    SubmitImages(String, Vec<rness_protocol::events::ImageRef>),
+    PreviewHistoryImage,
+    PasteClipboard,
     Cancel,
     Quit,
     ScrollUp(u16),
@@ -249,6 +391,7 @@ pub struct App {
     pub keymap: crate::keymaps::KeymapState,
     edit_prompt: Option<serde_json::Value>,
     command_results: std::collections::HashMap<SessionId, Vec<String>>,
+    background_models: std::collections::HashMap<SessionId, Model>,
     backend: Arc<dyn Backend>,
 }
 
@@ -263,20 +406,50 @@ impl App {
             keymap: crate::keymaps::KeymapState::stock(),
             edit_prompt: None,
             command_results: Default::default(),
+            background_models: Default::default(),
             backend,
         }
     }
 
     /// Load durable history into the model.
     pub fn reconcile(&mut self) {
-        let history = self.backend.history(&self.model.session);
-        self.model.load_history(&history);
+        let delta = self.model.projected_tail.as_deref()
+            .filter(|_| self.model.projected_session.as_ref() == Some(&self.model.session)
+                && self.model.entries.len() >= self.model.projected_entries)
+            .and_then(|after| self.backend.history_after(&self.model.session, after))
+            .filter(|events| !events.iter().any(|env| matches!(env.event, SessionEvent::Compaction(_))));
+        if let Some(events) = delta {
+            self.model.append_history(&events);
+        } else {
+            let history = self.backend.history(&self.model.session);
+            self.model.load_history(&history);
+        }
         if let Some(results) = self.command_results.get(&self.model.session) {
             self.model.entries.extend(results.iter().cloned().map(Entry::Notice));
         }
     }
 
     pub fn apply_frame(&mut self, frame: &Frame) {
+        let session = match frame {
+            Frame::StepStarted { session, .. } | Frame::Delta { session, .. }
+            | Frame::ToolStarted { session, .. } | Frame::ToolOutput { session, .. }
+            | Frame::StepCommitted { session, .. } | Frame::TurnIdle { session }
+            | Frame::HistoryChanged { session } | Frame::ApprovalRequested { session, .. }
+            | Frame::ApprovalResolved { session, .. } => session,
+        };
+        if session != &self.model.session {
+            if !self.background_models.contains_key(session) && !matches!(frame,
+                Frame::StepStarted { .. } | Frame::Delta { .. } | Frame::ToolStarted { .. }) {
+                return;
+            }
+            let model = self.background_models.entry(session.clone())
+                .or_insert_with(|| Model::new(session.clone(), self.model.model_name.clone()));
+            model.apply_frame(frame);
+            if matches!(frame, Frame::TurnIdle { .. }) {
+                self.background_models.remove(session);
+            }
+            return;
+        }
         if self.model.apply_frame(frame) == FrameEffect::Reconcile {
             self.reconcile();
         }
@@ -325,6 +498,8 @@ impl App {
                 return outcome.actions;
             }
         }
+        let message_outcome = self.slots.message_key(&ctx, key);
+        if message_outcome.handled { return message_outcome.actions; }
         // Host keymap: the rebindable chord→action table (stock seeded
         // in keymaps.rs, rewritten live by rness.keymaps).
         use crate::keymaps::HostAction;
@@ -347,6 +522,75 @@ impl App {
 
     pub fn apply(&mut self, action: Action) {
         match action {
+            Action::PreviewHistoryImage => {
+                let history = self.backend.history(&self.model.session);
+                let mut references = Vec::new();
+                for envelope in &history.envelopes {
+                    match &envelope.event {
+                        SessionEvent::UserMessage(message) => for part in &message.content { if let ContentPart::Image { attachment } = part { references.push(attachment.clone()); } },
+                        SessionEvent::AssistantMessage(message) => for part in &message.content { if let ContentPart::Image { attachment } = part { references.push(attachment.clone()); } },
+                        SessionEvent::ToolResult(result) => for part in &result.content { if let rness_protocol::events::ToolResultContentPart::Image { attachment } = part { references.push(attachment.clone()); } },
+                        _ => {},
+                    }
+                }
+                if references.is_empty() { self.apply(Action::Notice("No images in session history".into())); return; }
+                self.apply(Action::Custom("input:history-images".into(), serde_json::to_value(&references).unwrap()));
+                for reference in references {
+                    let thumbnail = self.backend.read_image(&self.model.session, &reference.id).and_then(|bytes| image::load_from_memory(&bytes).map_err(|e| e.to_string())).map(|image| image.thumbnail(160.min(image.width()), 80.min(image.height())).to_rgba8());
+                    match thumbnail {
+                        Ok(image) => self.apply(Action::Custom("input:image-thumbnail".into(), serde_json::json!({"id":reference.id,"width":image.width(),"height":image.height(),"pixels":image.into_raw()}))),
+                        Err(error) => self.apply(Action::Notice(format!("Cannot preview image: {error}"))),
+                    }
+                }
+            }
+            Action::PasteClipboard => {
+                let result: Result<_, String> = (|| {
+                    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+                    let pixels = match clipboard.get_image() {
+                        Ok(pixels) => pixels,
+                        Err(arboard::Error::ContentNotAvailable) => {
+                            let text = clipboard.get_text().map_err(|e| e.to_string())?;
+                            self.apply(Action::Custom("input:clipboard-text".into(), serde_json::json!(text)));
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    let width = u32::try_from(pixels.width).map_err(|e| e.to_string())?;
+                    let height = u32::try_from(pixels.height).map_err(|e| e.to_string())?;
+                    if u64::from(width) * u64::from(height) > 40_000_000 { return Err("clipboard image exceeds pixel limit".into()); }
+                    let image = image::RgbaImage::from_raw(width, height, pixels.bytes.into_owned()).ok_or("invalid clipboard pixels")?;
+                    let thumbnail = image::DynamicImage::ImageRgba8(image.clone()).thumbnail(160.min(width), 80.min(height)).to_rgba8();
+                    let mut bytes = std::io::Cursor::new(Vec::new());
+                    image::DynamicImage::ImageRgba8(image).write_to(&mut bytes, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+                    let reference = self.backend.admit_image(&self.model.session, bytes.get_ref(), "image/png")?;
+                    Ok(Some((reference, thumbnail)))
+                })();
+                match result {
+                    Ok(None) => {},
+                    Ok(Some((image, thumbnail))) => {
+                        let id = image.id.clone();
+                        self.apply(Action::Custom("input:image-added".into(), serde_json::to_value(image).unwrap()));
+                        self.apply(Action::Custom("input:image-thumbnail".into(), serde_json::json!({"id":id, "width":thumbnail.width(), "height":thumbnail.height(), "pixels":thumbnail.into_raw()})));
+                    },
+                    Err(error) => self.apply(Action::Notice(format!("Cannot paste from clipboard: {error}"))),
+                }
+            }
+            Action::SubmitImages(text, images) => {
+                if text.trim_start().starts_with('/') {
+                    self.apply(Action::Notice("Send images with a prompt, not a slash command".into()));
+                    return;
+                }
+                let mut content = vec![ContentPart::Text { text }];
+                content.extend(images.into_iter().map(|attachment| ContentPart::Image { attachment }));
+                match self.backend.submit(ClientRequest::Send { session: self.model.session.clone(), intent: UserIntent::Followup, content: content.clone() }) {
+                    Ok(None) => {
+                        self.model.entries.push(Entry::User { content });
+                        self.apply(Action::Custom("input:images-submitted".into(), serde_json::Value::Null));
+                    }
+                    Ok(Some(message)) => self.apply(Action::Notice(message)),
+                    Err(error) => self.apply(Action::Notice(error)),
+                }
+            }
             Action::Submit(text) => {
                 if text.trim().is_empty() {
                     return;
@@ -436,8 +680,13 @@ impl App {
                 self.slots.broadcast(&ctx, &name, &payload);
             }
             Action::SwitchSession(session) => {
-                let model_name = self.model.model_name.clone();
-                self.model = Model::new(session, model_name);
+                if session == self.model.session { return; }
+                let next = self.background_models.remove(&session)
+                    .unwrap_or_else(|| Model::new(session, self.model.model_name.clone()));
+                let previous = std::mem::replace(&mut self.model, next);
+                if previous.busy || previous.live.is_some() {
+                    self.background_models.insert(previous.session.clone(), previous);
+                }
                 self.reconcile();
             }
         }
@@ -714,7 +963,7 @@ mod tests {
                     chunks: vec![],
                 })),
                 env(SessionEvent::ToolResult(ToolResult {
-                    tasks: None, plan_review: None,
+                    content: vec![], tasks: None, plan_review: None, presentation: None,
                     call: "c1".into(),
                     name: "Write".into(),
                     output: "wrote foo.txt".into(),
@@ -730,6 +979,155 @@ mod tests {
                 })),
             ],
         }
+    }
+
+    #[test]
+    fn retries_interruptions_and_delayed_reconcile_keep_distinct_identities() {
+        let mut model = Model::new("s".into(), "fake".into());
+        let start = Frame::StepStarted {session:"s".into(),turn:1};
+        model.apply_frame(&start);
+        let failed = model.live_assistant_id.unwrap();
+        model.apply_frame(&start);
+        let retried = model.live_assistant_id.unwrap();
+        assert_ne!(failed, retried);
+        model.apply_frame(&Frame::TurnIdle {session:"s".into()});
+        assert_eq!(model.live_assistant_id, None);
+        model.apply_frame(&start);
+        let committed = model.live_assistant_id.unwrap();
+        assert_ne!(retried, committed);
+        model.apply_frame(&Frame::StepCommitted {session:"s".into(),event:"target".into()});
+        model.apply_frame(&Frame::TurnIdle {session:"s".into()});
+        let mut history = prior_history("s");
+        for (index, envelope) in history.envelopes.iter_mut().enumerate() { envelope.id = format!("older-{index}"); }
+        history.envelopes[4].id = "target".into();
+        model.load_history(&history);
+        assert_eq!(model.assistant_ids[&3], committed);
+        assert_ne!(model.assistant_ids[&1], committed);
+        model.load_history(&history);
+        assert_eq!(model.assistant_ids[&3], committed);
+    }
+
+    #[test]
+    fn assistant_identity_survives_removed_history_and_new_commits() {
+        let mut model = Model::new("s".into(), "fake".into());
+        let mut history = prior_history("s");
+        for (index, envelope) in history.envelopes.iter_mut().enumerate() { envelope.id = format!("event-{index}"); }
+        model.load_history(&history);
+        let retained = model.assistant_ids[&3];
+        history.envelopes.remove(2);
+        model.load_history(&history);
+        assert_eq!(model.assistant_ids[&2], retained);
+        let pending = model.next_assistant_id;
+        history.envelopes.push(env(SessionEvent::AssistantMessage(AssistantMessage {
+            model:"fake".into(), content:vec![ContentPart::Thinking {text:"new".into(),signature:None}],
+            stop:StopReason::EndTurn,usage:Usage::default(),chunks:vec![],
+        })));
+        model.load_history(&history);
+        assert_eq!(model.assistant_ids[&3], pending);
+        assert_ne!(pending, retained);
+        model.load_history(&history);
+        assert_eq!(model.assistant_ids[&2], retained);
+        assert_eq!(model.assistant_ids[&3], pending);
+    }
+
+    #[test]
+    fn append_projection_visits_only_new_events_and_rebuilds_compaction() {
+        let mut model = Model::new("s1".into(), "fake".into());
+        let mut history = prior_history("s1");
+        for (i, event) in history.envelopes.iter_mut().enumerate() { event.id = format!("event-{i}"); }
+        model.load_history(&history);
+        let visits = model.projection_visits;
+        model.load_history(&history);
+        assert_eq!(model.projection_visits, visits);
+        let mut added = history.envelopes[1].clone();
+        added.id = "appended".into();
+        history.envelopes.push(added);
+        model.load_history(&history);
+        assert_eq!(model.projection_visits, visits + 1);
+        let mut fresh = Model::new("s1".into(), "fake".into());
+        fresh.load_history(&history);
+        assert_eq!(model.entries, fresh.entries);
+        assert_eq!(model.entry_ids, fresh.entry_ids);
+        assert_eq!(model.tool_durations, fresh.tool_durations);
+        let mut checkpoint = env(SessionEvent::Compaction(rness_protocol::events::Compaction {
+            replaces: vec!["event-1".into()], summary: "summary".into(), model: "fake".into(),
+        }));
+        checkpoint.id = "checkpoint".into();
+        history.envelopes.push(checkpoint);
+        model.load_history(&history);
+        assert_eq!(model.projection_visits, visits + 1 + history.envelopes.len());
+        fresh = Model::new("s1".into(), "fake".into());
+        fresh.load_history(&history);
+        assert_eq!(model.entries, fresh.entries);
+        assert_eq!(model.entry_ids, fresh.entry_ids);
+        history.session = "s2".into();
+        let visits = model.projection_visits;
+        model.load_history(&history);
+        assert_eq!(model.projection_visits, visits + history.envelopes.len());
+    }
+
+    #[test]
+    fn switching_back_restores_stream_including_background_deltas() {
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut app = App::new(Model::new("s1".into(), "fake".into()), Slots::default(), backend);
+        app.model.busy = true;
+        app.model.live_assistant_id = Some(42);
+        app.model.live = Some(LiveStep { text: "before ".into(), ..Default::default() });
+        app.apply(Action::SwitchSession("s2".into()));
+        app.apply_frame(&Frame::Delta { session: "s1".into(), chunk: ChunkDelta::Text { t: "during".into() } });
+        assert!(app.model.live.is_none());
+        app.apply(Action::SwitchSession("s1".into()));
+        assert!(app.model.busy);
+        assert_eq!(app.model.live_assistant_id, Some(42));
+        assert_eq!(app.model.live.as_ref().unwrap().text, "before during");
+        app.apply(Action::SwitchSession("s2".into()));
+        app.apply_frame(&Frame::TurnIdle { session: "s1".into() });
+        app.apply(Action::SwitchSession("s1".into()));
+        assert!(!app.model.busy);
+        assert!(app.model.live.is_none());
+    }
+
+    #[test]
+    fn reconcile_uses_delta_without_fetching_full_history() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct DeltaBackend { full: AtomicUsize, delta: AtomicUsize }
+        impl Backend for DeltaBackend {
+            fn request(&self, _: ClientRequest) {}
+            fn history(&self, _: &SessionId) -> History {
+                assert_eq!(self.full.fetch_add(1, Ordering::SeqCst), 0);
+                prior_history("s1")
+            }
+            fn history_after(&self, _: &SessionId, _: &str) -> Option<Vec<rness_protocol::events::Envelope>> {
+                if self.delta.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let mut event = prior_history("s1").envelopes[1].clone();
+                    event.id = "new-event".into();
+                    Some(vec![event])
+                } else { Some(vec![]) }
+            }
+        }
+        let backend = Arc::new(DeltaBackend { full: AtomicUsize::new(0), delta: AtomicUsize::new(0) });
+        let mut app = App::new(Model::new("s1".into(), "fake".into()), Slots::default(), backend.clone());
+        app.reconcile();
+        let visits = app.model.projection_visits;
+        app.reconcile();
+        assert_eq!(app.model.projection_visits, visits + 1);
+        app.reconcile();
+        assert_eq!(app.model.projection_visits, visits + 1);
+        assert_eq!(backend.full.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.delta.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn unchanged_reconcile_retains_render_revision() {
+        let mut model = Model::new("s1".into(), "fake".into());
+        let history = prior_history("s1");
+        model.load_history(&history);
+        let revision = model.history_revision;
+        model.load_history(&history);
+        assert_eq!(model.history_revision, revision);
+        model.entries.push(Entry::Notice("temporary".into()));
+        model.load_history(&history);
+        assert_eq!(model.history_revision, revision + 1);
     }
 
     #[test]

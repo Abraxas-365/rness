@@ -31,6 +31,7 @@ pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const ORIGINATOR: &str = "rness";
 
 pub struct ResponsesProvider {
+    images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     base_url: String,
@@ -41,12 +42,18 @@ pub struct ResponsesProvider {
 impl ResponsesProvider {
     pub fn new(source: CodexCredentialSource, model: impl Into<String>) -> Self {
         Self {
+            images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
             source,
             model: model.into(),
         }
+    }
+
+    pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
+        self.images = Some((store, policy));
+        self
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
@@ -61,6 +68,10 @@ impl ResponsesProvider {
     }
 
     fn build_body(&self, request: &StepRequest<'_>) -> Result<Value, ProviderError> {
+        crate::validate_image_roles(request.context, self.images.is_some())?;
+        let images = self.images.as_ref().map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
+        let projected = images.as_ref().map(|(store, policy)| store.project_request(request.context, policy)).transpose().map_err(crate::image_error)?;
+        let request = StepRequest { context: projected.as_ref().unwrap_or(request.context), system: request.system, tools: request.tools, on_delta: request.on_delta };
         if matches!(request.context.config.reasoning, Some(Reasoning::BudgetTokens { .. })) {
             return Err(ProviderError { code: "PROVIDER", retry_after: None,
                 message: "reasoning budget tokens are unsupported by OpenAI Responses; use effort".into(),
@@ -70,7 +81,7 @@ impl ResponsesProvider {
         let mut body = json!({
             "model": self.model,
             "instructions": request.system,
-            "input": input_items(request.context),
+            "input": input_items(request.context, images.as_ref())?,
             "store": false,
             "stream": true,
             "parallel_tool_calls": true,
@@ -125,20 +136,24 @@ impl ResponsesProvider {
 
 // -- context → input items -------------------------------------------------
 
-fn input_items(context: &ModelContext) -> Vec<Value> {
+fn input_items(context: &ModelContext, images: Option<&(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>) -> Result<Vec<Value>, ProviderError> {
     let mut items = Vec::new();
     for turn in &context.turns {
         match turn {
             ModelTurn::User { content } => {
-                let parts: Vec<Value> = content
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } if !text.is_empty() => {
-                            Some(json!({"type": "input_text", "text": text}))
+                let mut parts = Vec::new();
+                for part in content {
+                    match part {
+                        ContentPart::Text { text } if !text.is_empty() => parts.push(json!({"type":"input_text", "text":text})),
+                        ContentPart::Image { attachment } => {
+                            let (store, policy) = images.ok_or_else(|| crate::image_error("image store not configured".into()))?;
+                            let (mime, data) = store.request_image(attachment, policy).map_err(crate::image_error)?;
+                            use base64::Engine;
+                            parts.push(json!({"type":"input_image", "image_url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}));
                         }
-                        _ => None,
-                    })
-                    .collect();
+                        _ => {}
+                    }
+                }
                 if !parts.is_empty() {
                     items.push(json!({"type": "message", "role": "user", "content": parts}));
                 }
@@ -180,6 +195,21 @@ fn input_items(context: &ModelContext) -> Vec<Value> {
                     } else {
                         &r.output
                     };
+                    let output = if r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) {
+                        let mut parts = Vec::new();
+                        for part in r.effective_content() {
+                            match part {
+                                rness_protocol::events::ToolResultContentPart::Text { text } => parts.push(json!({"type":"input_text", "text":text})),
+                                rness_protocol::events::ToolResultContentPart::Image { attachment } => {
+                                    let (store, policy) = images.ok_or_else(|| crate::image_error("image store not configured".into()))?;
+                                    let (mime, data) = store.request_image(&attachment, policy).map_err(crate::image_error)?;
+                                    use base64::Engine;
+                                    parts.push(json!({"type":"input_image", "image_url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}));
+                                }
+                            }
+                        }
+                        json!(parts)
+                    } else { json!(output) };
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": r.call,
@@ -189,7 +219,7 @@ fn input_items(context: &ModelContext) -> Vec<Value> {
             }
         }
     }
-    items
+    Ok(items)
 }
 
 // -- stream accumulation ---------------------------------------------------
@@ -341,6 +371,9 @@ impl Accumulator {
 
 #[async_trait]
 impl Provider for ResponsesProvider {
+    fn configure_images(&mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) {
+        self.images = Some((store, policy));
+    }
     fn model(&self) -> &str {
         &self.model
     }

@@ -9,12 +9,187 @@ use rness_tools::{bash::BashTool, edit::EditTool, glob::GlobTool, grep::GrepTool
 use serde_json::json;
 use tempfile::TempDir;
 
+#[tokio::test]
+async fn large_write_captures_changed_window_without_unchanged_file() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    let prefix = "unchanged\n".repeat(10000);
+    let before = format!("{prefix}old é\nlast\n");
+    let after = format!("{prefix}new ê\nlast\n");
+    std::fs::write(dir.path().join("large.txt"), before).unwrap();
+    ReadTool::new(workspace.clone()).execute(json!({"path":"large.txt","limit":1})).await.unwrap();
+    let (_, _, _, metadata) = WriteTool::new(workspace).execute_presented(
+        &"s".into(), &"w".into(), json!({"path":"large.txt","content":after}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["changes_complete"], true);
+    assert_eq!(metadata["hunks"][0]["old_start"], 10001);
+    assert_eq!(metadata["hunks"][0]["before"], "old é\n");
+    assert_eq!(metadata["hunks"][0]["after"], "new ê\n");
+    assert!(serde_json::to_vec(&metadata).unwrap().len() < 1024);
+}
+
+#[tokio::test]
+async fn large_edit_merges_overlapping_line_windows() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    std::fs::write(dir.path().join("large.txt"), format!("{}old old\n", "padding\n".repeat(10000))).unwrap();
+    ReadTool::new(workspace.clone()).execute(json!({"path":"large.txt","limit":1})).await.unwrap();
+    let (_, _, _, metadata) = EditTool::new(workspace).execute_presented(
+        &"s".into(), &"e".into(), json!({"path":"large.txt","old_string":"old","new_string":"new","replace_all":true}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["captured_replacements"], 2);
+    assert_eq!(metadata["hunks"].as_array().unwrap().len(), 1);
+    assert_eq!(metadata["hunks"][0]["before"], "old old\n");
+    assert_eq!(metadata["hunks"][0]["after"], "new new\n");
+}
+
+#[tokio::test]
+async fn large_write_captures_separated_changes() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    let middle = "unchanged\n".repeat(10000);
+    std::fs::write(dir.path().join("large.txt"), format!("old\n{middle}old\n")).unwrap();
+    ReadTool::new(workspace.clone()).execute(json!({"path":"large.txt","limit":1})).await.unwrap();
+    let (_, _, _, metadata) = WriteTool::new(workspace).execute_presented(
+        &"s".into(), &"w".into(), json!({"path":"large.txt","content":format!("new\n{middle}new\n")}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["changes_complete"], true);
+    assert_eq!(metadata["hunks"].as_array().unwrap().len(), 2);
+    assert!(serde_json::to_vec(&metadata).unwrap().len() < 2048);
+}
+
+#[tokio::test]
+async fn large_write_reports_when_change_capture_is_incomplete() {
+    let dir = TempDir::new().unwrap();
+    let tool = WriteTool::new(ws(&dir));
+    let content = "x".repeat(100_000);
+    let (output, _, error, metadata) = tool.execute_presented(
+        &"s".into(), &"w".into(), json!({"path":"new.txt","content":content}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    assert!(!error);
+    assert!(!output.is_empty());
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["changes_complete"], false);
+    assert_eq!(metadata["truncated"], true);
+    assert!(metadata.get("hunks").is_none());
+    assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), content);
+}
+
 fn ws(dir: &TempDir) -> Arc<Workspace> {
     Workspace::new(dir.path())
 }
 
 async fn exec(tool: &dyn Tool, args: serde_json::Value) -> Result<String, String> {
     tool.execute(args).await
+}
+
+#[tokio::test]
+async fn job_metadata_matches_consumed_window_and_is_immutable() {
+    let jobs = JobRegistry::new();
+    let (id, writer) = jobs.start("test", "snapshot".into());
+    writer.append(b"abc");
+    let output = JobOutputTool::new(jobs.clone());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (_, _, _, first) = output.execute_presented(&"s".into(), &"c".into(), json!({"job_id":id}), &cancel).await.unwrap();
+    let first = first.unwrap();
+    writer.append(b"de");
+    let (_, _, _, second) = output.execute_presented(&"s".into(), &"d".into(), json!({"job_id":id}), &cancel).await.unwrap();
+    assert_eq!(first["start_byte"], 0);
+    assert_eq!(first["end_byte"], 3);
+    assert_eq!(second.unwrap()["start_byte"], 3);
+    let list = JobListTool::new(jobs);
+    let (_, _, _, metadata) = list.execute_presented(&"s".into(), &"l".into(), json!({}), &cancel).await.unwrap();
+    writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
+    assert_eq!(metadata.unwrap()["jobs"][0]["status"], "[status: running]");
+}
+
+#[tokio::test]
+async fn read_and_bash_capture_execution_facts_without_changing_output() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "one\ntwo\nthree\n").unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let read = ReadTool::new(ws(&dir));
+    let (_, _, _, metadata) = read.execute_presented(&"s".into(), &"r".into(), json!({"path":"a.rs","offset":2,"limit":1}), &cancel).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["text"], "two\n");
+    assert_eq!(metadata["start_line"], 2);
+    assert_eq!(metadata["total_lines"], 3);
+    assert_eq!(metadata["truncated"], true);
+    let bash = BashTool::new(ws(&dir), JobRegistry::default());
+    let (content, _, is_error, metadata) = bash.execute_presented(&"s".into(), &"b".into(), json!({"command":"printf out; printf err >&2; exit 7", "description":"Capture streams"}), &cancel).await.unwrap();
+    assert!(!is_error);
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["exit_code"], 7);
+    assert_eq!(metadata["stdout_bytes"], 3);
+    assert_eq!(metadata["stderr_bytes"], 3);
+    assert_eq!(content, vec![rness_protocol::events::ToolResultContentPart::Text { text:"out\nerr\n[exit code: 7]".into() }]);
+}
+
+#[tokio::test]
+async fn large_edit_captures_bounded_fragments_with_shifted_offsets() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    let text = format!("{}target\nbetween\ntarget\n", "padding\n".repeat(10000));
+    std::fs::write(dir.path().join("large.txt"), text).unwrap();
+    ReadTool::new(workspace.clone()).execute(json!({"path":"large.txt","limit":1})).await.unwrap();
+    let (_, _, _, metadata) = EditTool::new(workspace).execute_presented(
+        &"s".into(), &"e".into(),
+        json!({"path":"large.txt","old_string":"target","new_string":"first\nsecond","replace_all":true}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["captured_replacements"], 2);
+    assert_eq!(metadata["hunks"][0]["old_start"], 10001);
+    assert_eq!(metadata["hunks"][1]["old_start"], 10003);
+    assert_eq!(metadata["hunks"][1]["new_start"], 10004);
+    assert_eq!(metadata["hunks"][0]["fragment"], false);
+    assert_eq!(metadata["hunks"][0]["before"], "target\n");
+    assert_eq!(metadata["hunks"][0]["after"], "first\nsecond\n");
+    assert!(serde_json::to_vec(&metadata).unwrap().len() < 50 * 1024);
+}
+
+#[tokio::test]
+async fn large_edit_preserves_surrounding_text_and_eof_in_line_windows() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    std::fs::write(dir.path().join("large.txt"), format!("{}prefix target suffix", "padding\n".repeat(10000))).unwrap();
+    ReadTool::new(workspace.clone()).execute(json!({"path":"large.txt","limit":1})).await.unwrap();
+    let (_, _, _, metadata) = EditTool::new(workspace).execute_presented(
+        &"s".into(), &"e".into(), json!({"path":"large.txt","old_string":"target","new_string":"replacement"}),
+        &tokio_util::sync::CancellationToken::new(),
+    ).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["hunks"][0]["before"], "prefix target suffix");
+    assert_eq!(metadata["hunks"][0]["after"], "prefix replacement suffix");
+    assert_eq!(metadata["hunks"][0]["fragment"], false);
+    assert_eq!(metadata["hunks"][0]["new_start"], 10001);
+}
+
+#[tokio::test]
+async fn write_and_edit_capture_immutable_execution_snapshots() {
+    let dir = TempDir::new().unwrap();
+    let workspace = ws(&dir);
+    let write = WriteTool::new(workspace.clone());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (_, _, _, metadata) = write.execute_presented(&"s".into(), &"w".into(), json!({"path":"a.rs","content":"old\n"}), &cancel).await.unwrap();
+    let metadata = metadata.unwrap();
+    assert_eq!(metadata["created"], true);
+    assert_eq!(metadata["before"], "");
+    assert_eq!(metadata["after"], "old\n");
+    let edit = EditTool::new(workspace);
+    let (_, _, _, metadata) = edit.execute_presented(&"s".into(), &"e".into(), json!({"path":"a.rs","old_string":"old","new_string":"new"}), &cancel).await.unwrap();
+    let metadata = metadata.unwrap();
+    std::fs::write(dir.path().join("a.rs"), "later").unwrap();
+    assert_eq!(metadata["before"], "old\n");
+    assert_eq!(metadata["after"], "new\n");
+    assert_eq!(metadata["old_start"], 1);
 }
 
 #[tokio::test]

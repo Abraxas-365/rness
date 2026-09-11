@@ -26,6 +26,20 @@ const MAX_ROWS: usize = 8;
 const PREFIX_CELLS: u16 = 2;
 
 pub struct Input {
+    history_images: Vec<rness_protocol::events::ImageRef>,
+    history_image_index: usize,
+    history_preview: bool,
+    history_image_key: Option<crate::keys::Chord>,
+    image_preview: bool,
+    image_preview_key: Option<crate::keys::Chord>,
+    image_close_key: Option<crate::keys::Chord>,
+    thumbnails: std::collections::HashMap<String, image::RgbaImage>,
+    image_session: Option<String>,
+    selected_image: usize,
+    next_image_key: Option<crate::keys::Chord>,
+    images: Vec<rness_protocol::events::ImageRef>,
+    clipboard_key: Option<crate::keys::Chord>,
+    remove_image_key: Option<crate::keys::Chord>,
     edit_key: Option<crate::keys::Chord>,
     preview_key: Option<crate::keys::Chord>,
     preview: Option<(usize, String)>,
@@ -55,7 +69,7 @@ pub fn install(slots: &mut Slots) {
 
 impl Input {
     pub fn new() -> Self {
-        Self { edit_key: crate::keys::Chord::parse("ctrl+e"), preview_key: crate::keys::Chord::parse("ctrl+g"), preview: None, preview_scroll: 0, preview_max: 0, paste_lines: 5, paste_chars: 500, external_editor: None, references: Vec::new(), reference_query: String::new(), commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: Editor::new() }
+        Self { history_images: Vec::new(), history_image_index: 0, history_preview: false, history_image_key: crate::keys::Chord::parse("alt+h"), image_preview: false, image_preview_key: crate::keys::Chord::parse("alt+p"), image_close_key: crate::keys::Chord::parse("esc"), thumbnails: Default::default(), selected_image: 0, next_image_key: crate::keys::Chord::parse("alt+right"), image_session: None, images: Vec::new(), clipboard_key: crate::keys::Chord::parse("ctrl+v"), remove_image_key: crate::keys::Chord::parse("alt+backspace"), edit_key: crate::keys::Chord::parse("ctrl+e"), preview_key: crate::keys::Chord::parse("ctrl+g"), preview: None, preview_scroll: 0, preview_max: 0, paste_lines: 5, paste_chars: 500, external_editor: None, references: Vec::new(), reference_query: String::new(), commands: Vec::new(), editor: Editor::new(), scroll_top: 0, candidates: vec![("unload".into(), "Unload a plugin".into())], selected: 0, dismissed: false, history: Vec::new(), history_index: None, draft: Editor::new() }
     }
 
     pub fn with_candidates(candidates: Vec<(String, String)>) -> Self {
@@ -101,6 +115,93 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_preview_is_read_only_and_preserves_draft() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.editor.insert_str("draft");
+        input.on_action(&ctx, "input:history-images", &serde_json::json!([
+            {"id":"a","media_type":"image/png","width":1,"height":1,"bytes":4},
+            {"id":"b","media_type":"image/png","width":1,"height":1,"bytes":4}
+        ]));
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(input.history_images.len(), 2);
+        assert!(input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).actions.is_empty());
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(input.history_image_index, 0);
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!input.image_preview);
+        assert!(!input.history_preview);
+        assert!(input.images.is_empty());
+        assert_eq!(input.editor.text(), "draft");
+    }
+
+    #[test]
+    fn unified_clipboard_paste_uses_promptbox_key_and_text_paste_behavior() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:promptbox-config", &serde_json::json!({"keys":{"paste":"ctrl+y"}}));
+        assert!(matches!(input.on_key(&ctx, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)).actions.as_slice(), [Action::PasteClipboard]));
+        assert!(!input.on_key(&ctx, KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)).actions.iter().any(|a| matches!(a, Action::PasteClipboard)));
+        let text = "clipboard text\n".repeat(10);
+        input.on_action(&ctx, "input:clipboard-text", &serde_json::json!(text));
+        assert_eq!(input.editor.text(), text);
+        assert!(input.editor.has_pastes());
+        input.on_action(&ctx, "input:promptbox-config", &serde_json::json!({"keys":{"paste":false}}));
+        assert!(input.clipboard_key.is_none());
+    }
+
+    #[test]
+    fn raster_preview_uses_configured_keys_and_renders_pixels() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:promptbox-config", &serde_json::json!({"images":{"keys":{"preview":"ctrl+y","close":"ctrl+x"}}}));
+        input.on_action(&ctx, "input:image-added", &serde_json::json!({"id":"a","media_type":"image/png","width":1,"height":2,"bytes":8}));
+        input.on_action(&ctx, "input:image-thumbnail", &serde_json::json!({"id":"a","width":1,"height":2,"pixels":[255,0,0,255,0,0,255,255]}));
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(!input.image_preview);
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(input.image_preview);
+        let area = Rect::new(0, 0, 20, 10);
+        let mut buf = Buffer::empty(area);
+        input.render(&ctx, area, &mut buf);
+        assert_eq!(buf[(1,1)].symbol(), "▀");
+        assert_eq!(buf[(1,1)].fg, ratatui::style::Color::Rgb(255,0,0));
+        assert_eq!(buf[(1,1)].bg, ratatui::style::Color::Rgb(0,0,255));
+        assert!(input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).actions.is_empty());
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(!input.image_preview);
+        assert_eq!(input.images.len(), 1);
+    }
+
+    #[test]
+    fn image_draft_survives_editor_and_clears_only_on_success() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        let reference = serde_json::json!({"id":"a".repeat(64),"media_type":"image/png","width":2,"height":2,"bytes":20});
+        input.on_action(&ctx, "input:image-added", &reference);
+        input.on_action(&ctx, "input:image-added", &reference);
+        input.on_action(&ctx, "input:prompt-edited", &serde_json::json!({"text":"describe"}));
+        assert_eq!(input.images.len(), 2);
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(&outcome.actions[..], [Action::SubmitImages(text, images)] if text == "describe" && images.len() == 2));
+        assert_eq!(input.editor.text(), "describe");
+        assert_eq!(input.images.len(), 2);
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(input.images.len(), 1);
+        input.on_action(&ctx, "input:images-submitted", &serde_json::Value::Null);
+        assert!(input.images.is_empty());
+        assert!(input.editor.text().is_empty());
+    }
 
     #[test]
     fn paste_preview_keys_are_configurable_and_modifier_sensitive() {
@@ -278,9 +379,38 @@ impl Component for Input {
         KeyOutcome::consumed()
     }
 
-    fn on_action(&mut self, _ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+    fn on_action(&mut self, ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "input:history-images" {
+            if let Ok(images) = serde_json::from_value::<Vec<rness_protocol::events::ImageRef>>(payload.clone()) {
+                self.history_images = images;
+                self.history_image_index = self.history_images.len().saturating_sub(1);
+                self.history_preview = !self.history_images.is_empty();
+                self.image_preview = self.history_preview;
+                self.image_session = Some(ctx.model.session.clone());
+            }
+            return;
+        }
+        if name == "input:clipboard-text" {
+            if let Some(text) = payload.as_str() { self.on_paste(ctx, text); }
+            return;
+        }
+        if name == "input:image-thumbnail" {
+            if let (Some(id), Some(width), Some(height), Ok(pixels)) = (payload["id"].as_str(), payload["width"].as_u64(), payload["height"].as_u64(), serde_json::from_value::<Vec<u8>>(payload["pixels"].clone())) {
+                if width <= 160 && height <= 80 && self.images.iter().chain(self.history_images.iter()).any(|image| image.id == id) {
+                    if let Some(image) = image::RgbaImage::from_raw(width as u32, height as u32, pixels) { self.thumbnails.insert(id.into(), image); }
+                }
+            }
+            return;
+        }
+        if name == "input:image-added" {
+            if self.image_session.as_ref() != Some(&ctx.model.session) { self.images.clear(); }
+            self.image_session = Some(ctx.model.session.clone());
+            if let Ok(image) = serde_json::from_value(payload.clone()) { self.images.push(image); self.selected_image = self.images.len() - 1; }
+            return;
+        }
+        if name == "input:images-submitted" { self.images.clear(); self.thumbnails.clear(); self.image_preview = false; self.editor.take(); return; }
         if name == "input:promptbox-config" {
-            for (value, target) in [(&payload["keys"]["edit"], &mut self.edit_key), (&payload["paste"]["keys"]["preview"], &mut self.preview_key)] {
+            for (value, target) in [(&payload["images"]["keys"]["history"], &mut self.history_image_key), (&payload["images"]["keys"]["preview"], &mut self.image_preview_key), (&payload["images"]["keys"]["close"], &mut self.image_close_key), (&payload["images"]["keys"]["next"], &mut self.next_image_key), (&payload["keys"]["paste"], &mut self.clipboard_key), (&payload["images"]["keys"]["remove"], &mut self.remove_image_key), (&payload["keys"]["edit"], &mut self.edit_key), (&payload["paste"]["keys"]["preview"], &mut self.preview_key)] {
                 if value == &serde_json::Value::Bool(false) { *target = None; }
                 else if let Some(key) = value.as_str() {
                     if let Some(chord) = crate::keys::Chord::parse(key) { *target = Some(chord); }
@@ -368,7 +498,7 @@ impl Component for Input {
     }
 
     fn height(&self, _ctx: &Ctx<'_>, width: u16) -> Option<u16> {
-        if self.preview.is_some() { return Some(18); }
+        if self.image_preview || self.preview.is_some() { return Some(18); }
         let rows = self.editor.wrapped_rows(Self::wrap_width(width)).len();
         // +1: blank margin row above the box, separating it from the
         // conversation body.
@@ -376,6 +506,31 @@ impl Component for Input {
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
+        if self.image_preview && self.image_session.as_ref() == Some(&ctx.model.session) {
+            use ratatui::widgets::{Block, Borders};
+            let block = Block::default().borders(Borders::ALL).title(" Image preview ");
+            let inner = block.inner(area);
+            block.render(area, buf);
+            let reference = if self.history_preview { self.history_images.get(self.history_image_index) } else { self.images.get(self.selected_image) };
+            if let Some(source) = reference.and_then(|r| self.thumbnails.get(&r.id)) {
+                if inner.width > 0 && inner.height > 0 {
+                    let image = image::DynamicImage::ImageRgba8(source.clone()).thumbnail(u32::from(inner.width).min(source.width()), (u32::from(inner.height) * 2).min(source.height())).to_rgba8();
+                    for y in 0..image.height().div_ceil(2) {
+                        for x in 0..image.width() {
+                            let color = |p: &image::Rgba<u8>| ratatui::style::Color::Rgb(
+                                ((u16::from(p[0]) * u16::from(p[3])) / 255) as u8,
+                                ((u16::from(p[1]) * u16::from(p[3])) / 255) as u8,
+                                ((u16::from(p[2]) * u16::from(p[3])) / 255) as u8,
+                            );
+                            let top = color(image.get_pixel(x, y * 2));
+                            let bottom = if y * 2 + 1 < image.height() { color(image.get_pixel(x, y * 2 + 1)) } else { ratatui::style::Color::Black };
+                            buf[(inner.x + x as u16, inner.y + y as u16)].set_symbol("▀").set_fg(top).set_bg(bottom);
+                        }
+                    }
+                }
+            } else { Line::raw("Preview unavailable for this attachment").render(inner, buf); }
+            return;
+        }
         if let Some((id, content)) = &self.preview {
             use ratatui::widgets::{Block, Borders, Paragraph};
             let block = Block::default().borders(Borders::ALL).title(format!(" Paste #{id} ")).title_bottom(" Esc: close · arrows/PageUp/PageDown: scroll ");
@@ -391,7 +546,11 @@ impl Component for Input {
             Paragraph::new(lines).render(inner, buf);
             return;
         }
-        if self.editor.selected_paste().is_some() && area.height > 0 {
+        if !self.images.is_empty() && self.image_session.as_ref() == Some(&ctx.model.session) && area.height > 0 {
+            let index = self.selected_image.min(self.images.len() - 1);
+            let image = &self.images[index];
+            Line::styled(format!("Image {}/{} · {} × {} · {} bytes", index + 1, self.images.len(), image.width, image.height, image.bytes), ctx.theme.editor_prompt).render(Rect::new(area.x, area.y, area.width, 1), buf);
+        } else if self.editor.selected_paste().is_some() && area.height > 0 {
             Line::styled("Paste selected", ctx.theme.editor_prompt).render(Rect::new(area.x, area.y, area.width, 1), buf);
         }
         let picker_height = self.picker_height().min(area.height.saturating_sub(2));
@@ -463,7 +622,33 @@ impl Component for Input {
         }
     }
 
-    fn on_key(&mut self, _ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
+    fn on_key(&mut self, ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
+        if self.image_session.as_ref().is_some_and(|session| session != &ctx.model.session) { self.images.clear(); self.thumbnails.clear(); self.history_images.clear(); self.history_preview = false; self.image_preview = false; self.image_session = None; }
+        if self.history_image_key.is_some_and(|chord| chord.matches(&key)) { return KeyOutcome::act(vec![Action::PreviewHistoryImage]); }
+        if self.image_preview && self.image_close_key.is_some_and(|chord| chord.matches(&key)) { self.image_preview = false; self.history_preview = false; return KeyOutcome::consumed(); }
+        if self.image_preview && self.history_preview {
+            if self.next_image_key.is_some_and(|chord| chord.matches(&key)) && !self.history_images.is_empty() { self.history_image_index = (self.history_image_index + 1) % self.history_images.len(); }
+            return KeyOutcome::consumed();
+        }
+        if self.image_preview_key.is_some_and(|chord| chord.matches(&key)) && !self.images.is_empty() { self.image_preview = !self.image_preview; return KeyOutcome::consumed(); }
+        if self.clipboard_key.is_some_and(|chord| chord.matches(&key)) { return KeyOutcome::act(vec![Action::PasteClipboard]); }
+        if self.next_image_key.is_some_and(|chord| chord.matches(&key)) && !self.images.is_empty() {
+            self.selected_image = (self.selected_image + 1) % self.images.len();
+            return KeyOutcome::consumed();
+        }
+        if self.remove_image_key.is_some_and(|chord| chord.matches(&key)) {
+            if !self.images.is_empty() {
+                let removed = self.images.remove(self.selected_image.min(self.images.len() - 1));
+                if !self.images.iter().any(|r| r.id == removed.id) { self.thumbnails.remove(&removed.id); }
+                if self.images.is_empty() { self.image_preview = false; }
+                self.selected_image = self.selected_image.min(self.images.len().saturating_sub(1));
+            }
+            return KeyOutcome::consumed();
+        }
+        if self.image_preview { return KeyOutcome::consumed(); }
+        if !self.images.is_empty() && self.preview.is_none() && key.code == KeyCode::Enter && key.modifiers.is_empty() {
+            return KeyOutcome::act(vec![Action::SubmitImages(self.editor.text(), self.images.clone())]);
+        }
         if self.edit_key.is_some_and(|chord| chord.matches(&key)) {
             return KeyOutcome::act(vec![Action::Custom("terminal:edit-prompt".into(), serde_json::json!({"text": self.editor.text(), "editor": self.external_editor}))]);
         }

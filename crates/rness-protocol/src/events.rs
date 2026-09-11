@@ -332,11 +332,23 @@ pub enum AttemptOutcome {
     Cancelled,
 }
 
+/// Content-addressed image reference; never a filesystem path or remote URL.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageRef {
+    pub id: String,
+    pub media_type: String,
+    pub bytes: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Message content, mirroring provider shapes closely enough to
 /// reconstruct requests exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ContentPart {
+    Image { attachment: ImageRef },
     Text { text: String },
     /// Model-internal reasoning (persisted; provider adapters decide
     /// whether it is replayed).
@@ -353,11 +365,27 @@ pub enum ContentPart {
 
 pub type ToolCallId = String;
 
+/// Ordered content emitted by a tool. Unlike message content, tool output
+/// cannot contain model reasoning or further tool calls.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ToolResultContentPart {
+    Text { text: String },
+    Image { attachment: ImageRef },
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call: ToolCallId,
     /// Tool name, denormalized for greppability.
     pub name: String,
+    /// Ordered durable tool output. Empty is accepted when reading pre-rich
+    /// logs, whose text-only output remains in `output`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<ToolResultContentPart>,
+    /// Text projection retained for wire and extension compatibility. New
+    /// writers set this to the concatenated text parts of `content`.
+    #[serde(default)]
     pub output: String,
     #[serde(default)]
     pub is_error: bool,
@@ -368,6 +396,31 @@ pub struct ToolResult {
     pub tasks: Option<TaskSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_review: Option<PlanReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<serde_json::Value>,
+}
+
+impl ToolResult {
+    /// Rich content when present, otherwise a lossless view of old text-only
+    /// logs. Keeping fallback here makes replay migrations transparent.
+    pub fn effective_content(&self) -> Vec<ToolResultContentPart> {
+        if self.content.is_empty() && !self.output.is_empty() {
+            vec![ToolResultContentPart::Text { text: self.output.clone() }]
+        } else {
+            self.content.clone()
+        }
+    }
+
+    pub fn text_output(content: &[ToolResultContentPart]) -> String {
+        content
+            .iter()
+            .filter_map(|part| match part {
+                ToolResultContentPart::Text { text } => Some(text.as_str()),
+                ToolResultContentPart::Image { .. } => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

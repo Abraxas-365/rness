@@ -13,7 +13,55 @@ use crate::theme::Theme;
 
 /// Render markdown into wrapped, styled lines.
 pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-    let width = width.max(10) as usize;
+    render_markdown_configured(source, width, theme, &serde_json::Value::Null)
+}
+
+struct CachedMarkdown {
+    source: String,
+    width: u16,
+    theme: Theme,
+    config: serde_json::Value,
+    lines: Vec<Line<'static>>,
+    bytes: usize,
+}
+
+thread_local! {
+    static MARKDOWN_CACHE: std::cell::RefCell<std::collections::VecDeque<CachedMarkdown>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+pub fn render_markdown_configured(source: &str, width: u16, theme: &Theme, config: &serde_json::Value) -> Vec<Line<'static>> {
+    if let Some(lines) = MARKDOWN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let index = cache.iter().position(|entry| entry.width == width && entry.source == source && entry.theme == *theme && entry.config == *config)?;
+        let entry = cache.remove(index)?;
+        let lines = entry.lines.clone();
+        cache.push_back(entry);
+        Some(lines)
+    }) { return lines; }
+    let lines = render_markdown_uncached(source, width, theme, config);
+    let bytes = source.len().saturating_add(config.to_string().len()).saturating_add(lines.iter().map(|line| {
+        std::mem::size_of::<Line<'static>>() + line.spans.iter().map(|span| std::mem::size_of::<Span<'static>>() + span.content.len()).sum::<usize>()
+    }).sum::<usize>());
+    const BUDGET: usize = 4 * 1024 * 1024;
+    if bytes <= BUDGET / 4 {
+        MARKDOWN_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let mut retained = cache.iter().map(|entry| entry.bytes).sum::<usize>();
+            while cache.len() >= 128 || retained.saturating_add(bytes) > BUDGET {
+                if let Some(entry) = cache.pop_front() { retained -= entry.bytes; } else { break; }
+            }
+            cache.push_back(CachedMarkdown {source:source.to_owned(), width, theme:theme.clone(), config:config.clone(), lines:lines.clone(), bytes});
+        });
+    }
+    lines
+}
+
+fn render_markdown_uncached(source: &str, width: u16, theme: &Theme, config: &serde_json::Value) -> Vec<Line<'static>> {
+    let resolve = |value: &serde_json::Value, fallback| theme.resolve_style(value, fallback).unwrap_or(fallback);
+    let heading = resolve(&config["heading"], theme.heading);
+    let inline_code = resolve(&config["inline_code"], theme.code);
+    let code_style = resolve(&config["code_block"]["style"], theme.code_block);
+    let width = width.max(1) as usize;
     let mut out: Vec<Line<'static>> = Vec::new();
 
     // Current inline accumulation (spans of the paragraph being built).
@@ -50,8 +98,10 @@ pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'sta
                 Tag::Heading { .. } => {
                     flush_inline(&mut inline, &mut out);
                     separate(&mut out);
-                    style_stack.push(theme.heading);
+                    style_stack.push(heading);
                 }
+                Tag::Link { .. } => style_stack.push(resolve(&config["link"], *style_stack.last().unwrap())),
+                Tag::BlockQuote(_) => style_stack.push(resolve(&config["quote"], *style_stack.last().unwrap())),
                 Tag::Emphasis => {
                     let top = *style_stack.last().expect("style stack");
                     style_stack.push(top.add_modifier(Modifier::ITALIC));
@@ -69,7 +119,7 @@ pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'sta
                     if let CodeBlockKind::Fenced(lang) = kind {
                         code_lang = lang.to_string();
                     }
-                    if code_lang.is_empty() {
+                    if code_lang.is_empty() || config["code_block"]["show_language"] == false {
                         out.push(Line::styled("```", theme.dim));
                     } else {
                         out.push(Line::styled(format!("```{code_lang}"), theme.dim));
@@ -97,16 +147,29 @@ pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'sta
                     }
                     style_stack.pop();
                 }
+                TagEnd::Link | TagEnd::BlockQuote(_) => { style_stack.pop(); },
                 TagEnd::Paragraph | TagEnd::Item => flush_inline(&mut inline, &mut out),
                 TagEnd::CodeBlock => {
                     in_code_block = false;
-                    match highlight_code(&code_buf, &code_lang) {
-                        Some(lines) => out.extend(lines),
-                        None => {
-                            for l in code_buf.lines() {
-                                out.push(Line::styled(l.to_string(), theme.code_block));
-                            }
-                        }
+                    let highlighted = if config["code_block"]["syntax_highlight"] == false { None } else { highlight_code(&code_buf, &code_lang) };
+                    let code_lines = highlighted.unwrap_or_else(|| code_buf.lines().map(|l| Line::raw(l.to_owned())).collect());
+                    let left = config["code_block"]["padding"]["left"].as_u64().unwrap_or(0).min(64) as usize;
+                    let right = config["code_block"]["padding"]["right"].as_u64().unwrap_or(0).min(64) as usize;
+                    for _ in 0..config["code_block"]["padding"]["top"].as_u64().unwrap_or(0).min(64) {
+                        out.push(Line::styled(" ".repeat(width), code_style));
+                    }
+                    for line in code_lines {
+                        let mut spans = vec![Span::styled(" ".repeat(left), code_style)];
+                        spans.extend(line.spans.into_iter().map(|span| {
+                            let mut style = code_style.patch(span.style);
+                            if config["code_block"]["style"].get("bg").is_some() { style.bg = code_style.bg; }
+                            span.style(style)
+                        }));
+                        spans.push(Span::styled(" ".repeat(right), code_style));
+                        out.push(Line::from(spans).style(code_style));
+                    }
+                    for _ in 0..config["code_block"]["padding"]["bottom"].as_u64().unwrap_or(0).min(64) {
+                        out.push(Line::styled(" ".repeat(width), code_style));
                     }
                     code_buf.clear();
                     out.push(Line::styled("```", theme.dim));
@@ -147,7 +210,7 @@ pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'sta
                     ));
                 }
             }
-            Event::Code(code) => inline.push(Span::styled(code.into_string(), theme.code)),
+            Event::Code(code) => inline.push(Span::styled(code.into_string(), inline_code)),
             Event::SoftBreak => inline.push(Span::raw(" ")),
             Event::HardBreak => flush_inline(&mut inline, &mut out),
             Event::Rule => {
@@ -210,6 +273,27 @@ fn split_keep_spaces(s: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_cache_tracks_width_theme_config_and_evicts() {
+        MARKDOWN_CACHE.with(|cache| cache.borrow_mut().clear());
+        let mut theme = Theme::default();
+        let config = serde_json::Value::Null;
+        let first = render_markdown_configured("hello world", 80, &theme, &config);
+        assert_eq!(first, render_markdown_configured("hello world", 80, &theme, &config));
+        MARKDOWN_CACHE.with(|cache| assert_eq!(cache.borrow().len(), 1));
+        render_markdown_configured("hello world", 5, &theme, &config);
+        theme.heading = Style::default().fg(ratatui::style::Color::Red);
+        render_markdown_configured("hello world", 5, &theme, &config);
+        render_markdown_configured("hello world", 5, &theme, &serde_json::json!({"code_block":{"syntax_highlight":false}}));
+        MARKDOWN_CACHE.with(|cache| assert_eq!(cache.borrow().len(), 4));
+        for i in 0..140 { render_markdown_configured(&format!("entry {i}"), 80, &theme, &config); }
+        MARKDOWN_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 128);
+            assert!(cache.iter().map(|entry| entry.bytes).sum::<usize>() <= 4 * 1024 * 1024);
+        });
+    }
 
     fn plain(lines: &[Line<'_>]) -> Vec<String> {
         lines
@@ -295,6 +379,21 @@ mod tests {
                 "Uno.", "", "Dos.", "", "- a", "- b", "", "```", "x", "```", "", "Tres.",
             ]
         );
+    }
+
+    #[test]
+    fn configured_markdown_styles_and_plain_code_preserve_text() {
+        let theme = Theme::default();
+        let config = serde_json::json!({
+            "heading":{"fg":"#ff0000"}, "link":{"underline":true},
+            "code_block":{"syntax_highlight":false,"show_language":false,"style":{"bg":"#1d2021"}}
+        });
+        let lines = render_markdown_configured("# Title\n\n[link](https://example.com)\n\n```rust\nlet x = 1;\n```", 40, &theme, &config);
+        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.content.contains("Title") && s.style.fg == Some(ratatui::style::Color::Rgb(255,0,0))));
+        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.content.contains("link") && s.style.add_modifier.contains(Modifier::UNDERLINED)));
+        let text = lines.iter().flat_map(|l| &l.spans).map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.contains("let x = 1;"));
+        assert!(!text.contains("```rust"));
     }
 
     #[test]

@@ -15,6 +15,33 @@ use rness_server::{router, ServerState};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn image_upload_validation_and_session_scoped_retrieval() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve_with(dir.path(), Arc::new(OneAnswer), Arc::new(ToolRegistry::default())).await;
+    sessions.set_images(Arc::new(rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default()).unwrap())).unwrap();
+    let id = sessions.create(None).unwrap();
+    let other = sessions.create(None).unwrap();
+    let client = reqwest::Client::new();
+    let mut data = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut data, image::ImageFormat::Png).unwrap();
+    let upload = format!("{base}/api/sessions/{id}/images");
+    assert_eq!(client.post(&upload).header("content-type", "image/jpeg").body(data.get_ref().clone()).send().await.unwrap().status(), 400);
+    let response = client.post(&upload).header("content-type", "image/png").body(data.get_ref().clone()).send().await.unwrap();
+    assert_eq!(response.status(), 201);
+    let reference: ImageRef = response.json().await.unwrap();
+    let download = format!("{upload}/{}", reference.id);
+    assert!(sessions.send(&other, UserIntent::Followup, vec![ContentPart::Image { attachment: reference.clone() }]).is_err());
+    assert_eq!(client.get(&download).send().await.unwrap().status(), 404);
+    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Image { attachment: reference.clone() }]).unwrap();
+    sessions.join(&id).await;
+    let response = client.get(&download).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["content-type"], "image/png");
+    assert_eq!(response.bytes().await.unwrap().as_ref(), data.get_ref());
+    assert_eq!(client.get(format!("{base}/api/sessions/{other}/images/{}", reference.id)).send().await.unwrap().status(), 404);
+}
+
+#[tokio::test]
 async fn file_reference_http_is_path_only_and_workspace_scoped() {
     let logs = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();

@@ -121,12 +121,16 @@ impl Questions {
         removed
     }
     pub(crate) async fn ask(&self, request: Request, cancel: &CancellationToken) -> Result<String, String> {
+        self.ask_presented(request, cancel).await.map(|(output, _)| output).map_err(|(error, _)| error)
+    }
+
+    async fn ask_presented(&self, request: Request, cancel: &CancellationToken) -> Result<(String, serde_json::Value), (String, &'static str)> {
         let (tx, rx) = oneshot::channel();
         let key = (request.session.clone(), request.call.clone());
         {
             let mut pending = self.pending.lock().unwrap();
-            if !self.available.load(std::sync::atomic::Ordering::SeqCst) { return Err("no question frontend available".into()); }
-            if pending.contains_key(&key) { return Err("duplicate pending question call".into()); }
+            if !self.available.load(std::sync::atomic::Ordering::SeqCst) { return Err(("no question frontend available".into(), "unavailable")); }
+            if pending.contains_key(&key) { return Err(("duplicate pending question call".into(), "duplicate")); }
             let event = QuestionEvent::QuestionRequested { session: request.session.clone(), call: request.call.clone(), questions: request.questions.clone() };
             pending.insert(key.clone(), Pending { request, tx });
             let _ = self.events.send(event);
@@ -136,8 +140,12 @@ impl Questions {
         let _guard = Guard(self, key);
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => Err("question cancelled".into()),
-            result = rx => serde_json::to_string(&result.map_err(|_| "question dismissed or frontend disconnected")?).map_err(|e| e.to_string()),
+            _ = cancel.cancelled() => Err(("question cancelled".into(), "cancelled")),
+            result = rx => {
+                let answers = result.map_err(|_| ("question dismissed or frontend disconnected".into(), "dismissed_or_disconnected"))?;
+                let output = serde_json::to_string(&answers).map_err(|e| (e.to_string(), "serialization_failed"))?;
+                Ok((output, serde_json::json!({"version":1,"kind":"questions","status":"answered","answers":answers})))
+            },
         }
     }
 }
@@ -167,6 +175,9 @@ mod tests {
             }
             let result = worker.await.unwrap();
             assert_eq!(result[0].is_error, cancel_it);
+            let metadata = result[0].presentation.as_ref().unwrap();
+            assert_eq!(metadata["status"], if cancel_it { "cancelled" } else { "answered" });
+            if !cancel_it { assert_eq!(metadata["answers"]["answers"][0]["selected"][0], "A"); }
             if !cancel_it { assert!(result[0].output.contains("A")); }
             assert!(questions.pending().is_empty());
         }
@@ -183,6 +194,11 @@ impl crate::tools::Tool for AskUser {
     }
     async fn execute(&self, _: serde_json::Value) -> Result<String, String> { Err("AskUser requires agent dispatch context".into()) }
     async fn execute_call(&self, session: &String, call: &str, args: serde_json::Value, cancel: &CancellationToken) -> Result<String, String> {
+        let (content, _, error, _) = self.execute_presented(session, &call.to_owned(), args, cancel).await?;
+        let output = rness_protocol::events::ToolResult::text_output(&content);
+        if error { Err(output) } else { Ok(output) }
+    }
+    async fn execute_presented(&self, session: &String, call: &String, args: serde_json::Value, cancel: &CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<serde_json::Value>), String> {
         let input: Input = serde_json::from_value(args).map_err(|e| e.to_string())?;
         if input.questions.is_empty() || input.questions.len() > 16 { return Err("expected 1 to 16 questions".into()); }
         let mut ids = std::collections::HashSet::new();
@@ -191,6 +207,10 @@ impl crate::tools::Tool for AskUser {
             let mut labels = std::collections::HashSet::new();
             if q.options.iter().any(|o| o.label.trim().is_empty() || !labels.insert(&o.label)) { return Err("options need unique nonempty labels".into()); }
         }
-        self.0.ask(Request { session: session.clone(), call: call.into(), questions: input.questions }, cancel).await
+        let (output, error, metadata) = match self.0.ask_presented(Request { session: session.clone(), call: call.into(), questions: input.questions }, cancel).await {
+            Ok((output, metadata)) => (output, false, metadata),
+            Err((output, status)) => (output, true, serde_json::json!({"version":1,"kind":"questions","status":status})),
+        };
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, error, Some(metadata)))
     }
 }

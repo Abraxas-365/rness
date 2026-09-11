@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use rness_protocol::events::{SessionId, ToolCallId, ToolResult};
+use rness_protocol::events::{SessionId, ToolCallId, ToolResult, ToolResultContentPart};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +53,26 @@ pub trait Tool: Send + Sync {
     async fn execute_with_tasks(&self, session: &SessionId, call: &str, args: serde_json::Value, cancel: &CancellationToken) -> Result<(String, Option<rness_protocol::events::TaskSnapshot>), String> {
         self.execute_call(session, call, args, cancel).await.map(|output| (output, None))
     }
+    /// Rich-output seam. The default preserves all existing text-only tools;
+    /// adapters that return binary attachments override this and must admit
+    /// every image through the session-bound image store first.
+    async fn execute_rich(
+        &self,
+        session: &SessionId,
+        call: &str,
+        args: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
+        self.execute_with_tasks(session, call, args, cancel)
+            .await
+            .map(|(output, tasks)| (vec![ToolResultContentPart::Text { text: output }], tasks, false))
+    }
+    async fn execute_presented(
+        &self, session: &SessionId, call: &ToolCallId, args: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<(Vec<ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<serde_json::Value>), String> {
+        self.execute_rich(session, call, args, cancel).await.map(|(content, tasks, error)| (content, tasks, error, None))
+    }
     async fn execute_in(
         &self,
         session: &SessionId,
@@ -83,6 +103,7 @@ pub struct ToolCall {
 pub struct ToolRegistry {
     /// Interior-mutable so composition roots holding `Arc<ToolRegistry>`
     /// can re-sync tools at runtime (Lua plugin hot reload).
+    pub images: Arc<std::sync::OnceLock<Arc<crate::images::ImageStore>>>,
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     /// Composition-owned approval seam. Default policy is `Allow`, which
     /// behaves exactly as if the seam didn't exist.
@@ -96,14 +117,14 @@ impl ToolRegistry {
         let tools = self.tools.read().expect("registry lock").iter()
             .map(|(name, tool)| (name.clone(), tool.for_workspace(session, workspace).unwrap_or_else(|| Arc::clone(tool))))
             .collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
+        Self { images: self.images.clone(), tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
     }
 
     pub fn restricted(&self, allowed: &[String]) -> Self {
         let tools = self.tools.read().expect("registry lock").iter()
             .filter(|(name, _)| allowed.contains(name))
             .map(|(name, tool)| (name.clone(), Arc::clone(tool))).collect();
-        Self { tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
+        Self { images: self.images.clone(), tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {
@@ -209,6 +230,8 @@ impl ToolRegistry {
                 let _permit = sem.acquire_owned().await.expect("semaphore open");
                 let started = Instant::now();
                 let mut plan_review = None;
+                let mut presentation = None;
+                let mut failure_kind = "execution_failed";
                 let outcome = match tool {
                     Some(t) => {
                         {
@@ -229,37 +252,58 @@ impl ToolRegistry {
                             };
                             match decision {
                                 Decision::Allowed if t.plan_config().is_some() => {
-                                    t.review_plan(&session, &call.call, call.args.clone(), &cancel).await.map(|(output, review)| { plan_review = Some(review); (output, None) })
+                                    t.review_plan(&session, &call.call, call.args.clone(), &cancel).await.map(|(output, review)| { plan_review = Some(review); (vec![ToolResultContentPart::Text { text: output }], None, false) })
                                 }
-                                Decision::Allowed => t.execute_with_tasks(&session, &call.call, call.args.clone(), &cancel).await,
+                                Decision::Allowed => t.execute_presented(&session, &call.call, call.args.clone(), &cancel).await.map(|(content, tasks, error, metadata)| {
+                                    presentation = metadata.filter(|value| {
+                                        let valid = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 256 * 1024);
+                                        if !valid { tracing::warn!(tool = %call.name, "discarding oversized tool presentation metadata"); }
+                                        valid
+                                    });
+                                    (content, tasks, error)
+                                }),
                                 Decision::Rejected => {
+                                    failure_kind = "approval_rejected";
                                     Err("the user rejected this tool call".into())
                                 }
                                 Decision::Cancelled => {
+                                    failure_kind = "approval_cancelled";
                                     Err("approval request was cancelled".into())
                                 }
-                                Decision::Unavailable => Err(
-                                    "approval required but no approver is available — \
-                                     the call was blocked"
-                                        .into(),
-                                ),
+                                Decision::Unavailable => {
+                                    failure_kind = "approval_unavailable";
+                                    Err("approval required but no approver is available — the call was blocked".into())
+                                },
                             }
                         }
                     }
-                    None => Err(format!("unknown tool '{}'", call.name)),
+                    None => { failure_kind = "unknown_tool"; Err(format!("unknown tool '{}'", call.name)) },
                 };
-                let (output, tasks, is_error) = match outcome {
-                    Ok((output, tasks)) => (output, tasks, false),
-                    Err(e) => (e, None, true),
+                let (content, tasks, is_error) = match outcome {
+                    Ok((content, tasks, is_error)) => (content, tasks, is_error),
+                    Err(e) => (vec![ToolResultContentPart::Text { text: e }], None, true),
                 };
+                let output = ToolResult::text_output(&content);
+                let duration_ms = started.elapsed().as_millis() as u64;
+                if presentation.is_none() {
+                    presentation = Some(serde_json::json!({
+                        "version":1,"kind":if tasks.is_some() { "tasks" } else if plan_review.is_some() { "plan_review" } else { "tool_result" },"name":call.name,
+                        "outcome":if is_error { failure_kind } else { "completed" },
+                        "is_error":is_error,"duration_ms":duration_ms,
+                        "content_parts":content.len(),"has_tasks":tasks.is_some(),
+                        "has_plan_review":plan_review.is_some(),
+                    }));
+                }
                 ToolResult {
                     plan_review,
+                    presentation,
                     tasks,
                     call: call.call,
                     name: call.name,
+                    content,
                     output,
                     is_error,
-                    duration_ms: started.elapsed().as_millis() as u64,
+                    duration_ms,
                 }
             }));
         }
@@ -277,6 +321,21 @@ impl ToolRegistry {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn unknown_tool_has_durable_error_presentation() {
+        let registry = ToolRegistry::default();
+        let results = registry.dispatch(&"s".into(), &[ToolCall {
+            call:"missing".into(),name:"missing".into(),args:serde_json::json!({}),
+        }], 1, &CancellationToken::new()).await;
+        let result = &results[0];
+        assert!(result.is_error);
+        let metadata = result.presentation.as_ref().unwrap();
+        assert_eq!(metadata["kind"], "tool_result");
+        assert_eq!(metadata["is_error"], true);
+        assert_eq!(metadata["duration_ms"], result.duration_ms);
+        assert_eq!(result.output, "unknown tool 'missing'");
+    }
 
     struct SleepEcho;
     #[async_trait]

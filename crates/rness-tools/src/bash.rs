@@ -97,6 +97,23 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.run_presented(args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, presentation) = self.run_presented(args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+    }
+}
+
+impl BashTool {
+    async fn run_presented(&self, args: Value) -> Result<(String, Value), String> {
         let command = required_str(&args, "command")?;
         required_str(&args, "description")?;
         let workdir = self.ws.resolve(args["workdir"].as_str().unwrap_or("."));
@@ -140,7 +157,10 @@ impl Tool for BashTool {
                     }
                 }
             });
-            return Ok(format!("started background job {id}"));
+            return Ok((format!("started background job {id}"), json!({
+                "version":1,"kind":"bash","command":command,"cwd":workdir,
+                "job_id":id,"status":"running",
+            })));
         }
 
         let timeout = Duration::from_millis(
@@ -185,6 +205,14 @@ impl Tool for BashTool {
             }
             text.push_str(&String::from_utf8_lossy(&err));
         }
+        let presentation = json!({
+            "version":1,"kind":"bash","command":command,"cwd":workdir,
+            "status":"finished","exit_code":status.code(),
+            "killed_by_signal":status.code().is_none(),
+            "stdout_bytes":out.len(),"stderr_bytes":err.len(),
+            "truncated":text.len() > MAX_OUTPUT_BYTES,
+            "output_order":"stdout_then_stderr",
+        });
         let mut text = tail_truncate(text);
 
         // Exit status is a RESULT the model reads, not a tool error: a
@@ -196,6 +224,6 @@ impl Tool for BashTool {
             Some(code) => format!("[exit code: {code}]"),
             None => "[killed by signal]".to_string(),
         };
-        Ok(if text.is_empty() { marker } else { format!("{text}{marker}") })
+        Ok((if text.is_empty() { marker } else { format!("{text}{marker}") }, presentation))
     }
 }

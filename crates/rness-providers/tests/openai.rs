@@ -57,6 +57,141 @@ async fn step(
 }
 
 #[tokio::test]
+async fn deepseek_files_upload_once_and_recover_missing_id() {
+    let server = MockServer::start().await;
+    let expires = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 3600;
+    Mock::given(method("POST")).and(path("/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file-image", "expires_at":expires}))).expect(1).mount(&server).await;
+    Mock::given(method("GET")).and(path("/files/file-image")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(sse_response(&stream_happy("seen"))).expect(2).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy { deepseek_files:true, ..Default::default() };
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext { turns:vec![ModelTurn::User { content:vec![ContentPart::Image { attachment }] }], ..Default::default() };
+    let provider = OpenAiProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy);
+    for _ in 0..2 { assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_))); }
+    for request in server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/chat/completions") {
+        let body:serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["messages"][0]["content"][0], json!({"type":"file","file_id":"file-image"}));
+    }
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file-new", "expires_at":expires}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(sse_response(&stream_happy("seen"))).expect(1).mount(&server).await;
+    assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_)));
+    server.verify().await;
+    server.reset().await;
+    // Metadata still says the old file exists; only the model rejects it.
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file-recovered", "expires_at":expires}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(|request: &wiremock::Request| {
+        let body: serde_json::Value = request.body_json().unwrap();
+        if body["messages"][0]["content"][0]["file_id"] == "file-new" {
+            ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"file-new file not found"}}))
+        } else { sse_response(&stream_happy("recovered")) }
+    }).expect(2).mount(&server).await;
+    assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_)));
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file-retry", "expires_at":expires}))).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"file expired"}}))).expect(2).mount(&server).await;
+    assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Failed { .. }));
+}
+
+#[tokio::test]
+async fn image_budget_limits_serialized_requests_not_durable_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(sse_response(&stream_happy("seen"))).expect(1).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy { max_request_images: 1, ..Default::default() };
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext { turns: vec![ModelTurn::User { content: vec![ContentPart::Image { attachment: attachment.clone() }, ContentPart::Image { attachment }] }], ..Default::default() };
+    let original = context.clone();
+    let provider = OpenAiProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy);
+    assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_)));
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = requests[0].body_json().unwrap();
+    let parts = body["messages"][0]["content"].as_array().unwrap();
+    assert!(parts[0]["text"].as_str().unwrap().contains("omitted"));
+    assert_eq!(parts[1]["type"], "image_url");
+    assert_eq!(context, original);
+}
+
+#[tokio::test]
+async fn image_requests_preserve_order_and_replay_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(sse_response(&stream_happy("seen"))).expect(2).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy::default();
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext { turns: vec![ModelTurn::User { content: vec![
+        ContentPart::Text { text: "before".into() }, ContentPart::Image { attachment }, ContentPart::Text { text: "after".into() },
+    ] }], ..Default::default() };
+    let unconfigured = OpenAiProvider::new("key", "vision").with_base_url(server.uri());
+    assert!(matches!(step(&unconfigured, &context, "", &[]).await, StepOutcome::Failed { .. }));
+    let provider = unconfigured.with_images(store, policy);
+    for _ in 0..2 { assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_))); }
+    let requests = server.received_requests().await.unwrap();
+    for request in requests {
+        let body: serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["text"], "before");
+        assert!(body["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(body["messages"][0]["content"][2]["text"], "after");
+    }
+}
+
+#[tokio::test]
+async fn tool_images_replay_through_openai_and_anthropic() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(sse_response(&stream_happy("seen"))).mount(&server).await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy::default();
+    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext { turns: vec![
+        ModelTurn::Assistant { content: vec![ContentPart::ToolUse { call:"c1".into(), name:"camera".into(), args:json!({}) }] },
+        ModelTurn::ToolResults { results:vec![ToolResult { call:"c1".into(), name:"camera".into(), output:"before\nafter".into(), content:vec![
+            ToolResultContentPart::Text { text:"before".into() }, ToolResultContentPart::Image { attachment }, ToolResultContentPart::Text { text:"after".into() },
+        ], is_error:false, duration_ms:0, tasks:None, plan_review:None, presentation:None }] },
+        ModelTurn::User { content: vec![ContentPart::Text { text:"next".into() }] },
+    ], ..Default::default() };
+    let openai = OpenAiProvider::new("k", "vision").with_base_url(server.uri()).with_images(store.clone(), policy.clone());
+    for _ in 0..2 { assert!(matches!(step(&openai, &context, "", &[]).await, StepOutcome::Committed(_))); }
+    let anthropic = rness_providers::anthropic::AnthropicProvider::new("k", "vision").with_base_url(server.uri()).with_images(store, policy);
+    // The mock emits OpenAI SSE: inspect Anthropic request serialization,
+    // rather than asserting successful parsing of another protocol's stream.
+    let _ = anthropic.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        let body:serde_json::Value = request.body_json().unwrap();
+        assert_eq!(body["messages"][1]["tool_call_id"], "c1");
+        assert_eq!(body["messages"][2]["content"][1]["text"], "before");
+        assert!(body["messages"][2]["content"][2]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(body["messages"][2]["content"][3]["text"], "after");
+        assert_eq!(body["messages"][3]["content"], "next");
+    }
+    let body:serde_json::Value = requests[2].body_json().unwrap();
+    let result = &body["messages"][1]["content"][0];
+    assert_eq!(result["tool_use_id"], "c1");
+    assert_eq!(result["content"][0]["text"], "before");
+    assert_eq!(result["content"][1]["source"]["media_type"], "image/png");
+    assert_eq!(result["content"][2]["text"], "after");
+}
+
+#[tokio::test]
 async fn happy_path_text_stream_commits_with_chunks_and_usage() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -175,7 +310,7 @@ async fn context_maps_to_tool_messages_and_assistant_tool_calls() {
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
-                    tasks: None, plan_review: None,
+                    content: vec![], tasks: None, plan_review: None, presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),
@@ -190,6 +325,13 @@ async fn context_maps_to_tool_messages_and_assistant_tool_calls() {
     let provider = OpenAiProvider::new("k", "gpt-test-1").with_base_url(server.uri());
     let outcome = step(&provider, &context, "", &[]).await;
     assert!(matches!(outcome, StepOutcome::Committed(_)));
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body = String::from_utf8(request.body).unwrap();
+        assert!(!body.contains("UI_ONLY_SENTINEL"));
+        assert!(!body.contains("presentation"));
+    }
 }
 
 #[tokio::test]

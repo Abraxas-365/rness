@@ -49,6 +49,20 @@ impl Tool for GlobTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.glob_presented(args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(
+        &self, _session: &String, _call: &String, args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, presentation) = self.glob_presented(args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+    }
+}
+
+impl GlobTool {
+    async fn glob_presented(&self, args: Value) -> Result<(String, Value), String> {
         let pattern = required_str(&args, "pattern")?.to_string();
         let base = self.ws.resolve(args["path"].as_str().unwrap_or("."));
 
@@ -77,10 +91,16 @@ impl Tool for GlobTool {
                 }
             }
             if hits.is_empty() {
-                return Ok(format!("No files match {pattern}"));
+                return Ok((format!("No files match {pattern}"), json!({"version":1,"kind":"glob","path":base,"pattern":pattern,"paths":[],"total":0,"truncated":false})));
             }
             hits.sort_by(|a, b| b.0.cmp(&a.0));
             let total = hits.len();
+            let mut bytes = 0;
+            let paths: Vec<_> = hits.iter().take(MAX_RESULTS).map(|(_, p)| p).take_while(|p| {
+                bytes += p.len();
+                bytes <= 24 * 1024
+            }).cloned().collect();
+            let presentation = json!({"version":1,"kind":"glob","path":base,"pattern":pattern,"truncated":paths.len()<total,"paths":paths,"total":total});
             let mut out: String = hits
                 .into_iter()
                 .take(MAX_RESULTS)
@@ -93,7 +113,7 @@ impl Tool for GlobTool {
                     total - MAX_RESULTS
                 ));
             }
-            Ok(out)
+            Ok((out, presentation))
         })
         .await
         .map_err(|e| format!("glob task: {e}"))?

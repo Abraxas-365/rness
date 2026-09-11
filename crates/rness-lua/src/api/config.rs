@@ -11,7 +11,9 @@ impl Default for QuestionOverlayConfig { fn default() -> Self { Self { enabled: 
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub images: rness_engine::images::ImagePolicy,
     pub promptbox: serde_json::Value,
+    pub messagebox: serde_json::Value,
     pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
     pub plugins: Vec<String>,
     pub colorschemes: BTreeMap<String, serde_json::Value>,
@@ -41,6 +43,60 @@ mod permission_tests {
         assert_eq!(super::load(&path).unwrap().stream_idle_timeouts["anthropic"], 500);
         std::fs::write(&path, "rness.providers.set_stream_idle_timeout('anthropic', 0)").unwrap();
         assert_eq!(super::load(&path).unwrap().stream_idle_timeouts["anthropic"], 0);
+    }
+
+    #[test]
+    fn messagebox_all_sections_accept_supported_options() {
+        use serde_json::json;
+        let style = json!({"fg":"#abcdef","bg":"#123456","bold":true,"italic":false,"underline":true,"reverse":false});
+        let padding = json!({"left":1,"right":2,"top":1,"bottom":2});
+        let border = json!({"kind":"rounded","style":style});
+        let message = json!({"visible":true,"display":"preview","preview_lines":2,"style":style,"padding":padding,"border":border,"marker":{"text":">","mode":"bar","style":"dim"},"label":{"text":"Label","style":"title"},"markdown":{"heading":style,"link":style,"quote":style,"inline_code":style,"code_block":{"style":style,"padding":padding,"show_language":true,"syntax_highlight":false}}});
+        let tool = json!({"visible":false,"display":"expanded","preview_lines":3,"style":style,"padding":padding,"border":border,"spacing":1,"label":false,"header":{"visible":true,"show_name":true,"show_status":true,"show_duration":true,"style":"tool_name"},"arguments":{"visible":true,"wrap":false,"style":"dim"},"output":{"visible":true,"wrap":true,"style":"tool_output"}});
+        let mut config = json!({"style":style,"padding":padding,"border":border,"spacing":1,"tool":tool,"tools":{"Read":tool},"keys":{"next_tool":false,"previous_tool":false,"toggle_tool":false,"toggle_thinking":false,"next_thinking":false,"previous_thinking":false}});
+        for role in ["message","user","assistant","thinking","notice","error"] { config[role] = message.clone(); }
+        for state in ["running","success","error","cancelled"] { config["tool"]["states"][state] = tool.clone(); }
+        super::validate_messagebox(&config, "messagebox", "root").unwrap();
+        for budget in [0, 8 * 1024 * 1024, 1024 * 1024 * 1024] {
+            config["cache_bytes"] = json!(budget);
+            super::validate_messagebox(&config, "messagebox", "root").unwrap();
+        }
+        for invalid in [json!(-1), json!(1.5), json!("1024"), json!(1073741825u64)] {
+            let mut bad = config.clone();
+            bad["cache_bytes"] = invalid;
+            assert!(super::validate_messagebox(&bad, "messagebox", "root").is_err());
+        }
+        for section in ["tool", "message", "user"] {
+            let mut bad = config.clone();
+            bad[section]["visible"] = json!("false");
+            assert!(super::validate_messagebox(&bad,"messagebox","root").is_err());
+        }
+    }
+
+    #[test]
+    fn messagebox_configuration_separates_functions_and_validates_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, r##"
+            rness.ui.messagebox = {
+                padding={left=1}, user={style={fg='#ebdbb2',bg='#3c3836'},marker=false},
+                tool={display='preview',preview_lines=8},
+                tools={Read={render=function() return nil end,style='tool_output'}},
+            }
+        "##).unwrap();
+        let config = super::load(&path).unwrap();
+        assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
+        assert!(config.messagebox["tools"]["Read"].get("render").is_none());
+        for source in [
+            "rness.ui.messagebox={padding={left=-1}}",
+            "rness.ui.messagebox={tool={collapsed=true}}",
+            "rness.ui.messagebox={tools={Read={render=3}}}",
+            "rness.ui.messagebox={user={style={unknown=true}}}",
+            "rness.ui.messagebox={keys={surprise='ctrl+x'}}",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            assert!(super::load(&path).is_err(), "{source}");
+        }
     }
 
     #[test]
@@ -77,6 +133,56 @@ pub enum ProviderAuth {
     Store { credential: String },
     Env { env: String },
     OAuth { oauth: String },
+}
+
+fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> Result<(), String> {
+    let object = value.as_object().ok_or_else(|| format!("{path} must be a table"))?;
+    for (key, value) in object {
+        let field = format!("{path}.{key}");
+        let child = match (section, key.as_str()) {
+            ("root", "message" | "user" | "assistant" | "thinking" | "notice" | "error") => Some("message"),
+            ("root", "tool") => Some("tool"),
+            ("root", "tools") => Some("tools"),
+            ("root", "keys") => Some("keys"),
+            ("tools", _) => Some("tool"),
+            ("root" | "message" | "tool" | "code", "padding") => Some("padding"),
+            ("root" | "message" | "tool", "border") => Some("border"),
+            ("message", "marker" | "label") | ("tool", "label") if value != false => Some(if key == "marker" { "marker" } else { "label" }),
+            ("message", "markdown") => Some("markdown"),
+            ("markdown", "code_block") => Some("code"),
+            ("tool", "header") => Some("header"),
+            ("tool", "arguments" | "output") => Some("output"),
+            ("tool", "states") => Some("states"),
+            ("states", "running" | "success" | "error" | "cancelled") => Some("tool"),
+            _ => None,
+        };
+        if let Some(child) = child { validate_messagebox(value, &field, child)?; continue; }
+        let valid = match (section, key.as_str()) {
+            ("root" | "message" | "tool" | "border" | "marker" | "label" | "header" | "output" | "code", "style")
+            | ("markdown", "heading" | "link" | "quote" | "inline_code") => {
+                if let Some(name) = value.as_str() { !name.is_empty() } else if let Some(style) = value.as_object() {
+                    style.iter().all(|(k, v)| match k.as_str() {
+                        "fg" | "bg" => v.as_str().is_some_and(|s| !s.is_empty()),
+                        "bold" | "italic" | "underline" | "reverse" => v.is_boolean(),
+                        _ => false,
+                    })
+                } else { false }
+            },
+            ("padding", "left" | "right" | "top" | "bottom") | ("root" | "tool", "spacing") => value.as_u64().is_some_and(|n| n <= 64),
+            ("root", "cache_bytes") => value.as_u64().is_some_and(|n| n <= 1024 * 1024 * 1024),
+            ("message" | "tool", "preview_lines") => value.as_u64().is_some_and(|n| (1..=10000).contains(&n)),
+            ("message" | "tool", "display") => value.as_str().is_some_and(|s| matches!(s, "collapsed" | "preview" | "expanded")),
+            ("border", "kind") => value.as_str().is_some_and(|s| matches!(s, "none" | "plain" | "rounded" | "double")),
+            ("marker", "mode") => value.as_str().is_some_and(|s| matches!(s, "first_line" | "bar")),
+            ("marker" | "label", "text") => value.as_str().is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control)),
+            ("message", "marker" | "label") | ("tool", "label") => value == false,
+            ("message" | "tool" | "header" | "output", "visible") | ("header", "show_name" | "show_status" | "show_duration") | ("output", "wrap") | ("code", "show_language" | "syntax_highlight") => value.is_boolean(),
+            ("keys", "next_tool" | "previous_tool" | "toggle_tool" | "toggle_thinking" | "next_thinking" | "previous_thinking") => value == false || value.as_str().is_some_and(|s| !s.is_empty()),
+            _ => false,
+        };
+        if !valid { return Err(format!("invalid messagebox option: {field}")); }
+    }
+    Ok(())
 }
 
 pub fn load(path: &std::path::Path) -> Result<StartupConfig, Box<dyn std::error::Error + Send + Sync>> {
@@ -198,18 +304,62 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     if path.is_file() {
         lua.load(std::fs::read_to_string(path)?).set_name(path.to_string_lossy()).exec()?;
     }
+    if let Some(images) = rness.get::<Option<Table>>("images")? {
+        let policy: rness_engine::images::ImagePolicy = lua.from_value(mlua::Value::Table(images))?;
+        policy.validate().map_err(std::io::Error::other)?;
+        state.lock().unwrap().images = policy;
+    }
+    if let Some(messagebox) = rness.get::<Table>("ui")?.get::<Option<Table>>("messagebox")? {
+        let data = lua.create_table()?;
+        for entry in messagebox.pairs::<String, mlua::Value>() {
+            let (key, value) = entry?;
+            if key == "tools" {
+                let mlua::Value::Table(tools) = value else { return Err("ui.messagebox.tools must be a table".into()); };
+                let declarations = lua.create_table()?;
+                for entry in tools.pairs::<String, mlua::Value>() {
+                    let (name, spec) = entry?;
+                    if name.trim().is_empty() { return Err("ui.messagebox tool name must not be empty".into()); }
+                    let options = lua.create_table()?;
+                    match spec {
+                        mlua::Value::Function(_) => {},
+                        mlua::Value::Table(spec) => {
+                            for entry in spec.pairs::<String, mlua::Value>() {
+                                let (field, value) = entry?;
+                                if field == "render" {
+                                    if !matches!(value, mlua::Value::Function(_)) { return Err("ui.messagebox tool render must be a function".into()); }
+                                } else { options.set(field, value)?; }
+                            }
+                        },
+                        _ => return Err("ui.messagebox tools must be functions or tables".into()),
+                    }
+                    declarations.set(name, options)?;
+                }
+                data.set(key, declarations)?;
+            } else { data.set(key, value)?; }
+        }
+        let value: serde_json::Value = lua.from_value(mlua::Value::Table(data))?;
+        validate_messagebox(&value, "ui.messagebox", "root")?;
+        state.lock().unwrap().messagebox = value;
+    }
     if let Some(promptbox) = rness.get::<Table>("ui")?.get::<Option<Table>>("promptbox")? {
         let value: serde_json::Value = lua.from_value(mlua::Value::Table(promptbox))?;
-        let valid_keys = |field: &serde_json::Value, name: &str| field.as_object().is_some_and(|keys| keys.iter().all(|(key, chord)| key == name && (chord == &serde_json::Value::Bool(false) || chord.as_str().is_some_and(|s| !s.is_empty()))));
+        let valid_keys = |field: &serde_json::Value, names: &[&str]| field.as_object().is_some_and(|keys| keys.iter().all(|(key, chord)| names.contains(&key.as_str()) && (chord == &serde_json::Value::Bool(false) || chord.as_str().is_some_and(|s| !s.is_empty()))));
         for (key, field) in value.as_object().ok_or("ui.promptbox must be a table")? {
             match key.as_str() {
                 "editor" if field.as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|s| s.as_str().is_some_and(|s| !s.is_empty()))) => {},
-                "keys" if valid_keys(field, "edit") => {},
+                "images" => {
+                    for (key, field) in field.as_object().ok_or("ui.promptbox.images must be a table")? {
+                        if key != "keys" || !field.as_object().is_some_and(|keys| keys.iter().all(|(name, chord)| matches!(name.as_str(), "remove" | "next" | "preview" | "close" | "history") && (chord == &serde_json::Value::Bool(false) || chord.as_str().is_some_and(|s| !s.is_empty())))) {
+                            return Err(format!("invalid ui.promptbox.images option: {key}").into());
+                        }
+                    }
+                }
+                "keys" if valid_keys(field, &["edit", "paste"]) => {},
                 "paste" => {
                     for (key, field) in field.as_object().ok_or("ui.promptbox.paste must be a table")? {
                         match key.as_str() {
                             "lines" | "chars" if field.as_u64().is_some() => {},
-                            "keys" if valid_keys(field, "preview") => {},
+                            "keys" if valid_keys(field, &["preview"]) => {},
                             _ => return Err(format!("invalid ui.promptbox.paste option: {key}").into()),
                         }
                     }
@@ -281,6 +431,20 @@ mod tests {
             .selection.unwrap().route, "ollama");
         assert!(config.models.resolve_profile("router-sonnet").is_ok());
         assert!(config.default_profile.is_none());
+    }
+
+    #[test]
+    fn image_policy_is_validated_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.images = { lossless=false, quality=75, max_pixels=1000000 }").unwrap();
+        let config = load(&path).unwrap();
+        assert!(!config.images.lossless);
+        assert_eq!(config.images.quality, 75);
+        for source in ["rness.images = {quality=0}", "rness.images = {max_pixels=0}", "rness.images = {typo=1}"] {
+            std::fs::write(&path, source).unwrap();
+            assert!(load(&path).is_err());
+        }
     }
 
     #[test]

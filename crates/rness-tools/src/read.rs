@@ -63,6 +63,23 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.read_presented(args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, presentation) = self.read_presented(args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+    }
+}
+
+impl ReadTool {
+    async fn read_presented(&self, args: Value) -> Result<(String, Value), String> {
         let path = self.ws.resolve(required_str(&args, "path")?);
         let offset = positive_arg(&args, "offset", 1)?;
         let limit = positive_arg(&args, "limit", DEFAULT_LIMIT)?;
@@ -76,16 +93,19 @@ impl Tool for ReadTool {
 
         let total = content.lines().count();
         if total == 0 {
-            return Ok("(empty file)".to_string());
+            return Ok(("(empty file)".to_string(), json!({"version":1,"kind":"read","path":path,"start_line":1,"total_lines":0,"text":"","truncated":false})));
         }
         if offset > total {
             return Err(format!("offset {offset} is past the end of the file ({total} lines)"));
         }
 
         let mut out = String::new();
+        let mut snapshot = String::new();
+        let mut snapshot_truncated = false;
         let mut shown_end = offset - 1;
         for (i, line) in content.lines().enumerate().skip(offset - 1).take(limit) {
             let line = if line.len() > MAX_LINE_LEN {
+                snapshot_truncated = true;
                 let mut end = MAX_LINE_LEN;
                 while !line.is_char_boundary(end) {
                     end -= 1;
@@ -100,6 +120,12 @@ impl Tool for ReadTool {
                 break;
             }
             out.push_str(&format!("{:>6}\t{line}\n", i + 1));
+            if snapshot.len() + line.len() + 1 <= 24 * 1024 && !snapshot_truncated {
+                snapshot.push_str(line);
+                snapshot.push('\n');
+            } else {
+                snapshot_truncated = true;
+            }
             shown_end = i + 1;
         }
         if shown_end < total {
@@ -109,6 +135,12 @@ impl Tool for ReadTool {
                 shown_end + 1,
             ));
         }
-        Ok(out)
+        let presentation = json!({
+            "version":1,"kind":"read","path":path,
+            "language":path.extension().and_then(|s| s.to_str()),
+            "start_line":offset,"end_line":shown_end,"total_lines":total,
+            "text":snapshot,"truncated":snapshot_truncated || shown_end < total,
+        });
+        Ok((out, presentation))
     }
 }

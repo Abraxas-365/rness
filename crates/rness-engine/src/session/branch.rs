@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
 use rness_protocol::events::{Envelope, EventId, SessionEvent, SessionId};
 
-use super::log::{read_session, LogError, SessionLog};
+use super::log::{LogError, SessionLog};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BranchError {
@@ -27,11 +27,20 @@ pub enum BranchError {
 /// Root directory holding one subdirectory per session.
 pub struct SessionStore {
     root: PathBuf,
+    readers: std::sync::Mutex<std::collections::HashMap<SessionId, super::log::SessionReader>>,
 }
 
 impl SessionStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self { root: root.into(), readers: Default::default() }
+    }
+
+    fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
+        let mut readers = self.readers.lock().unwrap();
+        if readers.len() >= 8 && !readers.contains_key(session) {
+            if let Some(oldest) = readers.keys().next().cloned() { readers.remove(&oldest); }
+        }
+        readers.entry(session.clone()).or_default().read(&self.root, session)
     }
 
     pub fn root(&self) -> &Path {
@@ -56,7 +65,7 @@ impl SessionStore {
     }
 
     pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
-        let events = read_session(&self.root, session)?;
+        let events = self.read_session(session)?;
         match &events[0].event {
             SessionEvent::Header(header) => Ok(header.workspace.clone()),
             _ => unreachable!("read_session guarantees header first"),
@@ -95,7 +104,7 @@ impl SessionStore {
         at: Option<EventId>,
         delegation: Option<Delegation>,
     ) -> Result<SessionLog, BranchError> {
-        let events = read_session(&self.root, session)?;
+        let events = self.read_session(session)?;
         let at = match at {
             Some(id) => {
                 let pos = events.iter().position(|e| e.id == id).ok_or_else(|| {
@@ -120,7 +129,7 @@ impl SessionStore {
 
     /// Delegation lineage of a session, if an agent created it.
     pub fn delegation(&self, session: &SessionId) -> Result<Option<Delegation>, BranchError> {
-        let events = read_session(&self.root, session)?;
+        let events = self.read_session(session)?;
         match &events[0].event {
             SessionEvent::Header(h) => Ok(h.delegation.clone()),
             _ => unreachable!(),
@@ -129,7 +138,7 @@ impl SessionStore {
 
     /// Parent reference of a session, if it is a fork.
     pub fn parent(&self, session: &SessionId) -> Result<Option<ForkRef>, BranchError> {
-        let events = read_session(&self.root, session)?;
+        let events = self.read_session(session)?;
         match &events[0].event {
             SessionEvent::Header(h) => Ok(h.parent.clone()),
             _ => unreachable!(),
@@ -183,7 +192,7 @@ impl SessionStore {
         let chain = self.ancestry(session)?;
         let mut out: Vec<Envelope> = Vec::new();
         for (i, hop) in chain.iter().enumerate() {
-            let events = read_session(&self.root, &hop.session)?;
+            let events = self.read_session(&hop.session)?;
             // This hop's prefix is bounded by where the next hop forked
             // from it — which is this hop's own `forked_at`.
             let bound = hop.forked_at.clone();
@@ -208,6 +217,16 @@ impl SessionStore {
             }
         }
         Ok(out)
+    }
+
+    /// Return only new local envelopes. An ancestor cursor requires a full
+    /// history reload; ancestor prefixes are immutable after a fork.
+    pub fn history_after(&self, session: &SessionId, after: &str) -> Result<Option<Vec<Envelope>>, BranchError> {
+        let mut readers = self.readers.lock().unwrap();
+        if readers.len() >= 8 && !readers.contains_key(session) {
+            if let Some(key) = readers.keys().next().cloned() { readers.remove(&key); }
+        }
+        Ok(readers.entry(session.clone()).or_default().read_after(&self.root, session, after)?)
     }
 
     /// All session ids in the store (unordered scan).
@@ -245,6 +264,25 @@ mod tests {
             },
             _ => None,
         }
+    }
+
+    #[test]
+    fn delta_history_excludes_prefix_and_respects_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut root = store.create(None).unwrap();
+        let sid = root.session().clone();
+        let first = root.append(&msg("first")).unwrap();
+        store.history(&sid).unwrap();
+        assert!(store.history_after(&sid, &first.id).unwrap().unwrap().is_empty());
+        let second = root.append(&msg("second")).unwrap();
+        assert_eq!(store.history_after(&sid, &first.id).unwrap(), Some(vec![second.clone()]));
+        let mut child = store.fork(&sid, Some(first.id.clone())).unwrap();
+        let child_id = child.session().clone();
+        assert!(store.history_after(&child_id, &first.id).unwrap().is_none());
+        let own = child.append(&msg("child")).unwrap();
+        assert!(store.history_after(&child_id, &own.id).unwrap().unwrap().is_empty());
+        assert!(store.history_after(&sid, "missing").unwrap().is_none());
     }
 
     #[test]

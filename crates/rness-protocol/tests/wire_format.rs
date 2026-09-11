@@ -14,6 +14,17 @@ fn roundtrip(ev: &SessionEvent) -> SessionEvent {
 }
 
 #[test]
+fn image_content_roundtrips_without_inline_bytes() {
+    let part = ContentPart::Image { attachment: ImageRef {
+        id: "a".repeat(64), media_type: "image/png".into(), bytes: 100, width: 20, height: 10,
+    }};
+    let value = serde_json::to_value(&part).unwrap();
+    assert_eq!(value["kind"], "image");
+    assert!(value["attachment"].get("data").is_none());
+    assert_eq!(serde_json::from_value::<ContentPart>(value).unwrap(), part);
+}
+
+#[test]
 fn all_event_kinds_roundtrip() {
     let events = vec![
         SessionEvent::Header(Header {
@@ -58,7 +69,7 @@ fn all_event_kinds_roundtrip() {
             chunks: vec![],
         }),
         SessionEvent::ToolResult(ToolResult {
-            tasks: None, plan_review: None,
+            content: vec![], tasks: None, plan_review: None, presentation: None,
             call: "c1".into(),
             name: "Read".into(),
             output: "contents".into(),

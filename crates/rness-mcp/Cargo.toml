@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 rness-engine = { path = "../rness-engine" }
+rness-protocol = { path = "../rness-protocol" }
+base64.workspace = true
+tokio-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

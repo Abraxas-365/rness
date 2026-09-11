@@ -11,6 +11,7 @@
 //! - [`interaction`]: UI-agnostic approval / ask-user contracts
 //! - [`service`]: SessionService — the ONLY public API frontends use
 
+pub mod images;
 pub mod file_references;
 pub mod plan;
 pub mod tasks;

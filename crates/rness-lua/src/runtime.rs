@@ -59,6 +59,25 @@ impl LuaRuntime {
     pub fn startup(&mut self, path: &std::path::Path) -> Result<crate::api::config::StartupConfig, String> {
         let config = crate::api::config::evaluate(&self.lua, path).map_err(|e| e.to_string())?;
         self.drain_registrations(None).map_err(|e| e.to_string())?;
+        let capture = || -> mlua::Result<()> {
+            let ui: Table = self.lua.globals().get::<Table>("rness")?.get("ui")?;
+            let messagebox: Table = ui.get("messagebox")?;
+            let renderers = self.lua.create_table()?;
+            if let Some(tools) = messagebox.get::<Option<Table>>("tools")? {
+                for entry in tools.pairs::<String, LuaValue>() {
+                    let (name, value) = entry?;
+                    if name.trim().is_empty() { return Err(mlua::Error::runtime("messagebox tool name must not be empty")); }
+                    let render = match value {
+                        LuaValue::Function(f) => Some(f),
+                        LuaValue::Table(t) => t.get::<Option<Function>>("render")?,
+                        _ => return Err(mlua::Error::runtime("messagebox tools must be functions or tables")),
+                    };
+                    if let Some(render) = render { renderers.set(name, owned_callback(&self.lua, render)?)?; }
+                }
+            }
+            self.lua.globals().set("__rness_messagebox_renderers", renderers)
+        };
+        capture().map_err(|e| e.to_string())?;
         self.install_config(&config).map_err(|e| e.to_string())?;
         Ok(config)
     }
@@ -492,14 +511,29 @@ impl LuaRuntime {
     }
 
     pub fn call_tool_context(&self, name: &str, args: &serde_json::Value, context: &serde_json::Value) -> Result<Result<String, String>, LuaError> {
+        self.call_tool_presented(name, args, context).map(|result| result.map(|(output, _)| output))
+    }
+
+    pub fn call_tool_presented(&self, name: &str, args: &serde_json::Value, context: &serde_json::Value) -> Result<Result<(String, Option<serde_json::Value>), String>, LuaError> {
         let Some((_, key)) = self.tools.get(name) else {
             return Err(LuaError::UnknownTool(name.to_string()));
         };
         let f: Function = self.lua.registry_value(key)?;
         let lua_args = self.lua.to_value(args)?;
-        match f.call::<LuaValue>((lua_args, self.lua.to_value(context)?)) {
-            Ok(LuaValue::Nil) => Ok(Ok(String::new())),
-            Ok(v) => Ok(Ok(lua_display(&self.lua, v)?)),
+        match f.call::<(LuaValue, LuaValue)>((lua_args, self.lua.to_value(context)?)) {
+            Ok((value, metadata)) => {
+                let output = if matches!(value, LuaValue::Nil) { String::new() } else { lua_display(&self.lua, value)? };
+                let presentation = if matches!(metadata, LuaValue::Nil) { None } else {
+                    match self.lua.from_value(metadata) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            tracing::warn!(tool = name, "invalid Lua presentation metadata: {error}");
+                            None
+                        }
+                    }
+                };
+                Ok(Ok((output, presentation)))
+            },
             Err(e) => Ok(Err(user_message(&e))),
         }
     }
@@ -578,36 +612,153 @@ impl LuaRuntime {
         output: &str,
         is_error: bool,
     ) -> Option<Vec<StyledLine>> {
-        let key = self.tool_cards.get(name).or_else(|| self.tool_cards.get("*"))?;
-        let f: Function = self.lua.registry_value(key).ok()?;
+        self.tool_card_presented(name, args, output, is_error, None)
+    }
+
+    pub fn tool_card_presented(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        output: &str,
+        is_error: bool,
+        presentation: Option<&serde_json::Value>,
+    ) -> Option<Vec<StyledLine>> {
+        let configured = self.lua.globals().get::<Option<Table>>("__rness_messagebox_renderers").ok().flatten();
+        let user_renderer = configured.and_then(|table| {
+            table.get::<Option<Function>>(name).ok().flatten()
+                .or_else(|| table.get::<Option<Function>>("*").ok().flatten())
+        });
+        let f: Function = match user_renderer {
+            Some(f) => f,
+            None => {
+                let key = self.tool_cards.get(name).or_else(|| self.tool_cards.get("*"))?;
+                self.lua.registry_value(key).ok()?
+            }
+        };
         let call = self.lua.create_table().ok()?;
         call.set("name", name).ok()?;
         call.set("args", self.lua.to_value(args).ok()?).ok()?;
         call.set("output", output).ok()?;
         call.set("is_error", is_error).ok()?;
-        let lines: LuaValue = match f.call(call) {
+        if let Some(presentation) = presentation {
+            call.set("presentation", self.lua.to_value(presentation).ok()?).ok()?;
+        }
+        let previous_limit = self.lua.set_memory_limit(self.lua.used_memory().saturating_add(16 * 1024 * 1024)).ok()?;
+        let started = std::time::Instant::now();
+        self.lua.set_hook(mlua::HookTriggers::new().every_nth_instruction(10000), move |_, _| {
+            if started.elapsed() > std::time::Duration::from_millis(100) {
+                Err(mlua::Error::runtime("tool card instruction deadline exceeded"))
+            } else { Ok(mlua::VmState::Continue) }
+        });
+        let result = f.call(call);
+        self.lua.remove_hook();
+        let _ = self.lua.set_memory_limit(previous_limit);
+        let lines: LuaValue = match result {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(tool = name, "lua tool card failed: {}", user_message(&e));
                 return None;
             }
         };
-        let LuaValue::Table(rows) = lines else { return None }; // nil = declined
-        let mut out = Vec::new();
-        for row in rows.sequence_values::<LuaValue>() {
-            match row.ok()? {
-                // "plain text" shorthand
-                LuaValue::String(text) => out.push(StyledLine {
-                    text: text.to_string_lossy().to_string(),
-                    style: String::new(),
+        let LuaValue::Table(rows) = lines else { return None };
+        fn bounded(value: LuaValue, depth: usize, budget: &mut usize) -> bool {
+            if depth > 16 || *budget == 0 { return false; }
+            *budget -= 1;
+            match value {
+                LuaValue::String(s) => {
+                    if s.as_bytes().len() > *budget { return false; }
+                    *budget -= s.as_bytes().len();
+                    true
+                }
+                LuaValue::Table(t) => t.pairs::<LuaValue, LuaValue>().all(|pair| {
+                    pair.is_ok_and(|(k, v)| bounded(k, depth + 1, budget) && bounded(v, depth + 1, budget))
                 }),
-                LuaValue::Table(t) => out.push(StyledLine {
-                    text: t.get::<Option<String>>("text").ok()?.unwrap_or_default(),
-                    style: t.get::<Option<String>>("style").ok()?.unwrap_or_default(),
-                }),
-                _ => return None,
+                LuaValue::Nil | LuaValue::Boolean(_) | LuaValue::Integer(_) | LuaValue::Number(_) => true,
+                _ => false,
             }
         }
+        if !bounded(LuaValue::Table(rows.clone()), 0, &mut (256 * 1024)) {
+            tracing::warn!(tool = name, "tool card exceeds size or nesting limits");
+            return None;
+        }
+        let decode = |value: LuaValue| -> Option<StyledLine> {
+            let mut row = StyledLine::default();
+            match value {
+                LuaValue::String(text) => row.text = text.to_string_lossy(),
+                LuaValue::Table(t) => {
+                    for key in ["text", "kind"] {
+                        if !matches!(t.get::<LuaValue>(key).ok()?, LuaValue::Nil | LuaValue::String(_)) { return None; }
+                    }
+                    for key in ["spans", "left", "right"] {
+                        if !matches!(t.get::<LuaValue>(key).ok()?, LuaValue::Nil | LuaValue::Table(_)) { return None; }
+                    }
+                    if let Some(kind) = t.get::<Option<String>>("kind").ok()? {
+                        for key in ["text", "before", "after", "language"] {
+                            if !matches!(t.get::<LuaValue>(key).ok()?, LuaValue::Nil | LuaValue::String(_)) { return None; }
+                        }
+                        for key in ["line_numbers", "syntax_highlight", "summary", "fragment"] {
+                            if !matches!(t.get::<LuaValue>(key).ok()?, LuaValue::Nil | LuaValue::Boolean(_)) { return None; }
+                        }
+                        for key in ["start_line", "old_start", "new_start", "context_lines"] {
+                            match t.get::<LuaValue>(key).ok()? {
+                                LuaValue::Nil => {}, LuaValue::Integer(n) if n >= 0 => {}, _ => return None,
+                            }
+                        }
+                        if !matches!(kind.as_str(), "code" | "diff") { return None; }
+                        row.block = Some(self.lua.from_value(LuaValue::Table(t)).ok()?);
+                        return Some(row);
+                    }
+                    row.text = t.get::<Option<String>>("text").ok()?.unwrap_or_default();
+                    let style: LuaValue = t.get("style").ok()?;
+                    if let LuaValue::String(name) = &style { row.style = name.to_string_lossy(); }
+                    else if !matches!(style, LuaValue::Nil) {
+                        row.spans.push(rness_kernel::presentation::StyledSpan { text:row.text.clone(), style:self.lua.from_value(style).ok()? });
+                    }
+                    for (field, target) in [("spans", &mut row.spans), ("right", &mut row.right)] {
+                        let values = t.get::<Option<Table>>(field).ok()?;
+                        let values = if field == "spans" { values.or(t.get::<Option<Table>>("left").ok()?) } else { values };
+                        if let Some(values) = values {
+                            for span in values.sequence_values::<Table>() {
+                                let span = span.ok()?;
+                                target.push(rness_kernel::presentation::StyledSpan {
+                                    text:span.get("text").ok()?,
+                                    style:self.lua.from_value(span.get::<LuaValue>("style").ok()?).ok()?,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => return None,
+            }
+            Some(row)
+        };
+        let structured = rows.contains_key("body").ok()?;
+        let mut out = Vec::new();
+        let body = if let Some(header) = rows.get::<Option<Table>>("header").ok()? {
+            let mut header = decode(LuaValue::Table(header))?;
+            header.is_header = true;
+            out.push(header);
+            rows.get::<Table>("body").ok()?
+        } else if let Some(body) = rows.get::<Option<Table>>("body").ok()? { body } else { rows };
+        for row in body.sequence_values::<LuaValue>() {
+            let row = decode(row.ok()?)?;
+            if row.block.is_some() { out.push(row); }
+            else if row.spans.is_empty() && row.right.is_empty() {
+                for text in row.text.split('\n') {
+                    out.push(StyledLine { text:text.to_owned(), style:row.style.clone(), ..Default::default() });
+                }
+            } else if row.right.is_empty() {
+                let mut current = StyledLine::default();
+                for span in &row.spans {
+                    for (index, text) in span.text.split('\n').enumerate() {
+                        if index > 0 { out.push(std::mem::take(&mut current)); }
+                        current.spans.push(rness_kernel::presentation::StyledSpan { text:text.to_owned(), style:span.style.clone() });
+                    }
+                }
+                out.push(current);
+            } else { out.push(row); }
+        }
+        for row in &mut out { row.structured = structured; }
         Some(out)
     }
 
@@ -1066,6 +1217,31 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             Ok(())
         })?)?;
     }
+    let messagebox_methods = lua.create_table()?;
+    for method in ["tool_card", "replace_tool_card"] {
+        messagebox_methods.set(method, ui.get::<Function>(method)?)?;
+    }
+    let messagebox = lua.create_table()?;
+    let box_meta = lua.create_table()?;
+    box_meta.set("__index", messagebox_methods)?;
+    messagebox.set_metatable(Some(box_meta.clone()));
+    lua.globals().set("__rness_messagebox", messagebox)?;
+    let ui_meta = lua.create_table()?;
+    ui_meta.set("__index", lua.create_function(|lua, (_table, key): (Table, String)| {
+        if key == "messagebox" { lua.globals().get::<LuaValue>("__rness_messagebox") } else { Ok(LuaValue::Nil) }
+    })?)?;
+    ui_meta.set("__newindex", lua.create_function(move |lua, (table, key, value): (Table, String, LuaValue)| {
+        if key == "messagebox" {
+            require_declaration_phase(lua)?;
+            if lua.globals().get::<Option<Table>>("__rness_messagebox_renderers")?.is_some() {
+                return Err(mlua::Error::runtime("messagebox configuration is startup-only"));
+            }
+            let LuaValue::Table(config) = value else { return Err(mlua::Error::runtime("messagebox must be a table")); };
+            config.set_metatable(Some(box_meta.clone()));
+            lua.globals().set("__rness_messagebox", config)
+        } else { table.raw_set(key, value) }
+    })?)?;
+    ui.set_metatable(Some(ui_meta));
     // rness.ui.app{ name=, slot=, title=, keymap=, view=, on_key= }
     // view(ctx) -> { "line", ... }; on_key(key, ctx) -> see app_key.
     let declared_apps = lua.create_table()?;
@@ -1382,6 +1558,44 @@ mod tests {
         "#).unwrap();
         assert!(rt.fire_hook("test", &serde_json::json!({})).is_empty());
         rt.load("check", "assert(seen == 'accdcd')").unwrap();
+    }
+
+    #[test]
+    fn messagebox_user_renderers_override_plugin_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, r#"
+            rness.ui.messagebox = { tools = {
+                Bash = function() return {'user bash'} end,
+                Read = {style='tool_output'},
+                ['*'] = function() return {'user fallback'} end,
+            }}
+            rness.ui.messagebox.tool_card('Bash', function() return {'plugin bash'} end)
+        "#).unwrap();
+        let mut rt = LuaRuntime::new().unwrap();
+        let config = rt.startup(&path).unwrap();
+        assert!(config.messagebox["tools"]["Bash"].get("render").is_none());
+        assert_eq!(config.messagebox["tools"]["Read"]["style"], "tool_output");
+        rt.load("plugin", r#"
+            rness.ui.messagebox.replace_tool_card('Bash', function() return {'replacement'} end)
+            rness.ui.messagebox.tool_card('Read', function() return {'plugin read'} end)
+        "#).unwrap();
+        assert_eq!(rt.tool_card("Bash", &serde_json::json!({}), "", false).unwrap()[0].text, "user bash");
+        assert_eq!(rt.tool_card("Read", &serde_json::json!({}), "", false).unwrap()[0].text, "user fallback");
+        assert!(rt.load("invalid", "rness.ui.messagebox = {}").is_err());
+    }
+
+    #[test]
+    fn messagebox_style_only_override_preserves_plugin_renderer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.ui.messagebox = {tools={Read={style='tool_output'}}}").unwrap();
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.startup(&path).unwrap();
+        rt.load("plugin", "rness.ui.messagebox.tool_card('Read', function() return {'plugin read'} end)").unwrap();
+        assert_eq!(rt.tool_card("Read", &serde_json::json!({}), "", false).unwrap()[0].text, "plugin read");
+        rt.unload("plugin").unwrap();
+        assert!(rt.tool_card("Read", &serde_json::json!({}), "", false).is_none());
     }
 
     #[test]

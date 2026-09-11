@@ -18,6 +18,12 @@ serde_json.workspace = true
 ulid.workspace = true
 jiff.workspace = true
 ignore = "0.4"
+image.workspace = true
+moxcms = "0.8.1"
+webp = { version = "0.3.1", default-features = false }
+sha2.workspace = true
+base64.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -16,6 +16,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(history))
         .route("/api/sessions/:id/file-references", post(file_references))
+        .route("/api/sessions/:id/images", post(upload_image).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))
+        .route("/api/sessions/:id/images/:image", get(read_image))
         .route("/api/sessions/:id/tasks", get(tasks))
         .route("/api/sessions/:id/phase", get(phase))
         .route("/api/sessions/:id/fork", post(fork))
@@ -29,6 +31,23 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/events", get(crate::sse::all_events))
         .route("/api/events/:id", get(crate::sse::session_events))
         .with_state(state)
+}
+
+async fn upload_image(State(s): State<ServerState>, Path(id): Path<String>, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> Response {
+    let media_type = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
+    match tokio::task::spawn_blocking(move || s.sessions.admit_image(&id, &body, &media_type)).await {
+        Ok(Ok(image)) => (StatusCode::CREATED, Json(image)).into_response(),
+        Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        Err(error) => err_response(error),
+    }
+}
+
+async fn read_image(State(s): State<ServerState>, Path((id, image)): Path<(String, String)>) -> Response {
+    match tokio::task::spawn_blocking(move || s.sessions.read_image(&id, &image)).await {
+        Ok(Ok((mime, data))) => ([("content-type", mime), ("x-content-type-options", "nosniff".into()), ("cache-control", "private, no-store".into())], data).into_response(),
+        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => err_response(error),
+    }
 }
 
 async fn pending_questions(State(s): State<ServerState>) -> Response { Json(s.questions.pending()).into_response() }

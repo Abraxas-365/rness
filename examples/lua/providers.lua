@@ -30,7 +30,7 @@ rness.providers.register("openai", {
 -- The connection name is independent of the OAuth credential-store key.
 rness.providers.register("chatgpt", {
   protocol = "chatgpt-responses",
-  base_url = "https://chatgpt.com/backend-api/codex",
+  base_url = "https://chatgpt.com/backend-api",
   auth = { oauth = "openai-chatgpt" },
 })
 

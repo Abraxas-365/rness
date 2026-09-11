@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "vendor/crossterm",
     "crates/rness-kernel",
     "crates/rness-protocol",
     "crates/rness-engine",
@@ -12,6 +13,10 @@ members = [
     "crates/rness-server",
     "crates/rness-cli",
 ]
+
+[patch.crates-io]
+# Preserve a second Escape as the start of the following terminal key sequence.
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.package]
 version = "0.1.0"
@@ -43,6 +48,7 @@ futures-util = "0.3"
 bytes = "1"
 sha2 = "0.10"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 rand = "0.8"
 open = "5"
 serde = { version = "1", features = ["derive"] }

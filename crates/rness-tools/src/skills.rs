@@ -207,15 +207,27 @@ impl Tool for SkillTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
+        self.load_presented(args).map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.load_presented(args)?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl SkillTool {
+    fn load_presented(&self, args: Value) -> Result<(String, Value), String> {
         let name = crate::required_str(&args, "name")?;
         let (skill, body) = load(&self.roots, name)
             .ok_or_else(|| format!("skill '{name}' is unknown or no longer available"))?;
-        Ok(format!(
+        let metadata = json!({"version":1,"kind":"skill","name":skill.name,"path":skill.path,"resource_dir":skill.dir,"body_bytes":body.len()});
+        Ok((format!(
             "<skill_content name=\"{}\" resource_dir=\"{}\">\n{}\n</skill_content>",
             skill.name,
             skill.dir.display(),
             body.trim_end(),
-        ))
+        ), metadata))
     }
 }
 

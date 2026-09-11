@@ -44,6 +44,12 @@ impl Tool for SendMessageTool {
         })
     }
 
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let target = crate::required_str(&args, "agent_id")?.to_string();
+        let output = self.execute_in(session, args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(json!({"version":1,"kind":"send_message","agent_id":target,"accepted":true}))))
+    }
+
     async fn execute(&self, _args: Value) -> Result<String, String> {
         Err("send_message requires a calling session".into())
     }
@@ -85,6 +91,12 @@ impl Tool for InterruptAgentTool {
             },
             "required": ["agent_id"],
         })
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let target = crate::required_str(&args, "agent_id")?.to_string();
+        let output = self.execute_in(session, args).await?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(json!({"version":1,"kind":"interrupt_agent","agent_id":target,"accepted":true}))))
     }
 
     async fn execute(&self, _args: Value) -> Result<String, String> {
@@ -138,15 +150,28 @@ impl Tool for ListAgentsTool {
     }
 
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
+        self.list_presented(session, args).map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.list_presented(session, args)?;
+        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+    }
+}
+
+impl ListAgentsTool {
+    fn list_presented(&self, session: &SessionId, args: Value) -> Result<(String, Value), String> {
         let descendants = args["scope"].as_str() == Some("descendants");
         let children = self
             .runtime
             .list_children(session, descendants)
             .map_err(|e| e.to_string())?;
+        let records: Vec<_> = children.iter().take(100).map(|c| json!({"session":c.session,"parent":c.parent,"depth":c.depth,"running":c.running})).collect();
+        let metadata = json!({"version":1,"kind":"list_agents","descendants":descendants,"total":children.len(),"truncated":records.len()<children.len(),"agents":records});
         if children.is_empty() {
-            return Ok("No continuable child agents".into());
+            return Ok(("No continuable child agents".into(), metadata));
         }
-        Ok(children
+        Ok((children
             .iter()
             .map(|c| {
                 format!(
@@ -158,7 +183,7 @@ impl Tool for ListAgentsTool {
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n"))
+            .join("\n"), metadata))
     }
 }
 

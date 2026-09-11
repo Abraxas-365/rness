@@ -194,6 +194,63 @@ fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
     }
 }
 
+/// Incremental reader for an immutable committed prefix. Incomplete tails are
+/// retried from their starting offset, never cached as committed events.
+#[derive(Default)]
+pub(super) struct SessionReader {
+    offset: u64,
+    line: usize,
+    events: Vec<Envelope>,
+    positions: std::collections::HashMap<EventId, usize>,
+}
+
+impl SessionReader {
+    pub(super) fn read(&mut self, root: &Path, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
+        self.refresh(root, session)?;
+        Ok(self.events.clone())
+    }
+
+    pub(super) fn read_after(&mut self, root: &Path, session: &SessionId, after: &str) -> Result<Option<Vec<Envelope>>, LogError> {
+        self.refresh(root, session)?;
+        Ok(self.positions.get(after).map(|index| self.events[index + 1..].to_vec()))
+    }
+
+    fn refresh(&mut self, root: &Path, session: &SessionId) -> Result<(), LogError> {
+        let path = log_file(&root.join(session));
+        let mut file = File::open(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound { LogError::NotFound(session.clone()) }
+            else { LogError::Io(error) }
+        })?;
+        if file.metadata()?.len() < self.offset {
+            *self = Self::default();
+        }
+        file.seek(SeekFrom::Start(self.offset))?;
+        let mut reader = BufReader::new(file);
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let n = reader.read_until(b'\n', &mut bytes)?;
+            if n == 0 || !bytes.ends_with(b"\n") { break; }
+            if !bytes.iter().all(u8::is_ascii_whitespace) {
+                let event: Envelope = serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
+                    line: self.line + 1, reason: error.to_string(),
+                })?;
+                if self.events.is_empty() && !matches!(event.event, SessionEvent::Header(_)) {
+                    return Err(LogError::Corrupt { line: 1, reason: "first event is not session/header".into() });
+                }
+                self.positions.insert(event.id.clone(), self.events.len());
+                self.events.push(event);
+            }
+            self.offset += n as u64;
+            self.line += 1;
+        }
+        if self.events.is_empty() {
+            return Err(LogError::Corrupt { line: 0, reason: "empty log".into() });
+        }
+        Ok(())
+    }
+}
+
 /// Commit timestamp (RFC 3339, ms precision, UTC).
 fn now_rfc3339() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
@@ -216,6 +273,31 @@ mod tests {
             content: vec![ContentPart::Text { text: text.into() }],
             source: None,
         })
+    }
+
+    #[test]
+    fn incremental_reader_retries_torn_tail_without_rereading_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "incremental".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let mut reader = SessionReader::default();
+        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 1);
+        let offset = reader.offset;
+        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 1);
+        assert_eq!(reader.offset, offset);
+        log.append(&user_msg("hello")).unwrap();
+        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 2);
+        let offset = reader.offset;
+        let event = Envelope { id: "tail".into(), at: now_rfc3339(), event: user_msg("é") };
+        let mut bytes = serde_json::to_vec(&event).unwrap();
+        bytes.push(b'\n');
+        let split = bytes.iter().position(|b| *b == 0xc3).unwrap() + 1;
+        log.file.write_all(&bytes[..split]).unwrap();
+        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 2);
+        assert_eq!(reader.offset, offset);
+        log.file.write_all(&bytes[split..]).unwrap();
+        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 3);
+        assert_eq!(reader.read(root.path(), &sid).unwrap(), log.read_all().unwrap());
     }
 
     #[test]

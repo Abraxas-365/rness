@@ -34,6 +34,11 @@ impl rness_engine::presentation::ToolCards for LuaHost {
         -> Option<Vec<crate::runtime::StyledLine>> {
         LuaHost::tool_card(self, name, args, output, is_error).await
     }
+
+    async fn tool_card_presented(&self, name: &str, args: serde_json::Value, output: &str, is_error: bool, presentation: Option<serde_json::Value>)
+        -> Option<Vec<crate::runtime::StyledLine>> {
+        LuaHost::tool_card_presented(self, name, args, output, is_error, presentation).await
+    }
 }
 
 use std::sync::mpsc;
@@ -85,7 +90,7 @@ enum Cmd {
         context: serde_json::Value,
         name: String,
         args: serde_json::Value,
-        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+        reply: tokio::sync::oneshot::Sender<Result<(String, Option<serde_json::Value>), String>>,
     },
     FireHook {
         event: String,
@@ -99,6 +104,7 @@ enum Cmd {
         args: serde_json::Value,
         output: String,
         is_error: bool,
+        presentation: Option<serde_json::Value>,
         reply: tokio::sync::oneshot::Sender<Option<Vec<crate::runtime::StyledLine>>>,
     },
     AppSpecs {
@@ -339,7 +345,7 @@ impl LuaHost {
                             let _ = reply.send(rt.tool_specs());
                         }
                         Cmd::CallTool { name, args, context, reply } => {
-                            let r = match rt.call_tool_context(&name, &args, &context) {
+                            let r = match rt.call_tool_presented(&name, &args, &context) {
                                 Ok(r) => r,
                                 Err(e) => Err(e.to_string()),
                             };
@@ -353,8 +359,8 @@ impl LuaHost {
                         Cmd::Statusline { reply } => {
                             let _ = reply.send(rt.statusline());
                         }
-                        Cmd::ToolCard { name, args, output, is_error, reply } => {
-                            let _ = reply.send(rt.tool_card(&name, &args, &output, is_error));
+                        Cmd::ToolCard { name, args, output, is_error, presentation, reply } => {
+                            let _ = reply.send(rt.tool_card_presented(&name, &args, &output, is_error, presentation.as_ref()));
                         }
                         Cmd::AppSpecs { reply } => {
                             let _ = reply.send(rt.app_specs());
@@ -485,6 +491,10 @@ impl LuaHost {
     }
 
     pub async fn call_tool_context(&self, name: &str, args: serde_json::Value, context: serde_json::Value) -> Result<String, String> {
+        self.call_tool_presented(name, args, context).await.map(|(output, _)| output)
+    }
+
+    pub async fn call_tool_presented(&self, name: &str, args: serde_json::Value, context: serde_json::Value) -> Result<(String, Option<serde_json::Value>), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::CallTool { name: name.into(), args, context, reply })
@@ -512,6 +522,17 @@ impl LuaHost {
         output: &str,
         is_error: bool,
     ) -> Option<Vec<crate::runtime::StyledLine>> {
+        self.tool_card_presented(name, args, output, is_error, None).await
+    }
+
+    pub async fn tool_card_presented(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        output: &str,
+        is_error: bool,
+        presentation: Option<serde_json::Value>,
+    ) -> Option<Vec<crate::runtime::StyledLine>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::ToolCard {
@@ -519,6 +540,7 @@ impl LuaHost {
                 args,
                 output: output.into(),
                 is_error,
+                presentation,
                 reply,
             })
             .ok()?;

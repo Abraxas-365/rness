@@ -19,6 +19,29 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn text_only_model_rejects_images_before_logging() {
+    use rness_engine::config::{ModelCapabilities, ModelDeclaration, ModelRegistry};
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![]);
+    let mut models = ModelRegistry::default();
+    models.declare_model(ModelDeclaration { provider: "test".into(), model: "text-only".into(),
+        capabilities: ModelCapabilities { image_input: Some(false), ..Default::default() } }).unwrap();
+    let resolved = provider.clone();
+    let svc = service(dir.path(), provider)
+        .with_agents(Default::default(), models)
+        .with_provider_resolver(CallConfig { selection: Some(ModelSelection { route: "test".into(), model: "text-only".into() }), ..Default::default() }, Arc::new(move |_| Ok(resolved.clone())));
+    svc.set_images(Arc::new(rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default()).unwrap())).unwrap();
+    let sid = svc.create(None).unwrap();
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    let attachment = svc.admit_image(&sid, bytes.get_ref(), "image/png").unwrap();
+    let before = svc.store().history(&sid).unwrap().len();
+    let error = svc.send(&sid, UserIntent::Followup, vec![ContentPart::Image { attachment }]).unwrap_err();
+    assert!(error.to_string().contains("disables image input"));
+    assert_eq!(svc.store().history(&sid).unwrap().len(), before);
+}
+
+#[tokio::test]
 async fn workspace_survives_resume_and_controls_instructions_and_input() {
     let logs = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
