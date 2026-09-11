@@ -117,6 +117,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn named_submit_is_not_redirected_by_configured_clipboard_key() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.clipboard_key = crate::keys::Chord::parse("enter");
+        input.editor.insert_str("draft");
+        let outcome = input.on_binding(&ctx, "submit");
+        assert!(matches!(outcome.actions.as_slice(), [Action::Submit(text)] if text == "draft"), "named submit was redirected: {:?}", outcome.actions);
+    }
+
+    #[test]
+    fn editor_modifier_compatibility_is_preserved() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        for mods in [KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT, KeyModifiers::SHIFT, KeyModifiers::ALT | KeyModifiers::CONTROL] {
+            let mut input = Input::new();
+            input.remove_image_key = None;
+            input.editor.insert_str("ab");
+            assert!(input.on_key(&ctx, KeyEvent::new(KeyCode::Left, mods)).handled);
+            assert!(input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, mods)).handled);
+            assert_eq!(input.editor.text(), "b");
+            let result = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, mods));
+            if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
+                assert!(result.actions.is_empty());
+                assert!(input.editor.text().contains('\n'));
+            } else {
+                assert!(matches!(result.actions.as_slice(), [Action::Submit(text)] if text == "b"));
+            }
+        }
+    }
+
+    #[test]
+    fn configured_binding_declarations_drive_help_and_dispatch() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.clipboard_key = crate::keys::Chord::parse("f8");
+        assert!(input.binding_help().iter().any(|line| line.contains("F(8)") && line.contains("paste_clipboard")));
+        assert!(matches!(input.on_key(&ctx, KeyEvent::from(KeyCode::F(8))).actions.as_slice(), [Action::PasteClipboard]));
+        input.clipboard_key = None;
+        assert!(!input.binding_help().iter().any(|line| line.contains("paste_clipboard")));
+        assert!(!input.on_key(&ctx, KeyEvent::from(KeyCode::F(8))).handled);
+    }
+
+    #[test]
     fn history_preview_is_read_only_and_preserves_draft() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -352,6 +400,9 @@ mod tests {
         let mut input = Input::new();
         input.editor.insert_str("/un");
         assert_eq!(input.matches().len(), 1);
+        let help = input.binding_help().join("\n");
+        assert!(help.contains("completion_accept"));
+        assert!(!help.contains("→ submit"));
         let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(outcome.actions.is_empty());
         assert_eq!(input.editor.text(), "/unload ");
@@ -361,6 +412,8 @@ mod tests {
         input.on_key(&ctx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(input.editor.text(), "/");
         assert!(input.matches().is_empty());
+        assert!(input.binding_help().iter().any(|line| line.contains("→ submit")));
+        assert!(!input.binding_help().iter().any(|line| line.contains("completion_accept")));
     }
 }
 
@@ -622,21 +675,92 @@ impl Component for Input {
         }
     }
 
-    fn on_key(&mut self, ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
-        if self.image_session.as_ref().is_some_and(|session| session != &ctx.model.session) { self.images.clear(); self.thumbnails.clear(); self.history_images.clear(); self.history_preview = false; self.image_preview = false; self.image_session = None; }
-        if self.history_image_key.is_some_and(|chord| chord.matches(&key)) { return KeyOutcome::act(vec![Action::PreviewHistoryImage]); }
-        if self.image_preview && self.image_close_key.is_some_and(|chord| chord.matches(&key)) { self.image_preview = false; self.history_preview = false; return KeyOutcome::consumed(); }
+    fn captures_input(&self) -> bool {
+        self.preview.is_some() || self.image_preview || !self.matches().is_empty()
+    }
+
+    fn bindings(&self) -> Vec<crate::keymaps::ComponentBinding> {
+        if self.preview.is_some() {
+            return self.edit_key.into_iter().map(|chord| crate::keymaps::ComponentBinding { action: "external_editor", chord }).chain([("esc", "close_preview"), ("up", "preview_up"), ("k", "preview_up"),
+                ("down", "preview_down"), ("j", "preview_down"), ("pageup", "preview_page_up"),
+                ("pagedown", "preview_page_down"), ("home", "preview_start"), ("end", "preview_end")]
+                .into_iter().map(|(key, action)| crate::keymaps::ComponentBinding {
+                    action, chord: crate::keys::Chord::parse(key).expect("preview chord"),
+                })).collect();
+        }
+        let mut bindings: Vec<_> = [
+            (self.clipboard_key, "paste_clipboard"), (self.edit_key, "external_editor"),
+            (self.preview_key, "paste_preview"), (self.history_image_key, "history_images"),
+            (self.image_preview_key, "image_preview"), (self.image_close_key, "close_image_preview"),
+            (self.next_image_key, "next_image"), (self.remove_image_key, "remove_image"),
+        ].into_iter().filter_map(|(chord, action)| chord.map(|chord| crate::keymaps::ComponentBinding { action, chord })).collect();
+        let keys = if !self.matches().is_empty() {
+            vec![("up", "completion_previous"), ("ctrl+p", "completion_previous"),
+                ("down", "completion_next"), ("ctrl+n", "completion_next"),
+                ("tab", "completion_accept"), ("enter", "completion_accept"), ("esc", "completion_dismiss")]
+        } else { Vec::new() };
+        bindings.extend(keys.into_iter().chain([
+            ("enter", "submit"), ("alt+enter", "newline"), ("shift+enter", "newline"),
+            ("backspace", "delete_previous"), ("left", "cursor_left"), ("right", "cursor_right"),
+            ("up", "cursor_up"), ("down", "cursor_down"), ("home", "cursor_home"), ("end", "cursor_end"),
+        ]).map(|(key, action)| crate::keymaps::ComponentBinding { action, chord: crate::keys::Chord::parse(key).expect("editor chord") }));
+        bindings
+    }
+
+    fn binding_help(&self) -> Vec<String> {
+        if self.preview.is_some() {
+            let mut lines: Vec<_> = self.bindings().iter().map(|binding| binding.help("Paste preview")).collect();
+            lines.push("Paste preview captures all other keys; prompt and global mappings are inactive.".into());
+            return lines;
+        }
         if self.image_preview && self.history_preview {
-            if self.next_image_key.is_some_and(|chord| chord.matches(&key)) && !self.history_images.is_empty() { self.history_image_index = (self.history_image_index + 1) % self.history_images.len(); }
+            let mut lines: Vec<_> = self.bindings().iter()
+                .filter(|binding| matches!(binding.action, "history_images" | "close_image_preview" | "next_image"))
+                .map(|binding| binding.help("History image preview")).collect();
+            lines.push("History image preview is read-only and captures all other keys.".into());
+            return lines;
+        }
+        let mut lines = vec![
+            "Prompt: text inserts; Up/Down navigate history or multiline text".into(),
+        ];
+        let completion = !self.matches().is_empty();
+        let bindings = self.bindings();
+        if completion { lines.push("Completion menu: navigation, acceptance and dismissal take precedence over prompt mappings.".into()); }
+        lines.extend(bindings.iter().filter(|binding| {
+            !completion || binding.action.starts_with("completion_") || !bindings.iter().any(|other| other.action.starts_with("completion_") && other.chord == binding.chord)
+        }).map(|binding| binding.help("Prompt")));
+        lines
+    }
+
+    fn on_key(&mut self, ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
+        self.handle_key(ctx, key, None)
+    }
+
+    fn on_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> KeyOutcome {
+        if action == "noop" { return KeyOutcome::consumed(); }
+        let Some(binding) = self.bindings().into_iter().find(|binding| binding.action == action) else { return KeyOutcome::pass(); };
+        self.handle_key(ctx, KeyEvent::new(binding.chord.code, binding.chord.mods), Some(action))
+    }
+}
+
+impl Input {
+    fn handle_key(&mut self, ctx: &Ctx<'_>, key: KeyEvent, action: Option<&str>) -> KeyOutcome {
+        let bindings = self.bindings();
+        let matched = |name: &str| action.map_or_else(|| bindings.iter().any(|binding| binding.matches(name, &key)), |action| action == name);
+        if self.image_session.as_ref().is_some_and(|session| session != &ctx.model.session) { self.images.clear(); self.thumbnails.clear(); self.history_images.clear(); self.history_preview = false; self.image_preview = false; self.image_session = None; }
+        if matched("history_images") { return KeyOutcome::act(vec![Action::PreviewHistoryImage]); }
+        if self.image_preview && matched("close_image_preview") { self.image_preview = false; self.history_preview = false; return KeyOutcome::consumed(); }
+        if self.image_preview && self.history_preview {
+            if matched("next_image") && !self.history_images.is_empty() { self.history_image_index = (self.history_image_index + 1) % self.history_images.len(); }
             return KeyOutcome::consumed();
         }
-        if self.image_preview_key.is_some_and(|chord| chord.matches(&key)) && !self.images.is_empty() { self.image_preview = !self.image_preview; return KeyOutcome::consumed(); }
-        if self.clipboard_key.is_some_and(|chord| chord.matches(&key)) { return KeyOutcome::act(vec![Action::PasteClipboard]); }
-        if self.next_image_key.is_some_and(|chord| chord.matches(&key)) && !self.images.is_empty() {
+        if matched("image_preview") && !self.images.is_empty() { self.image_preview = !self.image_preview; return KeyOutcome::consumed(); }
+        if matched("paste_clipboard") { return KeyOutcome::act(vec![Action::PasteClipboard]); }
+        if matched("next_image") && !self.images.is_empty() {
             self.selected_image = (self.selected_image + 1) % self.images.len();
             return KeyOutcome::consumed();
         }
-        if self.remove_image_key.is_some_and(|chord| chord.matches(&key)) {
+        if matched("remove_image") {
             if !self.images.is_empty() {
                 let removed = self.images.remove(self.selected_image.min(self.images.len() - 1));
                 if !self.images.iter().any(|r| r.id == removed.id) { self.thumbnails.remove(&removed.id); }
@@ -649,23 +773,24 @@ impl Component for Input {
         if !self.images.is_empty() && self.preview.is_none() && key.code == KeyCode::Enter && key.modifiers.is_empty() {
             return KeyOutcome::act(vec![Action::SubmitImages(self.editor.text(), self.images.clone())]);
         }
-        if self.edit_key.is_some_and(|chord| chord.matches(&key)) {
+        if matched("external_editor") {
             return KeyOutcome::act(vec![Action::Custom("terminal:edit-prompt".into(), serde_json::json!({"text": self.editor.text(), "editor": self.external_editor}))]);
         }
-        if self.preview_key.is_some_and(|chord| chord.matches(&key)) {
+        if matched("paste_preview") {
             self.preview = self.editor.selected_paste().map(|(id, text)| (id, text.to_owned()));
             self.preview_scroll = 0;
             return KeyOutcome::consumed();
         }
         if self.preview.is_some() {
-            match (key.code, key.modifiers) {
-                (KeyCode::Esc, KeyModifiers::NONE) => self.preview = None,
-                (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_sub(1),
-                (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => self.preview_scroll = (self.preview_scroll + 1).min(self.preview_max),
-                (KeyCode::PageUp, KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_sub(10),
-                (KeyCode::PageDown, KeyModifiers::NONE) => self.preview_scroll = self.preview_scroll.saturating_add(10).min(self.preview_max),
-                (KeyCode::Home, KeyModifiers::NONE) => self.preview_scroll = 0,
-                (KeyCode::End, KeyModifiers::NONE) => self.preview_scroll = self.preview_max,
+            let action = action.or_else(|| bindings.iter().find(|binding| binding.chord.matches(&key)).map(|binding| binding.action));
+            match action {
+                Some("close_preview") => self.preview = None,
+                Some("preview_up") => self.preview_scroll = self.preview_scroll.saturating_sub(1),
+                Some("preview_down") => self.preview_scroll = (self.preview_scroll + 1).min(self.preview_max),
+                Some("preview_page_up") => self.preview_scroll = self.preview_scroll.saturating_sub(10),
+                Some("preview_page_down") => self.preview_scroll = self.preview_scroll.saturating_add(10).min(self.preview_max),
+                Some("preview_start") => self.preview_scroll = 0,
+                Some("preview_end") => self.preview_scroll = self.preview_max,
                 _ => {}
             }
             return KeyOutcome::consumed();
@@ -680,16 +805,16 @@ impl Component for Input {
         if !matches.is_empty() {
             let count = matches.len();
             let selected = self.selected.min(count - 1);
-            match (key.code, key.modifiers) {
-                (KeyCode::Up, KeyModifiers::NONE) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+            match action.or_else(|| bindings.iter().find(|binding| binding.action.starts_with("completion_") && binding.matches_key(&key)).map(|binding| binding.action)) {
+                Some("completion_previous") => {
                     self.selected = (selected + count - 1) % count;
                     return KeyOutcome::consumed();
                 }
-                (KeyCode::Down, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                Some("completion_next") => {
                     self.selected = (selected + 1) % count;
                     return KeyOutcome::consumed();
                 }
-                (KeyCode::Tab | KeyCode::Enter, KeyModifiers::NONE) => {
+                Some("completion_accept") => {
                     if let Some(token) = self.at_token() {
                         let path = matches[selected].0.clone();
                         let drill = key.code == KeyCode::Tab && path.ends_with('/');
@@ -706,17 +831,17 @@ impl Component for Input {
                     self.dismissed = !self.candidates.iter().any(|(name, _)| name.starts_with(replacement.trim_start_matches('/')));
                     return KeyOutcome::consumed();
                 }
-                (KeyCode::Esc, _) => {
+                Some("completion_dismiss") => {
                     self.dismissed = true;
                     return KeyOutcome::consumed();
                 }
                 _ => {}
             }
         }
-        if key.modifiers == KeyModifiers::NONE && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        if key.modifiers == KeyModifiers::NONE && (matched("cursor_up") || matched("cursor_down"))
             && (self.editor.line_count() == 1 || self.history_index.is_some())
         {
-            if key.code == KeyCode::Up && !self.history.is_empty() {
+            if matched("cursor_up") && !self.history.is_empty() {
                 let index = match self.history_index {
                     Some(index) => index.saturating_sub(1),
                     None => { self.draft = self.editor.clone(); self.history.len() - 1 }
@@ -724,7 +849,7 @@ impl Component for Input {
                 self.history_index = Some(index);
                 self.editor.take();
                 self.editor = self.history[index].clone();
-            } else if key.code == KeyCode::Down {
+            } else if matched("cursor_down") {
                 if let Some(index) = self.history_index {
                     self.editor.take();
                     if index + 1 < self.history.len() {
@@ -745,13 +870,12 @@ impl Component for Input {
             self.selected = 0;
         }
         let outcome = match (key.code, key.modifiers) {
-            (KeyCode::Enter, m)
-                if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::SHIFT) =>
+            _ if matched("newline") =>
             {
                 self.editor.insert_newline();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Enter, _) => {
+            _ if matched("submit") => {
                 if self.editor.is_empty() {
                     return KeyOutcome::consumed();
                 }
@@ -768,40 +892,38 @@ impl Component for Input {
                 KeyOutcome::act(vec![Action::Submit(text)])
             }
             (KeyCode::Char(c), m)
-                if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+                if action.is_none() && !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
             {
                 self.editor.insert_char(c);
                 KeyOutcome::consumed()
             }
-            (KeyCode::Backspace, _) => {
+            _ if matched("delete_previous") => {
                 self.editor.backspace();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Left, _) => {
+            _ if matched("cursor_left") => {
                 self.editor.move_left();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Right, _) => {
+            _ if matched("cursor_right") => {
                 self.editor.move_right();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Up, m)
-                if !m.contains(KeyModifiers::SHIFT) && self.editor.line_count() > 1 =>
+            _ if matched("cursor_up") && self.editor.line_count() > 1 =>
             {
                 self.editor.move_up();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Down, m)
-                if !m.contains(KeyModifiers::SHIFT) && self.editor.line_count() > 1 =>
+            _ if matched("cursor_down") && self.editor.line_count() > 1 =>
             {
                 self.editor.move_down();
                 KeyOutcome::consumed()
             }
-            (KeyCode::Home, _) => {
+            _ if matched("cursor_home") => {
                 self.editor.move_home();
                 KeyOutcome::consumed()
             }
-            (KeyCode::End, _) => {
+            _ if matched("cursor_end") => {
                 self.editor.move_end();
                 KeyOutcome::consumed()
             }

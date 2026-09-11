@@ -348,8 +348,26 @@ fn panel_body(mut content: Vec<Line<'static>>, options: &serde_json::Value, widt
 }
 
 impl Component for Chat {
+    fn bindings(&self) -> Vec<crate::keymaps::ComponentBinding> {
+        if !self.config.is_object() { return Vec::new(); }
+        [("previous_thinking", "alt+p"), ("next_thinking", "alt+n"), ("toggle_thinking", "alt+t"),
+         ("previous_tool", "alt+up"), ("next_tool", "alt+down"), ("toggle_tool", "ctrl+o")]
+            .into_iter().filter_map(|(action, default)| {
+                let value = &self.config["keys"][action];
+                if value == false { return None; }
+                crate::keys::Chord::parse(value.as_str().unwrap_or(default))
+                    .map(|chord| crate::keymaps::ComponentBinding { action, chord })
+            }).collect()
+    }
+
     fn on_key(&mut self, ctx: &Ctx<'_>, key: crossterm::event::KeyEvent) -> crate::component::KeyOutcome {
-        use crate::{component::KeyOutcome, keys::Chord};
+        let action = self.bindings().into_iter().find(|binding| binding.matches_key(&key)).map(|binding| binding.action);
+        action.map_or_else(crate::component::KeyOutcome::pass, |action| self.on_binding(ctx, action))
+    }
+
+    fn on_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> crate::component::KeyOutcome {
+        use crate::component::KeyOutcome;
+        if action == "noop" { return KeyOutcome::consumed(); }
         if !self.config.is_object() { return KeyOutcome::pass(); }
         if self.session.as_ref() != Some(&ctx.model.session) {
             self.session = Some(ctx.model.session.clone());
@@ -366,14 +384,10 @@ impl Component for Chat {
             self.focused_thinking = None;
             self.card_rows.clear();
         }
-        let matched = |name: &str, default: &str| {
-            let value = &self.config["keys"][name];
-            if value == false { return false; }
-            Chord::parse(value.as_str().unwrap_or(default)).is_some_and(|chord| chord.code == key.code && chord.mods == key.modifiers)
-        };
-        let previous_thinking = matched("previous_thinking", "alt+p");
-        let next_thinking = matched("next_thinking", "alt+n");
-        if matched("toggle_thinking", "alt+t") || previous_thinking || next_thinking {
+        let matched = |name: &str| action == name;
+        let previous_thinking = matched("previous_thinking");
+        let next_thinking = matched("next_thinking");
+        if matched("toggle_thinking") || previous_thinking || next_thinking {
             let mut targets: Vec<_> = ctx.model.entries.iter().enumerate().filter_map(|(entry_index, entry)| {
                 match entry { Entry::Assistant { content, .. } => Some((entry_index, content)), _ => None }
             }).enumerate().flat_map(|(ordinal, (entry_index, content))| {
@@ -399,9 +413,9 @@ impl Component for Chat {
             }
             return KeyOutcome::consumed();
         }
-        let previous = matched("previous_tool", "alt+up");
-        let next = matched("next_tool", "alt+down");
-        let toggle = matched("toggle_tool", "ctrl+o");
+        let previous = matched("previous_tool");
+        let next = matched("next_tool");
+        let toggle = matched("toggle_tool");
         if !previous && !next && !toggle { return KeyOutcome::pass(); }
         let calls: Vec<_> = ctx.model.entries.iter().filter_map(|entry| match entry {
             Entry::ToolResult { call, name, is_error, .. } => Some((call, name, is_error)), _ => None,
@@ -1446,6 +1460,17 @@ mod tests {
         assert_eq!(chat.expanded.get("b"), Some(&true));
         chat.config["keys"] = serde_json::json!({"toggle_tool":false});
         assert!(!chat.on_key(&ctx, toggle).handled);
+        assert!(!chat.binding_help().iter().any(|line| line.contains("toggle_tool")));
+        chat.config["keys"] = serde_json::json!({"toggle_tool":"f8"});
+        assert!(chat.binding_help().iter().any(|line| line.contains("F(8)") && line.contains("toggle_tool")));
+        assert!(!chat.on_key(&ctx, toggle).handled);
+        assert!(chat.on_key(&ctx, KeyEvent::from(KeyCode::F(8))).handled);
+        chat.config["keys"] = serde_json::json!({"previous_tool":"f8", "toggle_tool":"f8"});
+        chat.focused_call = Some("b".into());
+        let before = chat.expanded.get("b").copied().unwrap_or(false);
+        assert!(chat.on_binding(&ctx, "toggle_tool").handled);
+        assert_eq!(chat.focused_call.as_deref(), Some("b"));
+        assert_eq!(chat.expanded.get("b"), Some(&!before));
     }
 
     #[test]

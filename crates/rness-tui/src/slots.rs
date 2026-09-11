@@ -83,6 +83,66 @@ impl Slots {
         self.winner(OVERLAY, ctx).is_some()
     }
 
+    pub fn focused_binding_help(&self, ctx: &Ctx<'_>) -> Vec<String> {
+        for slot in [OVERLAY, SIDEBAR, INPUT_FOOTER] {
+            if let Some(component) = self.winner(slot, ctx) {
+                let mut lines = vec![format!("Focus: {} ({slot})", component.name())];
+                let help = component.binding_help();
+                if help.is_empty() { lines.push("This component does not publish binding descriptions.".into()); }
+                lines.extend(help);
+                return lines;
+            }
+        }
+        vec!["No focused component".into()]
+    }
+
+    pub fn resolved_binding_help(&self, ctx: &Ctx<'_>, map: &crate::keymaps::ScopedKeymap) -> Vec<String> {
+        use crate::keymaps::{Scope, BindingLayer};
+        let mut lines = Vec::new();
+        for (slot, scope) in [(INPUT_FOOTER, Scope::Promptbox), (MESSAGE_BODY, Scope::Messagebox)] {
+            let Some(component) = self.winner(slot, ctx) else { continue; };
+            lines.push(format!("{} controls (when focused/applicable):", component.name()));
+            let bindings = component.bindings();
+            for line in component.binding_help() {
+                let shadowed = bindings.iter().find_map(|binding| {
+                    if !line.contains(&format!("{:?} → {} (when applicable)", binding.chord, binding.action)) { return None; }
+                    let key = crossterm::event::KeyEvent::new(binding.chord.code, binding.chord.mods);
+                    if map.layer(&scope, &key) != Some(BindingLayer::User) { return None; }
+                    map.lookup_exact(&scope, &key).filter(|action| {
+                        !component.captures_input() || action.strip_prefix("core.promptbox.").is_some_and(|action| {
+                            action == "noop" || ((action.starts_with("completion_") || action.starts_with("preview_") || action == "close_preview")
+                                && bindings.iter().any(|binding| binding.action == action))
+                        })
+                    }).map(|action| format!("{:?} → {action} (replaces {})", binding.chord, binding.action))
+                });
+                lines.push(shadowed.unwrap_or(line));
+            }
+        }
+        if self.modal_active(ctx) { lines.extend(self.focused_binding_help(ctx)); }
+        lines
+    }
+
+    pub fn binding_help(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for components in self.slots.values() {
+            for mounted in components {
+                lines.extend(mounted.component.binding_help());
+            }
+        }
+        lines.sort();
+        lines.dedup();
+        lines
+    }
+
+    pub fn modal_active(&self, ctx: &Ctx<'_>) -> bool {
+        self.winner(OVERLAY, ctx).is_some() || self.winner(SIDEBAR, ctx).is_some()
+    }
+
+    pub fn prompt_focused(&self, ctx: &Ctx<'_>) -> bool {
+        self.winner(OVERLAY, ctx).is_none() && self.winner(SIDEBAR, ctx).is_none()
+            && self.winner(INPUT_FOOTER, ctx).is_some()
+    }
+
     /// The focus target: the active overlay, else an active sidebar,
     /// else the input footer.
     pub fn focused_mut(&mut self, ctx: &Ctx<'_>) -> Option<&mut Box<dyn Component>> {
@@ -93,6 +153,11 @@ impl Slots {
             return self.winner_mut(SIDEBAR, ctx);
         }
         self.winner_mut(INPUT_FOOTER, ctx)
+    }
+
+    pub fn message_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> crate::component::KeyOutcome {
+        if self.modal_active(ctx) { return crate::component::KeyOutcome::pass(); }
+        self.winner_mut(MESSAGE_BODY, ctx).map(|c| c.on_binding(ctx, action)).unwrap_or_else(crate::component::KeyOutcome::pass)
     }
 
     pub fn message_key(&mut self, ctx: &Ctx<'_>, key: crossterm::event::KeyEvent) -> crate::component::KeyOutcome {

@@ -17,6 +17,7 @@ impl Chord {
     /// Parse `"ctrl+k"`, `"shift+up"`, `"pagedown"`, `"f5"`… `None` on
     /// anything unrecognized (callers decide whether that's an error).
     pub fn parse(s: &str) -> Option<Chord> {
+        let s = rness_kernel::presentation::canonical_chord(s).ok()?;
         let mut mods = KeyModifiers::NONE;
         let mut code = None;
         for part in s.split('+') {
@@ -25,6 +26,7 @@ impl Chord {
                 "alt" => mods |= KeyModifiers::ALT,
                 "shift" => mods |= KeyModifiers::SHIFT,
                 p => {
+                    if code.is_some() { return None; }
                     code = Some(match p {
                         "enter" => KeyCode::Enter,
                         "esc" => KeyCode::Esc,
@@ -42,8 +44,8 @@ impl Chord {
                         "delete" => KeyCode::Delete,
                         _ if p.len() == 1 => KeyCode::Char(p.chars().next().unwrap()),
                         _ if p.starts_with('f') => match p[1..].parse::<u8>() {
-                            Ok(n) => KeyCode::F(n),
-                            Err(_) => return None,
+                            Ok(n @ 1..=24) => KeyCode::F(n),
+                            _ => return None,
                         },
                         _ => return None,
                     })
@@ -90,6 +92,16 @@ mod tests {
 
         assert!(Chord::parse("hyper+q").is_none());
         assert!(Chord::parse("fzz").is_none());
+    }
+
+    #[test]
+    fn explicit_chords_reject_sequences_and_accept_documented_notation() {
+        assert_eq!(Chord::parse("<F6>"), Chord::parse("f6"));
+        assert_eq!(Chord::parse("<C-k>"), Chord::parse("ctrl+k"));
+        assert_eq!(Chord::parse("<Esc>"), Chord::parse("esc"));
+        for invalid in ["a+b", "]d", "<leader>r", "<F0>", "f25", "<F6", "ctrl+"] {
+            assert!(Chord::parse(invalid).is_none(), "accepted {invalid}");
+        }
     }
 
     #[test]

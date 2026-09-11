@@ -16,6 +16,70 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn explicit_file_lifecycle_remap_disable_reload_and_unload() {
+    use rness_lua::loader::{PluginSpec, PluginLocation, discover_specs};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("review.lua");
+    let source = "return function(opts, plugin) plugin.action('insert', {scope='promptbox', description='Insert', run=function(ctx) ctx.promptbox.insert(opts.text) end}); plugin.keys({insert={action='insert', key='<F6>'}}) end";
+    std::fs::write(&path, source).unwrap();
+    let mut spec = PluginSpec { name: "review".into(), source: PluginLocation::File(path.clone()), enabled: true, watch: false, opts: serde_json::json!({"text":"first"}), keys: serde_json::json!({"insert":["<F8>","<F9>"]}) };
+    let host = LuaHost::spawn().unwrap();
+    let sources = discover_specs(root.path(), &[spec.clone()]).unwrap();
+    assert!(rness_lua::loader::load_all(&host, &sources).await.is_empty());
+    assert_eq!(host.binding_specs().await[0].keys, vec!["<F8>", "<F9>"]);
+    assert_eq!(host.call_action("review.insert", "promptbox", serde_json::json!({})).await.unwrap(), vec![rness_lua::runtime::UiActionOperation::InsertPrompt("first".into())]);
+    let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+    std::fs::write(&path, "error('failed reload')").unwrap();
+    assert!(host.reload(discover_specs(root.path(), &[spec.clone()]).unwrap()).await.is_err());
+    assert_eq!(host.action_generation().load(std::sync::atomic::Ordering::SeqCst), generation);
+    assert_eq!(host.binding_specs().await[0].keys.len(), 2);
+    std::fs::write(&path, source).unwrap();
+    spec.keys = serde_json::json!(false);
+    host.reload(discover_specs(root.path(), &[spec.clone()]).unwrap()).await.unwrap();
+    assert!(host.binding_specs().await.iter().all(|b| b.keys.is_empty()));
+    assert!(host.unload("review").await.unwrap());
+    assert!(host.action_specs().await.is_empty());
+    host.reload(sources).await.unwrap();
+    assert!(host.action_specs().await.is_empty());
+    spec.enabled = false;
+    spec.source = PluginLocation::File(root.path().join("missing.lua"));
+    assert!(discover_specs(root.path(), &[spec.clone()]).unwrap().is_empty());
+    spec.enabled = true;
+    assert!(discover_specs(root.path(), &[spec]).is_err());
+}
+
+#[tokio::test]
+async fn watcher_retries_busy_reload_without_another_save() {
+    let root = tempfile::tempdir().unwrap();
+    let host = LuaHost::spawn().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(root.path().join("sessions")), Arc::new(Silent), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry.clone(), Default::default(), tokio::runtime::Handle::current(), "test/model".into()).await.unwrap();
+    let path = root.path().join("live.plugin");
+    std::fs::write(&path, "rness.tool.register{name='old', run=function() return 'old' end}").unwrap();
+    let specs = vec![rness_lua::loader::PluginSpec {
+        name: "live".into(), source: rness_lua::loader::PluginLocation::File(path.clone()),
+        enabled: true, watch: true, opts: serde_json::json!({}), keys: serde_json::json!({}),
+    }];
+    let sources = rness_lua::loader::discover_specs(root.path(), &specs).unwrap();
+    assert!(rness_lua::loader::load_all(&host, &sources).await.is_empty());
+    let installed = rness_lua::api::tools::sync_lua_tools(&registry, &host, &[]).await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _watcher = rness_lua::reload::watch_specs(root.path().into(), specs, host.clone(), registry.clone(), installed, move |report| { let _ = tx.send(report); }).unwrap();
+    let guard = sessions.try_extension_maintenance().unwrap();
+    let replacement = root.path().join("replacement.tmp");
+    std::fs::write(&replacement, "rness.tool.register{name='new', run=function() return 'new' end}").unwrap();
+    std::fs::rename(replacement, path).unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(700), rx.recv()).await.is_err());
+    assert_eq!(host.call_tool("old", serde_json::json!({})).await.unwrap(), "old");
+    drop(guard);
+    let report = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    assert!(matches!(report, rness_lua::reload::ReloadReport::Reloaded { .. }), "{report:?}");
+    assert!(registry.get("old").is_none());
+    assert!(registry.get("new").is_some());
+}
+
+#[tokio::test]
 async fn custom_tools_receive_session_workspace_without_chdir() {
     let host = LuaHost::spawn().unwrap();
     host.load("context", "rness.tool.register{name='where', run=function(args, ctx) return ctx.session .. ':' .. ctx.workspace end}").await.unwrap();

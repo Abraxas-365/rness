@@ -22,6 +22,15 @@ pub trait Component: Send {
     /// Stable identity (for unmounting / debugging).
     fn name(&self) -> &str;
 
+    /// Internal menus/previews own input before user mappings.
+    fn captures_input(&self) -> bool { false }
+
+    fn bindings(&self) -> Vec<crate::keymaps::ComponentBinding> { Vec::new() }
+
+    fn binding_help(&self) -> Vec<String> {
+        self.bindings().iter().map(|binding| binding.help(self.name())).collect()
+    }
+
     fn priority(&self) -> Option<i32> { None }
 
     /// Chain select (dsh pattern): whether this component wants to render
@@ -44,6 +53,14 @@ pub trait Component: Send {
     /// stops propagation.
     fn on_key(&mut self, _ctx: &Ctx<'_>, _key: KeyEvent) -> KeyOutcome {
         KeyOutcome::pass()
+    }
+
+    fn on_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> KeyOutcome {
+        if action == "noop" { return KeyOutcome::consumed(); }
+        match self.bindings().into_iter().find(|binding| binding.action == action) {
+            Some(binding) => self.on_key(ctx, KeyEvent::new(binding.chord.code, binding.chord.mods)),
+            None => KeyOutcome::pass(),
+        }
     }
 
     fn on_paste(&mut self, _ctx: &Ctx<'_>, _text: &str) -> KeyOutcome {

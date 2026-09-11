@@ -33,6 +33,30 @@ pub struct LuaToolSpec {
     pub tasks: Option<rness_engine::tasks::TasksConfig>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LuaActionSpec {
+    pub name: String,
+    pub owner: String,
+    pub scope: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UiActionOperation {
+    CloseApp(String),
+    InsertPrompt(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LuaBindingSpec {
+    pub owner: String,
+    pub slot: String,
+    pub action: String,
+    pub scope: String,
+    pub keys: Vec<String>,
+    pub user: bool,
+}
+
 /// VM-side state: the interpreter plus everything plugins registered.
 pub struct LuaRuntime {
     lua: Lua,
@@ -47,6 +71,8 @@ pub struct LuaRuntime {
     registration_owners: HashMap<(&'static str, String), String>,
     command_completers: HashMap<String, RegistryKey>,
     command_metadata: HashMap<String, (String, Vec<(String, String)>)>,
+    bindings: Vec<LuaBindingSpec>,
+    actions: HashMap<String, (LuaActionSpec, RegistryKey)>,
     commands: HashMap<String, (String, RegistryKey)>,
     plugin_hooks: HashMap<String, Table>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
@@ -83,6 +109,7 @@ impl LuaRuntime {
     }
 
     pub fn install_config(&self, config: &crate::api::config::StartupConfig) -> Result<(), LuaError> {
+        self.lua.globals().set("__rness_user_mappings", self.lua.to_value(&config.mappings)?)?;
         let rness: Table = self.lua.globals().get("rness")?;
         let models: Table = rness.get("models")?;
         let registry = config.models.clone();
@@ -127,6 +154,8 @@ impl LuaRuntime {
             registration_owners: HashMap::new(),
             command_completers: HashMap::new(),
             command_metadata: HashMap::new(),
+            bindings: Vec::new(),
+            actions: HashMap::new(),
             commands: HashMap::new(),
             plugin_hooks: HashMap::new(),
             references: None,
@@ -182,7 +211,7 @@ impl LuaRuntime {
         }
         let declarations: Table = self.lua.globals().get("__rness_declarations")?;
         let mut snapshots = Vec::new();
-        for name in ["tools", "apps", "cards", "commands"] {
+        for name in ["tools", "apps", "cards", "commands", "actions"] {
             let table: Table = declarations.get(name)?;
             let values = table.clone().pairs::<String, bool>().collect::<mlua::Result<Vec<_>>>()?;
             snapshots.push((name, values));
@@ -203,7 +232,7 @@ impl LuaRuntime {
             }
             hook_owner.clear()?;
             let pending: Table = self.lua.globals().get("__rness_pending")?;
-            for category in ["tools", "apps", "tool_cards", "keymaps", "commands"] {
+            for category in ["tools", "apps", "tool_cards", "keymaps", "commands", "actions", "bindings"] {
                 pending.get::<Table>(category)?.clear()?;
             }
             pending.set("statusline", LuaValue::Nil)?;
@@ -273,6 +302,8 @@ impl LuaRuntime {
                 tool_cards: self.tool_cards.iter().map(|(n, k)| Ok((n.clone(), copy_key(k)?))).collect::<mlua::Result<_>>()?,
                 keymap_binds: self.keymap_binds.clone(), registration_owners: self.registration_owners.clone(),
                 command_completers: self.command_completers.iter().map(|(n, k)| Ok((n.clone(), copy_key(k)?))).collect::<mlua::Result<_>>()?,
+                bindings: Vec::new(),
+                actions: self.actions.iter().map(|(n, (s, k))| Ok((n.clone(), (s.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
                 command_metadata: self.command_metadata.clone(),
                 commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
                 references: None,
@@ -280,7 +311,7 @@ impl LuaRuntime {
             };
             let declarations: Table = self.lua.globals().get("__rness_declarations")?;
             let fresh = self.lua.create_table()?;
-            for category in ["tools", "apps", "cards", "commands"] {
+            for category in ["tools", "apps", "cards", "commands", "actions"] {
                 let table = self.lua.create_table()?;
                 for pair in declarations.get::<Table>(category)?.pairs::<String, bool>() {
                     let (key, value) = pair?;
@@ -291,6 +322,7 @@ impl LuaRuntime {
             self.lua.globals().set("__rness_declarations", fresh)?;
             for (category, name) in self.registration_owners.keys() {
                 match *category {
+                    "actions" => { staged.actions.remove(name); }
                     "tools" => { staged.tools.remove(name); }
                     "apps" => { staged.apps.remove(name); }
                     "cards" => { staged.tool_cards.remove(name); }
@@ -306,6 +338,16 @@ impl LuaRuntime {
         let declarations: Table = self.lua.globals().get("__rness_declarations").map_err(|e| e.to_string())?;
         let mut staged = run().map_err(|e| e.to_string())?;
         let result = sources.iter().try_for_each(|source| staged.load(&source.name, &source.source).map_err(|e| format!("{}: {e}", source.name)))
+            .and_then(|()| {
+                for mapping in self.user_mappings()? {
+                    if let Some((previous, _)) = self.actions.get(&mapping.action) {
+                        if sources.iter().any(|source| source.name == previous.owner) && !staged.actions.contains_key(&mapping.action) {
+                            return Err(format!("reload removed mapped action: {}", mapping.action));
+                        }
+                    }
+                }
+                staged.validate_bindings(true)
+            })
             .and_then(|()| validate(&staged));
         if let Err(error) = result {
             for name in staged.plugin_names() { let _ = staged.unload(&name); }
@@ -336,6 +378,105 @@ impl LuaRuntime {
 
     pub fn command_metadata(&self, name: &str) -> (String, Vec<(String, String)>) {
         self.command_metadata.get(name).cloned().unwrap_or_default()
+    }
+
+    pub fn binding_specs(&self) -> Vec<LuaBindingSpec> {
+        let mut bindings = self.bindings.clone();
+        if let Ok(mappings) = self.user_mappings() {
+            for (index, mapping) in mappings.into_iter().enumerate() {
+                if rness_kernel::presentation::core_action_matches_scope(&mapping.action, &mapping.scope) {
+                    bindings.push(LuaBindingSpec { owner: "core".into(), slot: format!("user:{index}"), action: mapping.action,
+                        scope: mapping.scope, keys: vec![mapping.key], user: true });
+                    continue;
+                }
+                if let Some((action, _)) = self.actions.get(&mapping.action) {
+                    if action.scope == mapping.scope {
+                        bindings.push(LuaBindingSpec { owner: action.owner.clone(), slot: format!("user:{index}"), action: mapping.action,
+                            scope: mapping.scope, keys: vec![mapping.key], user: true });
+                    }
+                }
+            }
+        }
+        bindings
+    }
+
+    fn user_mappings(&self) -> Result<Vec<crate::api::config::UserMapping>, String> {
+        let value: LuaValue = self.lua.globals().get("__rness_user_mappings").map_err(|e| e.to_string())?;
+        if value.is_nil() { return Ok(Vec::new()); }
+        self.lua.from_value(value).map_err(|e| e.to_string())
+    }
+
+    pub fn validate_bindings(&self, allow_missing: bool) -> Result<(), String> {
+        for mapping in self.user_mappings()? {
+            if rness_kernel::presentation::core_action_scope(&mapping.action).is_some() {
+                if !rness_kernel::presentation::core_action_matches_scope(&mapping.action, &mapping.scope) { return Err(format!("mapping scope disagrees with action: {}", mapping.action)); }
+                continue;
+            }
+            match self.actions.get(&mapping.action) {
+                Some((action, _)) if action.scope == mapping.scope => {},
+                None if allow_missing => {},
+                None => return Err(format!("unknown mapping action: {}", mapping.action)),
+                _ => return Err(format!("mapping scope disagrees with action: {}", mapping.action)),
+            }
+        }
+        let mut explicit = std::collections::BTreeMap::new();
+        for binding in self.binding_specs().into_iter().filter(|binding| binding.user) {
+            for key in binding.keys {
+                let chord = rness_kernel::presentation::canonical_chord(&key)?;
+                if let Some(previous) = explicit.insert((binding.scope.clone(), chord.clone()), binding.action.clone()) {
+                    if previous != binding.action { return Err(format!("conflicting user mappings in {} for {chord}: {previous} and {}", binding.scope, binding.action)); }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn action_specs(&self) -> Vec<LuaActionSpec> {
+        let mut specs: Vec<_> = self.actions.values().map(|(spec, _)| spec.clone()).collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
+
+    pub fn call_action(&self, name: &str, scope: &str, context: serde_json::Value) -> Result<Vec<UiActionOperation>, String> {
+        let (spec, key) = self.actions.get(name).ok_or_else(|| format!("action unavailable: {name}"))?;
+        if spec.scope != scope { return Err(format!("action {name} is not available in scope {scope}")); }
+        let invoke = || -> mlua::Result<Vec<UiActionOperation>> {
+            let context: Table = match self.lua.to_value(&context)? {
+                LuaValue::Table(table) => table,
+                _ => return Err(mlua::Error::runtime("action context must be an object")),
+            };
+            let operations = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let promptbox = self.lua.create_table()?;
+            let pending = operations.clone();
+            let available = active.clone();
+            promptbox.set("insert", self.lua.create_function(move |_, text: String| {
+                if !available.load(std::sync::atomic::Ordering::Relaxed) { return Err(mlua::Error::runtime("action context expired")); }
+                pending.lock().unwrap().push(UiActionOperation::InsertPrompt(text));
+                Ok(())
+            })?)?;
+            context.set("promptbox", promptbox)?;
+            if let Some(name) = scope.strip_prefix("app:") {
+                let app = self.lua.create_table()?;
+                app.set("name", name)?;
+                let name = name.to_owned();
+                let pending = operations.clone();
+                let available = active.clone();
+                app.set("close", self.lua.create_function(move |_, ()| {
+                    if !available.load(std::sync::atomic::Ordering::Relaxed) { return Err(mlua::Error::runtime("action context expired")); }
+                    pending.lock().unwrap().push(UiActionOperation::CloseApp(name.clone()));
+                    Ok(())
+                })?)?;
+                context.set("app", app)?;
+            }
+            let run: Function = self.lua.registry_value(key)?;
+            let result = run.call::<()>(context);
+            active.store(false, std::sync::atomic::Ordering::Relaxed);
+            result?;
+            let result = operations.lock().unwrap().clone();
+            Ok(result)
+        };
+        invoke().map_err(|e| e.to_string())
     }
 
     pub fn command_specs(&self) -> Vec<(String, String)> {
@@ -386,6 +527,12 @@ impl LuaRuntime {
         let declarations: Table = self.lua.globals().get("__rness_declarations")?;
         for (category, key) in owned {
             match category {
+                "actions" => {
+                    if let Some((_, callback)) = self.actions.remove(&key) {
+                        self.lua.remove_registry_value(callback)?;
+                    }
+                    declarations.get::<Table>("actions")?.set(key.as_str(), LuaValue::Nil)?;
+                }
                 "commands" => {
                     if let Some(callback) = self.command_completers.remove(&key) { self.lua.remove_registry_value(callback)?; }
                     self.command_metadata.remove(&key);
@@ -423,6 +570,7 @@ impl LuaRuntime {
             }
             self.registration_owners.remove(&(category, key));
         }
+        self.bindings.retain(|binding| binding.owner != name);
         self.keymap_binds.retain(|(_, _, owner)| owner.as_deref() != Some(name));
         if let Some(qs) = &self.questions {
             if qs.owner().as_deref() == Some(name) {
@@ -766,6 +914,11 @@ impl LuaRuntime {
     /// into runtime state.
     fn drain_registrations(&mut self, owner: Option<&str>) -> Result<(), LuaError> {
         let pending: Table = self.lua.globals().get("__rness_pending")?;
+        let bindings: Table = pending.get("bindings")?;
+        let staged_bindings = bindings.clone().sequence_values::<LuaValue>()
+            .map(|value| self.lua.from_value::<LuaBindingSpec>(value?)).collect::<mlua::Result<Vec<_>>>()?;
+        self.bindings.extend(staged_bindings);
+        bindings.clear()?;
 
         let commands: Table = pending.get("commands")?;
         for entry in commands.sequence_values::<Table>() {
@@ -784,6 +937,18 @@ impl LuaRuntime {
             }
         }
         commands.clear()?;
+        let actions: Table = pending.get("actions")?;
+        for entry in actions.clone().sequence_values::<Table>() {
+            let entry = entry?;
+            let spec = LuaActionSpec {
+                name: entry.get("name")?, owner: entry.get("owner")?,
+                scope: entry.get("scope")?, description: entry.get("description")?,
+            };
+            let callback = self.lua.create_registry_value(entry.get::<Function>("run")?)?;
+            self.registration_owners.insert(("actions", spec.name.clone()), spec.owner.clone());
+            self.actions.insert(spec.name.clone(), (spec, callback));
+        }
+        actions.clear()?;
         let tools: Table = pending.get("tools")?;
         for entry in tools.sequence_values::<Table>() {
             let entry = entry?;
@@ -826,6 +991,7 @@ impl LuaRuntime {
             let view: Function = entry.get("view")?;
             let on_key: Option<Function> = entry.get("on_key")?;
             let spec = LuaAppSpec {
+                key_help: entry.get::<Option<Vec<String>>>("key_help")?.unwrap_or_default(),
                 name: name.clone(),
                 slot: entry.get::<Option<String>>("slot")?.unwrap_or_else(|| "overlay".into()),
                 title: entry.get::<Option<String>>("title")?.unwrap_or_else(|| name.clone()),
@@ -916,6 +1082,8 @@ fn require_declaration_phase(lua: &Lua) -> mlua::Result<()> {
 /// `__rness_pending`; the runtime drains them after each chunk load.
 fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let pending = lua.create_table()?;
+    pending.set("bindings", lua.create_table()?)?;
+    pending.set("actions", lua.create_table()?)?;
     pending.set("commands", lua.create_table()?)?;
     pending.set("tools", lua.create_table()?)?;
     pending.set("apps", lua.create_table()?)?;
@@ -931,6 +1099,106 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     // rness.tool.register{ name=, description=, schema=, sensitive=, run= }
     let declarations = lua.create_table()?;
     lua.globals().set("__rness_declarations", declarations.clone())?;
+    declarations.set("actions", lua.create_table()?)?;
+    lua.globals().set("__rness_plugin_context", lua.create_function(|lua, overrides: LuaValue| {
+        let owner: String = lua.globals().get("__rness_loading_plugin")?;
+        let context = lua.create_table()?;
+        context.set("name", owner.clone())?;
+        let slots = lua.create_table()?;
+        let registered_slots = slots.clone();
+        let binding_owner = owner.clone();
+        context.set("keys", lua.create_function(move |lua, specs: Table| {
+            require_declaration_phase(lua)?;
+            if lua.globals().get::<Option<String>>("__rness_loading_plugin")?.as_deref() != Some(binding_owner.as_str()) {
+                return Err(mlua::Error::runtime("bindings must be declared during their owner's setup"));
+            }
+            for pair in specs.pairs::<String, Table>() {
+                let (slot, spec) = pair?;
+                crate::loader::validate_name(&slot).map_err(mlua::Error::runtime)?;
+                if registered_slots.contains_key(slot.as_str())? { return Err(mlua::Error::runtime("binding slot already registered")); }
+                let copy = lua.create_table()?;
+                copy.set("action", spec.get::<String>("action")?)?;
+                copy.set("key", spec.get::<LuaValue>("key")?)?;
+                registered_slots.set(slot, copy)?;
+            }
+            Ok(())
+        })?)?;
+        let binding_owner = owner.clone();
+        context.set("__finish", lua.create_function(move |lua, ()| {
+            if let LuaValue::Table(overrides) = &overrides {
+                for pair in overrides.clone().pairs::<String, LuaValue>() {
+                    let (slot, _) = pair?;
+                    if !slots.contains_key(slot.as_str())? { return Err(mlua::Error::runtime(format!("unknown binding slot: {slot}"))); }
+                }
+            } else if !matches!(overrides, LuaValue::Nil | LuaValue::Boolean(false)) {
+                return Err(mlua::Error::runtime("keys must be a table or false"));
+            }
+            let actions: Table = lua.globals().get::<Table>("__rness_pending")?.get("actions")?;
+            let mut bindings = Vec::new();
+            for pair in slots.clone().pairs::<String, Table>() {
+                let (slot, spec) = pair?;
+                let action = format!("{binding_owner}.{}", spec.get::<String>("action")?);
+                let declaration = actions.clone().sequence_values::<Table>().collect::<mlua::Result<Vec<_>>>()?
+                    .into_iter().find(|entry| entry.get::<String>("name").ok().as_deref() == Some(action.as_str()))
+                    .ok_or_else(|| mlua::Error::runtime(format!("unknown binding action: {action}")))?;
+                let replacement = match &overrides {
+                    LuaValue::Table(table) => table.get::<LuaValue>(slot.as_str())?,
+                    LuaValue::Boolean(false) => LuaValue::Boolean(false),
+                    _ => LuaValue::Nil,
+                };
+                let user = !replacement.is_nil();
+                let value = if user { replacement } else { spec.get("key")? };
+                let keys = match value {
+                    LuaValue::Boolean(false) => Vec::new(),
+                    LuaValue::String(key) => vec![key.to_str()?.to_owned()],
+                    LuaValue::Table(table) => {
+                        let keys = table.clone().sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()?;
+                        if keys.is_empty() || table.pairs::<LuaValue, LuaValue>().count() != keys.len() {
+                            return Err(mlua::Error::runtime("binding keys must be a nonempty dense list"));
+                        }
+                        keys
+                    }
+                    _ => return Err(mlua::Error::runtime("binding key must be a string, list, or false")),
+                };
+                let mut seen = std::collections::HashSet::new();
+                for key in &keys {
+                    if !seen.insert(rness_kernel::presentation::canonical_chord(key).map_err(mlua::Error::runtime)?) { return Err(mlua::Error::runtime("duplicate normalized binding key")); }
+                }
+                bindings.push(LuaBindingSpec { owner: binding_owner.clone(), slot, action,
+                    scope: declaration.get("scope")?, keys, user });
+            }
+            bindings.sort_by(|a, b| a.slot.cmp(&b.slot));
+            let pending: Table = lua.globals().get::<Table>("__rness_pending")?.get("bindings")?;
+            for binding in bindings { pending.raw_push(lua.to_value(&binding)?)?; }
+            Ok(())
+        })?)?;
+        context.set("action", lua.create_function(move |lua, (id, spec): (String, Table)| {
+            require_declaration_phase(lua)?;
+            if lua.globals().get::<Option<String>>("__rness_loading_plugin")?.as_deref() != Some(owner.as_str()) {
+                return Err(mlua::Error::runtime("plugin actions must be declared during their owner's setup"));
+            }
+            crate::loader::validate_name(&id).map_err(mlua::Error::runtime)?;
+            let scope: String = spec.get("scope")?;
+            if !matches!(scope.as_str(), "global" | "promptbox" | "messagebox")
+                && !scope.strip_prefix("app:").is_some_and(|name| !name.is_empty()) {
+                return Err(mlua::Error::runtime("invalid action scope"));
+            }
+            let name = format!("{owner}.{id}");
+            let names: Table = lua.globals().get::<Table>("__rness_declarations")?.get("actions")?;
+            if names.contains_key(name.as_str())? { return Err(mlua::Error::runtime("action already registered")); }
+            let entry = lua.create_table()?;
+            entry.set("name", name.clone())?;
+            entry.set("owner", owner.clone())?;
+            entry.set("scope", scope)?;
+            entry.set("description", spec.get::<String>("description")?)?;
+            entry.set("run", owned_callback(lua, spec.get::<Function>("run")?)?)?;
+            let actions: Table = lua.globals().get::<Table>("__rness_pending")?.get("actions")?;
+            actions.raw_push(entry)?;
+            names.set(name, true)?;
+            Ok(())
+        })?)?;
+        Ok(context)
+    })?)?;
     let commands = lua.create_table()?;
     let names = lua.create_table()?;
     declarations.set("commands", names.clone())?;
@@ -1270,6 +1538,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             let apps: Table = pending.get("apps")?;
             let entry = lua.create_table()?;
             entry.set("name", name.clone())?;
+            entry.set("key_help", spec.get::<Option<Vec<String>>>("key_help")?)?;
             entry.set("view", owned_callback(lua, view)?)?;
             entry.set("on_key", on_key.map(|f| owned_callback(lua, f)).transpose()?)?;
             entry.set("title", title)?;
@@ -1383,6 +1652,175 @@ fn user_message(e: &mlua::Error) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn action_context_buffers_operations_and_expires_after_callback() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("review", r#"
+            local plugin = __rness_plugin_context()
+            plugin.action('insert', {scope='promptbox', description='Insert', run=function(ctx)
+                saved_insert = ctx.promptbox.insert
+                ctx.promptbox.insert('review')
+            end})
+            plugin.action('fail', {scope='promptbox', description='Fail', run=function(ctx)
+                ctx.promptbox.insert('discard')
+                error('failed')
+            end})
+        "#).unwrap();
+        assert_eq!(rt.call_action("review.insert", "promptbox", json!({})).unwrap(), vec![UiActionOperation::InsertPrompt("review".into())]);
+        rt.load("verify", "assert(not pcall(saved_insert, 'stale'))").unwrap();
+        assert!(rt.call_action("review.fail", "promptbox", json!({})).is_err());
+    }
+
+    #[test]
+    fn binding_slots_apply_overrides_and_unload_with_owner() {
+        for (overrides, expected, user) in [
+            ("nil", vec!["<F6>"], false),
+            ("{insert='<F8>'}", vec!["<F8>"], true),
+            ("{insert={'<F8>', '<F9>'}}", vec!["<F8>", "<F9>"], true),
+            ("{insert=false}", vec![], true),
+            ("false", vec![], true),
+        ] {
+            let mut rt = LuaRuntime::new().unwrap();
+            let source = format!(r#"
+                local plugin = __rness_plugin_context({overrides})
+                plugin.keys({{insert={{action='insert', key='<F6>'}}}})
+                plugin.action('insert', {{scope='promptbox', description='Insert', run=function() end}})
+                plugin.__finish()
+            "#);
+            rt.load("review", &source).unwrap();
+            let bindings = rt.binding_specs();
+            assert_eq!(bindings.len(), 1);
+            assert_eq!(bindings[0].keys, expected);
+            assert_eq!(bindings[0].user, user);
+            assert_eq!(bindings[0].action, "review.insert");
+            assert_eq!(bindings[0].scope, "promptbox");
+            rt.unload("review").unwrap();
+            assert!(rt.binding_specs().is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_binding_overrides_do_not_publish_actions_or_bindings() {
+        for overrides in ["{unknown=false}", "{insert={}}", "{insert={'f6','f6'}}", "{insert={'f6','<F6>'}}", "{insert=']d'}", "{insert='ctrl+ctrl+k'}", "{insert=true}", "{insert={[2]='f6'}}"] {
+            let mut rt = LuaRuntime::new().unwrap();
+            let source = format!(r#"
+                local plugin = __rness_plugin_context({overrides})
+                plugin.action('insert', {{scope='promptbox', description='Insert', run=function() end}})
+                plugin.keys({{insert={{action='insert', key='f6'}}}})
+                plugin.__finish()
+            "#);
+            assert!(rt.load("review", &source).is_err(), "accepted {overrides}");
+            assert!(rt.binding_specs().is_empty());
+            assert!(rt.action_specs().is_empty());
+        }
+    }
+
+    #[test]
+    fn app_key_help_metadata_survives_registration() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("review", "rness.ui.app{name='review', key_help={'j: next row', 'k: previous row'}, view=function() return {} end}").unwrap();
+        assert_eq!(rt.app_specs()[0].key_help, vec!["j: next row", "k: previous row"]);
+    }
+
+    #[test]
+    fn app_close_operation_is_scoped_and_callback_local() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("review", r#"
+            local plugin = __rness_plugin_context()
+            plugin.action('close', {scope='app:review', description='Close', run=function(ctx)
+                assert(ctx.app.name == 'review')
+                saved_close = ctx.app.close
+                ctx.app.close()
+            end})
+        "#).unwrap();
+        assert_eq!(rt.call_action("review.close", "app:review", json!({})).unwrap(), vec![UiActionOperation::CloseApp("review".into())]);
+        assert!(rt.call_action("review.close", "app:other", json!({})).is_err());
+        rt.load("verify", "assert(not pcall(saved_close))").unwrap();
+    }
+
+    #[test]
+    fn modal_core_mappings_validate_scope_and_publish() {
+        let rt = LuaRuntime::new().unwrap();
+        let mut config = crate::api::config::StartupConfig::default();
+        for (scope, action) in [("app:review", "core.app.close"), ("app:review", "core.app.noop"),
+            ("promptbox", "core.promptbox.completion_accept"), ("promptbox", "core.promptbox.close_preview")] {
+            config.mappings = vec![crate::api::config::UserMapping { scope: scope.into(), key: "f8".into(), action: action.into() }];
+            rt.install_config(&config).unwrap();
+            rt.validate_bindings(false).unwrap();
+            assert_eq!(rt.binding_specs()[0].action, action);
+            config.mappings[0].scope = "global".into();
+            rt.install_config(&config).unwrap();
+            assert!(rt.validate_bindings(false).is_err());
+        }
+    }
+
+    #[test]
+    fn central_core_mappings_validate_scope_and_publish() {
+        let rt = LuaRuntime::new().unwrap();
+        let mut config = crate::api::config::StartupConfig::default();
+        config.mappings.push(crate::api::config::UserMapping { scope: "global".into(), key: "f4".into(), action: "core.scroll_up_page".into() });
+        rt.install_config(&config).unwrap();
+        rt.validate_bindings(false).unwrap();
+        assert_eq!(rt.binding_specs()[0].action, "core.scroll_up_page");
+        config.mappings[0].scope = "promptbox".into();
+        rt.install_config(&config).unwrap();
+        assert!(rt.validate_bindings(false).is_err());
+    }
+
+    #[test]
+    fn reload_rejects_removed_centrally_mapped_action() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let mut config = crate::api::config::StartupConfig::default();
+        config.mappings.push(crate::api::config::UserMapping { scope: "promptbox".into(), key: "f8".into(), action: "review.insert".into() });
+        rt.install_config(&config).unwrap();
+        rt.load("review", "local p=__rness_plugin_context(); p.action('insert', {scope='promptbox', description='Insert', run=function() end})").unwrap();
+        rt.validate_bindings(false).unwrap();
+        let error = rt.reload_plugins(&[crate::loader::PluginSource { name: "review".into(), source: String::new() }], |_| Ok(())).unwrap_err();
+        assert!(error.contains("removed mapped action"), "{error}");
+        assert!(rt.call_action("review.insert", "promptbox", json!({})).is_ok());
+        rt.unload("review").unwrap();
+        rt.reload_plugins(&[], |_| Ok(())).unwrap();
+        assert!(rt.binding_specs().is_empty());
+    }
+
+    #[test]
+    fn owned_actions_validate_scope_and_survive_failed_reload() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let source = r#"
+            local plugin = __rness_plugin_context()
+            plugin.action('insert', {scope='promptbox', description='Insert', run=function(ctx)
+                observed = ctx.text
+            end})
+        "#;
+        rt.load("review", source).unwrap();
+        assert_eq!(rt.action_specs()[0].name, "review.insert");
+        assert!(rt.call_action("review.insert", "messagebox", json!({"text":"wrong"})).is_err());
+        rt.call_action("review.insert", "promptbox", json!({"text":"first"})).unwrap();
+        assert_eq!(rt.lua.globals().get::<String>("observed").unwrap(), "first");
+        let replacement = crate::loader::PluginSource { name: "review".into(), source: format!("{source}\nerror('broken')") };
+        assert!(rt.reload_plugins(&[replacement], |_| Ok(())).is_err());
+        rt.call_action("review.insert", "promptbox", json!({"text":"retained"})).unwrap();
+        assert_eq!(rt.lua.globals().get::<String>("observed").unwrap(), "retained");
+        rt.reload_plugins(&[crate::loader::PluginSource { name: "review".into(), source: source.into() }], |_| Ok(())).unwrap();
+        assert_eq!(rt.action_specs().len(), 1);
+        rt.unload("review").unwrap();
+        assert!(rt.action_specs().is_empty());
+        assert!(rt.call_action("review.insert", "promptbox", json!({})).is_err());
+    }
+
+    #[test]
+    fn failed_setup_does_not_publish_actions() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let source = r#"
+            local plugin = __rness_plugin_context()
+            plugin.action('test', {scope='global', description='Test', run=function() end})
+        "#;
+        assert!(rt.load("test", &format!("{source}\nerror('abort')")).is_err());
+        assert!(rt.action_specs().is_empty());
+        rt.load("test", source).unwrap();
+        assert_eq!(rt.action_specs().len(), 1);
+    }
 
     #[test]
     fn tool_registers_and_executes() {

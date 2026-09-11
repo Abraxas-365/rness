@@ -9,13 +9,23 @@ use rness_engine::config::{ModelDeclaration, ModelRegistry, Profile};
 pub struct QuestionOverlayConfig { pub enabled: bool, pub priority: i32, pub height: u16, pub title: String }
 impl Default for QuestionOverlayConfig { fn default() -> Self { Self { enabled: true, priority: 99, height: 20, title: "AskUser".into() } } }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserMapping {
+    pub scope: String,
+    pub key: String,
+    pub action: String,
+}
+
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub mappings: Vec<UserMapping>,
     pub images: rness_engine::images::ImagePolicy,
     pub promptbox: serde_json::Value,
     pub messagebox: serde_json::Value,
     pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
     pub plugins: Vec<String>,
+    pub plugin_specs: Vec<crate::loader::PluginSpec>,
     pub colorschemes: BTreeMap<String, serde_json::Value>,
     pub colorscheme: Option<String>,
     pub models: ModelRegistry,
@@ -236,7 +246,80 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     rness.set("permissions", permissions)?;
     let plugins = lua.create_table()?;
     let s = state.clone();
+    let callbacks = lua.create_table()?;
+    lua.globals().set("__rness_plugin_callbacks", callbacks.clone())?;
+    let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setup_configured = configured.clone();
+    plugins.set("setup", lua.create_function(move |lua, specs: Table| {
+        use crate::loader::{PluginLocation, PluginSpec};
+        if setup_configured.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(mlua::Error::runtime("plugins.setup may only be called once"));
+        }
+        let mut selected = Vec::new();
+        let mut functions = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        let count = specs.raw_len();
+        for pair in specs.clone().pairs::<mlua::Value, mlua::Value>() {
+            let (key, _) = pair?;
+            if !matches!(key, mlua::Value::Integer(i) if i > 0 && (i as usize) <= count) {
+                return Err(mlua::Error::runtime("plugins.setup expects a dense list"));
+            }
+        }
+        for index in 1..=count {
+            let spec: Table = specs.raw_get(index)?;
+            for pair in spec.clone().pairs::<String, mlua::Value>() {
+                let (key, _) = pair?;
+                if !matches!(key.as_str(), "name" | "file" | "package" | "config" | "enabled" | "watch" | "opts" | "keys") {
+                    return Err(mlua::Error::runtime(format!("unknown plugin field: {key}")));
+                }
+            }
+            let file: Option<String> = spec.get("file")?;
+            let package: Option<String> = spec.get("package")?;
+            let callback: Option<mlua::Function> = spec.get("config")?;
+            if usize::from(file.is_some()) + usize::from(package.is_some()) + usize::from(callback.is_some()) != 1 {
+                return Err(mlua::Error::runtime("plugin requires exactly one of file, package, config"));
+            }
+            let explicit_name: Option<String> = spec.get("name")?;
+            if package.is_some() && explicit_name.is_some() {
+                return Err(mlua::Error::runtime("package plugins use their manifest name; omit name"));
+            }
+            let name = package.clone().or(explicit_name).ok_or_else(|| mlua::Error::runtime("file and inline plugins require name"))?;
+            crate::loader::validate_name(&name).map_err(mlua::Error::runtime)?;
+            if !names.insert(name.clone()) { return Err(mlua::Error::runtime(format!("duplicate plugin: {name}"))); }
+            let enabled = spec.get::<Option<bool>>("enabled")?.unwrap_or(true);
+            let watch = spec.get::<Option<bool>>("watch")?.unwrap_or(false);
+            if callback.is_some() && watch { return Err(mlua::Error::runtime("inline plugins cannot be watched; restart after editing init.lua")); }
+            let opts = match spec.get::<mlua::Value>("opts")? {
+                mlua::Value::Nil => serde_json::json!({}),
+                mlua::Value::Table(table) => lua.from_value(mlua::Value::Table(table))?,
+                _ => return Err(mlua::Error::runtime("plugin opts must be a table")),
+            };
+            let keys = match spec.get::<mlua::Value>("keys")? {
+                mlua::Value::Nil => serde_json::json!({}),
+                mlua::Value::Boolean(false) => serde_json::Value::Bool(false),
+                mlua::Value::Table(table) => lua.from_value(mlua::Value::Table(table))?,
+                _ => return Err(mlua::Error::runtime("plugin keys must be a table or false")),
+            };
+            let source = if let Some(file) = file {
+                if file.is_empty() || file.starts_with('~') { return Err(mlua::Error::runtime("plugin file must be an explicit nonempty path; expand HOME yourself")); }
+                PluginLocation::File(file.into())
+            } else if let Some(package) = package { PluginLocation::Package(package) }
+            else { PluginLocation::Inline };
+            if let Some(callback) = callback { functions.push((name.clone(), callback)); }
+            selected.push(PluginSpec { name, source, enabled, watch, opts, keys });
+        }
+        let mut state = s.lock().unwrap();
+        if !state.plugins.is_empty() { return Err(mlua::Error::runtime("do not mix plugins.setup and plugins.load")); }
+        for (name, callback) in functions { callbacks.set(name, callback)?; }
+        state.plugin_specs = selected;
+        setup_configured.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })?)?;
+    let s = state.clone();
     plugins.set("load", lua.create_function(move |_, name: String| {
+        if configured.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(mlua::Error::runtime("do not mix plugins.setup and plugins.load"));
+        }
         crate::loader::validate_name(&name).map_err(mlua::Error::runtime)?;
         let mut state = s.lock().unwrap();
         if state.plugins.contains(&name) {
@@ -293,6 +376,27 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
         state.agents.insert(name, definition);
         Ok(())
     })?)?;
+    let keymap = lua.create_table()?;
+    let mapping_state = state.clone();
+    let configured = std::sync::atomic::AtomicBool::new(false);
+    keymap.set("setup", lua.create_function(move |lua, entries: Table| {
+        if configured.load(std::sync::atomic::Ordering::Relaxed) { return Err(mlua::Error::runtime("keymap.setup may only be called once")); }
+        let mut mappings = Vec::new();
+        for entry in entries.clone().sequence_values::<Table>() {
+            let mut mapping: UserMapping = lua.from_value(mlua::Value::Table(entry?))?;
+            if !matches!(mapping.scope.as_str(), "global" | "promptbox" | "messagebox") && !mapping.scope.strip_prefix("app:").is_some_and(|name| !name.is_empty()) {
+                return Err(mlua::Error::runtime("invalid mapping scope"));
+            }
+            if mapping.action.is_empty() { return Err(mlua::Error::runtime("mapping action is required")); }
+            mapping.key = rness_kernel::presentation::canonical_chord(&mapping.key).map_err(mlua::Error::runtime)?;
+            mappings.push(mapping);
+        }
+        if entries.pairs::<mlua::Value, mlua::Value>().count() != mappings.len() { return Err(mlua::Error::runtime("keymap.setup expects a dense list")); }
+        mapping_state.lock().unwrap().mappings = mappings;
+        configured.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    })?)?;
+    rness.set("keymap", keymap.clone())?;
     rness.set("agents", agents)?;
     rness.set("providers", providers)?;
     lua.globals().set("rness", rness.clone())?;
@@ -304,6 +408,9 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     if path.is_file() {
         lua.load(std::fs::read_to_string(path)?).set_name(path.to_string_lossy()).exec()?;
     }
+    keymap.set("setup", lua.create_function(|_, _: mlua::Value| -> mlua::Result<()> {
+        Err(mlua::Error::runtime("keymap.setup is startup-only; restart to change mappings"))
+    })?)?;
     if let Some(images) = rness.get::<Option<Table>>("images")? {
         let policy: rness_engine::images::ImagePolicy = lua.from_value(mlua::Value::Table(images))?;
         policy.validate().map_err(std::io::Error::other)?;
@@ -369,7 +476,7 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
         }
         state.lock().unwrap().promptbox = value;
     }
-    for (table, method) in [("providers", "set_stream_idle_timeout"), ("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
+    for (table, method) in [("plugins", "setup"), ("providers", "set_stream_idle_timeout"), ("plugins", "load"), ("agents", "declare"), ("providers", "register"), ("profiles", "declare"), ("models", "declare")] {
         let table: Table = rness.get(table)?;
         table.set(method, lua.create_function(|_, _: mlua::MultiValue| -> mlua::Result<()> {
             Err(mlua::Error::runtime("startup declarations are closed; edit init.lua and restart"))
@@ -393,6 +500,75 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn central_mappings_validate_targets_conflicts_and_unload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, r#"
+            rness.keymap.setup({{scope='promptbox', key='<F8>', action='review.insert'}})
+            assert(not pcall(rness.keymap.setup, {}))
+            rness.plugins.setup({{name='review', config=function(opts, plugin)
+                plugin.action('insert', {scope='promptbox', description='Insert', run=function() end})
+                plugin.keys({insert={action='insert', key='<F6>'}})
+            end}})
+        "#).unwrap();
+        let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(path).unwrap();
+        assert!(host.validate_bindings().await.is_err());
+        let sources = crate::loader::discover_specs(dir.path(), &config.plugin_specs).unwrap();
+        assert!(crate::loader::load_all(&host, &sources).await.is_empty());
+        host.validate_bindings().await.unwrap();
+        assert!(host.binding_specs().await.iter().any(|binding| binding.user && binding.keys == ["f8"]));
+        host.load("check", "assert(not pcall(rness.keymap.setup, {}))").await.unwrap();
+        assert!(host.unload("review").await.unwrap());
+        assert!(host.binding_specs().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_specs_preserve_inline_closures_and_file_options() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("custom.lua"), "return function(opts) assert(opts.message == 'configured'); order = order .. 'file' end").unwrap();
+        std::fs::write(dir.path().join("init.lua"), r#"
+            local captured = 'inline'
+            rness.plugins.setup({
+                {name='inline', config=function(opts, plugin)
+                    order = captured
+                    assert(plugin.name == 'inline')
+                    plugin.action('invoke', {scope='global', description='Invoke', run=function(ctx) invoked = ctx.value end})
+                end},
+                {name='custom', file='./custom.lua', opts={message='configured'}},
+                {name='missing', file='./missing.lua', enabled=false},
+            })
+            assert(order == nil)
+            assert(not pcall(rness.plugins.setup, {}))
+        "#).unwrap();
+        let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(dir.path().join("init.lua")).unwrap();
+        assert_eq!(config.plugin_specs.len(), 3);
+        let sources = crate::loader::discover_specs(dir.path(), &config.plugin_specs).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(crate::loader::load_all(&host, &sources).await.is_empty());
+        assert_eq!(host.action_specs().await[0].name, "inline.invoke");
+        host.call_action("inline.invoke", "global", serde_json::json!({"value":"called"})).await.unwrap();
+        host.load("verify", "assert(invoked == 'called'); assert(order == 'inlinefile'); assert(not pcall(rness.plugins.setup, {}))").await.unwrap();
+    }
+
+    #[test]
+    fn explicit_specs_reject_ambiguous_or_invalid_declarations() {
+        for declaration in [
+            "{{name='x', file='x.lua', package='x'}}",
+            "{{file='x.lua'}}",
+            "{{name='x', file='x.lua'}, {name='x', file='y.lua'}}",
+            "{{name='x', config=function() end, watch=true}}",
+            "{{name='x', file='x.lua', typo=true}}",
+            "{{name='x', file='x.lua', opts=false}}",
+            "{[2]={name='x', file='x.lua'}}",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("init.lua");
+            std::fs::write(&path, format!("rness.plugins.setup({declaration})")).unwrap();
+            assert!(load(&path).is_err(), "accepted {declaration}");
+        }
+    }
+
     #[tokio::test]
     async fn startup_registry_reaches_plugins_and_survives_reload() {
         let dir = tempfile::tempdir().unwrap();

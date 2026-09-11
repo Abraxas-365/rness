@@ -47,7 +47,9 @@ pub enum AppEvent {
 
 #[derive(Default)]
 struct Inner {
+    key_help: std::collections::HashMap<String, Vec<String>>,
     generation: u64,
+    input_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
     apps: Vec<AppInfo>,
     /// app name → published lines.
     views: std::collections::HashMap<String, Vec<String>>,
@@ -66,11 +68,19 @@ pub struct AppsState {
 }
 
 impl AppsState {
+    pub fn track_input_epoch(&self, epoch: Arc<std::sync::atomic::AtomicU64>) {
+        self.inner.write().expect("apps lock").input_epoch = Some(epoch);
+    }
+    pub fn set_key_help(&self, help: std::collections::HashMap<String, Vec<String>>) {
+        self.inner.write().expect("apps lock").key_help = help;
+    }
+
     /// Host: set the roster (boot and after hot reload).
     pub fn set_apps(&self, apps: Vec<AppInfo>) {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.apps != apps {
             inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
             inner.views.clear();
         }
         // Active app that vanished (reload) closes.
@@ -95,6 +105,7 @@ impl AppsState {
     pub fn invalidate(&self) {
         let mut inner = self.inner.write().expect("apps lock");
         inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         inner.views.clear();
         inner.active = None;
     }
@@ -123,6 +134,20 @@ impl AppsState {
 
     pub fn active_overlay(&self) -> bool { self.active_in_slot(OVERLAY).is_some() }
 
+    pub fn activation(&self) -> (Option<String>, u64) {
+        let inner = self.inner.read().expect("apps lock");
+        (inner.active.clone(), inner.generation)
+    }
+
+    pub fn close_activation(&self, name: &str, generation: u64) {
+        let mut inner = self.inner.write().expect("apps lock");
+        if inner.active.as_deref() == Some(name) && inner.generation == generation {
+            inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            inner.active = None;
+        }
+    }
+
     pub fn active(&self) -> Option<String> {
         self.inner.read().expect("apps lock").active.clone()
     }
@@ -145,6 +170,7 @@ impl AppsState {
     pub fn close(&self) {
         let mut inner = self.inner.write().expect("apps lock");
         inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         inner.active = None;
     }
 
@@ -157,6 +183,7 @@ impl AppsState {
         }
         if effect() {
             inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
             inner.active = None;
         }
         true
@@ -184,6 +211,7 @@ impl AppsState {
             return false;
         };
         inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
         if inner.active.as_deref() == Some(&app) {
             inner.active = None;
         } else {
@@ -253,6 +281,16 @@ struct ExtApp {
 }
 
 impl Component for ExtApp {
+    fn binding_help(&self) -> Vec<String> {
+        let Some(app) = self.state.active_in_slot(self.slot) else { return Vec::new(); };
+        let mut lines = vec![format!("App {}: Escape closes; other keys are forwarded to the plugin", app.name)];
+        if let Some(help) = self.state.inner.read().expect("apps lock").key_help.get(&app.name) {
+            lines.extend(help.iter().map(|line| format!("Plugin-declared: {line}")));
+        }
+        if let Some(key) = app.keymap { lines.push(format!("App {}: {key:?} toggles closed", app.name)); }
+        lines
+    }
+
     fn name(&self) -> &str {
         "ext_apps"
     }

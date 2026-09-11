@@ -43,6 +43,10 @@ impl Component for ApprovalOverlay {
         "approval"
     }
 
+    fn binding_help(&self) -> Vec<String> {
+        vec!["Y / Enter: allow; N / Escape: reject. All other keys are captured.".into()]
+    }
+
     fn wants(&self, ctx: &Ctx<'_>) -> bool {
         ctx.model.pending_approval.is_some()
     }

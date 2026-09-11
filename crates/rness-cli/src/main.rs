@@ -144,7 +144,7 @@ enum PluginAction {
     Link { directory: std::path::PathBuf },
     List,
     Update { name: String, #[arg(long)] rev: String },
-    /// Unregister a package. Existing version files remain for running sessions.
+    /// Remove a package and its managed checkout; stop affected sessions first.
     Remove { name: String, #[arg(long)] confirm: bool },
 }
 
@@ -167,13 +167,13 @@ fn run_plugin(action: PluginAction) -> anyhow::Result<()> {
             packages::change(&root, Some((&package.source, &rev)), None, Some(&name))?
         }
         PluginAction::Remove { name, confirm } => {
-            if !confirm { bail!("remove its load declaration from init.lua first, then pass --confirm; init.lua will not be executed to inspect activation"); }
+            if !confirm { bail!("stop affected sessions and remove its setup declaration from init.lua first, then pass --confirm; init.lua will not be executed to inspect activation"); }
             packages::change(&root, None, None, Some(&name))?;
-            println!("Unregistered {name}. Version files retained; running sessions unchanged.");
+            println!("Unregistered {name}. Managed checkout removed; linked source directories are retained. Restart affected sessions.");
             return Ok(());
         }
     };
-    println!("Installed {name}. Review before enabling in init.lua:\n  rness.plugins.load(\"{name}\")\nRestart to load it. No plugin code was executed.");
+    println!("Installed {name}. Review before adding this entry to rness.plugins.setup in init.lua:\n  {{ package = \"{name}\" }}\nRestart to load it. No plugin code was executed. Stop affected sessions before updating or removing managed packages.");
     Ok(())
 }
 
@@ -529,12 +529,17 @@ async fn main() -> anyhow::Result<()> {
     // NOW load the user's plugins: every rness.* namespace is live.
     // ONLY ~/.rness loads — nothing is embedded, nothing is implicit.
     // examples/ in the repo is copyable examples, not shipped defaults.
-    let plugins = rness_lua::loader::discover(&lua_root, &startup.plugins)?;
+    let plugins = if startup.plugin_specs.is_empty() {
+        rness_lua::loader::discover(&lua_root, &startup.plugins)?
+    } else {
+        rness_lua::loader::discover_specs(&lua_root, &startup.plugin_specs)?
+    };
     for (name, err) in rness_lua::loader::load_all(&lua, &plugins).await {
         eprintln!("warning: lua plugin '{name}' failed: {err}");
     }
-    lua.fire_hook("ready", serde_json::json!({}));
+    lua.validate_bindings().await.map_err(anyhow::Error::msg)?;
     let installed_lua_tools = rness_lua::api::tools::sync_lua_tools(&tools, &lua, &[]).await;
+    lua.fire_hook("ready", serde_json::json!({}));
 
     // Fan bus events out to Lua hooks (fire-and-forget: a slow hook
     // can't block the engine).
@@ -582,7 +587,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(addr) = cli.serve {
         let _reload = if lua_root.is_dir() {
             let lua_tools = installed_lua_tools.clone();
-            rness_lua::reload::watch(lua_root, startup.plugins.clone(), lua.clone(), Arc::clone(&tools), lua_tools, |_| {})
+            rness_lua::reload::watch_startup(lua_root, &startup, lua.clone(), Arc::clone(&tools), lua_tools, |_| {})
                 .ok()
         } else {
             None
@@ -617,7 +622,7 @@ async fn main() -> anyhow::Result<()> {
         // watcher owns re-sync; dropping it (end of scope) stops it.
         let _reload = if lua_root.is_dir() {
             let lua_tools = installed_lua_tools.clone();
-            match rness_lua::reload::watch(lua_root, startup.plugins.clone(), lua.clone(), Arc::clone(&tools), lua_tools, |report| {
+            match rness_lua::reload::watch_startup(lua_root, &startup, lua.clone(), Arc::clone(&tools), lua_tools, |report| {
                 use rness_lua::reload::ReloadReport;
                 match report {
                     ReloadReport::Reloaded { plugins, tools, errors } => {
@@ -963,12 +968,14 @@ async fn run_tui(
     // reloads revert bindings from removed plugins.
     let keymap = rness_tui::keymaps::KeymapState::stock();
 
+    let plugin_keymap = Arc::new(std::sync::RwLock::new(rness_tui::keymaps::ScopedKeymap::default()));
     let presentation_epoch = Arc::new(std::sync::Mutex::new(0u64));
     let status_task = {
         let epoch = presentation_epoch.clone();
         let lua = lua.clone();
         let cell = status_text.clone();
         let apps = apps_for_status.clone();
+        let plugin_keymap = plugin_keymap.clone();
         let keymap = keymap.clone();
         tokio::spawn(async move {
             loop {
@@ -976,9 +983,9 @@ async fn run_tui(
                 cell.refresh(&lua).await;
                 // Roster re-sync piggybacks on the same poll: after a hot
                 // reload the fresh VM's apps replace the old set.
-                let roster: Vec<rness_tui::modules::ext_apps::AppInfo> = lua
-                    .app_specs()
-                    .await
+                let specs = lua.app_specs().await;
+                let key_help = specs.iter().map(|spec| (spec.name.clone(), spec.key_help.clone())).collect();
+                let roster: Vec<rness_tui::modules::ext_apps::AppInfo> = specs
                     .into_iter()
                     .map(|s| rness_tui::modules::ext_apps::AppInfo {
                         name: s.name,
@@ -988,9 +995,39 @@ async fn run_tui(
                     })
                     .collect();
                 let binds = lua.keymap_binds().await;
+                let action_generation = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+                let mut declarations = Vec::new();
+                for binding in lua.binding_specs().await {
+                    use rness_tui::keymaps::{Scope, BindingLayer, ScopedBinding};
+                    let scope = match binding.scope.as_str() {
+                        "promptbox" => Scope::Promptbox,
+                        "messagebox" => Scope::Messagebox,
+                        scope if scope.starts_with("app:") => Scope::App(scope[4..].into()),
+                        "global" => Scope::Global,
+                        _ => continue,
+                    };
+                    for key in binding.keys {
+                        if let Some(chord) = rness_tui::keys::Chord::parse(&key) {
+                            declarations.push(ScopedBinding { owner: binding.owner.clone(), scope: scope.clone(), chord,
+                                action: binding.action.clone(), layer: if binding.user { BindingLayer::User } else { BindingLayer::PluginDefault } });
+                        }
+                    }
+                }
+                let resolved = rness_tui::keymaps::ScopedKeymap::resolve(&declarations);
                 {
                     let current = epoch.lock().unwrap();
                     if *current == generation {
+                        match resolved {
+                            Ok(mut resolved) => {
+                                resolved.generation = action_generation;
+                                *plugin_keymap.write().unwrap() = resolved;
+                            }
+                            Err(errors) => {
+                                *plugin_keymap.write().unwrap() = Default::default();
+                                for error in errors { tracing::warn!(target: "lua", "{error}"); }
+                            }
+                        }
+                        apps.set_key_help(key_help);
                         apps.set_apps(roster);
                         for err in keymap.rebuild(&binds) {
                             tracing::warn!(target: "lua", "{err}");
@@ -1070,6 +1107,39 @@ async fn run_tui(
     let _ = card_tx.send(session.clone());
 
     let (host_tx, host_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (plugin_action_tx, mut plugin_action_rx) = tokio::sync::mpsc::unbounded_channel::<rness_tui::app::PluginActionRequest>();
+    let input_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    apps_state.track_input_epoch(input_epoch.clone());
+    let plugin_action_task = {
+        let input_epoch = input_epoch.clone();
+        let apps = apps_state.clone();
+        let lua = lua.clone();
+        let host_tx = host_tx.clone();
+        tokio::spawn(async move {
+            while let Some(request) = plugin_action_rx.recv().await {
+                let Some(spec) = lua.action_specs().await.into_iter().find(|spec| spec.name == request.name) else { continue };
+                if !matches!(spec.scope.as_str(), "promptbox" | "global" | "messagebox") && !spec.scope.starts_with("app:") { continue; }
+                if let Some((app, activation)) = &request.app {
+                    if apps.activation() != (Some(app.clone()), *activation) || spec.scope != format!("app:{app}") { continue; }
+                } else if spec.scope.starts_with("app:") { continue; }
+                let guard_apps = apps.clone();
+                let expected_app = request.app.clone();
+                let guard_epoch = input_epoch.clone();
+                match lua.call_action_guarded(request.generation, &request.name, &spec.scope, serde_json::json!({"session":request.session}), move || {
+                    guard_epoch.load(std::sync::atomic::Ordering::SeqCst) == request.input_epoch && expected_app.is_none_or(|(name, generation)| guard_apps.activation() == (Some(name), generation))
+                }).await {
+                    Ok(operations) => {
+                        let operations = operations.into_iter().map(|operation| match operation {
+                            rness_lua::runtime::UiActionOperation::CloseApp(name) => rness_tui::app::PluginOperation::CloseApp(name),
+                            rness_lua::runtime::UiActionOperation::InsertPrompt(text) => rness_tui::app::PluginOperation::InsertPrompt(text),
+                        }).collect();
+                        let _ = host_tx.send(rness_tui::app::Action::PluginBatch { request, operations });
+                    },
+                    Err(error) => { let _ = host_tx.send(rness_tui::app::Action::Notice(format!("Plugin action failed: {error}"))); }
+                }
+            }
+        })
+    };
     let backend = Arc::new(LocalBackend { reference_cancel: Default::default(), sessions: Arc::clone(&sessions), results: host_tx.clone() });
 
     // Drive view/key round-trips for the mounted apps from a host task.
@@ -1258,8 +1328,13 @@ async fn run_tui(
     app.colorschemes = colorschemes;
     if let Some(name) = selected_scheme { app.theme = app.colorschemes.get(&name).context("unknown initial colorscheme")?.clone(); }
     app.apps = Some(apps_state);
+    app.input_epoch = input_epoch;
+    app.plugin_generation = lua.action_generation();
+    app.plugin_keymap = plugin_keymap;
+    app.plugin_actions = Some(plugin_action_tx);
     app.keymap = keymap;
     rness_tui::app::run(app, rx, approval_rx, host_rx).await?;
+    plugin_action_task.abort();
     plugin_catalog_task.abort();
     status_task.abort();
     card_task.abort();

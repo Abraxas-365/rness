@@ -64,7 +64,19 @@ pub struct UnloadSnapshot {
     pub keymap_binds: Vec<(String, Option<String>)>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReloadError {
+    #[error("extension runtime is busy")]
+    Busy,
+    #[error("{0}")]
+    Failed(String),
+}
+
 enum Cmd {
+    ValidateBindings { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
+    ActionSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaActionSpec>> },
+    BindingSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>> },
+    Action { guard: Box<dyn FnOnce() -> bool + Send>, generation: u64, name: String, scope: String, context: serde_json::Value, reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>> },
     Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<String>, String>> },
     Command { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
@@ -142,7 +154,7 @@ enum Cmd {
     Reload {
         sources: Vec<crate::loader::PluginSource>,
         reconcile: Option<Box<dyn FnOnce(Vec<LuaToolSpec>) + Send>>,
-        reply: tokio::sync::oneshot::Sender<Result<Vec<(String, String)>, String>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<(String, String)>, ReloadError>>,
     },
 }
 
@@ -151,6 +163,7 @@ enum Cmd {
 /// fire-and-forget so event fan-out never blocks on Lua.
 #[derive(Clone)]
 pub struct LuaHost {
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     tx: std::sync::Arc<mpsc::Sender<Cmd>>,
 }
 
@@ -226,6 +239,8 @@ impl LuaHost {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let tx = std::sync::Arc::new(tx);
         let command_tx = std::sync::Arc::downgrade(&tx);
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let actor_generation = generation.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("lua-vm".into())
@@ -250,11 +265,13 @@ impl LuaHost {
                         return;
                     }
                 };
+                let mut disabled_plugins = std::collections::HashSet::new();
                 let mut installed_commands = Vec::new();
                 let mut session_binding: Option<SessionBinding> = None;
                 let mut questions_ref: Option<std::sync::Arc<rness_engine::questions::Questions>> = None;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
+                        Cmd::ValidateBindings { reply } => { let _ = reply.send(rt.validate_bindings(false)); }
                         Cmd::Complete { name, context, cancel, reply } => {
                             let token = cancel.clone();
                             rt.lua().set_app_data(cancel.clone());
@@ -306,7 +323,7 @@ impl LuaHost {
                                     qs.set_available(staged.is_available());
                                 }
                             }
-                            if r.is_ok() { if let Some(binding) = &session_binding { binding.sessions.reference_service().configure(rt.reference_config()); } }
+                            if r.is_ok() { actor_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst); if let Some(binding) = &session_binding { binding.sessions.reference_service().configure(rt.reference_config()); } }
                             let _ = reply.send(r);
                         }
                         Cmd::CoordinatedUnload { name, installed, apply_ui, reply } => {
@@ -315,6 +332,8 @@ impl LuaHost {
                                 let _maintenance = binding.sessions.try_extension_maintenance().map_err(|e| e.to_string())?;
                                 let removed = rt.unload(&name).map_err(|e| e.to_string())?;
                                 if removed {
+                                    actor_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    disabled_plugins.insert(name.clone());
                                     binding.sessions.reference_service().configure(rt.reference_config());
                                     sync_commands(&rt, binding, &command_tx, &mut installed_commands)?;
                                     let remaining = rt.tool_specs();
@@ -336,7 +355,10 @@ impl LuaHost {
                             let result = if session_binding.is_some() {
                                 Err("mounted hosts require coordinated engine/UI teardown; restart rness to disable a plugin".into())
                             } else {
-                                rt.unload(&name).map_err(|e| e.to_string())
+                                rt.unload(&name).map_err(|e| e.to_string()).map(|removed| {
+                                    if removed { actor_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst); disabled_plugins.insert(name.clone()); }
+                                    removed
+                                })
                             };
                             let _ = reply.send(result);
                         }
@@ -361,6 +383,18 @@ impl LuaHost {
                         }
                         Cmd::ToolCard { name, args, output, is_error, presentation, reply } => {
                             let _ = reply.send(rt.tool_card_presented(&name, &args, &output, is_error, presentation.as_ref()));
+                        }
+                        Cmd::BindingSpecs { reply } => {
+                            let _ = reply.send(rt.binding_specs());
+                        }
+                        Cmd::ActionSpecs { reply } => {
+                            let _ = reply.send(rt.action_specs());
+                        }
+                        Cmd::Action { guard, generation, name, scope, context, reply } => {
+                            let result = if guard() && generation == actor_generation.load(std::sync::atomic::Ordering::SeqCst) {
+                                rt.call_action(&name, &scope, context)
+                            } else { Err("plugin action generation expired".into()) };
+                            let _ = reply.send(result);
                         }
                         Cmd::AppSpecs { reply } => {
                             let _ = reply.send(rt.app_specs());
@@ -396,10 +430,11 @@ impl LuaHost {
                             let r = rt.install_questions(questions).map_err(|e| e.to_string());
                             let _ = reply.send(r);
                         }
-                        Cmd::Reload { sources, reconcile, reply } => {
+                        Cmd::Reload { mut sources, reconcile, reply } => {
+                            sources.retain(|source| !disabled_plugins.contains(&source.name));
                             let _maintenance = match session_binding.as_ref().map(|b| b.sessions.try_extension_maintenance()).transpose() {
                                 Ok(guard) => guard,
-                                Err(error) => { let _ = reply.send(Err(error.to_string())); continue; }
+                                Err(_) => { let _ = reply.send(Err(ReloadError::Busy)); continue; }
                             };
                             let staged_questions = std::sync::Arc::new(rness_engine::questions::Questions::default());
                             if questions_ref.is_some() {
@@ -425,17 +460,18 @@ impl LuaHost {
                                 }
                             }
                             if r.is_ok() {
+                                actor_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 if let Some(binding) = &session_binding { binding.sessions.reference_service().configure(rt.reference_config()); }
                                 if let Some(reconcile) = reconcile { reconcile(rt.tool_specs()); }
                             }
-                            let _ = reply.send(r.map(|()| Vec::new()));
+                            let _ = reply.send(r.map(|()| Vec::new()).map_err(ReloadError::Failed));
                         }
                     }
                 }
             })
             .map_err(|e| e.to_string())?;
         let config = ready_rx.recv().map_err(|_| "lua vm thread died".to_string())??;
-        Ok((Self { tx }, config))
+        Ok((Self { tx, generation }, config))
     }
 
     pub async fn load(&self, name: &str, source: &str) -> Result<(), String> {
@@ -547,6 +583,41 @@ impl LuaHost {
         rx.await.ok().flatten()
     }
 
+    pub async fn action_specs(&self) -> Vec<crate::runtime::LuaActionSpec> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Cmd::ActionSpecs { reply }).is_err() { return Vec::new(); }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn binding_specs(&self) -> Vec<crate::runtime::LuaBindingSpec> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self.tx.send(Cmd::BindingSpecs { reply }).is_err() { return Vec::new(); }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn validate_bindings(&self) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::ValidateBindings { reply }).map_err(|_| "Lua host stopped".to_owned())?;
+        rx.await.map_err(|_| "Lua host stopped".to_owned())?
+    }
+
+    pub fn action_generation(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> { self.generation.clone() }
+
+    pub async fn call_action(&self, name: &str, scope: &str, context: serde_json::Value) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+        self.call_action_at(self.generation.load(std::sync::atomic::Ordering::SeqCst), name, scope, context).await
+    }
+
+    pub async fn call_action_at(&self, generation: u64, name: &str, scope: &str, context: serde_json::Value) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+        self.call_action_guarded(generation, name, scope, context, || true).await
+    }
+
+    pub async fn call_action_guarded(&self, generation: u64, name: &str, scope: &str, context: serde_json::Value, guard: impl FnOnce() -> bool + Send + 'static) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::Action { guard: Box::new(guard), generation, name: name.into(), scope: scope.into(), context, reply })
+            .map_err(|_| "Lua host stopped".to_owned())?;
+        rx.await.map_err(|_| "Lua host stopped".to_owned())?
+    }
+
     pub async fn app_specs(&self) -> Vec<LuaAppSpec> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         if self.tx.send(Cmd::AppSpecs { reply }).is_err() {
@@ -598,13 +669,13 @@ impl LuaHost {
         self.tx
             .send(Cmd::Reload { sources, reconcile: None, reply })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        rx.await.map_err(|_| "lua vm gone")?.map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn reload_reconciled(&self, sources: Vec<crate::loader::PluginSource>, reconcile: impl FnOnce(Vec<LuaToolSpec>) + Send + 'static) -> Result<Vec<(String, String)>, String> {
+    pub(crate) async fn reload_reconciled(&self, sources: Vec<crate::loader::PluginSource>, reconcile: impl FnOnce(Vec<LuaToolSpec>) + Send + 'static) -> Result<Vec<(String, String)>, ReloadError> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::Reload { sources, reconcile: Some(Box::new(reconcile)), reply }).map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        self.tx.send(Cmd::Reload { sources, reconcile: Some(Box::new(reconcile)), reply }).map_err(|_| ReloadError::Failed("lua vm gone".into()))?;
+        rx.await.map_err(|_| ReloadError::Failed("lua vm gone".into()))?
     }
 
     /// Inject the shared questions broker. Sticky across hot reloads.
@@ -639,6 +710,34 @@ impl LuaHost {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn queued_action_rejects_reloaded_registration_generation() {
+        let host = LuaHost::spawn().unwrap();
+        let source = "local p = __rness_plugin_context(); p.action('run', {scope='promptbox', description='Run', run=function(ctx) ctx.promptbox.insert('new') end})";
+        host.load("review", source).await.unwrap();
+        let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+        host.reload(vec![crate::loader::PluginSource { name: "review".into(), source: source.into() }]).await.unwrap();
+        assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.unwrap_err().contains("generation expired"));
+        assert_eq!(host.call_action("review.run", "promptbox", json!({})).await.unwrap().len(), 1);
+        let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+        assert!(host.reload(vec![crate::loader::PluginSource { name: "review".into(), source: "error('failed')".into() }]).await.is_err());
+        assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn reload_does_not_resurrect_session_unloaded_plugins() {
+        let host = LuaHost::spawn().unwrap();
+        let source = crate::loader::PluginSource {
+            name: "disabled".into(),
+            source: "rness.tool.register{name='owned', run=function() return 'ok' end}".into(),
+        };
+        host.load(&source.name, &source.source).await.unwrap();
+        assert!(host.unload("disabled").await.unwrap());
+        assert!(host.reload(vec![source]).await.unwrap().is_empty());
+        assert!(host.tool_specs().await.is_empty());
+        assert!(host.plugin_names().await.is_empty());
+    }
 
     #[tokio::test]
     async fn unmounted_host_unloads_across_cloned_handles() {

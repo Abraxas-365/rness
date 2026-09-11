@@ -4,6 +4,25 @@ use std::path::Path;
 
 use crate::plugin_host::LuaHost;
 
+/// An explicit startup selection. Inline callbacks remain in the startup VM.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSpec {
+    pub name: String,
+    pub source: PluginLocation,
+    pub enabled: bool,
+    pub watch: bool,
+    pub opts: serde_json::Value,
+    pub keys: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum PluginLocation {
+    File(std::path::PathBuf),
+    Package(String),
+    Inline,
+}
+
 /// One discovered plugin source.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginSource {
@@ -19,14 +38,50 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve explicit specifications without searching alternate source types.
+pub fn discover_specs(root: &Path, specs: &[PluginSpec]) -> std::io::Result<Vec<PluginSource>> {
+    let quote = |text: &str| format!("\"{}\"", text.as_bytes().iter().map(|b| format!("\\{b:03}")).collect::<String>());
+    let mut result = Vec::new();
+    for spec in specs.iter().filter(|spec| spec.enabled) {
+        let chunk = match &spec.source {
+            PluginLocation::File(path) => {
+                let path = if path.is_absolute() { path.clone() } else { root.join(path) };
+                let source = std::fs::read_to_string(&path).map_err(|error| std::io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
+                format!("assert(load({}, {}, 't', _ENV))()", quote(&source), quote(&format!("@{}", path.display())))
+            }
+            PluginLocation::Package(name) => {
+                let inventory = crate::packages::inventory(root)?;
+                let package = inventory.get(name).ok_or_else(|| std::io::Error::other(format!("package {name} is not installed; install or link it before enabling")))?;
+                if spec.watch && package.revision.is_some() { return Err(std::io::Error::other("watch is only supported for linked development packages")); }
+                let sources = discover_package(root, name)?;
+                format!("(function() {} end)()", sources.source)
+            }
+            PluginLocation::Inline => format!("__rness_plugin_callbacks[{}]", quote(&spec.name)),
+        };
+        let opts = serde_json::to_string(&spec.opts).map_err(std::io::Error::other)?;
+        let keys = serde_json::to_string(&spec.keys).map_err(std::io::Error::other)?;
+        let source = format!("local setup = {chunk}\nlocal opts = rness.json.decode({})\nlocal plugin = __rness_plugin_context(rness.json.decode({}))\nif type(setup) == 'function' then setup(opts, plugin) elseif setup ~= nil then error('plugin entrypoint must return a setup function or nil') elseif next(opts) ~= nil then error('plugin options require a setup function') end\nplugin.__finish()", quote(&opts), quote(&keys));
+        result.push(PluginSource { name: spec.name.clone(), source });
+    }
+    Ok(result)
+}
+
+fn discover_package(root: &Path, name: &str) -> std::io::Result<PluginSource> {
+    discover_selected(root, &[name.to_owned()], true)?.pop().ok_or_else(|| std::io::Error::other("missing package"))
+}
+
 /// Read only explicitly selected plugins, preserving declaration order.
 /// Missing selected files are errors; unselected files are never read.
 pub fn discover(root: &Path, names: &[String]) -> std::io::Result<Vec<PluginSource>> {
+    discover_selected(root, names, false)
+}
+
+fn discover_selected(root: &Path, names: &[String], package_only: bool) -> std::io::Result<Vec<PluginSource>> {
     let installed = crate::packages::inventory(root)?;
     names.iter().map(|name| {
         validate_name(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if let Some(package) = installed.get(name) {
-            if root.join(format!("plugins/{name}.lua")).exists() {
+            if !package_only && root.join(format!("plugins/{name}.lua")).exists() {
                 return Err(std::io::Error::other(format!("ambiguous plugin name: {name}")));
             }
             let manifest = crate::packages::manifest(&package.directory)?;
@@ -61,7 +116,7 @@ end
 rawset(env, 'require', package_require)
 local chunk, err = load({}, '@' .. {}, 't', env)
 if not chunk then error(err) end
-chunk()
+return chunk()
 "#, quote(&std::fs::read_to_string(path)?), quote(name));
             return Ok(PluginSource { name: name.clone(), source });
         }

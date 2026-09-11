@@ -352,9 +352,18 @@ pub enum FrameEffect {
     Reconcile,
 }
 
+#[derive(Debug)]
+pub enum PluginOperation {
+    CloseApp(String),
+    InsertPrompt(String),
+}
+
 /// Component-emitted commands, applied by the shell after input handling.
 #[derive(Debug)]
 pub enum Action {
+    PluginBatch { request: PluginActionRequest, operations: Vec<PluginOperation> },
+    PluginAppClose { input_epoch: u64, session: SessionId, epoch: u64, generation: u64, activation: u64, app: String },
+    PluginPromptInsert { input_epoch: u64, session: SessionId, epoch: u64, generation: u64, text: String },
     Submit(String),
     SubmitImages(String, Vec<rness_protocol::events::ImageRef>),
     PreviewHistoryImage,
@@ -378,7 +387,18 @@ pub enum Action {
     SwitchSession(SessionId),
 }
 
+#[derive(Debug)]
+pub struct PluginActionRequest {
+    pub input_epoch: u64,
+    pub app: Option<(String, u64)>,
+    pub generation: u64,
+    pub name: String,
+    pub session: SessionId,
+    pub epoch: u64,
+}
+
 pub struct App {
+    pub input_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub model: Model,
     pub slots: Slots,
     pub theme: Theme,
@@ -388,6 +408,9 @@ pub struct App {
     pub apps: Option<crate::modules::ext_apps::AppsState>,
     /// Rebindable host bindings (chord → named action). Lua rewrites
     /// this via rness.keymaps; the shell only reads.
+    pub plugin_generation: Arc<std::sync::atomic::AtomicU64>,
+    pub plugin_keymap: Arc<std::sync::RwLock<crate::keymaps::ScopedKeymap>>,
+    pub plugin_actions: Option<mpsc::UnboundedSender<PluginActionRequest>>,
     pub keymap: crate::keymaps::KeymapState,
     edit_prompt: Option<serde_json::Value>,
     command_results: std::collections::HashMap<SessionId, Vec<String>>,
@@ -403,6 +426,10 @@ impl App {
             theme: Theme::default(),
             colorschemes: [("default".into(), Theme::default())].into(),
             apps: None,
+            input_epoch: Default::default(),
+            plugin_generation: Default::default(),
+            plugin_keymap: Default::default(),
+            plugin_actions: None,
             keymap: crate::keymaps::KeymapState::stock(),
             edit_prompt: None,
             command_results: Default::default(),
@@ -450,6 +477,9 @@ impl App {
             }
             return;
         }
+        if matches!(frame, Frame::ApprovalRequested { .. } | Frame::ApprovalResolved { .. }) {
+            self.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if self.model.apply_frame(frame) == FrameEffect::Reconcile {
             self.reconcile();
         }
@@ -457,6 +487,7 @@ impl App {
 
     /// Route a terminal event; apply resulting actions.
     pub fn on_term_event(&mut self, event: TermEvent) {
+        self.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match event {
             TermEvent::Paste(text) => {
                 let ctx = Ctx { model: &self.model, theme: &self.theme };
@@ -481,10 +512,57 @@ impl App {
     }
 
     fn route_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let ctx = Ctx { model: &self.model, theme: &self.theme };
+        let prompt_focused = self.slots.prompt_focused(&ctx);
+        if let Some(component) = self.slots.focused_mut(&ctx) {
+            if component.captures_input() {
+                if prompt_focused {
+                    let map = self.plugin_keymap.read().unwrap();
+                    let scope = crate::keymaps::Scope::Promptbox;
+                    if map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst)
+                        && map.layer(&scope, &key) == Some(crate::keymaps::BindingLayer::User) {
+                        if let Some(action) = map.lookup_exact(&scope, &key).and_then(|name| name.strip_prefix("core.promptbox.")) {
+                            if action == "noop" || ((action.starts_with("completion_") || action.starts_with("preview_") || action == "close_preview") && component.bindings().iter().any(|binding| binding.action == action)) {
+                                return component.on_binding(&ctx, action).actions;
+                            }
+                        }
+                    }
+                }
+                return component.on_key(&ctx, key).actions;
+            }
+        }
+        if self.slots.prompt_focused(&ctx) {
+            if let Some(sender) = &self.plugin_actions {
+                let map = self.plugin_keymap.read().unwrap();
+                if let Some(name) = map.lookup_exact(&crate::keymaps::Scope::Promptbox, &key).filter(|_| map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst) && map.layer(&crate::keymaps::Scope::Promptbox, &key) == Some(crate::keymaps::BindingLayer::User)) {
+                    if let Some(action) = name.strip_prefix("core.messagebox.") {
+                        return self.slots.message_binding(&ctx, action).actions;
+                    }
+                    if let Some(action) = name.strip_prefix("core.promptbox.") {
+                        return self.slots.focused_mut(&ctx).map(|component| component.on_binding(&ctx, action).actions).unwrap_or_default();
+                    }
+                    if let Some(action) = name.strip_prefix("core.").and_then(crate::keymaps::HostAction::from_name) {
+                        use crate::keymaps::HostAction;
+                        return vec![match action {
+                            HostAction::ScrollUpLine => Action::ScrollUp(1),
+                            HostAction::ScrollDownLine => Action::ScrollDown(1),
+                            HostAction::ScrollUpPage => Action::ScrollUp(10),
+                            HostAction::ScrollDownPage => Action::ScrollDown(10),
+                            HostAction::Quit => Action::Quit,
+                            HostAction::CancelOrQuit if self.model.busy || self.backend.command_running(&self.model.session) => Action::Cancel,
+                            HostAction::CancelOrQuit => Action::Quit,
+                        }];
+                    }
+                    if sender.send(PluginActionRequest { input_epoch: self.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: None, generation: map.generation, name: name.into(), session: self.model.session.clone(), epoch: self.model.history_epoch }).is_ok() {
+                        return vec![];
+                    }
+                }
+            }
+        }
         // App toggles fire globally — even while the editor is focused.
         // (Except when a modal overlay like approval holds focus.)
         if let Some(apps) = &self.apps {
-            if self.model.pending_approval.is_none()
+            if !self.slots.modal_active(&ctx)
                 && crate::modules::ext_apps::handle_global_key(apps, &key)
             {
                 return vec![];
@@ -493,13 +571,79 @@ impl App {
         // Focused component (active overlay > editor) sees the key first.
         let ctx = Ctx { model: &self.model, theme: &self.theme };
         if let Some(focused) = self.slots.focused_mut(&ctx) {
+            if focused.name() == "ext_apps" {
+                if let (Some((Some(name), activation)), Some(sender)) = (self.apps.as_ref().map(|apps| apps.activation()), &self.plugin_actions) {
+                    let map = self.plugin_keymap.read().unwrap();
+                    if map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst) {
+                        let scope = crate::keymaps::Scope::App(name.clone());
+                        let core_close = key.code == crossterm::event::KeyCode::Esc;
+                        if let Some(action) = map.lookup_exact(&scope, &key).filter(|_| !core_close || map.layer(&scope, &key) == Some(crate::keymaps::BindingLayer::User)) {
+                            if action == "core.app.noop" { return vec![]; }
+                            if action == "core.app.close" {
+                                if let Some(apps) = &self.apps { apps.close_activation(&name, activation); }
+                                return vec![];
+                            }
+                            if sender.send(PluginActionRequest { input_epoch: self.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: Some((name, activation)), generation: map.generation, name: action.into(), session: self.model.session.clone(), epoch: self.model.history_epoch }).is_ok() {
+                                return vec![];
+                            }
+                        }
+                    }
+                }
+            }
             let outcome = focused.on_key(&ctx, key);
             if outcome.handled {
                 return outcome.actions;
             }
         }
-        let message_outcome = self.slots.message_key(&ctx, key);
-        if message_outcome.handled { return message_outcome.actions; }
+        if self.slots.modal_active(&ctx) {
+            return vec![];
+        }
+        let explicit_message_binding = {
+            let map = self.plugin_keymap.read().unwrap();
+            map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst)
+                && map.lookup_exact(&crate::keymaps::Scope::Messagebox, &key).is_some()
+                && map.layer(&crate::keymaps::Scope::Messagebox, &key) == Some(crate::keymaps::BindingLayer::User)
+        };
+        let prompt_binding = {
+            let map = self.plugin_keymap.read().unwrap();
+            map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst)
+                && map.lookup_exact(&crate::keymaps::Scope::Promptbox, &key).is_some()
+        };
+        if !explicit_message_binding && !prompt_binding {
+            let outcome = self.slots.message_key(&ctx, key);
+            if outcome.handled { return outcome.actions; }
+        }
+        if self.slots.prompt_focused(&ctx) {
+            let map = self.plugin_keymap.read().unwrap();
+            if map.generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst) {
+                let scope = if map.lookup_exact(&crate::keymaps::Scope::Promptbox, &key).is_some() { crate::keymaps::Scope::Promptbox } else { crate::keymaps::Scope::Messagebox };
+                if let Some(name) = map.lookup(&scope, &key).filter(|_| map.lookup_exact(&scope, &key).is_some() || map.layer(&scope, &key) == Some(crate::keymaps::BindingLayer::User) || self.keymap.lookup(&key).is_none()) {
+                    if let Some(action) = name.strip_prefix("core.messagebox.") {
+                        return self.slots.message_binding(&ctx, action).actions;
+                    }
+                    if let Some(action) = name.strip_prefix("core.promptbox.") {
+                        return self.slots.focused_mut(&ctx).map(|component| component.on_binding(&ctx, action).actions).unwrap_or_default();
+                    }
+                    if let Some(action) = name.strip_prefix("core.").and_then(crate::keymaps::HostAction::from_name) {
+                        use crate::keymaps::HostAction;
+                        return vec![match action {
+                            HostAction::ScrollUpLine => Action::ScrollUp(1),
+                            HostAction::ScrollDownLine => Action::ScrollDown(1),
+                            HostAction::ScrollUpPage => Action::ScrollUp(10),
+                            HostAction::ScrollDownPage => Action::ScrollDown(10),
+                            HostAction::Quit => Action::Quit,
+                            HostAction::CancelOrQuit if self.model.busy || self.backend.command_running(&self.model.session) => Action::Cancel,
+                            HostAction::CancelOrQuit => Action::Quit,
+                        }];
+                    }
+                    if let Some(sender) = &self.plugin_actions {
+                        if sender.send(PluginActionRequest { input_epoch: self.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: None, generation: map.generation, name: name.into(), session: self.model.session.clone(), epoch: self.model.history_epoch }).is_ok() {
+                            return vec![];
+                        }
+                    }
+                }
+            }
+        }
         // Host keymap: the rebindable chord→action table (stock seeded
         // in keymaps.rs, rewritten live by rness.keymaps).
         use crate::keymaps::HostAction;
@@ -521,7 +665,56 @@ impl App {
     }
 
     pub fn apply(&mut self, action: Action) {
+        if matches!(&action, Action::SwitchSession(_) | Action::ResolveApproval(_) | Action::Custom(_, _) | Action::PreviewHistoryImage) {
+            self.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         match action {
+            Action::PluginBatch { request, operations } => {
+                if request.input_epoch != self.input_epoch.load(std::sync::atomic::Ordering::SeqCst)
+                    || request.generation != self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst)
+                    || request.session != self.model.session || request.epoch != self.model.history_epoch { return; }
+                let ctx = Ctx { model: &self.model, theme: &self.theme };
+                if let Some((name, activation)) = &request.app {
+                    if !self.slots.focused_mut(&ctx).is_some_and(|c| c.name() == "ext_apps")
+                        || self.apps.as_ref().is_none_or(|apps| apps.activation() != (Some(name.clone()), *activation)) { return; }
+                } else if !self.slots.prompt_focused(&ctx) { return; }
+                // Validate the entire batch before changing either app or prompt state.
+                if operations.iter().any(|op| matches!(op, PluginOperation::CloseApp(name) if request.app.as_ref().is_none_or(|(owner, _)| owner != name))) { return; }
+                let apply_operations = || {
+                    let mut close = false;
+                    for operation in operations {
+                        match operation {
+                            PluginOperation::InsertPrompt(text) => self.slots.broadcast(&ctx, "input:clipboard-text", &serde_json::json!(text)),
+                            PluginOperation::CloseApp(_) => close = true,
+                        }
+                    }
+                    close
+                };
+                if let (Some(apps), Some((name, activation))) = (&self.apps, &request.app) {
+                    apps.apply_key_if_current(*activation, name, apply_operations);
+                } else {
+                    let mut apply_operations = apply_operations;
+                    apply_operations();
+                }
+            }
+            Action::PluginAppClose { input_epoch, session, epoch, generation, activation, app } => {
+                if input_epoch != self.input_epoch.load(std::sync::atomic::Ordering::SeqCst) { return; }
+                let ctx = Ctx { model: &self.model, theme: &self.theme };
+                let focused = self.slots.focused_mut(&ctx).is_some_and(|component| component.name() == "ext_apps");
+                if focused && generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst)
+                    && self.model.session == session && self.model.history_epoch == epoch {
+                    if let Some(apps) = &self.apps {
+                        apps.close_activation(&app, activation);
+                    }
+                }
+            }
+            Action::PluginPromptInsert { input_epoch, session, epoch, generation, text } => {
+                if input_epoch != self.input_epoch.load(std::sync::atomic::Ordering::SeqCst) { return; }
+                let ctx = Ctx { model: &self.model, theme: &self.theme };
+                if generation == self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst) && self.model.session == session && self.model.history_epoch == epoch && self.slots.prompt_focused(&ctx) {
+                    self.slots.broadcast(&ctx, "input:clipboard-text", &serde_json::json!(text));
+                }
+            }
             Action::PreviewHistoryImage => {
                 let history = self.backend.history(&self.model.session);
                 let mut references = Vec::new();
@@ -593,6 +786,24 @@ impl App {
             }
             Action::Submit(text) => {
                 if text.trim().is_empty() {
+                    return;
+                }
+                if text.trim() == "/help bindings" {
+                    let map = self.plugin_keymap.read().unwrap();
+                    let mut lines = vec!["Binding declarations and routing: explicit user mappings precede the editor; plugin defaults follow it. Modal components capture input.".to_owned()];
+                    let ctx = Ctx { model: &self.model, theme: &self.theme };
+                    lines.extend(self.slots.resolved_binding_help(&ctx, &map));
+                    if self.slots.modal_active(&ctx) {
+                        lines.push("Host/global mappings below are inactive while this modal owns focus.".into());
+                    }
+                    lines.push("Host fallback bindings (after focused components decline):".into());
+                    lines.extend(map.host_help(&self.keymap));
+                    lines.push("Scoped declarations (component controls and focus take precedence as described above):".into());
+                    lines.extend(map.effective_help());
+                    if map.generation != self.plugin_generation.load(std::sync::atomic::Ordering::SeqCst) {
+                        lines.push("Mappings are awaiting refresh; listed shortcuts are temporarily inactive.".into());
+                    }
+                    self.model.entries.push(Entry::Notice(lines.join("\n")));
                     return;
                 }
                 if text.trim() == "/help retry" || text.trim() == "/retry --help" {
@@ -775,6 +986,7 @@ pub async fn run(
                 if let Some(pending) = pending {
                     // Publish the question; the approval overlay selects
                     // itself into the overlay slot while this is Some.
+                    app.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     app.model.pending_approval = Some(pending);
                 }
             }
@@ -1154,6 +1366,303 @@ mod tests {
             panic!("expected assistant: {:?}", app.model.entries[3]);
         };
         assert_eq!(content, &vec![ContentPart::Text { text: "listo".into() }]);
+    }
+
+    #[test]
+    fn app_default_cannot_replace_escape_but_user_override_can() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut slots = Slots::default();
+        let apps = crate::modules::ext_apps::install(&mut slots);
+        apps.set_apps(vec![crate::modules::ext_apps::AppInfo { name: "review".into(), slot: crate::slots::SIDEBAR.into(), title: "Review".into(), keymap: Some("f6".into()) }]);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
+        app.apps = Some(apps.clone());
+        apps.track_input_epoch(app.input_epoch.clone());
+        let before = app.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        apps.close();
+        assert!(app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) > before);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        let mut binding = ScopedBinding { owner: "review".into(), scope: Scope::App("review".into()),
+            chord: crate::keys::Chord::parse("esc").unwrap(), action: "review.inspect".into(), layer: BindingLayer::PluginDefault };
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding.clone()]).unwrap();
+        crate::modules::ext_apps::handle_global_key(&apps, &KeyEvent::from(crossterm::event::KeyCode::F(6)));
+        app.route_key(KeyEvent::from(crossterm::event::KeyCode::Esc));
+        assert!(apps.active().is_none());
+        assert!(rx.try_recv().is_err());
+        binding.layer = BindingLayer::User;
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding]).unwrap();
+        crate::modules::ext_apps::handle_global_key(&apps, &KeyEvent::from(crossterm::event::KeyCode::F(6)));
+        app.route_key(KeyEvent::from(crossterm::event::KeyCode::Esc));
+        assert_eq!(apps.active().as_deref(), Some("review"));
+        assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
+    }
+
+    #[test]
+    fn messagebox_core_precedes_plugin_default_but_not_user_override() {
+        use crate::component::{Component, Ctx, KeyOutcome};
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        struct MessageControl;
+        impl Component for MessageControl {
+            fn name(&self) -> &str { "message-control" }
+            fn height(&self, _: &Ctx<'_>, _: u16) -> Option<u16> { None }
+            fn render(&mut self, _: &Ctx<'_>, _: ratatui::layout::Rect, _: &mut ratatui::buffer::Buffer) {}
+            fn on_key(&mut self, _: &Ctx<'_>, _: KeyEvent) -> KeyOutcome { KeyOutcome::act(vec![Action::ScrollUp(1)]) }
+        }
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        slots.mount(crate::slots::MESSAGE_BODY, 0, Box::new(MessageControl));
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        let mut binding = ScopedBinding { owner: "review".into(), scope: Scope::Messagebox,
+            chord: crate::keys::Chord::parse("f6").unwrap(), action: "review.inspect".into(), layer: BindingLayer::PluginDefault };
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding.clone()]).unwrap();
+        assert!(matches!(app.route_key(KeyEvent::from(crossterm::event::KeyCode::F(6))).as_slice(), [Action::ScrollUp(1)]));
+        assert!(rx.try_recv().is_err());
+        binding.layer = BindingLayer::User;
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding]).unwrap();
+        assert!(app.route_key(KeyEvent::from(crossterm::event::KeyCode::F(6))).is_empty());
+        assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[
+            ScopedBinding { owner: "prompt".into(), scope: Scope::Promptbox, chord: crate::keys::Chord::parse("f6").unwrap(), action: "prompt.inspect".into(), layer: BindingLayer::PluginDefault },
+            ScopedBinding { owner: "global".into(), scope: Scope::Global, chord: crate::keys::Chord::parse("f6").unwrap(), action: "global.inspect".into(), layer: BindingLayer::User },
+        ]).unwrap();
+        assert!(app.route_key(KeyEvent::from(crossterm::event::KeyCode::F(6))).is_empty());
+        assert_eq!(rx.try_recv().unwrap().name, "prompt.inspect");
+    }
+
+    #[test]
+    fn scoped_completion_accept_and_app_close_support_remap_and_disable() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        use crossterm::event::KeyCode;
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let apps = crate::modules::ext_apps::install(&mut slots);
+        apps.set_apps(vec![crate::modules::ext_apps::AppInfo { name: "review".into(), slot: crate::slots::SIDEBAR.into(), title: "Review".into(), keymap: Some("f6".into()) }]);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+        app.apps = Some(apps.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[
+            (Scope::Promptbox, "enter", "core.promptbox.noop"),
+            (Scope::Promptbox, "f8", "core.promptbox.completion_accept"),
+            (Scope::App("review".into()), "esc", "core.app.noop"),
+            (Scope::App("review".into()), "f9", "core.app.close"),
+        ].into_iter().map(|(scope,key,action)| ScopedBinding { owner:"core".into(), scope, chord:crate::keys::Chord::parse(key).unwrap(), action:action.into(), layer:BindingLayer::User }).collect::<Vec<_>>()).unwrap();
+        for c in "/un".chars() { app.route_key(KeyEvent::from(KeyCode::Char(c))); }
+        assert!(app.route_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        assert!(app.route_key(KeyEvent::from(KeyCode::F(8))).is_empty());
+        app.route_key(KeyEvent::from(KeyCode::F(6)));
+        assert_eq!(apps.active().as_deref(), Some("review"));
+        app.route_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(apps.active().as_deref(), Some("review"));
+        app.route_key(KeyEvent::from(KeyCode::F(9)));
+        assert!(apps.active().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn effective_help_does_not_advertise_disabled_core_submit() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[ScopedBinding {
+            owner: "core".into(), scope: Scope::Promptbox, chord: crate::keys::Chord::parse("enter").unwrap(), action: "core.promptbox.noop".into(), layer: BindingLayer::User,
+        }]).unwrap();
+        app.apply(Action::Submit("/help bindings".into()));
+        let Some(Entry::Notice(help)) = app.model.entries.last() else { panic!("missing help") };
+        assert!(help.contains("core.promptbox.noop"));
+        assert!(!help.contains("→ submit (when applicable)"), "disabled submit is still advertised");
+    }
+
+    #[test]
+    fn scoped_core_submit_and_noop_override_editor_defaults() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        use crossterm::event::KeyCode;
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[("enter", "core.promptbox.noop"), ("f8", "core.promptbox.submit")].into_iter().map(|(key, action)| ScopedBinding {
+            owner: "core".into(), scope: Scope::Promptbox, chord: crate::keys::Chord::parse(key).unwrap(), action: action.into(), layer: BindingLayer::User,
+        }).collect::<Vec<_>>()).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::Char('x')));
+        assert!(app.route_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Submit(text)] if text == "x"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn active_sidebar_mapping_precedes_global_app_toggle() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        use crossterm::event::KeyCode;
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let apps = crate::modules::ext_apps::install(&mut slots);
+        apps.set_apps(vec![crate::modules::ext_apps::AppInfo { name: "review".into(), slot: crate::slots::SIDEBAR.into(), title: "Review".into(), keymap: Some("f6".into()) }]);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+        app.apps = Some(apps.clone());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[ScopedBinding {
+            owner: "review".into(), scope: Scope::App("review".into()), chord: crate::keys::Chord::parse("f6").unwrap(), action: "review.inspect".into(), layer: BindingLayer::User,
+        }]).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::F(6)));
+        let activation = apps.activation();
+        app.route_key(KeyEvent::from(KeyCode::F(6)));
+        assert_eq!(apps.activation(), activation);
+        assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
+        assert!(app.route_key(KeyEvent::from(KeyCode::Enter)).is_empty());
+    }
+
+    #[test]
+    fn plugin_batch_validates_all_operations_before_mutation() {
+        use crossterm::event::KeyCode;
+        for invalid in [false, true] {
+            let mut slots = Slots::default();
+            crate::modules::input::install(&mut slots);
+            let apps = crate::modules::ext_apps::install(&mut slots);
+            apps.set_apps(vec![crate::modules::ext_apps::AppInfo { name: "review".into(), slot: crate::slots::SIDEBAR.into(), title: "Review".into(), keymap: Some("f6".into()) }]);
+            let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+            app.apps = Some(apps.clone());
+            apps.track_input_epoch(app.input_epoch.clone());
+            crate::modules::ext_apps::handle_global_key(&apps, &KeyEvent::from(KeyCode::F(6)));
+            let request = PluginActionRequest { input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: Some(("review".into(), apps.activation().1)), generation: 0, name: "review.insert".into(), session: "s1".into(), epoch: app.model.history_epoch };
+            app.apply(Action::PluginBatch { request, operations: vec![
+                PluginOperation::InsertPrompt("one".into()),
+                PluginOperation::CloseApp(if invalid { "other" } else { "review" }.into()),
+                PluginOperation::InsertPrompt("two".into()),
+            ] });
+            assert_eq!(apps.active().is_some(), invalid);
+            if invalid { apps.close(); }
+            let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
+            if invalid {
+                assert!(!actions.iter().any(|a| matches!(a, Action::Submit(text) if text.contains("one"))));
+            } else {
+                assert!(matches!(actions.as_slice(), [Action::Submit(text)] if text == "onetwo"), "{actions:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn binding_help_reports_resolved_actions_without_submitting() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut app = App::new(Model::new("s1".into(), "m".into()), Slots::default(), backend);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[ScopedBinding {
+            owner: "review".into(), scope: Scope::Promptbox, chord: crate::keys::Chord::parse("f8").unwrap(),
+            action: "review.inspect".into(), layer: BindingLayer::User,
+        }]).unwrap();
+        app.apply(Action::Submit("/help bindings".into()));
+        assert!(matches!(app.model.entries.last(), Some(Entry::Notice(text)) if text.contains("review.inspect") && text.contains("Promptbox")));
+        assert!(!app.model.busy);
+    }
+
+    #[test]
+    fn plugin_defaults_preserve_editor_input_but_user_mapping_overrides() {
+        use crossterm::event::KeyCode;
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        let mut binding = ScopedBinding { owner: "review".into(), scope: Scope::Promptbox,
+            chord: crate::keys::Chord::parse("j").unwrap(), action: "review.inspect".into(), layer: BindingLayer::PluginDefault };
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding.clone()]).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err());
+        binding.layer = BindingLayer::User;
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding]).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
+        let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(actions.as_slice(), [Action::Submit(text)] if text == "j"));
+    }
+
+    #[test]
+    fn messagebox_plugin_shortcuts_do_not_capture_prompt_text() {
+        use crossterm::event::KeyCode;
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&["j", "f6"].into_iter().map(|key| ScopedBinding {
+            owner: "review".into(), scope: Scope::Messagebox,
+            chord: crate::keys::Chord::parse(key).unwrap(), action: "review.inspect".into(), layer: BindingLayer::User,
+        }).collect::<Vec<_>>()).unwrap();
+        assert!(app.route_key(KeyEvent::from(KeyCode::Char('j'))).is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(app.route_key(KeyEvent::from(KeyCode::F(6))).is_empty());
+        assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
+        let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(actions.as_slice(), [Action::Submit(text)] if text == "j"));
+    }
+
+    #[test]
+    fn plugin_prompt_action_dispatch_and_stale_result_guard() {
+        use crossterm::event::KeyCode;
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        let backend = Arc::new(FakeBackend { history: prior_history("s1") });
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[ScopedBinding {
+            owner: "review".into(), scope: Scope::Promptbox,
+            chord: crate::keys::Chord::parse("f6").unwrap(), action: "review.insert".into(), layer: BindingLayer::User,
+        }]).unwrap();
+        assert!(app.route_key(KeyEvent::from(KeyCode::F(6))).is_empty());
+        let request = rx.try_recv().unwrap();
+        assert_eq!(request.name, "review.insert");
+        app.apply(Action::PluginPromptInsert { input_epoch: request.input_epoch, session: "s1".into(), epoch: request.epoch, generation: request.generation + 1, text: "stale".into() });
+        app.apply(Action::PluginPromptInsert { input_epoch: request.input_epoch, session: "other".into(), epoch: request.epoch, generation: request.generation, text: "wrong".into() });
+        app.apply(Action::PluginPromptInsert { input_epoch: request.input_epoch, session: request.session, epoch: request.epoch, generation: request.generation, text: "review".into() });
+        let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(actions.as_slice(), [Action::Submit(text)] if text == "review"), "{actions:?}");
+    }
+
+    #[test]
+    fn non_input_transitions_expire_pending_prompt_operations() {
+        use crossterm::event::KeyCode;
+        for transition in [Action::SwitchSession("s1".into()), Action::Custom("input:prompt-edited".into(), serde_json::json!({"text":""})), Action::ResolveApproval(rness_protocol::api::ApprovalDecision::Allowed)] {
+            let mut slots = Slots::default();
+            crate::modules::input::install(&mut slots);
+            let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+            let epoch = app.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            app.apply(transition);
+            assert!(app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) > epoch);
+            app.apply(Action::PluginPromptInsert { input_epoch: epoch, session: "s1".into(), epoch: app.model.history_epoch, generation: 0, text: "stale".into() });
+            let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
+            assert!(!actions.iter().any(|a| matches!(a, Action::Submit(text) if text.contains("stale"))));
+        }
+    }
+
+    #[test]
+    fn global_user_mapping_cannot_capture_prompt_typing() {
+        use crate::keymaps::{Scope, ScopedBinding, ScopedKeymap, BindingLayer};
+        use crossterm::event::KeyCode;
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots, Arc::new(FakeBackend { history: prior_history("s1") }));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[ScopedBinding {
+            owner: "review".into(), scope: Scope::Global, chord: crate::keys::Chord::parse("j").unwrap(),
+            action: "review.inspect".into(), layer: BindingLayer::User,
+        }]).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::Char('j')));
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::Enter)).as_slice(), [Action::Submit(text)] if text == "j"));
     }
 
     #[test]

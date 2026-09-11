@@ -15,7 +15,7 @@ async fn body_inactivity_timeout_is_explicit_and_retryable() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut request = [0; 8192];
-        socket.read(&mut request).await.unwrap();
+        assert!(socket.read(&mut request).await.unwrap() > 0, "client closed before sending a request");
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
         std::future::pending::<()>().await;
     });
