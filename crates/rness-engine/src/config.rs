@@ -38,9 +38,20 @@ pub struct RequestOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum Profile {
+    Fixed {
+        provider: String,
+        model: String,
+        #[serde(default)]
+        options: RequestOptions,
+    },
+    ByProvider { by_provider: BTreeMap<String, ProfileVariant> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Profile {
-    pub provider: String,
+pub struct ProfileVariant {
     pub model: String,
     #[serde(default)]
     pub options: RequestOptions,
@@ -102,8 +113,21 @@ impl ModelRegistry {
     }
 
     pub fn declare_profile(&mut self, name: String, profile: Profile) -> Result<(), String> {
-        if name.is_empty() || profile.provider.is_empty() || profile.model.is_empty() {
-            return Err("profile requires a name, provider and model".into());
+        if name.is_empty() { return Err("profile requires a name".into()); }
+        let variants: Vec<_> = match &profile {
+            Profile::Fixed { provider, model, options } => vec![(provider, model, options)],
+            Profile::ByProvider { by_provider } => {
+                if by_provider.is_empty() { return Err("by_provider requires at least one connection".into()); }
+                by_provider.iter().map(|(provider, variant)| (provider, &variant.model, &variant.options)).collect()
+            }
+        };
+        for (provider, model, options) in variants {
+            if provider.trim().is_empty() || model.trim().is_empty() {
+                return Err("profile requires nonempty provider and model names".into());
+            }
+            self.validate(&CallConfig { selection: Some(ModelSelection { route: provider.clone(), model: model.clone() }),
+                reasoning: options.reasoning.clone(), max_output_tokens: options.max_output_tokens,
+                temperature: options.temperature, ..Default::default() })?;
         }
         if self.profiles.contains_key(&name) {
             return Err(format!("duplicate profile: {name}"));
@@ -122,18 +146,40 @@ impl ModelRegistry {
         self.models.get(&(selection.route.clone(), selection.model.clone()))
     }
 
+    pub fn validate_profile(&self, name: &str) -> Result<(), String> {
+        match self.profiles.get(name).ok_or_else(|| format!("unknown profile: {name}"))? {
+            Profile::Fixed { .. } => { self.resolve_profile(name)?; }
+            Profile::ByProvider { by_provider } => {
+                for provider in by_provider.keys() { self.resolve_profile_for(name, Some(provider))?; }
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_profile(&self, name: &str) -> Result<CallConfig, String> {
+        self.resolve_profile_for(name, None)
+    }
+
+    pub fn resolve_profile_for(&self, name: &str, provider: Option<&str>) -> Result<CallConfig, String> {
         let profile = self.profiles.get(name).ok_or_else(|| format!("unknown profile: {name}"))?;
+        let (provider, model, options) = match profile {
+            Profile::Fixed { provider, model, options } => (provider.as_str(), model, options),
+            Profile::ByProvider { by_provider } => {
+                let provider = provider.ok_or_else(|| format!("profile '{name}' requires a current provider connection"))?;
+                let variant = by_provider.get(provider).ok_or_else(|| format!("profile '{name}' has no variant for provider '{provider}'"))?;
+                (provider, &variant.model, &variant.options)
+            }
+        };
         let config = CallConfig {
             tool_ceiling: None,
             agent: None,
             selection: Some(ModelSelection {
-                route: profile.provider.clone(),
-                model: profile.model.clone(),
+                route: provider.into(),
+                model: model.clone(),
             }),
-            reasoning: profile.options.reasoning.clone(),
-            max_output_tokens: profile.options.max_output_tokens,
-            temperature: profile.options.temperature,
+            reasoning: options.reasoning.clone(),
+            max_output_tokens: options.max_output_tokens,
+            temperature: options.temperature,
         };
         self.validate(&config)?;
         Ok(config)
@@ -191,9 +237,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provider_profile_rejects_ambiguous_or_invalid_shapes() {
+        for value in [
+            serde_json::json!({"provider":"a","model":"b","by_provider":{"a":{"model":"c"}}}),
+            serde_json::json!({"by_provider":{"a":{"model":"c","provider":"other"}}}),
+            serde_json::json!({"by_provider":{"a":{"model":"c"}},"options":{}}),
+        ] { assert!(serde_json::from_value::<Profile>(value).is_err()); }
+        for value in [
+            serde_json::json!({"by_provider":{}}),
+            serde_json::json!({"by_provider":{"a":{"model":""}}}),
+            serde_json::json!({"by_provider":{"a":{"model":"c","options":{"max_output_tokens":0}}}}),
+        ] {
+            let profile = serde_json::from_value(value).unwrap();
+            assert!(ModelRegistry::default().declare_profile("small".into(), profile).is_err());
+        }
+        let mut registry = ModelRegistry::default();
+        registry.declare_profile("small".into(), serde_json::from_value(serde_json::json!({"by_provider":{"a":{"model":"c"}}})).unwrap()).unwrap();
+        assert!(registry.validate_profile("small").is_ok());
+        assert!(registry.resolve_profile("small").unwrap_err().contains("current provider"));
+    }
+
+    #[test]
     fn profile_resolves_without_catalog_and_unknown_profile_fails() {
         let mut registry = ModelRegistry::default();
-        registry.declare_profile("local".into(), Profile {
+        registry.declare_profile("local".into(), Profile::Fixed {
             provider: "ollama".into(), model: "qwen3:14b".into(),
             options: RequestOptions::default(),
         }).unwrap();

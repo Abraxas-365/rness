@@ -513,7 +513,7 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     }
     for agent in config.agents.values() {
         if let Some(profile) = &agent.profile {
-            config.models.resolve_profile(profile).map_err(std::io::Error::other)?;
+            config.models.validate_profile(profile).map_err(std::io::Error::other)?;
         }
     }
     config.default_profile = rness.get("default_profile")?;

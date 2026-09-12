@@ -105,6 +105,7 @@ struct Live {
     operation: Arc<tokio::sync::Mutex<()>>,
     command: Mutex<Option<CancellationToken>>,
     inbox: Mutex<Inbox>,
+    job_wakes: Mutex<u32>,
     /// Token of the current (or last) burst. Replaced on each new burst.
     cancel: Mutex<CancellationToken>,
     /// Handle of the current burst task, for [`SessionService::join`].
@@ -117,6 +118,7 @@ impl Default for Live {
             operation: Arc::new(tokio::sync::Mutex::new(())),
             command: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
+            job_wakes: Mutex::new(0),
             cancel: Mutex::new(CancellationToken::new()),
             handle: Mutex::new(None),
         }
@@ -272,7 +274,7 @@ impl SessionService {
         let agent = self.agents.get(name).ok_or_else(|| ServiceError::InvalidConfig(format!("unknown agent: {name}")))?;
         if let Some(profile) = &agent.profile {
             let ceiling = config.tool_ceiling;
-            config = self.models.resolve_profile(profile).map_err(ServiceError::InvalidConfig)?;
+            config = self.models.resolve_profile_for(profile, config.selection.as_ref().map(|s| s.route.as_str())).map_err(ServiceError::InvalidConfig)?;
             config.tool_ceiling = ceiling;
         }
         if let Some(names) = &agent.tools {
@@ -636,18 +638,32 @@ impl SessionService {
         intent: UserIntent,
         content: Vec<ContentPart>,
     ) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, intent, content, false)
+        self.send_or_retry(session, intent, content, false, false, None)
+    }
+
+    /// Deliver a background completion at the next step, waking an idle owner.
+    pub fn notify_job(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, true, None)
+    }
+
+    /// Await reservations and retain them through admission, avoiding a retry race.
+    pub async fn notify_job_wait(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+        let activity = self.lifecycle.clone().read_owned().await;
+        let operation = self.live(session).operation.clone().lock_owned().await;
+        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, true, Some((activity, operation)))
     }
 
     /// Continue a failed turn from durable context without appending user content.
     pub fn retry(&self, session: &SessionId) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, UserIntent::Followup, vec![], true)
+        self.send_or_retry(session, UserIntent::Followup, vec![], true, false, None)
     }
 
-    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool) -> Result<Disposition, ServiceError> {
-        if let [ContentPart::Text { text }] = content.as_slice() {
-            if let Some(command) = self.prepare_command(session, text)? {
-                return command.execute(self);
+    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, job_notice: bool, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>) -> Result<Disposition, ServiceError> {
+        if !job_notice {
+            if let [ContentPart::Text { text }] = content.as_slice() {
+                if let Some(command) = self.prepare_command(session, text)? {
+                    return command.execute(self);
+                }
             }
         }
         let workspace = self.store.workspace(session)?.map(std::path::PathBuf::from);
@@ -670,9 +686,15 @@ impl SessionService {
                 images.read(attachment).map_err(ServiceError::InvalidConfig)?;
             }
         }
-        let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
-        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let (activity, _operation) = match reservation {
+            Some(reservation) => reservation,
+            None => {
+                let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+                let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+                (activity, operation)
+            }
+        };
         let command = live.command.lock().unwrap();
         if command.is_some() { return Err(ServiceError::Busy); }
         let request_config = self.config(session)?;
@@ -699,6 +721,12 @@ impl SessionService {
                 return Err(ServiceError::InvalidConfig("retry requires a failed turn at the session tip".into()));
             }
         }
+        let mut wakes = live.job_wakes.lock().unwrap();
+        let intent = if job_notice && inbox.phase() == Phase::Idle && *wakes >= 3 {
+            UserIntent::Inject
+        } else {
+            intent
+        };
         let (intent, disposition) = inbox.submit(intent, content.clone());
         match &disposition {
             Disposition::Command(_) => unreachable!("inbox does not execute commands"),
@@ -760,6 +788,11 @@ impl SessionService {
                 });
                 *live.handle.lock().unwrap() = Some(handle);
             }
+        }
+        if job_notice && disposition == Disposition::StartTurn {
+            *wakes += 1;
+        } else if !job_notice && intent != UserIntent::Inject {
+            *wakes = 0;
         }
         Ok(disposition)
     }

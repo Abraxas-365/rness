@@ -49,10 +49,115 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
     runtime.register(Arc::new(SpawnProvider));
     runtime.register(Arc::new(ForkProvider));
     let jobs = rness_tools::jobs::JobRegistry::new();
+    jobs.attach_sessions(&sessions);
     tools.register(Arc::new(rness_tools::jobs::JobOutputTool::new(jobs.clone())));
     rness_tools::register_subagent(&tools, Arc::clone(&runtime), jobs);
     rness_tools::subagent_control::register_subagent_control(&tools, runtime);
     (sessions, tools)
+}
+
+#[tokio::test]
+async fn completion_waits_for_reservations_without_duplicate_delivery() {
+    use rness_engine::interaction::{Command, CommandInvocation, CommandResult};
+    use rness_engine::service::ServiceError;
+    struct Hold;
+    impl Command for Hold {
+        fn name(&self) -> &str { "hold" }
+        fn description(&self) -> &str { "reserve the session" }
+        fn execute(&self, _: &SessionService, _: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
+            Ok(CommandResult::default())
+        }
+    }
+    for maintenance in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (sessions, _) = compose(dir.path());
+        let parent = sessions.create(None).unwrap();
+        sessions.commands().register(Arc::new(Hold)).unwrap();
+        let command = if maintenance { None } else { sessions.prepare_command(&parent, "/hold").unwrap() };
+        let guard = if maintenance { Some(sessions.try_extension_maintenance().unwrap()) } else { None };
+        let jobs = rness_tools::jobs::JobRegistry::new();
+        jobs.attach_sessions(&sessions);
+        let (_, writer) = jobs.start_owned("test", "reserved".into(), Some(&parent));
+        writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
+        writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
+        tokio::task::yield_now().await;
+        assert!(!sessions.store().history(&parent).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
+        drop(command);
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if sessions.store().history(&parent).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        sessions.join(&parent).await;
+        let history = sessions.store().history(&parent).unwrap();
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 1);
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn completion_reaches_busy_parent_before_it_can_go_idle() {
+    struct Gated {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait]
+    impl Provider for Gated {
+        fn model(&self) -> &str { "gated" }
+        async fn step(&self, _request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
+            self.entered.notify_one();
+            self.release.notified().await;
+            OneAnswer.step(_request, _cancel).await
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(Gated { entered: Default::default(), release: Default::default() });
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()), provider.clone(), Arc::new(ToolRegistry::default()),
+        TurnConfig::default(), Arc::new(EventBus::default()),
+    ));
+    let parent = sessions.create(None).unwrap();
+    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "work".into() }]).unwrap();
+    provider.entered.notified().await;
+    let jobs = rness_tools::jobs::JobRegistry::new();
+    jobs.attach_sessions(&sessions);
+    let (_, writer) = jobs.start_owned("test", "busy".into(), Some(&parent));
+    writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
+    provider.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), provider.entered.notified()).await.unwrap();
+    provider.release.notify_one();
+    sessions.join(&parent).await;
+    let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 2);
+}
+
+#[tokio::test]
+async fn job_completion_wakes_owner_once_and_bounds_automatic_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sessions, _) = compose(dir.path());
+    let parent = sessions.create(None).unwrap();
+    let stranger = sessions.create(None).unwrap();
+    let jobs = rness_tools::jobs::JobRegistry::new();
+    jobs.attach_sessions(&sessions);
+    for index in 0..4 {
+        let (_, writer) = jobs.start_owned("test", "completion".into(), Some(&parent));
+        writer.append(b"result");
+        writer.settle(rness_tools::jobs::JobStatus::Exited(Some(index)));
+        writer.settle(rness_tools::jobs::JobStatus::Exited(Some(99)));
+        sessions.join(&parent).await;
+    }
+    let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 4);
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 3);
+    assert!(!sessions.store().history(&stranger).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
+    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "continue".into() }]).unwrap();
+    sessions.join(&parent).await;
+    let (_, writer) = jobs.start_owned("test", "again".into(), Some(&parent));
+    writer.settle(rness_tools::jobs::JobStatus::Killed);
+    sessions.join(&parent).await;
+    assert_eq!(sessions.store().history(&parent).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 5);
 }
 
 #[tokio::test(flavor = "multi_thread")]

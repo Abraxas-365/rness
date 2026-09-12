@@ -20,6 +20,36 @@ power as the vendor.
   tree is a Lua plugin on purpose); `rness --dump-config` shows exactly
   what composed.
 
+## Install from a checkout
+
+With the repository's Rust toolchain installed:
+
+```sh
+./install.sh
+```
+
+This builds with `cargo build --locked --release`, installs `~/.local/bin/rness`,
+and copies `flavors/default/` to `~/.rness` only if that directory does not exist.
+Existing configuration is never overwritten or merged. To upgrade the binary,
+run `./install.sh --replace-binary`; your configuration stays untouched.
+
+The default flavor includes Gruvbox cards, session/branch/task/plan plugins,
+manual compaction, and specialist agents. The scout uses `small.by_provider` in
+`~/.rness/lua/providers.lua`: Anthropic Haiku is configured; add explicit mappings
+for other provider connections before delegating to scout. No fallback is used.
+Configure credentials separately, then select your principal explicitly:
+
+```sh
+rness --model anthropic/claude-haiku-4-5-20251001
+```
+
+Use `--binary /path/to/rness` to install an already-built executable without Cargo.
+`--bin-dir` and `--config-dir` change installation destinations; the latter does
+not change where rness looks for its runtime configuration (`$HOME/.rness`).
+The installer does not use sudo, modify shell startup files, or download models.
+Add `~/.local/bin` to your PATH if needed. Test installation safety offline with
+`python3 scripts/test_install.py`.
+
 ## Layout
 
 | Path | What |

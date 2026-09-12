@@ -502,6 +502,7 @@ async fn main() -> anyhow::Result<()> {
     ));
     subagents.register(Arc::new(rness_engine::subagent::SpawnProvider));
     subagents.register(Arc::new(rness_engine::subagent::ForkProvider));
+    jobs.attach_sessions(&sessions);
     rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs);
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
 

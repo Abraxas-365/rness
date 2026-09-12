@@ -158,7 +158,7 @@ impl SubagentTool {
             "subagent [{provider}]: {}",
             request.prompt.chars().take(80).collect::<String>()
         );
-        let (id, writer) = self.jobs.start("subagent", label);
+        let (id, writer) = self.jobs.start_owned("subagent", label, Some(session));
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {
             match runtime.start(&provider, request).await {
@@ -179,7 +179,7 @@ impl SubagentTool {
             }
         });
         Ok((format!(
-            "started background subagent as job {id} — read with job_output, cancel with job_kill"
+            "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill"
         ), json!({"version":1,"kind":"subagent","mode":"background","job_id":id,"accepted":true})))
     }
 }

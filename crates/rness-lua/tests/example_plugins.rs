@@ -15,6 +15,23 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default");
+    let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();
+    assert_eq!(config.colorscheme.as_deref(), Some("gruvbox"));
+    assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
+    assert!(config.agents["worker"].profile.is_none());
+    assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
+    assert_eq!(config.plugin_specs.len(), 6);
+    let specs = rness_lua::loader::discover_specs(&root, &config.plugin_specs).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let host = booted_host(dir.path()).await;
+    let errors = rness_lua::loader::load_all(&host, &specs).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    host.validate_bindings().await.unwrap();
+}
+
+#[tokio::test]
 async fn explicit_file_lifecycle_remap_disable_reload_and_unload() {
     use rness_lua::loader::{PluginSpec, PluginLocation, discover_specs};
     let root = tempfile::tempdir().unwrap();

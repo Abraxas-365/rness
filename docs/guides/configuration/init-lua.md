@@ -15,6 +15,27 @@ rness evaluates `~/.rness/init.lua` before constructing model providers. This is
 
 The loader prepends personal module paths to Lua's existing `package.path`; it does not remove the preexisting search paths. Do not treat `require` resolution as confined to `~/.rness`.
 
+## Provider-specific agent profiles
+
+A delegating agent can choose a model on its parent's current connection:
+
+```lua
+rness.profiles.declare("small", {
+  by_provider = {
+    anthropic = {
+      model = "claude-haiku-4-5-20251001",
+      options = { max_output_tokens = 2048 },
+    },
+    -- Add exact model IDs for your other configured connections.
+  },
+})
+-- Reference with profile = "small" in rness.agents.declare("scout", ...).
+```
+
+Keys are connection names, not protocols. Both spawn and fork resolve the profile before creating the child. The child retains that connection's endpoint/authentication and persists the concrete model/options. Parent reasoning, temperature, and output limits are not carried into the selected variant. Changing the parent later affects future children only. Missing variants fail explicitly without cross-provider fallback. Fixed profiles remain supported; mixing fixed fields and `by_provider` is invalid.
+
+Provider-specific profiles require an existing session selection when selecting an agent or delegating. They cannot serve as a standalone `default_profile` or initial CLI profile without provider context; use a fixed profile or explicit model for the principal.
+
 ## Separate declarations into modules
 
 For example:

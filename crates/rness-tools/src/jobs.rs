@@ -47,6 +47,7 @@ struct JobState {
     output: Vec<u8>,
     /// Byte offset of the next unread output.
     read_from: usize,
+    settled: bool,
 }
 
 struct Job {
@@ -56,6 +57,7 @@ struct Job {
     cancel: tokio_util::sync::CancellationToken,
     /// Notified on every output append and on settlement (for waits).
     changed: Arc<tokio::sync::Notify>,
+    completion: Option<(String, String, std::sync::Weak<rness_engine::service::SessionService>)>,
 }
 
 /// Owner of all background jobs for one composition. Cloneable handle.
@@ -67,6 +69,7 @@ pub struct JobRegistry {
 struct Registry {
     next_id: AtomicU64,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
+    sessions: Mutex<std::sync::Weak<rness_engine::service::SessionService>>,
 }
 
 /// Producer-side handle for appending output and settling a started job.
@@ -84,10 +87,31 @@ impl JobWriter {
 
     pub fn settle(&self, status: JobStatus) {
         let mut state = self.job.state.lock().expect("job lock");
+        if state.settled { return; }
+        state.settled = true;
         // A kill request wins over the natural exit that follows it.
         state.status = if state.status == JobStatus::Killed { JobStatus::Killed } else { status };
+        let notice = format!("Background {} job finished {}. Read its output with job_output.", state.kind, state.status.marker());
         drop(state);
         self.job.changed.notify_waiters();
+        if let Some((id, owner, sessions)) = &self.job.completion {
+            if let Some(sessions) = sessions.upgrade() {
+                let text = format!("Job {id}: {notice}");
+                match sessions.notify_job(owner, text.clone()) {
+                    Err(rness_engine::service::ServiceError::Busy) => {
+                        let owner = owner.clone();
+                        let id = id.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = sessions.notify_job_wait(&owner, text).await {
+                                tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed");
+                            }
+                        });
+                    }
+                    Err(error) => tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed"),
+                    Ok(_) => {}
+                }
+            }
+        }
     }
 
     pub fn cancelled(&self) -> tokio_util::sync::CancellationToken {
@@ -101,12 +125,21 @@ impl JobRegistry {
             inner: Arc::new(Registry {
                 next_id: AtomicU64::new(1),
                 jobs: Mutex::new(HashMap::new()),
+                sessions: Mutex::new(std::sync::Weak::new()),
             }),
         }
     }
 
+    pub fn attach_sessions(&self, sessions: &Arc<rness_engine::service::SessionService>) {
+        *self.inner.sessions.lock().expect("sessions lock") = Arc::downgrade(sessions);
+    }
+
     /// Register a new running job; returns its id and the producer handle.
     pub fn start(&self, kind: &'static str, label: String) -> (String, JobWriter) {
+        self.start_owned(kind, label, None)
+    }
+
+    pub fn start_owned(&self, kind: &'static str, label: String, owner: Option<&String>) -> (String, JobWriter) {
         let id = format!("j{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let job = Arc::new(Job {
             state: Mutex::new(JobState {
@@ -115,7 +148,9 @@ impl JobRegistry {
                 status: JobStatus::Running,
                 output: Vec::new(),
                 read_from: 0,
+                settled: false,
             }),
+            completion: owner.map(|owner| (id.clone(), owner.clone(), self.inner.sessions.lock().expect("sessions lock").clone())),
             cancel: tokio_util::sync::CancellationToken::new(),
             changed: Arc::new(tokio::sync::Notify::new()),
         });

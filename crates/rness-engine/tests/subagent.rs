@@ -66,6 +66,51 @@ async fn one_completed_turn(sessions: &Arc<SessionService>, id: &SessionId) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn provider_profiles_follow_parent_without_inheriting_model_options() {
+    use rness_engine::config::{AgentDefinition, ModelRegistry, Profile};
+    let dir = tempfile::tempdir().unwrap();
+    let mut models = ModelRegistry::default();
+    let profile: Profile = serde_json::from_value(serde_json::json!({"by_provider": {
+        "one": {"model":"cheap-one", "options":{"max_output_tokens":200}},
+        "two": {"model":"cheap-two", "options":{"max_output_tokens":300}}
+    }})).unwrap();
+    models.declare_profile("small".into(), profile).unwrap();
+    let agents = [("scout".into(), AgentDefinition { subagent:true, description:"Scout".into(),
+        instructions:"Inspect".into(), profile:Some("small".into()), tools:Some(vec![]) })].into();
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(EchoCount),
+        Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()))
+        .with_agents(agents, models)
+        .with_provider_resolver(Default::default(), Arc::new(|_| Ok(Arc::new(EchoCount)))));
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    one_completed_turn(&sessions, &parent).await;
+    let mut children = Vec::new();
+    for route in ["one", "two", "missing"] {
+        sessions.set_config(&parent, CallConfig { selection:Some(ModelSelection {route:route.into(), model:"expensive".into()}),
+            reasoning:Some(Reasoning::Effort {effort:"high".into()}), temperature:Some(0.9), max_output_tokens:Some(9999), ..Default::default() }).unwrap();
+        for mode in ["spawn", "fork"] {
+            let request = SubagentRequest { parent:parent.clone(), agent:Some("scout".into()), prompt:"inspect".into() };
+            if route == "missing" {
+                let before = sessions.list().unwrap();
+                assert!(rt.start(mode, request.clone()).await.unwrap_err().to_string().contains("no variant"));
+                assert!(rt.start_continuable(mode, request).is_err());
+                assert_eq!(before, sessions.list().unwrap());
+                continue;
+            }
+            let run = rt.start(mode, request).await.unwrap();
+            let config = sessions.config(&run.session).unwrap();
+            assert_eq!(config.selection, Some(ModelSelection {route:route.into(), model:format!("cheap-{route}")}));
+            assert_eq!(config.max_output_tokens, Some(if route == "one" {200} else {300}));
+            assert_eq!(config.reasoning, None);
+            assert_eq!(config.temperature, None);
+            children.push((run.session, config));
+        }
+    }
+    let reopened = service(dir.path());
+    for (child, config) in children { assert_eq!(reopened.config(&child).unwrap(), config); }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn named_roles_are_opt_in_and_inherit_generation_without_widening_tools() {
     use rness_engine::config::AgentDefinition;
     let dir = tempfile::tempdir().unwrap();

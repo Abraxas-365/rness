@@ -97,7 +97,7 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.run_presented(args).await.map(|(output, _)| output)
+        self.run_presented(args, None).await.map(|(output, _)| output)
     }
 
     async fn execute_presented(
@@ -107,13 +107,13 @@ impl Tool for BashTool {
         args: Value,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, presentation) = self.run_presented(args).await?;
+        let (output, presentation) = self.run_presented(args, Some(_session)).await?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
     }
 }
 
 impl BashTool {
-    async fn run_presented(&self, args: Value) -> Result<(String, Value), String> {
+    async fn run_presented(&self, args: Value, owner: Option<&String>) -> Result<(String, Value), String> {
         let command = required_str(&args, "command")?;
         required_str(&args, "description")?;
         let workdir = self.ws.resolve(args["workdir"].as_str().unwrap_or("."));
@@ -124,7 +124,7 @@ impl BashTool {
         if args["run_in_background"].as_bool().unwrap_or(false) {
             let mut child =
                 spawn_shell(command, &workdir).map_err(|e| format!("spawn: {e}"))?;
-            let (id, writer) = self.jobs.start("bash", command.to_string());
+            let (id, writer) = self.jobs.start_owned("bash", command.to_string(), owner);
             let mut stdout_pipe = child.stdout.take().expect("piped stdout");
             let mut stderr_pipe = child.stderr.take().expect("piped stderr");
             // Drain task: stream both pipes into the job, then settle.
