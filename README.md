@@ -1,6 +1,6 @@
 <div align="center">
 
-# rness
+# Rness
 
 ### Your terminal. Your models. Your agent.
 
@@ -20,7 +20,7 @@ A terminal-first coding agent with a Rust engine and a Lua-configurable workflow
 Start with the included Gruvbox flavor. Keep what you like. Rewrite the rest.
 
 > [!IMPORTANT]
-> **Early-stage software.** Configuration and extension APIs are evolving. Read the [known limitations](docs/project/known-limitations.md), review changes before upgrading, and use `--approval ask` when working in your projects. Approval prompts are not an OS sandbox.
+> **Early-stage software.** Configuration and extension APIs are evolving. Read the [known limitations](docs/project/known-limitations.md) and review changes before upgrading.
 
 ## Why rness?
 
@@ -68,7 +68,7 @@ The default `chatgpt` connection already uses OAuth:
 
 ```sh
 rness auth login --provider openai-chatgpt
-rness --model chatgpt/YOUR_AVAILABLE_MODEL --approval ask
+rness -m chatgpt/gpt-6-astra --reasoning high
 ```
 
 The login provider is `openai-chatgpt`; the configured connection name used by `--model` is `chatgpt`.
@@ -85,11 +85,7 @@ Then edit the existing `anthropic` connection in `~/.rness/lua/providers.lua`, r
 auth = { oauth = "anthropic" },
 ```
 
-Start a session:
-
-```sh
-rness --model anthropic/claude-haiku-4-5-20251001 --approval ask
-```
+Select an Anthropic model available to your account with `rness -m anthropic/YOUR_AVAILABLE_MODEL`. Reasoning support depends on the selected model.
 
 OAuth access and available models depend on your account and the provider's current policies. Signing in does not guarantee access to every model. Check stored authentication with `rness auth status`.
 
@@ -99,7 +95,6 @@ Keep the default environment-based Anthropic authentication and supply your key:
 
 ```sh
 export ANTHROPIC_API_KEY="your-api-key"
-rness --model anthropic/claude-haiku-4-5-20251001 --approval ask
 ```
 
 #### Local models: Ollama
@@ -107,7 +102,7 @@ rness --model anthropic/claude-haiku-4-5-20251001 --approval ask
 Use a model ID available to your account. To use a local model instead, start your Ollama server separately and select an installed, tool-capable model:
 
 ```sh
-rness --model ollama/YOUR_INSTALLED_MODEL --approval ask
+rness -m ollama/YOUR_INSTALLED_MODEL
 ```
 
 Edit `~/.rness/lua/providers.lua` to customize connections and profiles. For authentication options, including OAuth, see the [provider reference](docs/reference/configuration/providers.md).
@@ -116,19 +111,89 @@ Edit `~/.rness/lua/providers.lua` to customize connections and profiles. For aut
 
 ### 3. Put it to work
 
-Open the terminal interface in your project, or pass a prompt for a headless run:
+Open the terminal interface in your project:
 
 ```sh
-rness --model anthropic/claude-haiku-4-5-20251001 --approval ask \
+rness -m chatgpt/gpt-6-astra --reasoning high
+```
+
+Or pass a prompt for a headless run:
+
+```sh
+rness -m chatgpt/gpt-6-astra --reasoning high \
   -p "Read this project and explain its entry points. Do not edit files."
 ```
 
-Return to a conversation later:
+> [!WARNING]
+> The default approval policy is `allow`: sensitive tools run without confirmation. Add `--approval ask` to request approval, or `--approval never` to reject sensitive tools. Neither is an OS sandbox.
+
+### Ways to launch Rness
+
+| Mode | Command |
+| :--- | :--- |
+| Interactive, explicit model | `rness -m chatgpt/gpt-6-astra --reasoning high` |
+| Separate connection and model arguments | `rness --provider chatgpt -m gpt-6-astra --reasoning high` |
+| Saved profile | `rness --profile YOUR_PROFILE` |
+| Named principal agent | `rness --agent coding -m chatgpt/gpt-6-astra --reasoning high` |
+| Configured defaults | `rness` — requires a configured default selection/profile |
+| One headless prompt | `rness -m chatgpt/gpt-6-astra --reasoning high -p "Explain this project"` |
+| Resume a session | `rness -s SESSION_ID` |
+| Resume with a prompt | `rness -s SESSION_ID -p "Continue the implementation"` |
+| List saved sessions | `rness --list` |
+| HTTP/SSE server | `rness --serve 127.0.0.1:7777 -m chatgpt/gpt-6-astra --reasoning high` |
+| Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
+| One-off OpenAI-compatible connection | `rness --route local=http://localhost:8000/v1,none -m local/YOUR_MODEL` |
+
+Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
+
+### Reasoning and request options
 
 ```sh
-rness --list
-rness --session SESSION_ID --approval ask
+# High reasoning (also accepted as --effort high)
+rness -m chatgpt/gpt-6-astra --reasoning high
+
+# Optional output limit
+rness -m chatgpt/gpt-6-astra --reasoning high --max-output-tokens 8192
 ```
+
+| Option | What it controls |
+| :--- | :--- |
+| `--reasoning LEVEL` / `--effort LEVEL` | Named reasoning effort, such as `low`, `medium`, or `high`. Accepted levels depend on the provider and model. |
+| `--budget-tokens TOKENS` | Anthropic manual thinking budget, minimum 1,024 tokens. Cannot be combined with named reasoning effort. |
+| `--max-output-tokens TOKENS` | Maximum output tokens per provider request. |
+| `--temperature VALUE` | Sampling temperature, where supported by the selected model. |
+| `--approval allow\|ask\|never` | Allow tools without questions, ask for sensitive tools, or reject sensitive tools. Default: `allow`. |
+
+Reasoning effort is not a universal model capability. Do not assume every model supports every level, manual thinking, or temperature; use options supported by your selected endpoint.
+
+<details>
+<summary><strong>More CLI options and shortcuts</strong></summary>
+
+| Option | Purpose |
+| :--- | :--- |
+| `-m`, `--model` | Select `connection/model`; with `--provider`, supply a literal model ID instead. |
+| `-p`, `--prompt` | Run a headless prompt and print the transcript. |
+| `-s`, `--session` | Continue an existing session. |
+| `--profile` / `--agent` | Select a declared profile or agent. |
+| `--base-url URL` | Override the selected provider endpoint. |
+| `--route SPEC` | Declare an OpenAI-compatible connection; repeat for multiple connections. |
+| `--root DIR` | Change session storage from `~/.rness/sessions`; this is not the workspace directory. |
+| `--instructions NAMES` | Comma-separated instruction filenames in precedence order; default: `AGENTS.md,CLAUDE.md`. Use `none` to disable. |
+| `--instructions-bytes BYTES` | Instruction baseline byte budget; default: `65536`. |
+| `--serve ADDR` | Run the HTTP/SSE service instead of the TUI. |
+| `--list` | List sessions and exit. |
+| `-h`, `--help` | Show the current CLI reference. |
+| `-V`, `--version` | Print the installed version. |
+
+Credential and package management are separate subcommands:
+
+```sh
+rness auth --help
+rness plugin --help
+rness --help
+```
+
+</details>
 
 <details>
 <summary><strong>Upgrading and alternative installation options</strong></summary>
