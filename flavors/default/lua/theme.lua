@@ -22,6 +22,10 @@ rness.ui.colorscheme.register("gruvbox", {
 })
 rness.ui.colorscheme.set("gruvbox")
 rness.ui.messagebox = {
+  selection = {
+    style = { bg = "#504945" },
+    marker = { text = "▎", style = { fg = p.blue, bold = true } },
+  },
   padding = { left = 1, right = 1 },
   user = {
     style = { fg = p.fg, bg = p.card }, padding = { left = 1, right = 1 },
@@ -29,6 +33,12 @@ rness.ui.messagebox = {
   },
   assistant = { style = "assistant_text", marker = false },
   thinking = { display = "preview", preview_lines = 3, style = "thinking" },
+  compaction = {
+    style = { fg = p.fg, bg = p.card },
+    border = { kind = "rounded", style = { fg = p.border } },
+    padding = { left = 1, right = 1 }, display = "preview", preview_lines = 6,
+    header = { style = "tool_name" },
+  },
   tool = {
     style = { fg = p.fg, bg = p.card },
     border = { kind = "rounded", style = { fg = p.border } },

@@ -939,7 +939,15 @@ impl SessionService {
         // model saw it (shadowing of prior checkpoints honored).
         let mut fold_ctx = crate::session::projection::model_context(&history[..cut]);
         fold_ctx.config = replayed.context.config.clone();
-        let summary = summarize(provider.as_ref(), fold_ctx).await?;
+        let estimated_tokens = crate::turn::compaction::measure(&fold_ctx, "", &[]);
+        self.bus.emit::<FrameEv>(&Frame::CompactionStarted {
+            session: session.clone(), events: replaces.len(), estimated_tokens,
+        });
+        let summary = summarize(provider.as_ref(), fold_ctx).await;
+        self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
+            session: session.clone(), changed: summary.is_ok(),
+        });
+        let summary = summary?;
 
         let shadowed = replaces.len();
         let mut log = self.store.open(session)?;
@@ -995,9 +1003,20 @@ impl SessionService {
         }
         let mut log = self.store.open(session)?;
         crate::turn::compaction::recover(&mut log)?;
-        let changed = crate::turn::compaction::reduce_region(&self.store, &mut log, provider.as_ref(),
-            "", &[], &policy, false, Some(start..end), &cancel).await
-            .map_err(|e| ServiceError::Summarizer(e.to_string()))?;
+        let progress_session = session.clone();
+        let progress_bus = Arc::clone(&self.bus);
+        let on_compaction = move |progress: crate::turn::compaction::CompactionProgress| {
+            progress_bus.emit::<FrameEv>(&Frame::CompactionStarted {
+                session: progress_session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens,
+            });
+        };
+        let changed = crate::turn::compaction::reduce_region_with_progress(&self.store, &mut log, provider.as_ref(),
+            "", &[], &policy, false, Some(start..end), &cancel, &on_compaction).await
+            .map_err(|e| ServiceError::Summarizer(e.to_string()));
+        self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
+            session: session.clone(), changed: matches!(changed, Ok(true)),
+        });
+        let changed = changed?;
         if changed { self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() }); }
         Ok(changed)
     }

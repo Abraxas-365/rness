@@ -170,7 +170,12 @@ async fn drive(
             .and_then(|s| config.compaction.get(&format!("{}/{}", s.route, s.model)))
             .or_else(|| config.compaction.get("default"));
         if let Some(policy) = policy {
-            if compaction::reduce(store, log, provider, &step_system, &tool_specs, policy, false, cancel).await? {
+            let on_compaction = |progress: compaction::CompactionProgress| {
+                frames(Frame::CompactionStarted { session: session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens });
+            };
+            let compacted = compaction::reduce_with_progress(store, log, provider, &step_system, &tool_specs, policy, false, cancel, &on_compaction).await;
+            frames(Frame::CompactionFinished { session: session.clone(), changed: matches!(compacted, Ok(true)) });
+            if compacted? {
                 frames(Frame::HistoryChanged { session: session.clone() });
                 replayed = replay(store, log.session())?;
             }
@@ -217,7 +222,12 @@ async fn drive(
                     frames(Frame::HistoryChanged { session: session.clone() });
                     if error.code == "CONTEXT_OVERFLOW" {
                         if let Some(policy) = policy.filter(|p| overflow_retries < p.max_overflow_retries) {
-                            let changed = compaction::reduce(store, log, provider, &step_system, &tool_specs, policy, true, cancel).await?;
+                            let on_compaction = |progress: compaction::CompactionProgress| {
+                                frames(Frame::CompactionStarted { session: session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens });
+                            };
+                            let compacted = compaction::reduce_with_progress(store, log, provider, &step_system, &tool_specs, policy, true, cancel, &on_compaction).await;
+                            frames(Frame::CompactionFinished { session: session.clone(), changed: matches!(compacted, Ok(true)) });
+                            let changed = compacted?;
                             if cancel.is_cancelled() { return Ok(TurnOutcome::Cancelled); }
                             if changed {
                                 overflow_retries += 1;

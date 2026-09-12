@@ -247,6 +247,10 @@ rness.ui.messagebox = {
     output = { visible = true, wrap = true },
     states = { running = { style = 'dim' }, error = { style = 'error' } },
   },
+  compaction = {
+    -- Uses normal tool-card styling unless overridden.
+    display = 'preview', preview_lines = 6,
+  },
   keys = {
     previous_tool = 'alt+up', next_tool = 'alt+down', toggle_tool = 'ctrl+o',
     previous_thinking = 'alt+p', next_thinking = 'alt+n', toggle_thinking = 'alt+t',
@@ -256,6 +260,14 @@ rness.ui.messagebox = {
 
 Each key accepts `false` to disable it. Tool output wrapping affects presentation
 only; it never truncates the durable result or changes provider requests.
+
+Compaction summarizes model context, not the visible or durable transcript. A summary
+card appears before the compacted messages and inherits `tool` card options unless
+`compaction` overrides them. `display` accepts `collapsed`, `preview`, or `expanded`;
+`preview_lines` controls the body rows initially shown in preview mode. Use normal
+message selection (`select_message`, then `selection_toggle`) to expand or collapse a
+selected summary card without changing its configuration.
+
 Styles accept theme group names or direct `fg`, `bg`, `bold`, `italic`,
 `underline`, and `reverse` fields. Direct fields patch inherited styles.
 

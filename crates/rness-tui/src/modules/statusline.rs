@@ -27,7 +27,11 @@ impl Component for Statusline {
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
         let model = ctx.model;
         let theme = ctx.theme;
-        let phase = if model.busy { "streaming" } else { "idle" };
+        let phase = match &model.compaction {
+            Some(compaction) => format!("compacting {} events · ~{}k tok", compaction.events, compaction.estimated_tokens / 1000),
+            None if model.busy => "streaming".into(),
+            None => "idle".into(),
+        };
         let scroll = if model.scroll_from_bottom > 0 {
             format!("  ↑{}", model.scroll_from_bottom)
         } else {

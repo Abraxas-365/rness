@@ -26,6 +26,11 @@ pub enum Frame {
     StepCommitted { session: SessionId, event: EventId },
     /// The turn is over (committed, cancelled, or failed); idle again.
     TurnIdle { session: SessionId },
+    /// A compaction summary is running; its source event count and estimated
+    /// input tokens let frontends show progress before the durable checkpoint.
+    CompactionStarted { session: SessionId, events: usize, estimated_tokens: u64 },
+    /// A compaction summary ended, whether it wrote a checkpoint or failed.
+    CompactionFinished { session: SessionId, changed: bool },
     /// Durable history changed outside a turn (compaction): reload.
     HistoryChanged { session: SessionId },
     /// A sensitive tool call paused for a one-shot decision (`ask`

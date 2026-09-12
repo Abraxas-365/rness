@@ -53,6 +53,8 @@ fn frame_session(frame: &Frame) -> &str {
         | Frame::ToolOutput { session, .. }
         | Frame::StepCommitted { session, .. }
         | Frame::TurnIdle { session }
+        | Frame::CompactionStarted { session, .. }
+        | Frame::CompactionFinished { session, .. }
         | Frame::HistoryChanged { session }
         | Frame::ApprovalRequested { session, .. }
         | Frame::ApprovalResolved { session, .. } => session,

@@ -637,6 +637,8 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
             Frame::ToolOutput { output, .. } => format!("out:{output}"),
             Frame::StepCommitted { .. } => "committed".into(),
             Frame::TurnIdle { .. } => "idle".into(),
+            Frame::CompactionStarted { .. } => "compacting".into(),
+            Frame::CompactionFinished { .. } => "compacted".into(),
             Frame::HistoryChanged { .. } => "history".into(),
             Frame::ApprovalRequested { .. } => "ask".into(),
             Frame::ApprovalResolved { .. } => "answered".into(),

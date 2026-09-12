@@ -1,6 +1,6 @@
 -- Structured statusline: aggregate activity on the left, active session model
 -- and cached token usage on the right. Explicitly loaded by init.lua.
--- Usage is refreshed on turn_end, never by replaying history during rendering.
+-- Usage is loaded once per displayed session, then refreshed on turn_end.
 local function max_input_tokens(session)
   local selection = rness.session.config(session).selection
   local policies = rness.compaction or {}
@@ -83,6 +83,10 @@ rness.ui.statusline = {
     }
   end,
   right = function(ctx)
+    if ctx.session and tokens[ctx.session] == nil then
+      tokens[ctx.session] = ""
+      refresh(ctx.session)
+    end
     return { { text = ctx.model or "" }, { text = tokens[ctx.session] or "" } }
   end,
 }

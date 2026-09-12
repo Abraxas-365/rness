@@ -296,7 +296,9 @@ See [your first agent](docs/tutorials/first-agent.md) and [the specialist exampl
 
 ## Long conversations, explicit control
 
-rness separates the durable session history from the context sent to the model. The default flavor enables automatic summarization at **165,000 estimated tokens** and microcompaction of older tool outputs above **8,192 characters**, retaining their head and tail. Original records remain in the session log. Run **`/compact`** to summarize the current context immediately, without a region picker.
+rness separates the durable session history from the context sent to the model. The default flavor enables automatic summarization at **165,000 estimated tokens** and microcompaction of older tool outputs above **8,192 characters**, retaining their head and tail. Compaction reduces only model context: the original messages remain visible in the transcript and durable session log, with a summary card placed at the folded span. Run **`/compact`** to summarize the current context immediately, without a region picker.
+
+The summary card is configured through `rness.ui.messagebox.compaction`; see [Messagebox presentation](docs/guides/plugins/example-recipes.md#messagebox-presentation) for preview and expansion options.
 
 Automatic summaries retain roughly 24,000 tokens of recent context and request up to 4,096 output tokens. Configure lower thresholds for models with smaller context windows; estimates are not exact tokenization. Explicit `provider/model` policies override `rness.compaction.default`.
 

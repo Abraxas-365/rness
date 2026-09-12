@@ -140,6 +140,7 @@ impl Slots {
 
     pub fn prompt_focused(&self, ctx: &Ctx<'_>) -> bool {
         self.winner(OVERLAY, ctx).is_none() && self.winner(SIDEBAR, ctx).is_none()
+            && !self.winner(MESSAGE_BODY, ctx).is_some_and(|component| component.captures_input())
             && self.winner(INPUT_FOOTER, ctx).is_some()
     }
 
@@ -151,6 +152,9 @@ impl Slots {
         }
         if self.winner(SIDEBAR, ctx).is_some() {
             return self.winner_mut(SIDEBAR, ctx);
+        }
+        if self.winner(MESSAGE_BODY, ctx).is_some_and(|component| component.captures_input()) {
+            return self.winner_mut(MESSAGE_BODY, ctx);
         }
         self.winner_mut(INPUT_FOOTER, ctx)
     }

@@ -67,6 +67,52 @@ async fn failed_empty_and_nonshrinking_summaries_preserve_region_after_reopen() 
     }
 }
 
+#[tokio::test]
+async fn compaction_uses_configured_prompts() {
+    struct CapturesPrompts;
+    #[async_trait]
+    impl Provider for CapturesPrompts {
+        fn model(&self) -> &str { "test" }
+        async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            assert_eq!(request.system, "Configured system prompt");
+            assert!(matches!(&request.context.turns.last().unwrap(), rness_engine::session::projection::ModelTurn::User { content }
+                if matches!(&content[0], ContentPart::Text { text } if text == "Configured user prompt")));
+            StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+        content: vec![ContentPart::Text { text: "original ".repeat(1000) }], source: None })).unwrap();
+    let mut policy = compact_policy(100000);
+    policy.system_prompt = "Configured system prompt".into();
+    policy.prompt = "Configured user prompt".into();
+    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &CapturesPrompts,
+        "", &[], &policy, false, Some(0..1), &CancellationToken::new()).await.unwrap());
+}
+
+#[tokio::test]
+async fn compaction_omits_unsupported_output_limit() {
+    struct RejectsOutputLimit;
+    #[async_trait]
+    impl Provider for RejectsOutputLimit {
+        fn model(&self) -> &str { "subscription" }
+        fn supports_max_output_tokens(&self) -> bool { false }
+        async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            assert_eq!(request.context.config.max_output_tokens, None);
+            StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+        content: vec![ContentPart::Text { text: "original ".repeat(1000) }], source: None })).unwrap();
+    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &RejectsOutputLimit,
+        "", &[], &compact_policy(100000), false, Some(0..1), &CancellationToken::new()).await.unwrap());
+}
+
 #[test]
 fn interrupted_compaction_recovery_is_idempotent_and_preserves_checkpoint() {
     for committed in [false, true] {
@@ -121,6 +167,8 @@ fn compact_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
         meter: Default::default(),
         summary_selection: None,
         threshold_tokens: threshold, retain_tokens: 40, summary_tokens: 100,
+        system_prompt: "Summarize without tools.".into(),
+        prompt: "Create a continuation briefing.".into(),
         max_overflow_retries: 1, max_compactions: 2,
         prune_threshold: 8192, prune_head: 4096, prune_tail: 1024,
     }

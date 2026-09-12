@@ -80,6 +80,8 @@ pub(crate) struct ImageCapabilityProvider {
 #[async_trait]
 impl Provider for ImageCapabilityProvider {
     fn model(&self) -> &str { self.inner.model() }
+    fn summary_model(&self) -> &str { self.inner.summary_model() }
+    fn summary_supports_max_output_tokens(&self) -> bool { self.inner.summary_supports_max_output_tokens() }
 
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         use crate::session::projection::ModelTurn;
@@ -165,6 +167,7 @@ pub(crate) struct SummaryProvider {
 impl Provider for SummaryProvider {
     fn model(&self) -> &str { self.main.model() }
     fn summary_model(&self) -> &str { self.summary.model() }
+    fn summary_supports_max_output_tokens(&self) -> bool { self.summary.supports_max_output_tokens() }
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         self.main.step(request, cancel).await
     }
@@ -181,8 +184,12 @@ pub trait Provider: Send + Sync {
     /// Configure attachment resolution before the provider is shared.
     fn configure_images(&mut self, _store: std::sync::Arc<crate::images::ImageStore>, _policy: crate::images::ImagePolicy) {}
 
+    /// Whether this provider accepts `max_output_tokens` in requests.
+    fn supports_max_output_tokens(&self) -> bool { true }
+
     /// Separate summarization route, when explicitly configured by the host.
     fn summary_model(&self) -> &str { self.model() }
+    fn summary_supports_max_output_tokens(&self) -> bool { self.supports_max_output_tokens() }
     async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         self.step(request, cancel).await
     }

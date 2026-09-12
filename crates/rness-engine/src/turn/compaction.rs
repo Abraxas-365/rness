@@ -15,6 +15,8 @@ pub struct Policy {
     pub threshold_tokens: u64,
     pub retain_tokens: u64,
     pub summary_tokens: u32,
+    pub system_prompt: String,
+    pub prompt: String,
     pub max_overflow_retries: u32,
     pub max_compactions: u32,
     pub prune_threshold: usize,
@@ -32,10 +34,11 @@ impl Policy {
             return Err("summary selection requires route and model".into());
         }
         if self.threshold_tokens == 0 || self.retain_tokens >= self.threshold_tokens
-            || self.summary_tokens == 0 || self.max_compactions == 0
+            || self.summary_tokens == 0 || self.system_prompt.trim().is_empty() || self.prompt.trim().is_empty()
+            || self.max_compactions == 0
             || self.max_compactions > 10 || self.max_overflow_retries > 10
             || self.prune_head.saturating_add(self.prune_tail).saturating_add(128) >= self.prune_threshold {
-            return Err("invalid compaction budgets or retry limits".into());
+            return Err("invalid compaction prompts, budgets, or retry limits".into());
         }
         Ok(())
     }
@@ -128,7 +131,20 @@ pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError
 pub async fn reduce(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
     system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool, cancel: &CancellationToken,
 ) -> Result<bool, TurnError> {
-    reduce_region(store, log, provider, system, tools, policy, overflow, None, cancel).await
+    reduce_with_progress(store, log, provider, system, tools, policy, overflow, cancel, &|_| {}).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn reduce_with_progress(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
+    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool, cancel: &CancellationToken,
+    progress: &(dyn Fn(CompactionProgress) + Send + Sync),
+) -> Result<bool, TurnError> {
+    reduce_region_with_progress(store, log, provider, system, tools, policy, overflow, None, cancel, progress).await
+}
+
+pub struct CompactionProgress {
+    pub events: usize,
+    pub estimated_tokens: u64,
 }
 
 /// Explicit half-open region of model messages; endpoints preserve tool pairs.
@@ -136,6 +152,15 @@ pub async fn reduce(store: &SessionStore, log: &mut SessionLog, provider: &dyn P
 pub async fn reduce_region(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
     system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool,
     region: Option<std::ops::Range<usize>>, cancel: &CancellationToken,
+) -> Result<bool, TurnError> {
+    reduce_region_with_progress(store, log, provider, system, tools, policy, overflow, region, cancel, &|_| {}).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
+    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool,
+    region: Option<std::ops::Range<usize>>, cancel: &CancellationToken,
+    progress: &(dyn Fn(CompactionProgress) + Send + Sync),
 ) -> Result<bool, TurnError> {
     policy.validate().map_err(|last| TurnError::ModelExhausted { attempts: 0, last })?;
     let mut changed = false;
@@ -191,15 +216,20 @@ pub async fn reduce_region(store: &SessionStore, log: &mut SessionLog, provider:
             }
             if before == selected.len() { break; }
         }
-        let replaces = replayed.history.iter().filter(|e| selected.contains(&e.id)).map(|e| e.id.clone()).collect();
+        let replaces: Vec<_> = replayed.history.iter().filter(|e| selected.contains(&e.id)).map(|e| e.id.clone()).collect();
         let mut context = ModelContext { turns: replayed.context.turns[start..cut].to_vec(), ..Default::default() };
         let before = policy.meter.measure(&context, "", &[]);
+        progress(CompactionProgress { events: replaces.len(), estimated_tokens: before });
         context.config = if let Some(selection) = &policy.summary_selection {
             rness_protocol::events::CallConfig { selection: Some(selection.clone()), ..Default::default() }
         } else { replayed.context.config.clone() };
-        context.config.max_output_tokens = Some(policy.summary_tokens);
-        context.turns.push(ModelTurn::User { content: vec![ContentPart::Text { text: "Summarize this history for continuation. Preserve goals, constraints, decisions, exact paths, completed work and remaining tasks.".into() }] });
-        let request = StepRequest { context: &context, system: "You summarize conversation data. Output only a concise continuation briefing.", tools: &[], on_delta: None };
+        if provider.summary_supports_max_output_tokens() {
+            context.config.max_output_tokens = Some(policy.summary_tokens);
+        } else {
+            context.config.max_output_tokens = None;
+        }
+        context.turns.push(ModelTurn::User { content: vec![ContentPart::Text { text: policy.prompt.clone() }] });
+        let request = StepRequest { context: &context, system: &policy.system_prompt, tools: &[], on_delta: None };
         let started = log.append(&SessionEvent::CompactionStarted {
             model: provider.summary_model().into(), sources: replayed.context.sources[first..n].to_vec(),
             estimated_input: measure(&context, request.system, &[]),

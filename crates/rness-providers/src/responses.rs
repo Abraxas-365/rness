@@ -377,6 +377,7 @@ impl Provider for ResponsesProvider {
     fn model(&self) -> &str {
         &self.model
     }
+    fn supports_max_output_tokens(&self) -> bool { false }
 
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         let started = Instant::now();
