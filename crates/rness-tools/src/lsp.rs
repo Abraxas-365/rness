@@ -88,7 +88,32 @@ impl Operation {
         }
     }
 }
-type Slot = Arc<tokio::sync::Mutex<Option<Connection>>>;
+type Slot = Arc<tokio::sync::Mutex<Option<ManagedConnection>>>;
+struct ManagedConnection(Option<Connection>);
+impl std::ops::Deref for ManagedConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.0.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for ManagedConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.0.as_mut().unwrap()
+    }
+}
+impl Drop for ManagedConnection {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.0.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                connection.close().await;
+            });
+        }
+        // Without a runtime, Child::kill_on_drop remains the last-resort cleanup.
+    }
+}
 struct Runtime {
     config: Config,
     connections: Mutex<BTreeMap<(String, PathBuf), Slot>>,
@@ -284,9 +309,41 @@ struct Connection {
     capabilities: Value,
     configuration: Value,
     root_uri: String,
+    pending: Option<u64>,
+    writable: bool,
+    synchronized: bool,
+    initialized: bool,
 }
 impl Connection {
-    async fn start(server: &Server, root: &Path, root_uri: &str) -> Result<Self, String> {
+    async fn close(&mut self) {
+        // A cancelled write cannot safely be followed by another JSON-RPC frame.
+        let graceful = async {
+            if !self.writable {
+                return;
+            }
+            if let Some(id) = self.pending {
+                let _ = self
+                    .send(json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}))
+                    .await;
+                let _ = tokio::time::timeout(Duration::from_millis(100), self.child.wait()).await;
+            }
+            // A cancelled read may have consumed a partial frame. Never resume that parser.
+            if self.initialized && self.synchronized && self.pending.is_none() {
+                if self.request("shutdown", Value::Null).await.is_ok() {
+                    let _ = self.send(json!({"jsonrpc":"2.0","method":"exit"})).await;
+                    let _ = self.child.wait().await;
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(1), graceful).await;
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+    }
+    async fn start(
+        server: &Server,
+        root: &Path,
+        root_uri: &str,
+    ) -> Result<ManagedConnection, String> {
         let mut command = tokio::process::Command::new(&server.command);
         command.args(&server.args).current_dir(root).env_clear();
         for key in [
@@ -313,7 +370,11 @@ impl Connection {
             .map_err(|e| format!("LSP launch {}: {e}", server.command))?;
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
-        let mut this = Self {
+        let mut this = ManagedConnection(Some(Self {
+            pending: None,
+            writable: true,
+            synchronized: true,
+            initialized: false,
             child,
             input,
             output,
@@ -321,7 +382,7 @@ impl Connection {
             capabilities: Value::Null,
             configuration: server.configuration.clone(),
             root_uri: root_uri.into(),
-        };
+        }));
         let initialized=this.request("initialize",json!({"processId":std::process::id(),"rootUri":root_uri,"capabilities":{"general":{"positionEncodings":["utf-16"]},"workspace":{"configuration":true,"workspaceFolders":true}},"workspaceFolders":[{"uri":root_uri,"name":root.file_name().and_then(|s|s.to_str()).unwrap_or("workspace")}],"initializationOptions":server.initialization_options})).await?;
         this.capabilities = initialized["capabilities"].clone();
         if this
@@ -337,10 +398,12 @@ impl Connection {
         }
         this.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))
             .await?;
+        this.initialized = true;
         Ok(this)
     }
     async fn send(&mut self, value: Value) -> Result<(), String> {
         let bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+        self.writable = false;
         self.input
             .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
             .await
@@ -349,15 +412,20 @@ impl Connection {
             .write_all(&bytes)
             .await
             .map_err(|e| e.to_string())?;
-        self.input.flush().await.map_err(|e| e.to_string())
+        self.input.flush().await.map_err(|e| e.to_string())?;
+        self.writable = true;
+        Ok(())
     }
     async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
         self.next += 1;
         let id = self.next;
         self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
             .await?;
+        self.pending = Some(id);
         loop {
+            self.synchronized = false;
             let message = read_message(&mut self.output).await?;
+            self.synchronized = true;
             if let Some(method) = message["method"].as_str() {
                 if let Some(id) = message.get("id") {
                     let result = match method {
@@ -384,6 +452,7 @@ impl Connection {
                 continue;
             }
             if message["id"] == id {
+                self.pending = None;
                 if let Some(error) = message.get("error") {
                     return Err(format!("LSP request error: {error}"));
                 }
@@ -553,6 +622,83 @@ while True:
             .execute(json!({"operation":"hover","file_path":"a.rs","line":0,"character":1}))
             .await
             .is_err());
+    }
+    #[tokio::test]
+    async fn lifecycle_shutdown_cancel_timeout_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("lifecycle.py");
+        let log = dir.path().join("events");
+        std::fs::write(&script, r#"
+import sys,json,os
+log=sys.argv[1]
+def record(text):
+    with open(log,'a') as f: f.write(str(os.getpid())+' '+text+'\n')
+record('start')
+while True:
+    headers={}
+    while True:
+        line=sys.stdin.buffer.readline()
+        if not line: sys.exit(0)
+        if line==b'\r\n': break
+        k,v=line.decode().split(':',1); headers[k.lower()]=v.strip()
+    m=json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
+    method=m.get('method');record(method)
+    if method=='exit': sys.exit(0)
+    if method=='$/cancelRequest':
+        record('cancel-id-'+str(m['params']['id']));continue
+    if 'id' not in m: continue
+    if method=='initialize': result={'capabilities':{'textDocumentSync':1,'hoverProvider':True}}
+    elif method=='shutdown': result=None
+    elif method=='hang': continue
+    elif method=='partial':
+        sys.stdout.buffer.write(b'Content-Length: 100\r\n\r\n{"id":');sys.stdout.buffer.flush();continue
+    elif method=='crash': sys.exit(1)
+    else: result={'contents':'ok'}
+    body=json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(body)).encode()+body);sys.stdout.buffer.flush()
+"#).unwrap();
+        let server: Server = serde_json::from_value(
+            json!({"command":"python3","args":[script,log],"extension_to_language":{".rs":"rust"}}),
+        )
+        .unwrap();
+        let mut connection = Connection::start(&server, dir.path(), "file:///workspace/")
+            .await
+            .unwrap();
+        connection.close().await;
+        let events = std::fs::read_to_string(&log).unwrap();
+        assert!(events.contains(" shutdown\n"));
+        assert!(events.contains(" exit\n"));
+        for method in ["hang", "partial"] {
+            let mut connection = Connection::start(&server, dir.path(), "file:///workspace/")
+                .await
+                .unwrap();
+            assert!(tokio::time::timeout(
+                Duration::from_millis(100),
+                connection.request(method, json!({}))
+            )
+            .await
+            .is_err());
+            assert_eq!(connection.pending, Some(2));
+            connection.close().await;
+            assert!(connection.child.try_wait().unwrap().is_some());
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap().matches("cancel-id-2").count(), 2);
+        let mut crashed = Connection::start(&server, dir.path(), "file:///workspace/")
+            .await
+            .unwrap();
+        assert!(crashed.request("crash", json!({})).await.is_err());
+        crashed.close().await;
+        let mut restarted = Connection::start(&server, dir.path(), "file:///workspace/")
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted
+                .request("textDocument/hover", json!({}))
+                .await
+                .unwrap()["contents"],
+            "ok"
+        );
+        restarted.close().await;
     }
     #[test]
     fn duplicate_extensions_rejected_atomically() {
