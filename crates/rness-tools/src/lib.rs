@@ -21,6 +21,7 @@ pub mod skills;
 pub mod subagent;
 pub mod subagent_control;
 pub mod write;
+pub mod web;
 
 /// The observed version of a file: mtime plus length. Comparing both
 /// catches same-mtime rewrites that a timestamp alone would miss

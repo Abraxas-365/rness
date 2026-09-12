@@ -417,6 +417,10 @@ async fn main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("no working directory")?;
     let tools = Arc::new(ToolRegistry::default());
     let jobs = rness_tools::register_all(&tools, rness_tools::Workspace::new(&cwd));
+    if let Some(web) = startup.web.clone() {
+        let web = serde_json::from_value(web).context("invalid rness.web configuration")?;
+        rness_tools::web::register_with_hooks(&tools, web, Arc::new(lua.clone())).map_err(|e| anyhow::anyhow!("invalid rness.web: {e}"))?;
+    }
 
     // Lua host: the VM boots now, but plugins load AFTER the engine
     // mounts — rness.session/subagents/mcp must exist when a plugin's

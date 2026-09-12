@@ -24,6 +24,10 @@ grep-regex.workspace = true
 grep-matcher.workspace = true
 similar.workspace = true
 notify.workspace = true
+reqwest.workspace = true
+encoding_rs = "0.8"
+htmd = "0.5"
+markup5ever_rcdom = "0.38"
 
 [dev-dependencies]
 tempfile.workspace = true

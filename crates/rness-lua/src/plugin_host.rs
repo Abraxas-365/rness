@@ -19,6 +19,21 @@ impl rness_kernel::presentation::TextProvider for LuaHost {
     }
 }
 
+#[async_trait::async_trait]
+impl rness_tools::web::WebHooks for LuaHost {
+    async fn transform(&self, operation: &str, phase: &str, value: serde_json::Value, context: serde_json::Value, cancel: &tokio_util::sync::CancellationToken) -> Result<serde_json::Value, String> {
+        let token = cancel.child_token();
+        let _guard = token.clone().drop_guard();
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::WebTransform { operation: operation.into(), phase: phase.into(), value, context, cancel: token.clone(), reply }).map_err(|_| "lua vm gone")?;
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err("web hook cancelled".into()),
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), rx) => result.map_err(|_| "web hook timed out")?.map_err(|_| "lua vm gone")?,
+        }
+    }
+}
+
 impl rness_kernel::presentation::HookSink for LuaHost {
     fn fire_hook(&self, event: &str, payload: serde_json::Value) { LuaHost::fire_hook(self, event, payload); }
 }
@@ -79,6 +94,7 @@ pub(crate) enum ReloadError {
 }
 
 enum Cmd {
+    WebTransform { operation: String, phase: String, value: serde_json::Value, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>> },
     ValidateBindings { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
     ActionSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaActionSpec>> },
     BindingSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>> },
@@ -377,6 +393,28 @@ impl LuaHost {
                         Cmd::PluginNames { reply } => { let _ = reply.send(rt.plugin_names()); }
                         Cmd::ToolSpecs { reply } => {
                             let _ = reply.send(rt.tool_specs());
+                        }
+                        Cmd::WebTransform { operation, phase, value, context, cancel, reply } => {
+                            use mlua::LuaSerdeExt;
+                            let token = cancel.clone();
+                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                            rt.lua().set_app_data(cancel.clone());
+                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                                if token.is_cancelled() || std::time::Instant::now() >= deadline { Err(mlua::Error::runtime("web hook cancelled or timed out")) } else { Ok(mlua::VmState::Continue) }
+                            });
+                            let result = (|| -> mlua::Result<serde_json::Value> {
+                                if cancel.is_cancelled() || reply.is_closed() { return Err(mlua::Error::runtime("web hook cancelled")); }
+                                let rness: mlua::Table = rt.lua().globals().get("rness")?;
+                                let Some(web) = rness.get::<Option<mlua::Table>>("web")? else { return Ok(value); };
+                                let Some(section) = web.get::<Option<mlua::Table>>(operation.as_str())? else { return Ok(value); };
+                                let Some(callback) = section.get::<Option<mlua::Function>>(phase.as_str())? else { return Ok(value); };
+                                let returned: mlua::Value = callback.call((rt.lua().to_value(&value)?, rt.lua().to_value(&context)?))?;
+                                if !matches!(returned, mlua::Value::Table(_)) { return Err(mlua::Error::runtime("web hook must return a table")); }
+                                rt.lua().from_value(returned)
+                            })().map_err(|e| format!("web.{operation}.{phase}: {e}"));
+                            rt.lua().remove_hook();
+                            rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
+                            let _ = reply.send(result);
                         }
                         Cmd::CallTool { name, args, context, reply } => {
                             let r = match rt.call_tool_presented(&name, &args, &context) {

@@ -19,6 +19,7 @@ pub struct UserMapping {
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub web: Option<serde_json::Value>,
     pub tool_exposure: rness_engine::tools::exposure::Exposure,
     pub compaction: BTreeMap<String, rness_engine::turn::compaction::Policy>,
     pub mappings: Vec<UserMapping>,
@@ -42,6 +43,23 @@ pub struct StartupConfig {
 
 #[cfg(test)]
 mod permission_tests {
+    #[test]
+    fn web_configuration_registers_selected_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for provider in ["exa", "perplexity", "deepseek"] {
+            std::fs::write(&path, format!("rness.web = {{ fetch = {{timeout_ms=30000}}, search = {{provider='{provider}'}} }}")).unwrap();
+            let startup = super::load(&path).unwrap();
+            let config = serde_json::from_value(startup.web.unwrap()).unwrap();
+            let registry = rness_engine::tools::ToolRegistry::default();
+            rness_tools::web::register(&registry, config).unwrap();
+            assert!(registry.get("web_search").is_some());
+            assert!(registry.get("web_fetch").is_some());
+        }
+        std::fs::write(&path, "rness.web = {search={provider='brave'}}").unwrap();
+        let startup = super::load(&path).unwrap();
+        assert!(serde_json::from_value::<rness_tools::web::Config>(startup.web.unwrap()).is_err());
+    }
     #[test]
     fn boundary_compaction_requires_explicit_valid_route_budgets() {
         let dir = tempfile::tempdir().unwrap();
@@ -426,6 +444,24 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     keymap.set("setup", lua.create_function(|_, _: mlua::Value| -> mlua::Result<()> {
         Err(mlua::Error::runtime("keymap.setup is startup-only; restart to change mappings"))
     })?)?;
+    if let Some(web) = rness.get::<Option<Table>>("web")? {
+        let data = lua.create_table()?;
+        for entry in web.pairs::<String, mlua::Value>() {
+            let (key, value) = entry?;
+            if matches!(key.as_str(), "search" | "fetch") {
+                let mlua::Value::Table(section) = value else { return Err("web sections must be tables".into()); };
+                let cleaned = lua.create_table()?;
+                for entry in section.pairs::<String, mlua::Value>() {
+                    let (field, value) = entry?;
+                    if matches!(field.as_str(), "before" | "after") {
+                        if !matches!(value, mlua::Value::Function(_)) { return Err("web hooks must be functions".into()); }
+                    } else { cleaned.set(field, value)?; }
+                }
+                data.set(key, cleaned)?;
+            } else { data.set(key, value)?; }
+        }
+        state.lock().unwrap().web = Some(lua.from_value(mlua::Value::Table(data))?);
+    }
     if let Some(exposure) = rness.get::<Option<Table>>("tool_exposure")? {
         state.lock().unwrap().tool_exposure = lua.from_value(mlua::Value::Table(exposure))?;
     }

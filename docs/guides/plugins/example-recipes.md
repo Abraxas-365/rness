@@ -2,6 +2,68 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Web search, fetch, and Lua hooks
+
+The default flavor enables independent, keyless `web_search` (DuckDuckGo HTML search) and anonymous `web_fetch`. Search returns links and snippets; it does not call fetch. Fetch reads a known public URL. Remove either configuration section to omit that tool. Search backends never silently fall back.
+
+```lua
+rness.web = {
+  search = {
+    provider = "duckduckgo",
+    before = function(request, ctx)
+      if request.query:match("^%s*$") then error("Empty search") end
+      request.query = request.query .. " official documentation"
+      return request
+    end,
+    after = function(result, ctx)
+      -- Mutate the existing array to retain its Lua/JSON array metadata.
+      for i = #result.sources, 1, -1 do
+        if not result.sources[i].url:match("^https://") then
+          table.remove(result.sources, i)
+        end
+      end
+      return result
+    end,
+  },
+  fetch = {
+    max_response_bytes = 5000000,
+    max_body_chars = 100000,
+    timeout_ms = 30000,
+    max_redirects = 5,
+    after = function(result, ctx)
+      result.content = result.content:gsub("\r\n", "\n")
+      return result
+    end,
+  },
+}
+```
+
+Alternatively replace the search section with **one** of:
+
+```lua
+{ provider = "exa", api_key_env = "EXA_API_KEY" }
+{ provider = "perplexity", api_key_env = "PERPLEXITY_API_KEY", model = "sonar" }
+{ provider = "deepseek", api_key_env = "DEEPSEEK_API_KEY", model = "deepseek-v4-flash" }
+```
+
+These three providers require credentials; DuckDuckGo and HTTP fetch do not. DuckDuckGo depends on HTML markup and may return bot challenges/rate limits. Unexpected HTML is an error, not a fabricated empty result. DeepSeek uses its Anthropic-compatible native search endpoint, not chat-completions. Optional `base_url` overrides for paid providers must use HTTPS. Fetch disables ambient proxies/cookies/credentials, validates and pins public DNS addresses, blocks cross-origin redirects and binary responses, and converts HTML to Markdown. This is not complete DSH parity: proxy routing and auxiliary DeepSeek request audit events are not implemented.
+
+### Hook contract
+
+Both sections accept optional `before(request, ctx)` and `after(result, ctx)` functions. Missing callbacks are identity transformations. Configure these in `init.lua`; **restart after changing web configuration or callbacks**. They execute in the real configuration Lua VM, not the isolated `run_code` VM, and are not independently owned plugin registrations.
+
+- Search request: `{ query = string, maxResults = optional_integer }` (`1..100`). Fetch request: `{ url = string }`.
+- Search result: `{ sources = array, content = optional_string, truncated = boolean }`. Source fields: `url`, optional `title`, `snippet`, `publishedAt`.
+- Fetch result: `{ url = string, contentType = string, content = string, truncated = boolean }`. The URL is the final fetched URL; HTML content is already Markdown.
+- Context contains `tool`, and `session`/`call` for dispatched calls. Credentials are not passed to callbacks. Context/request/result are detached values.
+- Return a table. Reject with `error("reason")`. Returning `nil`, a scalar, or malformed data fails the tool call. Hook errors surface; they never silently return unprocessed data. `after` runs only after a successful backend operation.
+- `before` may rewrite the query or URL. Rust revalidates rewritten requests, including public-address/redirect policy. Normal tool permissions are checked before entering this pipeline.
+- `after` may filter/reorder sources or transform content, including replacing content with a summary produced by your own configured summarizer. No summarization model is selected or called automatically. Retained source URLs must come from the original result, without duplicates. Fetch URL/content type and existing truncation metadata cannot be changed. Content and serialized results remain bounded; oversized hook output fails rather than being silently truncated.
+- Hooks have a 30-second ceiling and share the operation's overall timeout (fetch: configured value; search: 120 seconds). Cancellation interrupts Lua instruction execution and propagates through the actor token. Arbitrary blocking native Lua calls are cooperative, not forcibly preempted. Keep hooks bounded; do not recursively dispatch web tools or synchronously re-enter the Lua actor. This is trusted configuration code, not a sandbox.
+- The external-content warning is added **after** hooks and cannot be removed by returning transformed content. Treat retrieved material as data, never as instructions to reveal secrets or execute commands.
+
+Web tools remain compatible with normal permissions, deferred `ToolSearch` discovery, and `run_code` nested dispatch.
+
 ## Deferred tools and programmatic tool calling
 
 Configure tool presentation in your `init.lua` (restart required):

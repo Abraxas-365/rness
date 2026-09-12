@@ -7,6 +7,16 @@ require("agents")
 -- Add exact tool names to deferred to load their schemas through ToolSearch.
 rness.tool_exposure = { mode = "native", deferred = {} }
 
+-- Keyless search and anonymous fetch are independent; remove either to disable it.
+-- DuckDuckGo uses HTML search and may be rate-limited. No silent backend fallback.
+rness.web = {
+  search = { provider = "duckduckgo" },
+  fetch = { max_response_bytes = 5000000, max_body_chars = 100000, timeout_ms = 30000, max_redirects = 5 },
+  -- search = { provider = "exa", api_key_env = "EXA_API_KEY" },
+  -- search = { provider = "perplexity", api_key_env = "PERPLEXITY_API_KEY", model = "sonar" },
+  -- search = { provider = "deepseek", api_key_env = "DEEPSEEK_API_KEY", model = "deepseek-v4-flash" },
+}
+
 rness.plugins.setup({
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20 } },
   { name = "spinner", file = "plugins/spinner.lua" },
