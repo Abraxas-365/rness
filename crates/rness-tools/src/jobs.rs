@@ -120,6 +120,12 @@ impl JobWriter {
 }
 
 impl JobRegistry {
+    pub(crate) fn stream_output(&self, session: &str, call: &str, output: String) {
+        if let Some(sessions) = self.inner.sessions.lock().unwrap().upgrade() {
+            sessions.bus().emit::<rness_engine::subagent::ToolStreamEv>(&(session.into(), call.into(), output));
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Registry {

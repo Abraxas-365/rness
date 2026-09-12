@@ -37,6 +37,21 @@ async fn structured_statusline_callbacks_replace_and_unload() {
 }
 
 #[tokio::test]
+async fn default_subagent_renderer_shows_task_command_and_live_text() {
+    use rness_engine::presentation::ToolCards;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    let lines = host.tool_card_presented("subagent", serde_json::json!({"agent":"scout", "prompt":"Inspect tests"}), "", false,
+        Some(serde_json::json!({"kind":"subagent_activity", "status":"running", "activity":"Bash cargo test", "elapsed_ms":2000,
+            "lines":["> Bash cargo test", "passed"], "live":"Checking next file"}))).await.unwrap();
+    assert!(lines[0].is_header);
+    assert!(lines[0].text.contains("scout · running · 2s"));
+    assert!(lines.iter().any(|line| line.text == "Inspect tests"));
+    assert!(lines.iter().any(|line| line.text == "> Bash cargo test"));
+    assert!(lines.iter().any(|line| line.text == "Checking next file"));
+}
+
+#[tokio::test]
 async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default");
     let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();
@@ -44,7 +59,9 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 6);
+    assert_eq!(config.messagebox["tools"]["Bash"]["arguments"]["visible"], true);
+    assert_eq!(config.messagebox["tools"]["Bash"]["arguments"]["wrap"], true);
+    assert_eq!(config.plugin_specs.len(), 7);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
     assert_eq!(policy.prune_threshold, 8192);
@@ -54,9 +71,22 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert!(!commands.contains("compact-region"));
     let specs = rness_lua::loader::discover_specs(&root, &config.plugin_specs).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let host = booted_host(dir.path()).await;
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()), Arc::new(Silent), registry.clone(),
+        TurnConfig::default(), Arc::new(EventBus::default()),
+    ));
+    let host = LuaHost::spawn().unwrap();
+    host.install_session(
+        sessions.clone(),
+        Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)),
+        registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into(),
+    ).await.unwrap();
+    host.install_questions(Arc::new(rness_engine::questions::Questions::default())).await.unwrap();
+    assert!(!sessions.reference_service().enabled());
     let errors = rness_lua::loader::load_all(&host, &specs).await;
     assert!(errors.is_empty(), "{errors:?}");
+    assert!(sessions.reference_service().enabled());
     host.validate_bindings().await.unwrap();
 }
 

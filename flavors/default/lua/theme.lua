@@ -38,6 +38,29 @@ rness.ui.messagebox = {
   },
   error = { style = "error", display = "expanded" },
   tools = {
+    subagent = { display = "collapsed", render = function(call)
+      local p = call.presentation
+      if not p or p.kind ~= "subagent_activity" then return nil end
+      local a = call.args or {}
+      local body = { { text = a.prompt or "", style = "dim" } }
+      for _, line in ipairs(p.lines or {}) do
+        body[#body + 1] = { text = line, style = "tool_output" }
+      end
+      local streams = {}
+      for id in pairs(p.streams or {}) do streams[#streams + 1] = id end
+      table.sort(streams)
+      for _, id in ipairs(streams) do
+        body[#body + 1] = { text = id .. " (live)", style = "dim" }
+        body[#body + 1] = { text = p.streams[id], style = "tool_output" }
+      end
+      if p.live and p.live ~= "" then body[#body + 1] = { text = p.live, style = "assistant_text" } end
+      return {
+        header = { text = string.format("%s · %s · %ds · %s",
+          a.agent or "subagent", p.status, math.floor(p.elapsed_ms / 1000), p.activity), style = "tool_name" },
+        body = body,
+      }
+    end },
+    Bash = { arguments = { visible = true, wrap = true } },
     Edit = { render = function(call)
       if call.is_error then return nil end
       local a = call.args

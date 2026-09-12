@@ -108,17 +108,18 @@ impl Tool for SubagentTool {
     }
 
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
-        self.run_presented(session, args).await.map(|(output, _)| output)
+        self.run_presented(session, args, None).await.map(|(output, _)| output)
     }
 
     async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, metadata) = self.run_presented(session, args).await?;
+        let presentation = Some((_call.clone(), args.clone()));
+        let (output, metadata) = self.run_presented(session, args, presentation).await?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
     }
 }
 
 impl SubagentTool {
-    async fn run_presented(&self, session: &SessionId, args: Value) -> Result<(String, Value), String> {
+    async fn run_presented(&self, session: &SessionId, args: Value, presentation: Option<(String, Value)>) -> Result<(String, Value), String> {
         let provider = crate::required_str(&args, "provider")?.to_string();
         let prompt = crate::required_str(&args, "prompt")?.to_string();
         let background = args["run_in_background"].as_bool().unwrap_or(false);
@@ -136,7 +137,7 @@ impl SubagentTool {
             // settle watch; steering goes through send_message.
             let child = self
                 .runtime
-                .start_continuable(&provider, request)
+                .start_continuable_presented(&provider, request, presentation)
                 .map_err(|e| e.to_string())?;
             return Ok((format!(
                 "started continuable agent {child} — message it with \
@@ -148,7 +149,7 @@ impl SubagentTool {
         if !background {
             let run = self
                 .runtime
-                .start(&provider, request)
+                .start_presented(&provider, request, presentation)
                 .await
                 .map_err(|e| e.to_string())?;
             return render(&run).map(|output| (output, json!({"version":1,"kind":"subagent","mode":"foreground","session":run.session,"status":"completed"})));
@@ -161,7 +162,7 @@ impl SubagentTool {
         let (id, writer) = self.jobs.start_owned("subagent", label, Some(session));
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {
-            match runtime.start(&provider, request).await {
+            match runtime.start_presented(&provider, request, presentation).await {
                 Ok(run) => match render(&run) {
                     Ok(text) => {
                         writer.append(text.as_bytes());

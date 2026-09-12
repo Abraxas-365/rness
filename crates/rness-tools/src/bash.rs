@@ -48,6 +48,35 @@ fn tail_truncate(mut text: String) -> String {
     format!("… {cut} bytes truncated …\n{text}")
 }
 
+fn publish_stream(pending: &mut Vec<u8>, bytes: &[u8], eof: bool, stream: &Option<(JobRegistry, String, String)>) {
+    let Some((jobs, session, call)) = stream else { return };
+    pending.extend_from_slice(bytes);
+    let complete = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(error) if error.error_len().is_none() && !eof => error.valid_up_to(),
+        Err(_) => pending.len(),
+    };
+    if complete > 0 {
+        jobs.stream_output(session, call, String::from_utf8_lossy(&pending[..complete]).into_owned());
+        pending.drain(..complete);
+    }
+}
+
+async fn drain_stream(
+    mut pipe: impl tokio::io::AsyncRead + Unpin,
+    stream: &Option<(JobRegistry, String, String)>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = pipe.read(&mut buffer).await?;
+        output.extend_from_slice(&buffer[..n]);
+        publish_stream(&mut pending, &buffer[..n], n == 0, stream);
+        if n == 0 { return Ok(output); }
+    }
+}
+
 fn spawn_shell(command: &str, workdir: &std::path::Path) -> std::io::Result<tokio::process::Child> {
     tokio::process::Command::new("/bin/sh")
         .arg("-c")
@@ -97,7 +126,7 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.run_presented(args, None).await.map(|(output, _)| output)
+        self.run_presented(args, None, None).await.map(|(output, _)| output)
     }
 
     async fn execute_presented(
@@ -107,13 +136,13 @@ impl Tool for BashTool {
         args: Value,
         _cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, presentation) = self.run_presented(args, Some(_session)).await?;
+        let (output, presentation) = self.run_presented(args, Some(_session), Some(_call)).await?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
     }
 }
 
 impl BashTool {
-    async fn run_presented(&self, args: Value, owner: Option<&String>) -> Result<(String, Value), String> {
+    async fn run_presented(&self, args: Value, owner: Option<&String>, call: Option<&String>) -> Result<(String, Value), String> {
         let command = required_str(&args, "command")?;
         required_str(&args, "description")?;
         let workdir = self.ws.resolve(args["workdir"].as_str().unwrap_or("."));
@@ -121,6 +150,7 @@ impl BashTool {
             return Err(format!("workdir {} is not a directory", workdir.display()));
         }
 
+        let stream = owner.zip(call).map(|(owner, call)| (self.jobs.clone(), owner.clone(), call.clone()));
         if args["run_in_background"].as_bool().unwrap_or(false) {
             let mut child =
                 spawn_shell(command, &workdir).map_err(|e| format!("spawn: {e}"))?;
@@ -132,6 +162,8 @@ impl BashTool {
                 let cancel = writer.cancelled();
                 let mut out_buf = [0u8; 8192];
                 let mut err_buf = [0u8; 8192];
+                let mut out_stream = Vec::new();
+                let mut err_stream = Vec::new();
                 let mut out_open = true;
                 let mut err_open = true;
                 loop {
@@ -142,12 +174,18 @@ impl BashTool {
                             return;
                         }
                         n = stdout_pipe.read(&mut out_buf), if out_open => match n {
-                            Ok(0) | Err(_) => out_open = false,
-                            Ok(n) => writer.append(&out_buf[..n]),
+                            Ok(0) | Err(_) => { out_open = false; publish_stream(&mut out_stream, &[], true, &stream); },
+                            Ok(n) => {
+                                writer.append(&out_buf[..n]);
+                                publish_stream(&mut out_stream, &out_buf[..n], false, &stream);
+                            },
                         },
                         n = stderr_pipe.read(&mut err_buf), if err_open => match n {
-                            Ok(0) | Err(_) => err_open = false,
-                            Ok(n) => writer.append(&err_buf[..n]),
+                            Ok(0) | Err(_) => { err_open = false; publish_stream(&mut err_stream, &[], true, &stream); },
+                            Ok(n) => {
+                                writer.append(&err_buf[..n]);
+                                publish_stream(&mut err_stream, &err_buf[..n], false, &stream);
+                            },
                         },
                         status = child.wait(), if !out_open && !err_open => {
                             let code = status.ok().and_then(|s| s.code());
@@ -177,15 +215,13 @@ impl BashTool {
         let mut stdout_pipe = child.stdout.take().expect("piped stdout");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
         let run = async {
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            let (o, e, status) = tokio::join!(
-                stdout_pipe.read_to_end(&mut out),
-                stderr_pipe.read_to_end(&mut err),
+            let (out, err, status) = tokio::join!(
+                drain_stream(&mut stdout_pipe, &stream),
+                drain_stream(&mut stderr_pipe, &stream),
                 child.wait(),
             );
-            o.map_err(|e| format!("read stdout: {e}"))?;
-            e.map_err(|e| format!("read stderr: {e}"))?;
+            let out = out.map_err(|e| format!("read stdout: {e}"))?;
+            let err = err.map_err(|e| format!("read stderr: {e}"))?;
             let status = status.map_err(|e| format!("wait: {e}"))?;
             Ok::<_, String>((out, err, status))
         };

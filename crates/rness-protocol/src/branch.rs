@@ -41,6 +41,8 @@ pub struct ChildRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
     pub parent: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
     pub depth: u32,
     /// Child shape (dsh): one-shot settles once; continuable keeps a
     /// durable session that accepts later messages and interrupts.

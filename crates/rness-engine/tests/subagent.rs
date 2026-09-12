@@ -66,6 +66,57 @@ async fn one_completed_turn(sessions: &Arc<SessionService>, id: &SessionId) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn activity_is_scoped_to_parent_call_and_excludes_fork_seed() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    one_completed_turn(&sessions, &parent).await;
+    for (mode, call) in [("spawn", "a"), ("fork", "b")] {
+        rt.start_presented(mode, SubagentRequest {
+            parent: parent.clone(), agent: None, prompt: "inspect".into(),
+        }, Some((call.into(), serde_json::json!({"prompt":"inspect"})))).await.unwrap();
+    }
+    assert!(rt.activity.snapshots(&sessions, "other").is_empty());
+    let snapshots = rt.activity.snapshots(&sessions, &parent);
+    assert_eq!(snapshots.len(), 2);
+    for (call, args, view) in &snapshots {
+        assert!(["a", "b"].contains(&call.as_str()));
+        assert_eq!(args["prompt"], "inspect");
+        assert_eq!(view["status"], "completed");
+        assert_eq!(view["lines"].as_array().unwrap().len(), 1);
+    }
+    let again = rt.activity.snapshots(&sessions, &parent);
+    assert_eq!(snapshots, again);
+    let mut log = rness_engine::session::log::SessionLog::open(dir.path(), &parent).unwrap();
+    log.append(&SessionEvent::AssistantMessage(AssistantMessage {
+        model: "fake".into(), content: ["a", "b"].into_iter().map(|call| ContentPart::ToolUse {
+            call: call.into(), name: "subagent".into(), args: serde_json::json!({"prompt":"inspect"}),
+        }).collect(), stop: StopReason2::ToolUse, usage: Usage::default(), chunks: vec![],
+    })).unwrap();
+    drop(log);
+    let reopened = service(dir.path());
+    let recovered = runtime(&reopened, 3);
+    recovered.activity.recover(&reopened, &parent).unwrap();
+    let restored = recovered.activity.snapshots(&reopened, &parent);
+    assert_eq!(restored.len(), 2);
+    for (call, _, view) in &restored {
+        let old = snapshots.iter().find(|(id, _, _)| id == call).unwrap();
+        assert_eq!(view["lines"], old.2["lines"]);
+        assert_eq!(view["status"], "completed");
+    }
+    recovered.activity.recover(&reopened, &parent).unwrap();
+    assert_eq!(restored, recovered.activity.snapshots(&reopened, &parent));
+    let child = snapshots[0].2["session"].as_str().unwrap().to_string();
+    rt.activity.observe(&rness_protocol::frames::Frame::Delta {
+        session: child.clone(), chunk: ChunkDelta::Text { t: "live text".into() },
+    });
+    assert!(rt.activity.snapshots(&sessions, &parent).iter().any(|(_, _, view)| view["live"] == "live text"));
+    rt.activity.observe(&rness_protocol::frames::Frame::StepCommitted { session: child, event: "commit".into() });
+    assert!(rt.activity.snapshots(&sessions, &parent).iter().all(|(_, _, view)| view["live"] == ""));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn provider_profiles_follow_parent_without_inheriting_model_options() {
     use rness_engine::config::{AgentDefinition, ModelRegistry, Profile};
     let dir = tempfile::tempdir().unwrap();

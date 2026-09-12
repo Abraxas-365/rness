@@ -57,6 +57,35 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
 }
 
 #[tokio::test]
+async fn bash_streams_before_exit_and_preserves_split_utf8() {
+    use rness_engine::tools::Tool;
+    let dir = tempfile::tempdir().unwrap();
+    let (sessions, _) = compose(dir.path());
+    let jobs = rness_tools::jobs::JobRegistry::new();
+    jobs.attach_sessions(&sessions);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _watch = sessions.bus().on::<rness_engine::subagent::ToolStreamEv>(move |value| { tx.send(value.clone()).unwrap(); });
+    let tool = rness_tools::bash::BashTool::new(rness_tools::Workspace::new(dir.path()), jobs);
+    let gate = dir.path().join("gate");
+    let command = format!("printf 'ready'; printf '\\303'; while [ ! -f '{}' ]; do :; done; printf '\\251'; printf 'stderr' >&2", gate.display());
+    let run = tokio::spawn(async move {
+        tool.execute_presented(&"owner".into(), &"bash-call".into(), serde_json::json!({"command":command,"description":"stream test","timeout_ms":5000}), &CancellationToken::new()).await
+    });
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(first, ("owner".into(), "bash-call".into(), "ready".into()));
+    assert!(!run.is_finished());
+    std::fs::write(gate, "go").unwrap();
+    run.await.unwrap().unwrap();
+    let mut text = first.2;
+    while let Ok((session, call, chunk)) = rx.try_recv() {
+        assert_eq!(session, "owner"); assert_eq!(call, "bash-call"); text.push_str(&chunk);
+    }
+    assert!(text.contains("é"));
+    assert!(text.contains("stderr"));
+    assert!(!text.contains('\u{fffd}'));
+}
+
+#[tokio::test]
 async fn completion_waits_for_reservations_without_duplicate_delivery() {
     use rness_engine::interaction::{Command, CommandInvocation, CommandResult};
     use rness_engine::service::ServiceError;

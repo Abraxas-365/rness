@@ -71,7 +71,7 @@ async fn workspace_survives_resume_and_controls_instructions_and_input() {
     assert!(seen.contains("project-specific-rule"));
     assert!(!seen.contains("wrong-launch-rule"));
     let spawned = resumed.create_delegated(None, rness_protocol::branch::Delegation {
-        parent: id.clone(), depth: 1, mode: Default::default(),
+        parent: id.clone(), call: None, depth: 1, mode: Default::default(),
     }).unwrap();
     assert_eq!(resumed.store().workspace(&spawned).unwrap().as_deref(), expected.to_str());
     let child = resumed.fork(&id, None).unwrap();

@@ -27,6 +27,9 @@ use crate::inbox::Disposition;
 use crate::service::{ServiceError, SessionIdleEv, SessionService};
 use crate::session::branch::BranchError;
 
+mod activity;
+pub use activity::{SubagentActivity, ToolStreamEv};
+
 /// What a provider can do. Requests asking for anything a provider does
 /// not declare are rejected at `start` — fail loud (dsh invariant).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -158,6 +161,7 @@ pub struct SubagentRuntime {
     /// Hard ceiling on delegation depth (root = 0). Runaway recursive
     /// delegation dies here, not in a stack.
     max_depth: u32,
+    pub activity: SubagentActivity,
     /// Live settle-watch subscriptions for continuable children;
     /// dropped with the runtime.
     watchers: std::sync::Mutex<Vec<Disposer>>,
@@ -169,6 +173,7 @@ impl SubagentRuntime {
             sessions: Arc::clone(&sessions),
             providers: RwLock::new(HashMap::new()),
             max_depth,
+            activity: SubagentActivity::default(),
             watchers: std::sync::Mutex::new(Vec::new()),
         };
         // Settle watch (dsh: "when a resident Activation settles, the
@@ -243,6 +248,13 @@ impl SubagentRuntime {
         provider: &str,
         request: SubagentRequest,
     ) -> Result<SubagentRun, SubagentError> {
+        self.start_presented(provider, request, None).await
+    }
+
+    pub async fn start_presented(
+        &self, provider: &str, request: SubagentRequest,
+        presentation: Option<(String, serde_json::Value)>,
+    ) -> Result<SubagentRun, SubagentError> {
         let provider = self
             .providers
             .read()
@@ -263,7 +275,7 @@ impl SubagentRuntime {
             return Err(SubagentError::DepthExceeded { depth, max: self.max_depth });
         }
         let delegation =
-            Delegation { parent: request.parent.clone(), depth, mode: DelegationMode::OneShot };
+            Delegation { parent: request.parent.clone(), call: presentation.as_ref().map(|(call, _)| call.clone()), depth, mode: DelegationMode::OneShot };
 
         let config = self.sessions.delegated_config(&request.parent, request.agent.as_deref())?;
         let child = provider.create_child(&self.sessions, &request, delegation)?;
@@ -273,12 +285,18 @@ impl SubagentRuntime {
         // fork seed). The settled output must come from after it, so a
         // fork never re-reads inherited assistant text as its "result".
         let boundary = self.sessions.store().history(&child)?.len();
+        if let Some((call, args)) = presentation {
+            self.activity.register(&self.sessions, &request.parent, &call, &child, args);
+        }
 
         self.sessions.send(
             &child,
             UserIntent::Followup,
             vec![ContentPart::Text { text: request.prompt.clone() }],
-        )?;
+        ).map_err(|error| {
+            self.activity.failed(&child);
+            error
+        })?;
         self.sessions.join(&child).await;
 
         Ok(settle(&self.sessions, &child, boundary)?)
@@ -295,6 +313,13 @@ impl SubagentRuntime {
         &self,
         provider: &str,
         request: SubagentRequest,
+    ) -> Result<SessionId, SubagentError> {
+        self.start_continuable_presented(provider, request, None)
+    }
+
+    pub fn start_continuable_presented(
+        &self, provider: &str, request: SubagentRequest,
+        presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SessionId, SubagentError> {
         let provider = self
             .providers
@@ -322,6 +347,7 @@ impl SubagentRuntime {
         }
         let delegation = Delegation {
             parent: request.parent.clone(),
+            call: presentation.as_ref().map(|(call, _)| call.clone()),
             depth,
             mode: DelegationMode::Continuable,
         };
@@ -329,11 +355,17 @@ impl SubagentRuntime {
         let config = self.sessions.delegated_config(&request.parent, request.agent.as_deref())?;
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
+        if let Some((call, args)) = presentation {
+            self.activity.register(&self.sessions, &request.parent, &call, &child, args);
+        }
         self.sessions.send(
             &child,
             UserIntent::Followup,
             vec![ContentPart::Text { text: request.prompt.clone() }],
-        )?;
+        ).map_err(|error| {
+            self.activity.failed(&child);
+            error
+        })?;
         Ok(child)
     }
 

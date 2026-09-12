@@ -648,7 +648,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         // Run the TUI over protocol frames.
-        return run_tui(kernel, sessions, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone(), startup.messagebox.clone())
+        return run_tui(kernel, sessions, subagents, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone(), startup.messagebox.clone())
             .await;
     };
 
@@ -901,6 +901,7 @@ impl rness_tui::app::Backend for LocalBackend {
 async fn run_tui(
     kernel: Kernel,
     sessions: Arc<SessionService>,
+    subagents: Arc<rness_engine::subagent::SubagentRuntime>,
     session: SessionId,
     model_name: String,
     questions: Arc<rness_engine::questions::Questions>,
@@ -1104,6 +1105,53 @@ async fn run_tui(
             }
         }
     });
+
+    let activity_runtime = subagents.clone();
+    let _activity_sub = kernel.bus().on::<FrameEv>(move |frame| activity_runtime.activity.observe(frame));
+    let stream_runtime = subagents.clone();
+    let _stream_sub = kernel.bus().on::<rness_engine::subagent::ToolStreamEv>(move |(session, call, text)| {
+        stream_runtime.activity.stream(session, call, text);
+    });
+    let activity_task = {
+        let lua = lua.clone();
+        let cache = card_cache.clone();
+        let sessions = sessions.clone();
+        let subagents = subagents.clone();
+        let watched = watched.clone();
+        tokio::spawn(async move {
+            let mut recovered = std::collections::HashSet::new();
+            let mut published = std::collections::HashMap::new();
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+            loop {
+                tick.tick().await;
+                let session = watched.read().unwrap().clone();
+                if recovered.insert(session.clone()) {
+                    if let Err(error) = subagents.activity.recover(&sessions, &session) {
+                        tracing::warn!(%error, "subagent activity recovery failed");
+                        recovered.remove(&session);
+                    }
+                }
+                let generation = cache.generation();
+                for (call, args, mut presentation) in subagents.activity.snapshots(&sessions, &session) {
+                    let ms = presentation["elapsed_ms"].as_u64().unwrap_or(0);
+                    presentation["elapsed_ms"] = serde_json::json!(ms / 1000 * 1000);
+                    let key = (session.clone(), call.clone(), generation);
+                    if published.get(&key) == Some(&presentation) { continue; }
+                    let snapshot = presentation.clone();
+                    let error = presentation["status"] == "error";
+                    if let Some(lines) = rness_engine::presentation::ToolCards::tool_card_presented(
+                        &lua, "subagent", args, "", error, Some(presentation),
+                    ).await {
+                        if *watched.read().unwrap() == session {
+                            if cache.insert_if_current(generation, call, lines) {
+                                published.insert(key, snapshot);
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    };
 
     // Initial hydration: continued sessions may already hold tool results.
     let _ = card_tx.send(session.clone());
@@ -1340,6 +1388,7 @@ async fn run_tui(
     plugin_catalog_task.abort();
     status_task.abort();
     card_task.abort();
+    activity_task.abort();
     apps_task.abort();
 
     // Let any in-flight turn settle before dropping the engine.

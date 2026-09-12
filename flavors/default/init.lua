@@ -4,6 +4,7 @@ require("theme")
 require("agents")
 
 rness.plugins.setup({
+  { name = "references", file = "plugins/references.lua", opts = { max_results = 20 } },
   { name = "spinner", file = "plugins/spinner.lua" },
   { name = "sessions", file = "plugins/sessions.lua" },
   { name = "branches", file = "plugins/branches.lua" },

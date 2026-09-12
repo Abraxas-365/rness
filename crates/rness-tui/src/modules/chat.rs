@@ -417,9 +417,12 @@ impl Component for Chat {
         let next = matched("next_tool");
         let toggle = matched("toggle_tool");
         if !previous && !next && !toggle { return KeyOutcome::pass(); }
-        let calls: Vec<_> = ctx.model.entries.iter().filter_map(|entry| match entry {
-            Entry::ToolResult { call, name, is_error, .. } => Some((call, name, is_error)), _ => None,
+        let mut calls: Vec<_> = ctx.model.entries.iter().filter_map(|entry| match entry {
+            Entry::ToolResult { call, name, is_error, .. } => Some((call, name, *is_error)), _ => None,
         }).collect();
+        if let Some(live) = &ctx.model.live {
+            calls.extend(live.running_tools.iter().map(|(call, name)| (call, name, false)));
+        }
         if calls.is_empty() { return KeyOutcome::pass(); }
         let current = calls.iter().position(|(call, _, _)| self.focused_call.as_ref() == Some(call));
         let index = match current {
@@ -432,7 +435,7 @@ impl Component for Chat {
         self.focused_call = Some(call.clone());
         if toggle {
             let options = merge_options(&self.config["tool"], &self.config["tools"][name]);
-            let options = merge_options(&options, &options["states"][if ctx.model.cancelled_tools.contains(call) { "cancelled" } else if *is_error { "error" } else { "success" }]);
+            let options = merge_options(&options, &options["states"][if ctx.model.cancelled_tools.contains(call) { "cancelled" } else if is_error { "error" } else { "success" }]);
             let default = options["display"] == "expanded";
             let expanded = self.expanded.entry(call.clone()).or_insert(default);
             *expanded = !*expanded;
@@ -893,11 +896,26 @@ impl Component for Chat {
                     }
                 } else { lines.extend(body); }
             }
-            for (_, name) in &live.running_tools {
+            for (call, name) in &live.running_tools {
+                self.card_rows.insert(call.clone(), durable_rows + lines.len());
                 if configured {
                     let options = merge_options(&self.config["tool"], &self.config["tools"][name]);
-                    let options = merge_options(&options, &options["states"]["running"]);
+                    let mut options = merge_options(&options, &options["states"]["running"]);
                     if options["visible"] == false { continue; }
+                    if let Some(expanded) = self.expanded.get(call) {
+                        options["display"] = serde_json::json!(if *expanded { "expanded" } else { "collapsed" });
+                    }
+                    if let Some(card) = self.cards.get(call) {
+                        let inner = panel_inner_width(&options, width);
+                        let limit = match options["display"].as_str() {
+                            Some("expanded") => usize::MAX,
+                            Some("collapsed") => 1,
+                            _ => options["preview_lines"].as_u64().unwrap_or(8) as usize + 1,
+                        };
+                        let body = card.iter().take(limit).flat_map(|row| card_rows(row.clone(), inner, theme)).collect();
+                        lines.extend(panel(body, &options, width, theme, background));
+                        continue;
+                    }
                     if options["header"]["visible"] != false {
                         let mut title = if options["header"]["show_name"] == false { String::new() } else { name.clone() };
                         if options["header"]["show_status"] == true { title.push_str(" · running"); }
@@ -1437,6 +1455,34 @@ mod tests {
         for y in 0..3 { for x in 0..8 { assert_eq!(buf[(x,y)].bg, Color::Rgb(60,56,54)); } }
         assert_eq!((0..8).map(|x| buf[(x,1)].symbol()).collect::<String>(), " abcdef ");
         assert_eq!((0..8).map(|x| buf[(x,2)].symbol()).collect::<String>(), " ghijk  ");
+    }
+
+    #[test]
+    fn running_subagent_cards_expand_and_update_without_switching_sessions() {
+        use super::*;
+        use crate::{app::{Model, LiveStep}, theme::Theme};
+        let mut model = Model::new("parent".into(), "fake".into());
+        model.live = Some(LiveStep { running_tools: vec![("a".into(), "subagent".into()), ("b".into(), "subagent".into())], ..Default::default() });
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut chat = Chat { config: serde_json::json!({"tool":{"display":"collapsed"}}), session: Some("parent".into()), ..Default::default() };
+        for call in ["a", "b"] {
+            chat.cards.insert(call.into(), vec![
+                crate::modules::tool_cards::CardLine {text: format!("{call} running"), is_header:true, ..Default::default()},
+                crate::modules::tool_cards::CardLine {text: "Bash cargo test".into(), ..Default::default()},
+            ]);
+        }
+        let area = Rect::new(0, 0, 50, 10);
+        let mut buf = Buffer::empty(area);
+        chat.render(&ctx, area, &mut buf);
+        assert!(chat.on_binding(&ctx, "toggle_tool").handled);
+        chat.render(&ctx, area, &mut buf);
+        assert_eq!(chat.expanded.get("b"), Some(&true));
+        assert_eq!(chat.expanded.get("a"), None);
+        assert!(buf.content.iter().map(|cell| cell.symbol()).collect::<String>().contains("Bash cargo test"));
+        chat.cards.insert("b".into(), vec![crate::modules::tool_cards::CardLine { text: "tests passed".into(), ..Default::default() }]);
+        chat.render(&ctx, area, &mut buf);
+        assert!(buf.content.iter().map(|cell| cell.symbol()).collect::<String>().contains("tests passed"));
     }
 
     #[test]
