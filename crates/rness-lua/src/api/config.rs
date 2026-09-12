@@ -19,6 +19,7 @@ pub struct UserMapping {
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub lsp: Option<rness_tools::lsp::Config>,
     pub web: Option<serde_json::Value>,
     pub tool_exposure: rness_engine::tools::exposure::Exposure,
     pub compaction: BTreeMap<String, rness_engine::turn::compaction::Policy>,
@@ -444,6 +445,9 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     keymap.set("setup", lua.create_function(|_, _: mlua::Value| -> mlua::Result<()> {
         Err(mlua::Error::runtime("keymap.setup is startup-only; restart to change mappings"))
     })?)?;
+    if let Some(lsp) = rness.get::<Option<Table>>("lsp")? {
+        state.lock().unwrap().lsp = Some(lua.from_value(mlua::Value::Table(lsp))?);
+    }
     if let Some(web) = rness.get::<Option<Table>>("web")? {
         let data = lua.create_table()?;
         for entry in web.pairs::<String, mlua::Value>() {

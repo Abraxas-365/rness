@@ -2,6 +2,56 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Read-only LSP navigation
+
+Rness exposes the same four semantic operations as DSH: `goToDefinition`, `findReferences`, `goToImplementation`, and `hover`. This is operation-scope parity, not complete provider/lifecycle parity. Rename, formatting, code actions, symbols and diagnostics are not exposed.
+
+Configure servers explicitly in `~/.rness/init.lua`, then restart:
+
+```lua
+rness.lsp = {
+  timeout_ms = 60000,
+  max_locations = 100,
+  max_result_chars = 16000,
+  servers = {
+    rust = {
+      command = "rust-analyzer",
+      extension_to_language = { [".rs"] = "rust" },
+    },
+    go = {
+      command = "gopls",
+      args = { "serve" },
+      extension_to_language = { [".go"] = "go" },
+    },
+  },
+}
+```
+
+Install the server executables separately and make them available on `PATH`, or use absolute command paths. These are configuration examples, not claims of acceptance testing against those servers. No server is automatically installed or selected. Without `rness.lsp`, the `lsp` tool is absent; the default flavor does not enable it.
+
+Each server accepts `command`, optional `args`, required `extension_to_language`, optional `env`, `initialization_options`, and `configuration`. Extension keys must be lowercase, dot-prefixed and unique across configured servers. Server processes inherit only `PATH`, `HOME`, `USERPROFILE`, `SYSTEMROOT`, `TMPDIR`, `TEMP`, and `LANG`; explicitly add other required variables with `env`. Commands execute directly, not through a shell. `configuration` is returned as a whole for each `workspace/configuration` item; section-specific configuration lookup is not implemented.
+
+### Calling the tool
+
+```json
+{"operation":"findReferences","file_path":"src/main.rs","line":12,"character":5}
+```
+
+- `file_path` is absolute or relative to the calling session's workspace. It must resolve to a readable UTF-8 file (maximum 4 MB). Paths may resolve outside the workspace; this tool is not a filesystem sandbox.
+- `line` and `character` are **one-based**. Character offsets count UTF-16 code units, not bytes or displayed columns. For example, the position after a leading emoji is character 3. Positions inside a surrogate pair are rejected.
+- References include declarations. Capability checks return an error when the selected server does not advertise an operation. Missing extension mappings fail instead of falling back to another server.
+- Location results contain `kind="locations"`, `locations` (URI and one-based UTF-16 range), `resolvedWorkspaceUri`, and `truncated`. LocationLink results use `targetSelectionRange`. Hover results contain `kind="hover"` and `hover` (null, or contents plus optional range). Results are JSON text; character/location limits preserve valid JSON and mark truncation.
+
+Normal tool permissions and workspace adaptation apply. To defer its schema, add `"lsp"` to `rness.tool_exposure.deferred`. Programmatic calls use `tools.call("lsp", args)` or `tools.parallel(...)` just like other registered tools.
+
+### Lifecycle and current limits
+
+Connections start lazily and are reused per configured server and canonical session workspace. Requests sharing a connection serialize. Each request reads the latest file from disk, sends `didOpen`, performs the query, then sends `didClose`; unsaved editor buffers and persistent document versions are not synchronized. Servers must support UTF-16 and document open/close notifications.
+
+The timeout includes waiting for the connection, startup and the request. Cancellation or transport failure discards/kills the active connection rather than reusing an incomplete exchange; the next call can start a fresh server. Idle connections live with the tool registry. Graceful LSP `shutdown`/`exit`, protocol-level `$/cancelRequest`, dynamic capability registration, diagnostic collection and stderr capture are not implemented. Server-initiated `workspace/applyEdit` is rejected. Configured server executables remain trusted local processes; read-only operations do not sandbox server behavior.
+
+Tests cover the four operations through a real stdio fixture, fresh document contents, location translation, malformed/oversized frames, UTF-16 coordinates, result limits and duplicate extension rejection. Broader cancellation/restart coverage and real `gopls`/`rust-analyzer` acceptance remain follow-up work.
+
 ## Web search, fetch, and Lua hooks
 
 The default flavor enables independent, keyless `web_search` (DuckDuckGo HTML search) and anonymous `web_fetch`. Search returns links and snippets; it does not call fetch. Fetch reads a known public URL. Remove either configuration section to omit that tool. Search backends never silently fall back.
