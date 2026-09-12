@@ -464,6 +464,12 @@ impl App {
             | Frame::HistoryChanged { session } | Frame::ApprovalRequested { session, .. }
             | Frame::ApprovalResolved { session, .. } => session,
         };
+        if matches!(frame, Frame::StepStarted { .. }) {
+            self.command_results.remove(session);
+            if session == &self.model.session {
+                self.reconcile();
+            }
+        }
         if session != &self.model.session {
             if !self.background_models.contains_key(session) && !matches!(frame,
                 Frame::StepStarted { .. } | Frame::Delta { .. } | Frame::ToolStarted { .. }) {
@@ -941,13 +947,15 @@ pub async fn run(
 
     // Crossterm events on a blocking thread → channel.
     let (tx, mut term_events) = mpsc::unbounded_channel();
-    let terminal_input = Arc::new(std::sync::Mutex::new(()));
+    // FIFO handoff prevents the polling reader from starving editor launch.
+    let terminal_input = Arc::new(tokio::sync::Mutex::new(()));
     let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_stop = reader_done.clone();
     let reader_lock = terminal_input.clone();
     std::thread::spawn(move || loop {
         if reader_stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
-        let _guard = reader_lock.lock().unwrap();
+        let _guard = reader_lock.blocking_lock();
+        if reader_stop.load(std::sync::atomic::Ordering::Relaxed) { return; }
         match crossterm::event::poll(Duration::from_millis(20)) {
             Ok(false) => continue,
             Err(_) => return,
@@ -1002,7 +1010,7 @@ pub async fn run(
         }
         if let Some(payload) = app.edit_prompt.take() {
             // The reader must relinquish stdin before handing it to an editor.
-            let _guard = terminal_input.lock().unwrap();
+            let _guard = terminal_input.lock().await;
             let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture, crossterm::event::DisableBracketedPaste);
             ratatui::restore();
             let edited = edit_prompt(&payload);
@@ -1026,7 +1034,7 @@ pub async fn run(
     };
 
     reader_done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _guard = terminal_input.lock().unwrap();
+    let _guard = terminal_input.lock().await;
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste, crossterm::event::DisableMouseCapture);
     ratatui::restore();
     result
@@ -1052,6 +1060,30 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn editor_handoff_precedes_reader_reacquisition() {
+        let input = Arc::new(tokio::sync::Mutex::new(()));
+        let reader = input.clone().lock_owned().await;
+        let editor = input.lock();
+        tokio::pin!(editor);
+        // Queue the editor while the reader still owns stdin.
+        assert!(matches!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(editor.as_mut(), cx))
+        }).await, std::task::Poll::Pending));
+        let reader_input = input.clone();
+        let (acquired, mut acquisition) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            drop(reader);
+            let _guard = reader_input.blocking_lock();
+            acquired.send(()).unwrap();
+        });
+        let editor_guard = tokio::time::timeout(Duration::from_secs(2), editor).await.unwrap();
+        assert!(matches!(acquisition.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        drop(editor_guard);
+        tokio::time::timeout(Duration::from_secs(2), acquisition).await.unwrap().unwrap();
+        thread.join().unwrap();
+    }
+
     #[test]
     fn ctrl_c_cancels_admitted_command_before_any_turn_frame() {
         struct Pending;
@@ -1064,6 +1096,27 @@ mod tests {
         assert!(!app.model.busy);
         let actions = app.route_key(KeyEvent::new(crossterm::event::KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL));
         assert!(matches!(actions.as_slice(), [Action::Cancel]));
+    }
+
+    #[test]
+    fn command_results_expire_when_their_session_starts_a_response() {
+        let backend = Arc::new(FakeBackend { history: prior_history("s") });
+        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), backend);
+        app.reconcile();
+        let durable = app.model.entries.clone();
+        app.apply(Action::CommandResult("s".into(), "old help".into()));
+        app.apply(Action::CommandResult("other".into(), "other help".into()));
+        app.reconcile();
+        assert!(app.model.entries.contains(&Entry::Notice("old help".into())));
+        app.apply_frame(&Frame::StepStarted { session: "s".into(), turn: 2 });
+        assert_eq!(app.model.entries, durable);
+        app.reconcile();
+        assert_eq!(app.model.entries, durable);
+        assert!(app.command_results.contains_key("other"));
+        app.apply_frame(&Frame::StepStarted { session: "other".into(), turn: 2 });
+        assert!(!app.command_results.contains_key("other"));
+        app.apply(Action::SwitchSession("other".into()));
+        assert!(!app.model.entries.contains(&Entry::Notice("other help".into())));
     }
 
     #[test]
