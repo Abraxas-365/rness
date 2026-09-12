@@ -12,7 +12,13 @@ rness.plugins.setup({
   { name = "commands", file = "plugins/commands.lua" },
 })
 rness.keymap.setup({})
--- Ctrl+G opens compaction selection, so paste preview uses Alt+G.
 rness.ui.promptbox = { paste = { keys = { preview = "alt+g" } } }
--- Automatic compaction requires verified budgets for your selected model.
--- Do not enable the legacy turn-end autocompact alongside boundary compaction.
+-- Global policy; explicit provider/model entries override this default.
+-- Token counts are estimates. Use lower thresholds for smaller context windows.
+rness.compaction = {
+  default = {
+    threshold_tokens = 165000, retain_tokens = 24000, summary_tokens = 4096,
+    max_overflow_retries = 1, max_compactions = 2,
+    prune_threshold = 8192, prune_head = 4096, prune_tail = 1024,
+  },
+}

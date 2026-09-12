@@ -128,7 +128,7 @@ fn compact_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
 
 #[tokio::test]
 async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
-    for overflow in [false, true] {
+    for (overflow, policy_key) in [(false, "test/fake-1"), (true, "test/fake-1"), (false, "default"), (true, "default")] {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
@@ -147,10 +147,10 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
         steps.push(StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![])));
         steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
         let provider = Scripted::new(steps);
-        let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(if overflow { 100000 } else { 1000 }))].into(), ..Default::default() };
+        let config = TurnConfig { compaction: [(policy_key.into(), compact_policy(if overflow { 100000 } else { 1000 }))].into(), ..Default::default() };
         // Keep only the latest message in this fixture.
         let mut config = config;
-        config.compaction.get_mut("test/fake-1").unwrap().retain_tokens = 1;
+        config.compaction.get_mut(policy_key).unwrap().retain_tokens = 1;
         let outcome = run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
             &CancellationToken::new(), &mut Vec::new, 1, &|_| {}).await.unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
@@ -205,7 +205,8 @@ async fn boundary_pruning_remeasures_without_summarizing_or_splitting_tools() {
     log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Steer,
         content: vec![ContentPart::Text { text: "continue".into() }], source: None })).unwrap();
     let provider = Scripted::new(vec![]); // Pruning alone must avoid any model call.
-    let mut policy = compact_policy(2000);
+    let mut policy = compact_policy(165000);
+    assert!(rness_engine::turn::compaction::measure(&replay(&store, log.session()).unwrap().context, "", &[]) < policy.threshold_tokens);
     policy.retain_tokens = 1;
     assert!(rness_engine::turn::compaction::reduce(&store, &mut log, &provider, "", &[], &policy,
         false, &CancellationToken::new()).await.unwrap());

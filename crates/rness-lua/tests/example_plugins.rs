@@ -23,6 +23,13 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
     assert_eq!(config.plugin_specs.len(), 6);
+    let policy = &config.compaction["default"];
+    assert_eq!(policy.threshold_tokens, 165000);
+    assert_eq!(policy.prune_threshold, 8192);
+    policy.validate().unwrap();
+    let commands = std::fs::read_to_string(root.join("plugins/commands.lua")).unwrap();
+    assert!(commands.contains("name = \"compact\""));
+    assert!(!commands.contains("compact-region"));
     let specs = rness_lua::loader::discover_specs(&root, &config.plugin_specs).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let host = booted_host(dir.path()).await;

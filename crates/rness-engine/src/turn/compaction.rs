@@ -149,7 +149,6 @@ pub async fn reduce_region(store: &SessionStore, log: &mut SessionLog, provider:
                 return Err(TurnError::ModelExhausted { attempts: 0, last: "invalid compaction region or split tool pair".into() });
             }
         }
-        if region.is_none() && !overflow && policy.meter.pressure(&replayed.context, system, tools) < policy.threshold_tokens { break; }
         let cut = prefix(&replayed.context, policy.retain_tokens, &policy.meter);
         let n: usize = replayed.context.turns[..cut].iter().map(source_count).sum();
         let eligible: std::collections::HashSet<_> = replayed.context.sources[..n].iter().cloned().collect();
@@ -170,7 +169,7 @@ pub async fn reduce_region(store: &SessionStore, log: &mut SessionLog, provider:
             changed = true;
         }
         replayed = replay(store, log.session())?;
-        if changed && (overflow || policy.meter.pressure(&replayed.context, system, tools) < policy.threshold_tokens) { break; }
+        if region.is_none() && ((!overflow && policy.meter.pressure(&replayed.context, system, tools) < policy.threshold_tokens) || (changed && overflow)) { break; }
         let cut = region.as_ref().map_or_else(|| prefix(&replayed.context, policy.retain_tokens, &policy.meter), |r| r.end);
         let start = region.as_ref().map_or(0, |r| r.start);
         if cut == 0 { break; }

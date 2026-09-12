@@ -164,7 +164,8 @@ async fn drive(
         }
 
         let policy = replayed.context.config.selection.as_ref()
-            .and_then(|s| config.compaction.get(&format!("{}/{}", s.route, s.model)));
+            .and_then(|s| config.compaction.get(&format!("{}/{}", s.route, s.model)))
+            .or_else(|| config.compaction.get("default"));
         if let Some(policy) = policy {
             if compaction::reduce(store, log, provider, &step_system, &tool_specs, policy, false, cancel).await? {
                 frames(Frame::HistoryChanged { session: session.clone() });

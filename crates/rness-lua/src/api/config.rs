@@ -428,8 +428,8 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     if let Some(policies) = rness.get::<Option<Table>>("compaction")? {
         let policies: BTreeMap<String, rness_engine::turn::compaction::Policy> = lua.from_value(mlua::Value::Table(policies))?;
         for (route, policy) in &policies {
-            if !route.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()) {
-                return Err("compaction keys must be provider/model".into());
+            if route != "default" && !route.split_once('/').is_some_and(|(provider, model)| !provider.is_empty() && !model.is_empty()) {
+                return Err("compaction keys must be provider/model or default".into());
             }
             policy.validate().map_err(std::io::Error::other)?;
         }

@@ -744,6 +744,7 @@ impl SessionService {
                 let mut provider = self.provider_for(&request_config)?;
                 if let Some(selection) = request_config.selection.as_ref()
                     .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
+                    .or_else(|| self.config.compaction.get("default"))
                     .and_then(|p| p.summary_selection.clone()) {
                     let summary_config = CallConfig { selection: Some(selection), ..Default::default() };
                     let summary = self.provider_for(&summary_config)?;
