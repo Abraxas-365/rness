@@ -31,6 +31,9 @@ encoding_rs = "0.8"
 htmd = "0.5"
 markup5ever_rcdom = "0.38"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 insta.workspace = true

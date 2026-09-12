@@ -45,7 +45,39 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(snapshot, {str(p.relative_to(config)): p.read_bytes() for p in config.rglob("*") if p.is_file()})
             self.assertFalse(list(installed.parent.glob(".rness-install.*")))
 
-    def test_existing_symlinks_and_invalid_arguments(self):
+    def test_bootstrap_installs_from_source_archive_and_forwards_options(self):
+        with tempfile.TemporaryDirectory(prefix="rness bootstrap ") as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            home.mkdir()
+            archive_root = root / "archive" / "rness-main"
+            archive_root.mkdir(parents=True)
+            subprocess.run(["cp", str(REPO / "install.sh"), str(archive_root / "install.sh")], check=True)
+            subprocess.run(["cp", "-R", str(REPO / "flavors"), str(archive_root / "flavors")], check=True)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "curl").write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"--proto\" ]; then shift 4; fi\n"
+                "if [ \"$1\" = \"https://sh.rustup.rs\" ]; then exit 1; fi\n"
+                "while [ \"$1\" != \"-o\" ]; do shift; done\n"
+                "cp \"$RNESS_TEST_ARCHIVE\" \"$2\"\n"
+            )
+            (fake_bin / "curl").chmod(0o755)
+            tarball = root / "rness.tar.gz"
+            subprocess.run(["tar", "-czf", str(tarball), "-C", str(archive_root.parent), archive_root.name], check=True)
+            binary = root / "rness-test"
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            binary.chmod(0o755)
+            env = dict(os.environ, HOME=str(home), PATH=f"{fake_bin}:{os.environ['PATH']}", RNESS_TEST_ARCHIVE=str(tarball))
+            result = subprocess.run(
+                ["sh", str(REPO / "bootstrap.sh"), "--binary", str(binary)],
+                env=env, cwd=root, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((home / ".local/bin/rness").read_bytes(), binary.read_bytes())
+            self.assertTrue((home / ".rness/init.lua").is_file())
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binary = root / "binary"

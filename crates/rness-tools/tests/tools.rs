@@ -525,6 +525,40 @@ async fn bash_timeout_kills_command() {
     assert!(err.contains("timed out"));
 }
 
+#[tokio::test]
+async fn bash_input_prompt_receives_eof() {
+    let dir = TempDir::new().unwrap();
+    let out = exec(&bash(&dir), json!({
+        "command": "printf 'Password: '; read -r password", "description": "Check closed input", "timeout_ms": 1000
+    })).await.unwrap();
+    assert!(out.contains("Password:"), "{out}");
+    assert!(out.contains("[exit code: 1]"), "{out}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_has_no_controlling_terminal() {
+    let dir = TempDir::new().unwrap();
+    let out = exec(&bash(&dir), json!({
+        "command": "python3 -c 'import os; assert os.getsid(0) == os.getpgrp(); assert os.getsid(0) != os.getsid(os.getppid()); os.open(\"/dev/tty\", os.O_RDONLY)'",
+        "description": "Check terminal isolation", "timeout_ms": 2000
+    })).await.unwrap();
+    assert!(out.contains("OSError"), "{out}");
+    assert!(out.contains("[exit code: 1]"), "{out}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bash_timeout_stops_descendants() {
+    let dir = TempDir::new().unwrap();
+    let err = exec(&bash(&dir), json!({
+        "command": "(sleep 0.4; touch survived) & wait", "description": "Check descendant cleanup", "timeout_ms": 100
+    })).await.unwrap_err();
+    assert!(err.contains("timed out"), "{err}");
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert!(!dir.path().join("survived").exists());
+}
+
 // -- Background jobs -------------------------------------------------------
 
 #[tokio::test]

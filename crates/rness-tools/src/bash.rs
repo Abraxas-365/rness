@@ -77,16 +77,54 @@ async fn drain_stream(
     }
 }
 
-fn spawn_shell(command: &str, workdir: &std::path::Path) -> std::io::Result<tokio::process::Child> {
-    tokio::process::Command::new("/bin/sh")
-        .arg("-c")
+struct ShellGroup {
+    #[cfg(unix)]
+    pid: Option<i32>,
+}
+
+impl ShellGroup {
+    fn disarm(&mut self) {
+        #[cfg(unix)]
+        { self.pid = None; }
+    }
+
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.pid.take() {
+            // The child starts its own session, so this targets only its process group.
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+        }
+    }
+}
+
+impl Drop for ShellGroup {
+    fn drop(&mut self) { self.kill(); }
+}
+
+fn spawn_shell(command: &str, workdir: &std::path::Path) -> std::io::Result<(tokio::process::Child, ShellGroup)> {
+    let mut process = tokio::process::Command::new("/bin/sh");
+    process.arg("-c")
         .arg(command)
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    // Closing stdin alone does not prevent sudo/getpass from opening /dev/tty.
+    // setsid detaches the controlling terminal and creates a cleanup process group.
+    unsafe {
+        process.pre_exec(|| {
+            if libc::setsid() == -1 { return Err(std::io::Error::last_os_error()); }
+            Ok(())
+        });
+    }
+    let child = process.spawn()?;
+    let group = ShellGroup {
+        #[cfg(unix)]
+        pid: child.id().map(|id| id as i32),
+    };
+    Ok((child, group))
 }
 
 #[async_trait]
@@ -105,7 +143,9 @@ impl Tool for BashTool {
     fn description(&self) -> &str {
         "Run a shell command in the working directory. Returns combined \
          stdout/stderr; check the [exit code: N] marker on every result. \
-         Each call is a fresh shell — no state persists; pass workdir \
+         Each call is a fresh non-interactive shell with closed stdin and no \
+         controlling terminal on Unix; password/input prompts cannot be answered. \
+         No state persists; pass workdir \
          instead of using cd. Set run_in_background for long-running \
          commands: the call returns a job id immediately; read output \
          with job_output, stop with job_kill."
@@ -152,7 +192,7 @@ impl BashTool {
 
         let stream = owner.zip(call).map(|(owner, call)| (self.jobs.clone(), owner.clone(), call.clone()));
         if args["run_in_background"].as_bool().unwrap_or(false) {
-            let mut child =
+            let (mut child, mut group) =
                 spawn_shell(command, &workdir).map_err(|e| format!("spawn: {e}"))?;
             let (id, writer) = self.jobs.start_owned("bash", command.to_string(), owner);
             let mut stdout_pipe = child.stdout.take().expect("piped stdout");
@@ -169,6 +209,7 @@ impl BashTool {
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => {
+                            group.kill();
                             let _ = child.kill().await;
                             writer.settle(JobStatus::Killed);
                             return;
@@ -189,6 +230,7 @@ impl BashTool {
                         },
                         status = child.wait(), if !out_open && !err_open => {
                             let code = status.ok().and_then(|s| s.code());
+                            group.disarm();
                             writer.settle(JobStatus::Exited(code));
                             return;
                         }
@@ -208,7 +250,7 @@ impl BashTool {
                 .min(MAX_TIMEOUT_MS),
         );
 
-        let mut child = spawn_shell(command, &workdir).map_err(|e| format!("spawn: {e}"))?;
+        let (mut child, mut group) = spawn_shell(command, &workdir).map_err(|e| format!("spawn: {e}"))?;
 
         // Interleave-tolerant capture: drain both pipes concurrently, then
         // append stderr after stdout.
@@ -229,11 +271,13 @@ impl BashTool {
         let (out, err, status) = match tokio::time::timeout(timeout, run).await {
             Ok(r) => r?,
             Err(_) => {
+                group.kill();
                 let _ = child.kill().await;
                 return Err(format!("command timed out after {}ms", timeout.as_millis()));
             }
         };
 
+        group.disarm();
         let mut text = String::from_utf8_lossy(&out).into_owned();
         if !err.is_empty() {
             if !text.is_empty() && !text.ends_with('\n') {

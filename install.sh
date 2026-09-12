@@ -2,7 +2,7 @@
 # Install from this checkout. No sudo, shell-profile edits, or credential setup.
 set -euo pipefail
 
-repo=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo=$(CDPATH= cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 bin_dir="${HOME:?HOME must be set}/.local/bin"
 config_dir="$HOME/.rness"
 binary=""
@@ -52,23 +52,23 @@ if [[ -z "$binary" ]]; then
   binary="$repo/target/release/rness"
 fi
 [[ -f "$binary" && -x "$binary" ]] || { printf 'Not an executable file: %s\n' "$binary" >&2; exit 1; }
-mkdir -p -- "$bin_dir"
+mkdir -p "$bin_dir"
 staged=$(mktemp "$bin_dir/.rness-install.XXXXXX")
-trap 'rm -f -- "$staged"' EXIT
-install -m 755 -- "$binary" "$staged"
+trap 'rm -f "$staged"' EXIT
+install -m 755 "$binary" "$staged"
 if [[ "$replace_binary" == true ]]; then
-  mv -f -- "$staged" "$destination"
+  mv -f "$staged" "$destination"
 else
   # Atomic no-clobber publication if another install created the destination.
-  ln -- "$staged" "$destination"
+  ln "$staged" "$destination"
 fi
 if [[ -e "$config_dir" || -L "$config_dir" ]]; then
   printf 'Preserved existing configuration: %s\n' "$config_dir"
 else
-  mkdir -p -- "$(dirname -- "$config_dir")"
+  mkdir -p "$(dirname "$config_dir")"
   # mkdir claims a new directory without ever writing into an existing one.
-  if mkdir -m 700 -- "$config_dir"; then
-    cp -R -- "$repo/flavors/default/." "$config_dir/"
+  if mkdir -m 700 "$config_dir"; then
+    cp -R "$repo/flavors/default/." "$config_dir/"
     printf 'Installed default flavor: %s\n' "$config_dir"
   else
     printf 'Could not create configuration directory; binary installed but flavor was not copied: %s\n' "$config_dir" >&2

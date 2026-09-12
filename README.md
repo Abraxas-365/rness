@@ -37,17 +37,31 @@ Start with the included Gruvbox flavor. Keep what you like. Rewrite the rest.
 
 ## Get started
 
-### 1. Install from this checkout
+### 1. Install
 
-You need Rust/Cargo and a Bash-compatible environment for the source installer. From the repository root:
+**From GitHub:** install the current `main` source with one reviewed command:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSfL \
+  https://raw.githubusercontent.com/Abraxas-365/rness/main/bootstrap.sh | sh
+```
+
+This requires Rust/Cargo, a native C/C++ build toolchain, Bash, `curl`, and `tar`. To let the bootstrapper install Rust through rustup when Cargo is unavailable:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSfL \
+  https://raw.githubusercontent.com/Abraxas-365/rness/main/bootstrap.sh | RNESS_INSTALL_RUST=1 sh
+```
+
+For a reproducible installation, pin `RNESS_REF` to a reviewed tag or commit. The bootstrapper downloads that source archive over HTTPS, invokes its installer, writes `~/.local/bin/rness`, and copies the default flavor only when `~/.rness` does not exist.
+
+**From a checkout:** Rust/Cargo and a Bash-compatible environment are required. From the repository root:
 
 ```sh
 ./install.sh
 ```
 
-This builds a release binary at `~/.local/bin/rness` and installs the default flavor into `~/.rness` **only if that directory does not already exist**.
-
-If needed, add the binary directory to your current shell's `PATH`:
+Both paths preserve an existing configuration. If needed, add the binary directory to your current shell's `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"

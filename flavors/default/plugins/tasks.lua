@@ -3,6 +3,46 @@
 -- Rust owns durable tasks; Lua owns activation, layout, and navigation.
 rness.tasks.enable { allow_parallel_in_progress = true }
 
+rness.ui.messagebox.tool_card("TaskWrite", function(call)
+  if call.is_error then return nil end
+  local tasks = type(call.args) == "table" and call.args.tasks
+  if type(tasks) ~= "table" then return nil end
+
+  local completed, active, pending = 0, 0, 0
+  for _, task in ipairs(tasks) do
+    if task.status == "completed" then completed = completed + 1
+    elseif task.status == "in_progress" then active = active + 1
+    else pending = pending + 1 end
+  end
+  local total = #tasks
+  local filled = total > 0 and math.floor(completed / total * 16) or 0
+  local body = {
+    { spans = {
+      { text = "[" .. string.rep("=", filled) .. string.rep("-", 16 - filled) .. "]", style = "added" },
+      { text = string.format("  %d/%d complete", completed, total), style = "dim" },
+    } },
+    { text = "" },
+  }
+  local markers = { pending = "[ ]", in_progress = "[>]", completed = "[x]" }
+  local styles = { pending = "dim", in_progress = "heading", completed = "added" }
+  for _, task in ipairs(tasks) do
+    local style = styles[task.status] or "dim"
+    body[#body + 1] = { spans = {
+      { text = (markers[task.status] or "[ ]") .. "  ", style = style },
+      { text = task.content, style = task.status == "in_progress" and "heading" or "dim" },
+      { text = task.status == "in_progress" and "  <- in progress" or "", style = style },
+    } }
+  end
+  if total == 0 then body[#body + 1] = { text = "No tasks yet.", style = "dim" } end
+  return {
+    header = {
+      left = { { text = "Tasks", style = "tool_name" } },
+      right = { { text = string.format("%d active · %d pending · %d done", active, pending, completed), style = "dim" } },
+    },
+    body = body,
+  }
+end)
+
 local offsets = {}
 rness.ui.app {
   name = "tasks",

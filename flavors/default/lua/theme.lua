@@ -60,7 +60,34 @@ rness.ui.messagebox = {
         body = body,
       }
     end },
-    Bash = { arguments = { visible = true, wrap = true } },
+    Bash = { render = function(call)
+      local args = type(call.args) == "table" and call.args or {}
+      local command = type(args.command) == "string" and args.command or ""
+      local duration = call.presentation and tonumber(call.presentation.duration_ms)
+      local status = call.is_error and "failed" or "done"
+      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local header = {
+        left = {
+          { text = "Bash", style = "tool_name" },
+          { text = " · ", style = "dim" },
+          { text = status, style = status_style },
+        },
+        right = duration and { { text = string.format("%.0f ms", duration), style = "dim" } } or {},
+      }
+      local body = {
+        { kind = "code", text = command, language = "bash", syntax_highlight = true, line_numbers = false },
+      }
+      if type(args.workdir) == "string" and args.workdir ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "in ", style = "dim" },
+          { text = args.workdir, style = "code" },
+        } }
+      end
+      if type(call.output) == "string" and call.output ~= "" then
+        body[#body + 1] = { text = call.output, style = "tool_output" }
+      end
+      return { header = header, body = body }
+    end },
     Edit = { render = function(call)
       if call.is_error then return nil end
       local a = call.args
@@ -78,6 +105,23 @@ rness.ui.messagebox = {
         end
       end
       return lines
+    end },
+    Write = { render = function(call)
+      if call.is_error then return nil end
+      local a = call.args
+      if type(a) ~= "table" or type(a.path) ~= "string" or type(a.content) ~= "string" then return nil end
+      return {
+        header = {
+          left = {
+            { text = "Write", style = "tool_name" },
+            { text = "  " .. a.path, style = "code" },
+          },
+          right = { { text = "done", style = { fg = p.green, bold = true } } },
+        },
+        body = {
+          { kind = "code", text = a.content, syntax_highlight = true, line_numbers = true },
+        },
+      }
     end },
   },
 }

@@ -537,7 +537,11 @@ impl Component for Chat {
             && self.entry_cache.len() == ctx.model.entries.len()
             && self.cache_width == width
             && self.cache_theme.as_ref() == Some(theme) && self.cache_config == self.config;
-        let dirty = if selective { self.cards.changes_since(self.cache_card_revision) } else { None };
+        let dirty = if selective {
+            self.cards.changes_since(self.cache_card_revision).and_then(|calls| {
+                calls.iter().all(|call| self.cached_calls.contains_key(call)).then_some(calls)
+            })
+        } else { None };
         let mut durable_rows = self.row_ends.last().copied().unwrap_or(0);
         let mut assistant_count = ctx.model.next_assistant_id;
         if !unchanged {
@@ -664,7 +668,13 @@ impl Component for Chat {
                                     let expanded = self.thinking_expanded.get(&key).copied().unwrap_or(options["display"] == "expanded");
                                     let limit = if expanded { usize::MAX } else if options["display"] == "collapsed" { 0 } else { options["preview_lines"].as_u64().unwrap_or(3) as usize };
                                     let thinking_width = panel_inner_width(&options, inner_width);
-                                    let rows = text.lines().flat_map(|s| visual_rows_limited(Line::raw(sanitize(s)), usize::from(thinking_width), true, limit)).take(limit).collect();
+                                    let rendered = crate::core::render::render_markdown_configured(text, thinking_width, theme, &options["markdown"]);
+                                    let mut rows = Vec::new();
+                                    for line in rendered {
+                                        let remaining = limit.saturating_sub(rows.len());
+                                        if remaining == 0 { break; }
+                                        rows.extend(visual_rows_limited(line, usize::from(thinking_width), true, remaining));
+                                    }
                                     body.extend(panel(rows, &options, inner_width, theme, background));
                                 },
                                 ContentPart::Image { attachment } => body.push(Line::raw(format!("[Image · {} × {} · {} bytes]", attachment.width, attachment.height, attachment.bytes))),
@@ -1308,6 +1318,26 @@ mod tests {
     }
 
     #[test]
+    fn configured_thinking_renders_markdown_before_previewing() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("qa".into(), "fake".into());
+        model.entries.push(Entry::Assistant {
+            model: "fake".into(),
+            content: vec![ContentPart::Thinking { text: "**Bold thought**".into(), signature: None }],
+        });
+        model.entry_ids.push("thinking-1".into());
+        let theme = Theme::default();
+        let mut chat = Chat { config: serde_json::json!({"thinking":{"visible":true,"display":"preview","preview_lines":3}}), ..Default::default() };
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+        chat.render(&Ctx { model: &model, theme: &theme }, area, &mut buffer);
+        let rendered = chat.entry_cache[0].2.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(rendered.contains("Bold thought"), "{rendered:?}");
+        assert!(!rendered.contains("**"));
+    }
+
+    #[test]
     fn message_display_limits_visual_rows_without_mutating_content() {
         use super::*;
         let original = vec![Line::raw("abcdefghij")];
@@ -1340,6 +1370,28 @@ mod tests {
         let rendered = card_line(row, 4, &crate::theme::Theme::default());
         assert_eq!(rendered.width(), 4);
         assert_eq!(rendered.spans.iter().map(|span| span.content.as_ref()).collect::<String>(), "long");
+    }
+
+    #[test]
+    fn delayed_card_publication_rebuilds_when_result_was_not_indexed() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("qa".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        model.entries.push(Entry::ToolResult { call: "call".into(), name: "Bash".into(), output: "fallback".into(), is_error: false });
+        model.entry_ids.push("result".into());
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 8);
+        let mut chat = Chat::default();
+        let mut buffer = Buffer::empty(area);
+        chat.render(&Ctx { model: &model, theme: &theme }, area, &mut buffer);
+        chat.cached_calls.clear();
+        chat.cards.insert("call".into(), vec![rness_kernel::presentation::StyledLine { text: "custom card".into(), ..Default::default() }]);
+        chat.render(&Ctx { model: &model, theme: &theme }, area, &mut buffer);
+        let rendered = chat.entry_cache[0].2.iter().flat_map(|line| &line.spans).map(|span| span.content.as_ref()).collect::<String>();
+        assert!(rendered.contains("custom card"), "{rendered:?}");
+        assert!(!rendered.contains("fallback"));
     }
 
     #[test]

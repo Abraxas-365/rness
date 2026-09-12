@@ -38,7 +38,6 @@ async fn structured_statusline_callbacks_replace_and_unload() {
 
 #[tokio::test]
 async fn default_subagent_renderer_shows_task_command_and_live_text() {
-    use rness_engine::presentation::ToolCards;
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
     let (host, _) = LuaHost::spawn_from_init(root).unwrap();
     let lines = host.tool_card_presented("subagent", serde_json::json!({"agent":"scout", "prompt":"Inspect tests"}), "", false,
@@ -52,6 +51,44 @@ async fn default_subagent_renderer_shows_task_command_and_live_text() {
 }
 
 #[tokio::test]
+async fn default_task_renderer_shows_progress_and_states() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    host.load("tasks", include_str!("../../../flavors/default/plugins/tasks.lua")).await.unwrap();
+    let tasks = serde_json::json!([
+        {"content":"Done task", "status":"completed"},
+        {"content":"Active task", "status":"in_progress"},
+        {"content":"Pending task", "status":"pending"},
+    ]);
+    let lines = host.tool_card("TaskWrite", serde_json::json!({"tasks":tasks}), "updated", false).await.unwrap();
+    assert!(lines[0].is_header);
+    assert!(lines[0].spans.iter().any(|span| span.text == "Tasks"));
+    assert!(lines[0].right.iter().any(|span| span.text == "1 active · 1 pending · 1 done"));
+    assert!(lines.iter().any(|line| line.spans.iter().any(|span| span.text == "[=====-----------]")));
+    assert!(lines.iter().any(|line| line.spans.iter().any(|span| span.text == "Active task")));
+}
+
+#[tokio::test]
+async fn default_bash_and_write_renderers_show_command_and_content() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+
+    let bash = host.tool_card_presented("Bash", serde_json::json!({"command":"printf 'hello'", "workdir":"/tmp"}), "hello", false,
+        Some(serde_json::json!({"duration_ms":27}))).await.unwrap();
+    assert!(bash[0].is_header);
+    assert!(bash[0].spans.iter().any(|span| span.text == "Bash"));
+    assert!(bash[0].spans.iter().any(|span| span.text == "done"));
+    assert!(bash.iter().any(|line| line.block.as_ref().is_some_and(|block| block["text"] == "printf 'hello'")));
+    assert!(bash.iter().any(|line| line.text == "hello"));
+
+    let write = host.tool_card("Write", serde_json::json!({"path":"/tmp/test.lua", "content":"return true"}), "Wrote 11 bytes", false).await.unwrap();
+    assert!(write[0].is_header);
+    assert!(write[0].spans.iter().any(|span| span.text == "Write"));
+    assert!(write[0].spans.iter().any(|span| span.text == "  /tmp/test.lua"));
+    assert!(write.iter().any(|line| line.block.as_ref().is_some_and(|block| block["text"] == "return true")));
+}
+
+#[tokio::test]
 async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default");
     let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();
@@ -59,8 +96,6 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.messagebox["tools"]["Bash"]["arguments"]["visible"], true);
-    assert_eq!(config.messagebox["tools"]["Bash"]["arguments"]["wrap"], true);
     assert_eq!(config.plugin_specs.len(), 7);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
