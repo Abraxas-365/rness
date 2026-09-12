@@ -50,6 +50,7 @@ pub struct TurnConfig {
     pub max_tool_concurrency: usize,
     /// Safety valve: maximum steps (model requests) per turn.
     pub max_steps: u32,
+    pub tool_exposure: crate::tools::exposure::Exposure,
     /// System prompt sent with every request.
     pub system: String,
     /// Explicit route-keyed budgets supplied by the composition root.
@@ -62,6 +63,7 @@ impl Default for TurnConfig {
             max_retries: 2,
             max_tool_concurrency: 4,
             max_steps: 50,
+            tool_exposure: Default::default(),
             system: String::new(),
             compaction: Default::default(),
         }
@@ -124,8 +126,9 @@ async fn drive(
         Some(agent) => format!("{}\n\n{}", config.system, agent.instructions),
         None => config.system.clone(),
     };
-    let tool_specs = tools.specs();
+    let mut activated = crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
     for _step in 0..config.max_steps {
+        let tool_specs = config.tool_exposure.specs(tools, &activated);
         if cancel.is_cancelled() {
             log.append(&SessionEvent::AssistantAttempt(AssistantAttempt { model: provider.model().into(), outcome: AttemptOutcome::Cancelled, chunks: vec![] }))?;
             return Ok(TurnOutcome::Cancelled);
@@ -269,8 +272,50 @@ async fn drive(
                         name: call.name.clone(),
                     });
                 }
-                let results =
-                    tools.dispatch(&session, &calls, config.max_tool_concurrency, cancel).await;
+                let exposed: Vec<_> = tool_specs.iter().map(|spec| spec.name.clone()).collect();
+                let results = if calls.iter().all(|call| call.name != "ToolSearch" && call.name != "run_code") {
+                    tools.restricted(&exposed).dispatch(&session, &calls, config.max_tool_concurrency, cancel).await
+                } else {
+                    let mut results = Vec::new();
+                    for call in &calls {
+                        if !exposed.contains(&call.name) {
+                            results.push(crate::tools::exposure::result(call, Err("tool is not exposed; discover it with ToolSearch first".into())));
+                        } else if call.name == "ToolSearch" {
+                            let output = config.tool_exposure.search(tools, &call.args);
+                            match output {
+                                Ok((output, names)) => {
+                                    log.append(&SessionEvent::ToolsActivated { names: names.clone() })?;
+                                    activated.extend(names);
+                                    results.push(crate::tools::exposure::result(call, Ok(output)));
+                                }
+                                Err(error) => results.push(crate::tools::exposure::result(call, Err(error))),
+                            }
+                        } else if call.name == "run_code" {
+                            let registry = std::sync::Arc::new(tools.restricted(&tools.names()));
+                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                            let running = crate::tools::exposure::program(registry, session.clone(), call.clone(), cancel.clone(), Some(tx));
+                            tokio::pin!(running);
+                            let (result, _) = loop {
+                                tokio::select! {
+                                    finished = &mut running => break finished,
+                                    Some((nested, result, ack)) = rx.recv() => {
+                                        let event = match result {
+                                            Some(result) => SessionEvent::ProgramToolResult { parent:call.call.clone(), args:nested.args, result },
+                                            None => SessionEvent::ProgramToolStarted { parent:call.call.clone(), call:nested.call, name:nested.name, args:nested.args },
+                                        };
+                                        let appended = log.append(&event);
+                                        let _ = ack.send(appended.is_ok());
+                                        appended?;
+                                    }
+                                }
+                            };
+                            results.push(result);
+                        } else {
+                            results.extend(tools.restricted(&exposed).dispatch(&session, std::slice::from_ref(call), 1, cancel).await);
+                        }
+                    }
+                    results
+                };
                 let dismissed = results.iter().any(|result| result.plan_review == Some(rness_protocol::events::PlanReview::Dismissed));
                 for result in results {
                     frames(Frame::ToolOutput {

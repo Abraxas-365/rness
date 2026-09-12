@@ -437,6 +437,9 @@ async fn tool_roundtrip_turn_commits_and_replays() {
         .history
         .iter()
         .map(|e| match &e.event {
+            SessionEvent::ToolsActivated { .. } => "tools-activated",
+            SessionEvent::ProgramToolStarted { .. } => "program-started",
+            SessionEvent::ProgramToolResult { .. } => "program-result",
             SessionEvent::Header(_) => "header",
             SessionEvent::UserMessage(_) => "user",
             SessionEvent::TurnStarted { .. } => "turn+",

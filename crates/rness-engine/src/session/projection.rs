@@ -166,6 +166,9 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
             SessionEvent::RequestConfig(c) => ctx.config = c.clone(),
             // Structure and trace events never reach the model.
             SessionEvent::Header(_)
+            | SessionEvent::ToolsActivated { .. }
+            | SessionEvent::ProgramToolStarted { .. }
+            | SessionEvent::ProgramToolResult { .. }
             | SessionEvent::CompactionRequest { .. }
             | SessionEvent::CompactionStarted { .. }
             | SessionEvent::CompactionFinished { .. }
@@ -220,6 +223,9 @@ pub fn transcript(history: &[Envelope]) -> Transcript {
             SessionEvent::Compaction(_) => {} // replayed at its anchor
             SessionEvent::Prune(_) => {} // replayed at its target
             SessionEvent::Header(_)
+            | SessionEvent::ToolsActivated { .. }
+            | SessionEvent::ProgramToolStarted { .. }
+            | SessionEvent::ProgramToolResult { .. }
             | SessionEvent::CompactionRequest { .. }
             | SessionEvent::CompactionStarted { .. }
             | SessionEvent::CompactionFinished { .. }

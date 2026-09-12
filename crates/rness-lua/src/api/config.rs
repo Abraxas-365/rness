@@ -19,6 +19,7 @@ pub struct UserMapping {
 
 #[derive(Clone, Default)]
 pub struct StartupConfig {
+    pub tool_exposure: rness_engine::tools::exposure::Exposure,
     pub compaction: BTreeMap<String, rness_engine::turn::compaction::Policy>,
     pub mappings: Vec<UserMapping>,
     pub images: rness_engine::images::ImagePolicy,
@@ -425,6 +426,9 @@ pub fn evaluate(lua: &Lua, path: &std::path::Path) -> Result<StartupConfig, Box<
     keymap.set("setup", lua.create_function(|_, _: mlua::Value| -> mlua::Result<()> {
         Err(mlua::Error::runtime("keymap.setup is startup-only; restart to change mappings"))
     })?)?;
+    if let Some(exposure) = rness.get::<Option<Table>>("tool_exposure")? {
+        state.lock().unwrap().tool_exposure = lua.from_value(mlua::Value::Table(exposure))?;
+    }
     if let Some(policies) = rness.get::<Option<Table>>("compaction")? {
         let policies: BTreeMap<String, rness_engine::turn::compaction::Policy> = lua.from_value(mlua::Value::Table(policies))?;
         for (route, policy) in &policies {

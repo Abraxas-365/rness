@@ -2,6 +2,55 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Deferred tools and programmatic tool calling
+
+Configure tool presentation in your `init.lua` (restart required):
+
+```lua
+rness.tool_exposure = {
+  mode = "both", -- "native" (default), "ptc", or "both"
+  deferred = { "plugin_echo", "Read" }, -- exact registered names
+}
+```
+
+- `native` exposes ordinary tool schemas. Names in `deferred` are withheld until discovered.
+- `ptc` exposes only `ToolSearch` and `run_code`; ordinary tools are invoked through programs.
+- `both` exposes `run_code`, `ToolSearch`, and non-deferred or already-discovered native tools.
+- The default flavor remains `native` with no deferred names. Nothing is automatically deferred, including MCP tools.
+
+`ToolSearch` takes `{ "query": "keywords" }` or `{ "query": "select:plugin_echo,Read" }` and returns up to 20 matching full schemas. Keyword searches require every word to match the name/description. Search sees only the calling agent's permitted registry. Successful discovery is logged; native schema activation takes effect on the next model step and survives session replay. Activation is not permission: removed or disallowed tools remain unavailable. `ToolSearch` and `run_code` are reserved engine names, not plugin registration names.
+
+Lua plugin tools registered through `rness.tool.register` work through the same bridge as native tools. For example, a plugin can declare:
+
+```lua
+rness.tool.register {
+  name = "plugin_echo",
+  description = "Echo text",
+  input_schema = {
+    type = "object",
+    properties = { text = { type = "string" } },
+    required = { "text" },
+  },
+  run = function(args, ctx)
+    return args.text .. " from " .. ctx.session
+  end,
+}
+```
+
+After discovering its schema, the model can invoke `run_code` with:
+
+```json
+{"code":"local results = {}; for i = 1, 3 do results[i] = tools.call('plugin_echo', {text = tostring(i)}) end; return results"}
+```
+
+`tools.call(name, args)` returns `{ output, is_error, content }`. A rejected or failed tool returns `is_error=true`; the program must inspect that field. Calls execute sequentially through the existing dispatcher, preserving agent restrictions, approvals, session/workspace context, and cancellation. The nested call ID is derived from the outer call ID. Programs may invoke permitted tools without prior discovery; deferred loading controls schemas, not authority.
+
+Each invocation uses a fresh restricted Lua VM, separate from the configuration/plugin actor. It has table/string/math libraries but no direct filesystem, process, network, package loading, or plugin-global access. Tool implementations retain their usual capabilities; calling Bash is still shell execution governed by its approval policy. This is not an OS process sandbox.
+
+Limits: 64 KiB source, 16 MiB Lua memory, 32 tool calls, and a 60-second cooperative execution budget. Cancellation/time checks occur at Lua instruction hooks and tool boundaries; this is not a hard preemptive deadline for native library operations or non-cooperative tool implementations. Recursive `run_code` and nested `ToolSearch` are rejected. Return values must be JSON-serializable; plugin presentation metadata is not returned to the program.
+
+Nested call starts are appended before dispatch, and results before returning to Lua, as `tools/program_started` and `tools/program_result` audit events. They are not injected as standalone model tool messages: only the outer program result enters model context. Programs are not resumed after a crash. Tool reload/unload is supported between calls after the plugin registry has been synchronized; no guarantee is made for replacing a plugin during an executing program.
+
 ## Structured statusline
 
 Declare a one-row statusline at startup or during plugin loading:

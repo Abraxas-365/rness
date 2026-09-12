@@ -67,6 +67,14 @@ pub enum SessionEvent {
     #[serde(rename = "tool/result")]
     ToolResult(ToolResult),
 
+    #[serde(rename = "tools/activated")]
+    ToolsActivated { names: Vec<String> },
+    /// Nested program calls are auditable, not standalone model messages.
+    #[serde(rename = "tools/program_started")]
+    ProgramToolStarted { parent: ToolCallId, call: ToolCallId, name: String, args: serde_json::Value },
+    #[serde(rename = "tools/program_result")]
+    ProgramToolResult { parent: ToolCallId, args: serde_json::Value, result: ToolResult },
+
     /// A turn opened (one user intent -> agent until idle).
     #[serde(rename = "turn/started")]
     TurnStarted { turn: u32 },
@@ -128,7 +136,7 @@ impl PlanState {
         for env in history {
             match &env.event {
                 SessionEvent::PlanMode { active } => { state.active = *active; state.pending = None; }
-                SessionEvent::ToolResult(result) if !result.is_error && result.plan_review == Some(PlanReview::Approved) => state.pending = Some(false),
+                SessionEvent::ToolResult(result) | SessionEvent::ProgramToolResult { result, .. } if !result.is_error && result.plan_review == Some(PlanReview::Approved) => state.pending = Some(false),
                 _ => {}
             }
         }
@@ -158,7 +166,7 @@ impl TaskSnapshot {
     /// Latest successful snapshot in full fork-resolved history, including compacted events.
     pub fn from_history(history: &[Envelope]) -> Self {
         history.iter().rev().find_map(|env| match &env.event {
-            SessionEvent::ToolResult(result) if !result.is_error => result.tasks.clone(),
+            SessionEvent::ToolResult(result) | SessionEvent::ProgramToolResult { result, .. } if !result.is_error => result.tasks.clone(),
             _ => None,
         }).unwrap_or_default()
     }

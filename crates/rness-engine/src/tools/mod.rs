@@ -5,6 +5,8 @@
 //! model emitted the tool_use parts. History stays deterministic no
 //! matter how execution interleaves (invariant #8).
 
+pub mod exposure;
+
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -134,6 +136,7 @@ impl ToolRegistry {
     pub fn try_register(&self, tool: Arc<dyn Tool>) -> Result<(), String> {
         let mut tools = self.tools.write().expect("registry lock");
         let name = tool.name().to_string();
+        if name == "ToolSearch" || name == "run_code" { return Err(format!("reserved engine tool name: {name}")); }
         if tools.contains_key(&name) { return Err(format!("tool already registered: {name}")); }
         tools.insert(name, tool);
         Ok(())

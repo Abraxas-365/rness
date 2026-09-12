@@ -99,6 +99,42 @@ mod ownership_tests {
         async fn execute(&self, _: serde_json::Value) -> Result<String, String> { Ok("native".into()) }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deferred_program_calls_lua_tools_and_tracks_reload() {
+        use rness_engine::tools::{exposure::{Exposure, Mode, program}, ToolCall, ToolRegistry};
+        use serde_json::json;
+        let host = LuaHost::spawn().unwrap();
+        host.load("program-tool", r#"
+            plugin_secret = 'not program state'
+            rness.tool.register { name='plugin_echo', description='Echo from Lua',
+                input_schema={type='object', properties={text={type='string'}}},
+                run=function(args, ctx) return args.text .. ':' .. ctx.session .. ':' .. ctx.call end }
+        "#).await.unwrap();
+        let registry = Arc::new(ToolRegistry::default());
+        let installed = sync_lua_tools(&registry, &host, &[]).await;
+        let exposure = Exposure {mode:Mode::Both, deferred:vec!["plugin_echo".into()]};
+        assert!(!exposure.specs(&registry, &Default::default()).iter().any(|s| s.name == "plugin_echo"));
+        let (schema, names) = exposure.search(&registry, &json!({"query":"select:plugin_echo"})).unwrap();
+        assert!(schema.contains("Echo from Lua"));
+        assert_eq!(names, vec!["plugin_echo"]);
+        let call = ToolCall {call:"outer".into(),name:"run_code".into(),args:json!({"code":"assert(plugin_secret == nil); return tools.call('plugin_echo', {text='hello'})"})};
+        let (result, nested) = tokio::time::timeout(std::time::Duration::from_secs(5),
+            program(registry.clone(), "session".into(), call.clone(), Default::default(), None)).await.unwrap();
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(nested[0].1.output, "hello:session:outer/0");
+        assert!(host.reload(vec![crate::loader::PluginSource {
+            name:"program-tool".into(), source:"rness.tool.register {name='plugin_echo', run=function() return 'reloaded' end}".into(),
+        }]).await.unwrap().is_empty());
+        let installed = sync_lua_tools(&registry, &host, &installed).await;
+        let (_, nested) = program(registry.clone(), "session".into(), call.clone(), Default::default(), None).await;
+        assert_eq!(nested[0].1.output, "reloaded");
+        assert!(host.reload(vec![]).await.unwrap().is_empty());
+        sync_lua_tools(&registry, &host, &installed).await;
+        assert!(exposure.search(&registry, &json!({"query":"plugin_echo"})).unwrap().1.is_empty());
+        let (_, nested) = program(registry, "session".into(), call, Default::default(), None).await;
+        assert!(nested[0].1.is_error);
+    }
+
     #[tokio::test]
     async fn plugin_second_return_is_presentation_not_model_output() {
         let host = LuaHost::spawn().unwrap();

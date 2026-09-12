@@ -460,6 +460,7 @@ async fn main() -> anyhow::Result<()> {
             tools: Arc::clone(&tools),
             config: TurnConfig {
                 compaction: startup.compaction.clone(),
+                tool_exposure: startup.tool_exposure.clone(),
                 system: "You are rness, a coding agent. Be concise.".into(),
                 ..Default::default()
             },

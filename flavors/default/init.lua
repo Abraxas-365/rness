@@ -3,6 +3,10 @@ require("providers")
 require("theme")
 require("agents")
 
+-- Set mode to "both" or "ptc" to enable isolated Lua run_code programs.
+-- Add exact tool names to deferred to load their schemas through ToolSearch.
+rness.tool_exposure = { mode = "native", deferred = {} }
+
 rness.plugins.setup({
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20 } },
   { name = "spinner", file = "plugins/spinner.lua" },
