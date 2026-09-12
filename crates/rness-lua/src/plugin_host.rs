@@ -8,6 +8,12 @@
 
 #[async_trait::async_trait]
 impl rness_kernel::presentation::TextProvider for LuaHost {
+    async fn status(&self, context: serde_json::Value) -> Option<serde_json::Value> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::StatusView { context, reply }).ok()?;
+        rx.await.ok().flatten()
+    }
+
     async fn text(&self) -> Option<String> {
         self.statusline().await
     }
@@ -107,6 +113,10 @@ enum Cmd {
     FireHook {
         event: String,
         payload: serde_json::Value,
+    },
+    StatusView {
+        context: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
     },
     Statusline {
         reply: tokio::sync::oneshot::Sender<Option<String>>,
@@ -379,6 +389,9 @@ impl LuaHost {
                             for err in rt.fire_hook(&event, &payload) {
                                 tracing::warn!(target: "lua", "hook '{event}' failed: {err}");
                             }
+                        }
+                        Cmd::StatusView { context, reply } => {
+                            let _ = reply.send(rt.status_view(context));
                         }
                         Cmd::Statusline { reply } => {
                             let _ = reply.send(rt.statusline());

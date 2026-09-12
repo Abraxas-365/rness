@@ -15,6 +15,28 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn structured_statusline_callbacks_replace_and_unload() {
+    use rness_kernel::presentation::TextProvider;
+    let host = LuaHost::spawn().unwrap();
+    host.load("status", r##"
+        rness.ui.statusline = {
+            style = { fg = "#83a598" }, padding = { left = 1 },
+            left = function(ctx) ctx.model = ctx.model .. "!"; return {{ text = ctx.model }} end,
+            right = "static", visible = function(ctx) return ctx.busy end,
+        }
+    "##).await.unwrap();
+    let context = serde_json::json!({"model":"test", "busy":true});
+    let view = host.status(context.clone()).await.unwrap();
+    assert_eq!(view["left"][0]["text"], "test!");
+    assert_eq!(view["right"], "static");
+    assert_eq!(view["visible"], true);
+    assert_eq!(context["model"], "test");
+    assert!(host.load("bad", "rness.ui.statusline = 42").await.is_err());
+    host.reload(vec![]).await.unwrap();
+    assert!(host.status(context).await.is_none());
+}
+
+#[tokio::test]
 async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default");
     let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();

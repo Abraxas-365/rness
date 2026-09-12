@@ -1,35 +1,14 @@
--- spinner.lua — busy indicator + context budget in the statusline.
---
--- Copy this file, then add { name = "spinner", file = "plugins/spinner.lua" }
--- to init.lua's single rness.plugins.setup list. Copying alone does not enable it.
---
--- While a turn runs, shadows the built-in statusline with a spinner,
--- WHAT the agent is doing right now (thinking… / writing… / the tool
--- that is executing), how many agents are working, and elapsed
--- seconds. Once a turn has completed it also shows how much context
--- the session is using against YOUR compact threshold:
--- "46.3k/150.0k tok". Returning nil lets the built-in render — the
--- chain pattern, no configuration.
---
--- Wiring it uses:
---   rness.hook.on("turn_start"/"turn_end")  engine bus → Lua hooks
---   rness.hook.on("frame")                  live frames, protocol wire shape
---   rness.session.usage(id)                 context tokens (replays the log)
---   rness.ui.statusline(fn)                 polled by the host (~2/s)
-
--- Compact threshold: 80% of the declared context window of the active
--- model (see models.lua) when available, else YOUR literal. Same
--- policy number as autocompact.lua — keep them in sync.
-local function max_input_tokens()
-  local caps = rness.models.get(rness.model)
-  if caps and caps.context_window then
-    return math.floor(caps.context_window * 0.8)
-  end
-  return 150000
+-- Structured statusline: aggregate activity on the left, active session model
+-- and cached token usage on the right. Explicitly loaded by init.lua.
+-- Usage is refreshed on turn_end, never by replaying history during rendering.
+local function max_input_tokens(session)
+  local selection = rness.session.config(session).selection
+  local policies = rness.compaction or {}
+  local policy = (selection and policies[selection.route .. "/" .. selection.model]) or policies.default
+  return policy and policy.threshold_tokens or 165000
 end
 
-local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
-local tick = 0
+local frames = { "|", "/", "-", "\\\\" }
 
 -- session id → start time; several sessions can run at once
 -- (subagents, server clients) — busy means ANY turn is live.
@@ -43,7 +22,7 @@ local doing = {}
 -- Cached: usage() replays the log, too heavy for a 2/s poll. Recorded
 -- usage only moves when a request commits, so turn_end is the right
 -- moment to refresh.
-local tokens = nil
+local tokens = {}
 
 local function k(n)
   return string.format("%.1fk", n / 1000)
@@ -52,7 +31,7 @@ end
 local function refresh(session)
   local ok, usage = pcall(rness.session.usage, session)
   if not ok then return end
-  tokens = string.format("%s/%s tok", k(usage.input), k(max_input_tokens()))
+  tokens[session] = string.format("%s/%s tok", k(usage.input), k(max_input_tokens(session)))
 end
 
 rness.hook.on("turn_start", function(ev)
@@ -82,27 +61,28 @@ rness.hook.on("frame", function(f)
   end
 end)
 
-rness.ui.statusline(function()
-  local count, oldest, act = 0, nil, nil
-  for id, started in pairs(running) do
-    count = count + 1
-    if oldest == nil or started < oldest then
-      oldest = started
-      act = doing[id] -- show what the OLDEST busy session is doing
+rness.ui.statusline = {
+  style = { fg = "#a89984", bg = "#282828" },
+  padding = { left = 1, right = 1 },
+  separator = " · ",
+  left = function(ctx)
+    local count, oldest, act = 0, nil, nil
+    for id, started in pairs(running) do
+      count = count + 1
+      if oldest == nil or started < oldest then
+        oldest, act = started, doing[id]
+      end
     end
-  end
-
-  if count == 0 then
-    return tokens -- idle: budget if known, else built-in renders
-  end
-
-  tick = tick + 1
-  local spin = frames[(tick % #frames) + 1]
-  local secs = os.time() - oldest
-  local verb = act and (act .. "…") or "working…"
-  local suffix = tokens and (" · " .. tokens) or ""
-  if count == 1 then
-    return string.format("%s %s %ds%s", spin, verb, secs, suffix)
-  end
-  return string.format("%s %d agents · %s %ds%s", spin, count, verb, secs, suffix)
-end)
+    if count == 0 then return "idle" end
+    local secs = os.time() - oldest
+    local spin = frames[(secs % #frames) + 1]
+    return {
+      { text = spin .. " " .. (act or "working"), style = { fg = "#83a598" } },
+      { text = tostring(secs) .. "s" },
+      { text = count > 1 and (count .. " agents") or "" },
+    }
+  end,
+  right = function(ctx)
+    return { { text = ctx.model or "" }, { text = tokens[ctx.session] or "" } }
+  end,
+}

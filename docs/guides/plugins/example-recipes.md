@@ -2,6 +2,45 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Structured statusline
+
+Declare a one-row statusline at startup or during plugin loading:
+
+```lua
+rness.ui.statusline = {
+  style = { fg = "#a89984", bg = "#282828" },
+  padding = { left = 1, right = 1 },
+  separator = " · ",
+  left = function(ctx)
+    return {
+      { text = ctx.activity, style = { fg = "#83a598" } },
+      { text = ctx.busy and ctx.elapsed or "" },
+    }
+  end,
+  right = function(ctx) return ctx.model end,
+}
+```
+
+`left` and `right` accept strings, arrays of `{ text, style }` segments, or
+callbacks returning either. Empty segments are skipped. Styles use the same
+named groups or inline tables as other UI components. Right content receives
+space first; left content is clipped to the remainder with a one-cell gap.
+Long right content is clipped too. No wrapping or extra rows are introduced.
+
+Callbacks receive a detached context snapshot: `session`, `model`, `busy`,
+`activity` (`working` or `idle`), `elapsed_ms`, and `elapsed` (formatted seconds).
+Elapsed time starts when the frontend observes the active session becoming busy.
+Mutations to this snapshot cannot change application state. Token usage and
+cross-session activity can be cached through hooks, as in the default spinner;
+they are not built-in context fields. Callbacks run in the Lua actor outside
+terminal rendering, on the existing approximately 500ms refresh cycle.
+
+`visible = false` (or a callback returning false) hides the row. The existing
+`rness.ui.statusline(function() ... end)` API remains available: a string uses
+the legacy display, while `nil` declines to the built-in statusline. Callback
+errors also fall back and are logged. Plugin unload removes its declaration;
+in-flight output is discarded when presentation or session context changes.
+
 ## Messagebox presentation
 
 Startup configuration in `init.lua` can style messages and built-in tool cards:

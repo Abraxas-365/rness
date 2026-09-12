@@ -66,6 +66,10 @@ pub fn canonical_chord(input: &str) -> Result<String, String> {
 #[async_trait::async_trait]
 pub trait TextProvider: Send + Sync {
     async fn text(&self) -> Option<String>;
+
+    async fn status(&self, _context: serde_json::Value) -> Option<serde_json::Value> {
+        self.text().await.map(serde_json::Value::String)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

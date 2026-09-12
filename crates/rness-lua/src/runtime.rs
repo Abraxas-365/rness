@@ -747,6 +747,20 @@ impl LuaRuntime {
         Ok(())
     }
 
+    pub fn status_view(&self, context: serde_json::Value) -> Option<serde_json::Value> {
+        let result = (|| -> mlua::Result<serde_json::Value> {
+            let Some(key) = &self.statusline else { return Ok(serde_json::Value::Null) };
+            let f: Function = self.lua.registry_value(key)?;
+            let value: LuaValue = f.call(self.lua.to_value(&context)?)?;
+            self.lua.from_value(value)
+        })();
+        match result {
+            Ok(serde_json::Value::Null) => None,
+            Ok(value) => Some(value),
+            Err(error) => { tracing::warn!("lua statusline failed: {}", user_message(&error)); None }
+        }
+    }
+
     /// Evaluate the registered statusline provider, if any.
     pub fn statusline(&self) -> Option<String> {
         let key = self.statusline.as_ref()?;
@@ -1461,8 +1475,8 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
         Ok(textwrap::wrap(&text, usize::from(columns)).into_iter().map(|line| line.into_owned()).collect::<Vec<_>>())
     })?)?;
-    ui.set(
-        "statusline",
+    lua.globals().set(
+        "__rness_statusline_register",
         lua.create_function(|lua, provider: Function| {
             require_declaration_phase(lua)?;
             let pending: Table = lua.globals().get("__rness_pending")?;
@@ -1508,10 +1522,39 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     lua.globals().set("__rness_messagebox", messagebox)?;
     let ui_meta = lua.create_table()?;
     ui_meta.set("__index", lua.create_function(|lua, (_table, key): (Table, String)| {
+        if key == "statusline" { return lua.globals().get::<LuaValue>("__rness_statusline_register"); }
         if key == "messagebox" { lua.globals().get::<LuaValue>("__rness_messagebox") } else { Ok(LuaValue::Nil) }
     })?)?;
     ui_meta.set("__newindex", lua.create_function(move |lua, (table, key, value): (Table, String, LuaValue)| {
-        if key == "messagebox" {
+        if key == "statusline" {
+            require_declaration_phase(lua)?;
+            let LuaValue::Table(config) = value else { return Err(mlua::Error::runtime("statusline must be a table")); };
+            for pair in config.clone().pairs::<String, LuaValue>() {
+                let (key, value) = pair?;
+                let valid = match key.as_str() {
+                    "left" | "right" => matches!(value, LuaValue::String(_) | LuaValue::Table(_) | LuaValue::Function(_)),
+                    "visible" => matches!(value, LuaValue::Boolean(_) | LuaValue::Function(_)),
+                    "style" => matches!(value, LuaValue::String(_) | LuaValue::Table(_)),
+                    "padding" => matches!(value, LuaValue::Table(_)),
+                    "separator" => matches!(value, LuaValue::String(_)),
+                    _ => false,
+                };
+                if !valid { return Err(mlua::Error::runtime(format!("invalid statusline field: {key}"))); }
+            }
+            let callback = lua.create_function(move |lua, context: Table| {
+                let output = lua.create_table()?;
+                for pair in config.clone().pairs::<String, LuaValue>() {
+                    let (key, value) = pair?;
+                    let value = match value {
+                        LuaValue::Function(f) if matches!(key.as_str(), "left" | "right" | "visible") => f.call::<LuaValue>(context.clone())?,
+                        other => other,
+                    };
+                    output.set(key, value)?;
+                }
+                Ok(output)
+            })?;
+            lua.globals().get::<Table>("__rness_pending")?.set("statusline", owned_callback(lua, callback)?)
+        } else if key == "messagebox" {
             require_declaration_phase(lua)?;
             if lua.globals().get::<Option<Table>>("__rness_messagebox_renderers")?.is_some() {
                 return Err(mlua::Error::runtime("messagebox configuration is startup-only"));
