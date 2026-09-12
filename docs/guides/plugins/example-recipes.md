@@ -64,6 +64,25 @@ Both sections accept optional `before(request, ctx)` and `after(result, ctx)` fu
 
 Web tools remain compatible with normal permissions, deferred `ToolSearch` discovery, and `run_code` nested dispatch.
 
+### Plugin-owned hooks
+
+For reloadable hooks, register from an explicitly loaded plugin:
+
+```lua
+rness.web_hooks.register("fetch", {
+  after = function(result, ctx)
+    result.content = result.content:gsub(" +", " ")
+    return result
+  end,
+})
+```
+
+One plugin may own each operation (`search` or `fetch`); duplicate ownership fails. Removing a plugin from the reload set removes its callbacks, and failed reloads retain the previous callbacks. Plugin callbacks take precedence over startup callbacks for the whole operation; after unload, startup callbacks apply again. Registration is only allowed while loading a plugin. Each callback invocation is serialized with reload in the Lua actor. A callback already executing finishes before reload; a network request spanning reload uses the newly installed `after` callback when it returns (not a request-wide callback snapshot).
+
+### Durable background jobs
+
+The CLI persists jobs under `<session-root>/jobs`, including owner, status, output and read cursor. Output is appended and synced to a separate `.output` file; small metadata snapshots are atomically replaced only on lifecycle/read/delivery changes. Abandoned running jobs recover as `interrupted`, never automatically rerun. Process-owner file locks prevent another live Rness instance from being mistaken for a crashed owner; live instances' jobs are not imported. Completion notices carry a stable job ID in the session message's provenance. Admission deduplicates queued IDs and checks durable provenance before retrying, so losing the job-side acknowledgment after the session commit does not append a duplicate. The job is acknowledged only after the session record is visible. This guarantees idempotent session-message insertion under the session service's existing single-writer ownership; it does not promise exactly-once model execution or external side effects. Persistence errors cancel the producer and are logged. Tests cover concurrent retries, lost acknowledgment/restart, output-before-settlement recovery, abandoned partial metadata, append failure, read-cursor recovery and live-owner exclusion. No supervisor or process reconnection is provided.
+
 ## Deferred tools and programmatic tool calling
 
 Configure tool presentation in your `init.lua` (restart required):
@@ -104,6 +123,8 @@ After discovering its schema, the model can invoke `run_code` with:
 ```json
 {"code":"local results = {}; for i = 1, 3 do results[i] = tools.call('plugin_echo', {text = tostring(i)}) end; return results"}
 ```
+
+`tools.parallel({{name="Read", args={file_path="a.txt"}}, {name="Read", args={file_path="b.txt"}}})` returns an array of the same result objects in input order. Up to four calls execute concurrently; all entries count against the shared 32-call program budget. Each call retains approvals, restrictions and audit records. An individual tool error does not discard sibling results. Lua-plugin tools still serialize inside their shared actor.
 
 `tools.call(name, args)` returns `{ output, is_error, content }`. A rejected or failed tool returns `is_error=true`; the program must inspect that field. Calls execute sequentially through the existing dispatcher, preserving agent restrictions, approvals, session/workspace context, and cancellation. The nested call ID is derived from the outer call ID. Programs may invoke permitted tools without prior discovery; deferred loading controls schemas, not authority.
 

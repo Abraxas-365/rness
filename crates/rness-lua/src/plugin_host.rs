@@ -404,10 +404,7 @@ impl LuaHost {
                             });
                             let result = (|| -> mlua::Result<serde_json::Value> {
                                 if cancel.is_cancelled() || reply.is_closed() { return Err(mlua::Error::runtime("web hook cancelled")); }
-                                let rness: mlua::Table = rt.lua().globals().get("rness")?;
-                                let Some(web) = rness.get::<Option<mlua::Table>>("web")? else { return Ok(value); };
-                                let Some(section) = web.get::<Option<mlua::Table>>(operation.as_str())? else { return Ok(value); };
-                                let Some(callback) = section.get::<Option<mlua::Function>>(phase.as_str())? else { return Ok(value); };
+                                let Some(callback) = rt.web_hook(&operation, &phase)? else { return Ok(value); };
                                 let returned: mlua::Value = callback.call((rt.lua().to_value(&value)?, rt.lua().to_value(&context)?))?;
                                 if !matches!(returned, mlua::Value::Table(_)) { return Err(mlua::Error::runtime("web hook must return a table")); }
                                 rt.lua().from_value(returned)

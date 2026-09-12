@@ -315,6 +315,7 @@ pub struct UserMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageSource {
+    JobCompletion { id: String },
     /// Workspace instruction baseline (AGENTS.md chain). `identity`
     /// fingerprints discovery inputs+content: a visible baseline with a
     /// matching identity is current; mismatch or absence → re-inject.

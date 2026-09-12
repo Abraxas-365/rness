@@ -490,6 +490,7 @@ async fn steer_lands_before_next_step() {
     let mut steers = move || {
         if calls.fetch_add(1, Ordering::Relaxed) == 1 {
             vec![Pending {
+                source: None,
                 intent: UserIntent::Steer,
                 content: vec![ContentPart::Text { text: "actually stop".into() }],
             }]

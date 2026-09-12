@@ -4,6 +4,22 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 struct Echo;
+#[tokio::test(flavor="multi_thread")]
+async fn parallel_calls_overlap_and_keep_input_order() {
+    struct BarrierTool(Arc<tokio::sync::Barrier>);
+    #[async_trait::async_trait]
+    impl Tool for BarrierTool {
+        fn name(&self)->&str { "Barrier" }
+        async fn execute(&self,args:Value)->Result<String,String> { self.0.wait().await; Ok(args["index"].to_string()) }
+    }
+    let registry = Arc::new(ToolRegistry::default());
+    registry.register(Arc::new(BarrierTool(Arc::new(tokio::sync::Barrier::new(4)))));
+    let call = ToolCall {call:"p".into(),name:"run_code".into(),args:json!({"code":"local calls = {}; for i=1,8 do calls[i]={name='Barrier',args={index=i}} end; local results=tools.parallel(calls); for i=1,8 do assert(results[i].output == tostring(i)) end; return results"})};
+    let (result,nested) = tokio::time::timeout(std::time::Duration::from_secs(5),program(registry,"s".into(),call,CancellationToken::new(),None)).await.unwrap();
+    assert!(!result.is_error,"{}",result.output); assert_eq!(nested.len(),8);
+    for (index,(call,_)) in nested.iter().enumerate() { assert_eq!(call.call,format!("p/{index}")); }
+}
+
 struct Flow(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl rness_engine::turn::provider::Provider for Flow {

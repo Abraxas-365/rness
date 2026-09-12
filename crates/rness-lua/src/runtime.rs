@@ -86,6 +86,7 @@ pub struct LuaRuntime {
     bindings: Vec<LuaBindingSpec>,
     actions: HashMap<String, (LuaActionSpec, RegistryKey)>,
     commands: HashMap<String, (String, RegistryKey)>,
+    web_hooks: HashMap<String, Table>,
     plugin_hooks: HashMap<String, Table>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
     references: Option<(String, rness_engine::file_references::Config)>,
@@ -153,6 +154,14 @@ impl LuaRuntime {
         Ok(())
     }
 
+    pub(crate) fn web_hook(&self, operation: &str, phase: &str) -> mlua::Result<Option<Function>> {
+        if let Some(callbacks) = self.web_hooks.get(operation) { return callbacks.get(phase); }
+        let rness: Table = self.lua.globals().get("rness")?;
+        let Some(web) = rness.get::<Option<Table>>("web")? else { return Ok(None); };
+        let Some(section) = web.get::<Option<Table>>(operation)? else { return Ok(None); };
+        section.get(phase)
+    }
+
     pub fn new() -> Result<Self, LuaError> {
         let lua = Lua::new();
         install_api(&lua)?;
@@ -169,6 +178,7 @@ impl LuaRuntime {
             bindings: Vec::new(),
             actions: HashMap::new(),
             commands: HashMap::new(),
+            web_hooks: HashMap::new(),
             plugin_hooks: HashMap::new(),
             references: None,
             plan_store: None,
@@ -237,7 +247,16 @@ impl LuaRuntime {
         self.lua.globals().set("__rness_loading_hooks", LuaValue::Nil)?;
         self.lua.globals().set("__rness_load_owner", LuaValue::Nil)?;
         self.lua.globals().set("__rness_loading_plugin", LuaValue::Nil)?;
-        let execution = execution.and_then(|()| self.drain_registrations(Some(name)).map_err(|e| mlua::Error::runtime(e.to_string())));
+        let execution = execution.and_then(|()| {
+            let pending: Table = self.lua.globals().get("__rness_pending")?;
+            if let Some(hooks) = pending.get::<Option<Table>>("web_hooks")? {
+                for pair in hooks.pairs::<String,Table>() {
+                    let (operation,_) = pair?;
+                    if self.web_hooks.contains_key(&operation) { return Err(mlua::Error::runtime(format!("web hooks already owned for {operation}"))); }
+                }
+            }
+            self.drain_registrations(Some(name)).map_err(|e| mlua::Error::runtime(e.to_string()))
+        });
         if let Err(error) = execution {
             for unsubscribe in hook_cleanup.sequence_values::<Function>() {
                 unsubscribe?.call::<bool>(())?;
@@ -247,6 +266,7 @@ impl LuaRuntime {
             for category in ["tools", "apps", "tool_cards", "keymaps", "commands", "actions", "bindings"] {
                 pending.get::<Table>(category)?.clear()?;
             }
+            pending.set("web_hooks", LuaValue::Nil)?;
             pending.set("statusline", LuaValue::Nil)?;
             pending.set("questions", LuaValue::Nil)?;
             pending.set("tasks_disabled", LuaValue::Nil)?;
@@ -297,6 +317,14 @@ impl LuaRuntime {
         }
         pending.set("references", LuaValue::Nil)?;
         pending.set("questions", LuaValue::Nil)?;
+        if let Some(hooks) = pending.get::<Option<Table>>("web_hooks")? {
+            for pair in hooks.pairs::<String,Table>() {
+                let (operation, callbacks) = pair?;
+                if self.web_hooks.contains_key(&operation) { return Err(mlua::Error::runtime(format!("web hooks already owned for {operation}")).into()); }
+                self.web_hooks.insert(operation, callbacks);
+            }
+            pending.set("web_hooks", LuaValue::Nil)?;
+        }
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
         Ok(())
     }
@@ -319,7 +347,8 @@ impl LuaRuntime {
                 command_metadata: self.command_metadata.clone(),
                 commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
                 references: None,
-                plugin_hooks: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
+                web_hooks: HashMap::new(),
+            plugin_hooks: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
             };
             let declarations: Table = self.lua.globals().get("__rness_declarations")?;
             let fresh = self.lua.create_table()?;
@@ -1071,6 +1100,7 @@ impl LuaRuntime {
             if let Some(owner) = owner {
                 self.registration_owners.insert(("statusline", String::new()), owner.to_owned());
             }
+            pending.set("web_hooks", LuaValue::Nil)?;
             pending.set("statusline", LuaValue::Nil)?;
         }
         Ok(())
@@ -1121,6 +1151,24 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     lua.globals().set("__rness_hooks", lua.create_table()?)?;
 
     let rness = lua.create_table()?;
+    let web_hooks = lua.create_table()?;
+    web_hooks.set("register", lua.create_function(|lua, (operation, callbacks): (String, Table)| {
+        let _: String = lua.globals().get("__rness_loading_plugin").map_err(|_| mlua::Error::runtime("web_hooks.register is plugin-load only"))?;
+        if !matches!(operation.as_str(), "search" | "fetch") { return Err(mlua::Error::runtime("web hook operation must be search or fetch")); }
+        let copy = lua.create_table()?;
+        for pair in callbacks.pairs::<String,LuaValue>() {
+            let (key,value) = pair?;
+            if !matches!(key.as_str(), "before" | "after") || !matches!(value,LuaValue::Function(_)) { return Err(mlua::Error::runtime("web hooks accept before/after functions only")); }
+            copy.set(key,value)?;
+        }
+        let pending: Table = lua.globals().get("__rness_pending")?;
+        let hooks = match pending.get::<Option<Table>>("web_hooks")? { Some(table) => table, None => lua.create_table()? };
+        if hooks.contains_key(operation.as_str())? { return Err(mlua::Error::runtime("duplicate web hook operation")); }
+        hooks.set(operation,copy)?;
+        pending.set("web_hooks",hooks)?;
+        Ok(())
+    })?)?;
+    rness.set("web_hooks",web_hooks)?;
 
     // rness.tool.register{ name=, description=, schema=, sensitive=, run= }
     let declarations = lua.create_table()?;

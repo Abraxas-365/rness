@@ -9,7 +9,8 @@
 //!     command = "npx",
 //!     args = {"-y", "@modelcontextprotocol/server-github"},
 //!     env = { GITHUB_TOKEN = "..." },   -- optional
-//!     timeout_ms = 30000,               -- optional, default 30s
+//!     defer_tools = true,                 -- optional, default false
+//!     timeout_ms = 30000,                 -- optional, default 30s
 //!   } -> { "mcp__github__create_issue", ... }  (public tool names)
 //!
 //!   rness.mcp.disconnect("github") -> true|false
@@ -58,6 +59,7 @@ pub fn install(
                 .into_iter()
                 .collect();
             let timeout_ms: u64 = spec.get::<Option<u64>>("timeout_ms")?.unwrap_or(30_000);
+            let defer_tools: bool = spec.get::<Option<bool>>("defer_tools")?.unwrap_or(false);
 
             if conns.lock().expect("mcp lock").contains_key(&name) {
                 return Err(err(format!("mcp server '{name}' is already connected")));
@@ -76,6 +78,9 @@ pub fn install(
                     Ok::<_, rness_mcp::McpError>((conn, tools))
                 })
                 .map_err(err)?;
+            if defer_tools {
+                reg.defer(tools.iter().cloned());
+            }
             conns.lock().expect("mcp lock").insert(name, conn);
             Ok(tools)
         })?,
@@ -99,8 +104,7 @@ pub fn install(
     mcp.set(
         "servers",
         lua.create_function(move |_, ()| {
-            let mut v: Vec<String> =
-                conns.lock().expect("mcp lock").keys().cloned().collect();
+            let mut v: Vec<String> = conns.lock().expect("mcp lock").keys().cloned().collect();
             v.sort();
             Ok(v)
         })?,

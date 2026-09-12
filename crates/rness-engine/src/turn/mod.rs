@@ -150,7 +150,7 @@ async fn drive(
             log.append(&SessionEvent::UserMessage(UserMessage {
                 intent: pending.intent,
                 content: pending.content,
-                        source: None,
+                source: pending.source,
             }))?;
         }
 

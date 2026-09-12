@@ -7,7 +7,7 @@
 
 pub mod exposure;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -23,10 +23,24 @@ use crate::approval::{ApprovalRequest, Approvals, Decision};
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
-    fn plan_config(&self) -> Option<crate::plan::PlanConfig> { None }
-    async fn review_plan(&self, _session: &str, _call: &str, _args: serde_json::Value, _cancel: &CancellationToken) -> Result<(String, rness_protocol::events::PlanReview), String> { Err("not a plan tool".into()) }
+    fn plan_config(&self) -> Option<crate::plan::PlanConfig> {
+        None
+    }
+    async fn review_plan(
+        &self,
+        _session: &str,
+        _call: &str,
+        _args: serde_json::Value,
+        _cancel: &CancellationToken,
+    ) -> Result<(String, rness_protocol::events::PlanReview), String> {
+        Err("not a plan tool".into())
+    }
     /// Bind workspace-dependent tools without mutating shared registrations.
-    fn for_workspace(&self, _session: &SessionId, _workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn for_workspace(
+        &self,
+        _session: &SessionId,
+        _workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         None
     }
     /// Shown to the model in the tool list.
@@ -48,12 +62,26 @@ pub trait Tool: Send + Sync {
     /// Session-aware entry point the dispatcher calls. Most tools don't
     /// care who called them — the default drops the session. Tools that
     /// delegate (subagent) override this instead of `execute`.
-    async fn execute_call(&self, session: &SessionId, _call: &str, args: serde_json::Value, _cancel: &CancellationToken) -> Result<String, String> {
+    async fn execute_call(
+        &self,
+        session: &SessionId,
+        _call: &str,
+        args: serde_json::Value,
+        _cancel: &CancellationToken,
+    ) -> Result<String, String> {
         self.execute_in(session, args).await
     }
     /// Typed durable effects are committed by the turn's existing log writer.
-    async fn execute_with_tasks(&self, session: &SessionId, call: &str, args: serde_json::Value, cancel: &CancellationToken) -> Result<(String, Option<rness_protocol::events::TaskSnapshot>), String> {
-        self.execute_call(session, call, args, cancel).await.map(|output| (output, None))
+    async fn execute_with_tasks(
+        &self,
+        session: &SessionId,
+        call: &str,
+        args: serde_json::Value,
+        cancel: &CancellationToken,
+    ) -> Result<(String, Option<rness_protocol::events::TaskSnapshot>), String> {
+        self.execute_call(session, call, args, cancel)
+            .await
+            .map(|output| (output, None))
     }
     /// Rich-output seam. The default preserves all existing text-only tools;
     /// adapters that return binary attachments override this and must admit
@@ -64,16 +92,42 @@ pub trait Tool: Send + Sync {
         call: &str,
         args: serde_json::Value,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
+    ) -> Result<
+        (
+            Vec<ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+        ),
+        String,
+    > {
         self.execute_with_tasks(session, call, args, cancel)
             .await
-            .map(|(output, tasks)| (vec![ToolResultContentPart::Text { text: output }], tasks, false))
+            .map(|(output, tasks)| {
+                (
+                    vec![ToolResultContentPart::Text { text: output }],
+                    tasks,
+                    false,
+                )
+            })
     }
     async fn execute_presented(
-        &self, session: &SessionId, call: &ToolCallId, args: serde_json::Value,
+        &self,
+        session: &SessionId,
+        call: &ToolCallId,
+        args: serde_json::Value,
         cancel: &CancellationToken,
-    ) -> Result<(Vec<ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<serde_json::Value>), String> {
-        self.execute_rich(session, call, args, cancel).await.map(|(content, tasks, error)| (content, tasks, error, None))
+    ) -> Result<
+        (
+            Vec<ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<serde_json::Value>,
+        ),
+        String,
+    > {
+        self.execute_rich(session, call, args, cancel)
+            .await
+            .map(|(content, tasks, error)| (content, tasks, error, None))
     }
     async fn execute_in(
         &self,
@@ -107,6 +161,7 @@ pub struct ToolRegistry {
     /// can re-sync tools at runtime (Lua plugin hot reload).
     pub images: Arc<std::sync::OnceLock<Arc<crate::images::ImageStore>>>,
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    deferred: RwLock<HashSet<String>>,
     /// Composition-owned approval seam. Default policy is `Allow`, which
     /// behaves exactly as if the seam didn't exist.
     pub file_references: Arc<crate::file_references::FileReferences>,
@@ -116,28 +171,62 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn for_workspace(&self, session: &SessionId, workspace: &std::path::Path) -> Self {
-        let tools = self.tools.read().expect("registry lock").iter()
-            .map(|(name, tool)| (name.clone(), tool.for_workspace(session, workspace).unwrap_or_else(|| Arc::clone(tool))))
+        let tools = self
+            .tools
+            .read()
+            .expect("registry lock")
+            .iter()
+            .map(|(name, tool)| {
+                (
+                    name.clone(),
+                    tool.for_workspace(session, workspace)
+                        .unwrap_or_else(|| Arc::clone(tool)),
+                )
+            })
             .collect();
-        Self { images: self.images.clone(), tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
+        Self {
+            images: self.images.clone(),
+            tools: RwLock::new(tools),
+            deferred: RwLock::new(self.deferred.read().expect("registry lock").clone()),
+            approvals: Arc::clone(&self.approvals),
+            plan_selections: self.plan_selections.clone(),
+            file_references: self.file_references.clone(),
+        }
     }
 
     pub fn restricted(&self, allowed: &[String]) -> Self {
-        let tools = self.tools.read().expect("registry lock").iter()
+        let tools = self
+            .tools
+            .read()
+            .expect("registry lock")
+            .iter()
             .filter(|(name, _)| allowed.contains(name))
-            .map(|(name, tool)| (name.clone(), Arc::clone(tool))).collect();
-        Self { images: self.images.clone(), tools: RwLock::new(tools), approvals: Arc::clone(&self.approvals), plan_selections: self.plan_selections.clone(), file_references: self.file_references.clone() }
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect();
+        Self {
+            images: self.images.clone(),
+            tools: RwLock::new(tools),
+            deferred: RwLock::new(self.deferred.read().expect("registry lock").clone()),
+            approvals: Arc::clone(&self.approvals),
+            plan_selections: self.plan_selections.clone(),
+            file_references: self.file_references.clone(),
+        }
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {
-        self.try_register(tool).expect("duplicate tool registration; use replace explicitly");
+        self.try_register(tool)
+            .expect("duplicate tool registration; use replace explicitly");
     }
 
     pub fn try_register(&self, tool: Arc<dyn Tool>) -> Result<(), String> {
         let mut tools = self.tools.write().expect("registry lock");
         let name = tool.name().to_string();
-        if name == "ToolSearch" || name == "run_code" { return Err(format!("reserved engine tool name: {name}")); }
-        if tools.contains_key(&name) { return Err(format!("tool already registered: {name}")); }
+        if name == "ToolSearch" || name == "run_code" {
+            return Err(format!("reserved engine tool name: {name}"));
+        }
+        if tools.contains_key(&name) {
+            return Err(format!("tool already registered: {name}"));
+        }
         tools.insert(name, tool);
         Ok(())
     }
@@ -146,32 +235,74 @@ impl ToolRegistry {
     pub fn replace(&self, tool: Arc<dyn Tool>) -> Result<Arc<dyn Tool>, String> {
         let mut tools = self.tools.write().expect("registry lock");
         let name = tool.name().to_string();
-        let entry = tools.get_mut(&name).ok_or_else(|| format!("unknown tool: {name}"))?;
+        let entry = tools
+            .get_mut(&name)
+            .ok_or_else(|| format!("unknown tool: {name}"))?;
         Ok(std::mem::replace(entry, tool))
     }
 
     /// Compare-and-replace for owners retaining their installed implementation.
-    pub fn replace_if_current(&self, expected: &Arc<dyn Tool>, tool: Arc<dyn Tool>) -> Result<(), String> {
-        if expected.name() != tool.name() { return Err("replacement name differs".into()); }
+    pub fn replace_if_current(
+        &self,
+        expected: &Arc<dyn Tool>,
+        tool: Arc<dyn Tool>,
+    ) -> Result<(), String> {
+        if expected.name() != tool.name() {
+            return Err("replacement name differs".into());
+        }
         let mut tools = self.tools.write().expect("registry lock");
-        let entry = tools.get_mut(expected.name()).ok_or("registration no longer exists")?;
-        if !Arc::ptr_eq(entry, expected) { return Err("registration ownership changed".into()); }
+        let entry = tools
+            .get_mut(expected.name())
+            .ok_or("registration no longer exists")?;
+        if !Arc::ptr_eq(entry, expected) {
+            return Err("registration ownership changed".into());
+        }
         *entry = tool;
         Ok(())
     }
 
     pub fn unregister_if_current(&self, expected: &Arc<dyn Tool>) -> bool {
         let mut tools = self.tools.write().expect("registry lock");
-        if tools.get(expected.name()).is_some_and(|entry| Arc::ptr_eq(entry, expected)) {
+        if tools
+            .get(expected.name())
+            .is_some_and(|entry| Arc::ptr_eq(entry, expected))
+        {
             tools.remove(expected.name());
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     /// Remove a tool by name. Returns whether it was present. In-flight
     /// dispatches keep their `Arc` — removal affects the next turn.
     pub fn unregister(&self, name: &str) -> bool {
-        self.tools.write().expect("registry lock").remove(name).is_some()
+        if self
+            .tools
+            .write()
+            .expect("registry lock")
+            .remove(name)
+            .is_some()
+        {
+            self.deferred.write().expect("registry lock").remove(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Hide registered tools from model tool lists until `ToolSearch` has
+    /// selected them for the current session. They remain dispatchable.
+    pub fn defer(&self, names: impl IntoIterator<Item = String>) {
+        self.deferred.write().expect("registry lock").extend(names);
+    }
+
+    pub fn is_deferred(&self, name: &str) -> bool {
+        self.deferred.read().expect("registry lock").contains(name)
+    }
+
+    pub fn has_deferred(&self) -> bool {
+        !self.deferred.read().expect("registry lock").is_empty()
     }
 
     /// The approval seam: set policy / mount answerers here.
@@ -184,7 +315,13 @@ impl ToolRegistry {
     }
 
     pub fn names(&self) -> Vec<String> {
-        let mut v: Vec<_> = self.tools.read().expect("registry lock").keys().cloned().collect();
+        let mut v: Vec<_> = self
+            .tools
+            .read()
+            .expect("registry lock")
+            .keys()
+            .cloned()
+            .collect();
         v.sort();
         v
     }
@@ -328,9 +465,18 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_has_durable_error_presentation() {
         let registry = ToolRegistry::default();
-        let results = registry.dispatch(&"s".into(), &[ToolCall {
-            call:"missing".into(),name:"missing".into(),args:serde_json::json!({}),
-        }], 1, &CancellationToken::new()).await;
+        let results = registry
+            .dispatch(
+                &"s".into(),
+                &[ToolCall {
+                    call: "missing".into(),
+                    name: "missing".into(),
+                    args: serde_json::json!({}),
+                }],
+                1,
+                &CancellationToken::new(),
+            )
+            .await;
         let result = &results[0];
         assert!(result.is_error);
         let metadata = result.presentation.as_ref().unwrap();
@@ -372,7 +518,9 @@ mod tests {
             },
         ];
         let started = Instant::now();
-        let results = reg.dispatch(&"s".to_string(), &calls, 4, &CancellationToken::new()).await;
+        let results = reg
+            .dispatch(&"s".to_string(), &calls, 4, &CancellationToken::new())
+            .await;
         // Concurrency: total should be ~80ms, not ~81+ sequential… allow slack.
         assert!(started.elapsed() < Duration::from_millis(160));
         assert_eq!(results[0].output, "slow");
@@ -383,9 +531,14 @@ mod tests {
     #[tokio::test]
     async fn unknown_tool_is_an_error_result() {
         let reg = ToolRegistry::default();
-        let calls = vec![ToolCall { call: "c".into(), name: "nope".into(), args: serde_json::Value::Null }];
-        let results =
-            reg.dispatch(&"s".to_string(), &calls, 1, &CancellationToken::new()).await;
+        let calls = vec![ToolCall {
+            call: "c".into(),
+            name: "nope".into(),
+            args: serde_json::Value::Null,
+        }];
+        let results = reg
+            .dispatch(&"s".to_string(), &calls, 1, &CancellationToken::new())
+            .await;
         assert!(results[0].is_error);
         assert!(results[0].output.contains("unknown tool"));
     }

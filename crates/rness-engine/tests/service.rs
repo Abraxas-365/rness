@@ -19,6 +19,23 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn job_completion_id_survives_lost_ack_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done",StopReason::EndTurn,vec![]))]);
+    let first = service(dir.path(),provider);
+    let id = first.create(None).unwrap();
+    let (a,b) = tokio::join!(first.notify_job_once(&id,"job-1","finished".into()), first.notify_job_once(&id,"job-1","changed retry text".into()));
+    a.unwrap(); b.unwrap();
+    first.join(&id).await;
+    // Simulate losing the job-side acknowledgment after the session commit.
+    drop(first);
+    let recovered = service(dir.path(),Scripted::new(vec![]));
+    assert!(recovered.notify_job_once(&id,"job-1","retry after crash".into()).await.unwrap());
+    let history = recovered.store().history(&id).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(&e.event,SessionEvent::UserMessage(m) if matches!(&m.source,Some(MessageSource::JobCompletion {id}) if id == "job-1"))).count(),1);
+}
+
+#[tokio::test]
 async fn text_only_model_rejects_images_before_logging() {
     use rness_engine::config::{ModelCapabilities, ModelDeclaration, ModelRegistry};
     let dir = tempfile::tempdir().unwrap();

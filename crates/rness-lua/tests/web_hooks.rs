@@ -5,6 +5,23 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test(flavor="multi_thread")]
+async fn owned_hooks_reload_unload_and_failed_reload() {
+    let host = LuaHost::spawn().unwrap();
+    let source = "rness.web_hooks.register('fetch',{after=function(result) result.content='first'; return result end})";
+    host.load("web",source).await.unwrap();
+    let input = json!({"content":"original"});
+    let cancel = CancellationToken::new();
+    assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"first");
+    assert!(host.load("duplicate",source).await.is_err());
+    assert!(host.reload(vec![rness_lua::loader::PluginSource {name:"web".into(),source:format!("{source}; error('bad reload')")}]).await.is_err());
+    assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"first");
+    host.reload(vec![rness_lua::loader::PluginSource {name:"web".into(),source:source.replace("first","second")}]).await.unwrap();
+    assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"second");
+    host.reload(vec![]).await.unwrap();
+    assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap(),input);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn startup_callbacks_transform_and_fail_closed() {
     let dir = tempfile::tempdir().unwrap();

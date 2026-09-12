@@ -5,14 +5,14 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use rness_engine::service::SessionService;
 use rness_engine::session::branch::SessionStore;
-use rness_engine::tools::ToolRegistry;
-use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
+use rness_engine::tools::{ToolRegistry, exposure::Exposure};
 use rness_engine::turn::TurnConfig;
+use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
 use rness_kernel::EventBus;
 use rness_protocol::events::*;
-use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 struct Silent;
@@ -69,8 +69,10 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
         TurnConfig::default(),
         Arc::new(EventBus::default()),
     ));
-    let subagents =
-        Arc::new(rness_engine::subagent::SubagentRuntime::new(Arc::clone(&sessions), 3));
+    let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(
+        Arc::clone(&sessions),
+        3,
+    ));
 
     let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
     host.install_session(
@@ -92,24 +94,67 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
                 name = "fake",
                 command = "python3",
                 args = {{ "{}", "{}" }},
+                defer_tools = true,
                 timeout_ms = 5000,
             }}
             assert(tools[1] == "mcp__fake__ping", "bridged: " .. tostring(tools[1]))
             assert(rness.mcp.servers()[1] == "fake", "listed")
             "#,
-            script.display(), marker.display()
+            script.display(),
+            marker.display()
         ),
     )
     .await
     .unwrap();
 
-    let calls = vec![rness_engine::tools::ToolCall { call: "permission".into(), name: "mcp__fake__ping".into(), args: serde_json::json!({}) }];
-    registry.approvals().set_rules([("mcp__fake__ping".into(), rness_engine::approval::ToolPolicy::Deny)].into());
-    let result = registry.dispatch(&"s".into(), &calls, 1, &CancellationToken::new()).await;
+    assert!(registry.get("mcp__fake__ping").is_some());
+    let exposure = Exposure::default();
+    assert!(
+        exposure
+            .specs(&registry, &Default::default())
+            .iter()
+            .any(|tool| tool.name == "ToolSearch")
+    );
+    assert!(
+        !exposure
+            .specs(&registry, &Default::default())
+            .iter()
+            .any(|tool| tool.name == "mcp__fake__ping")
+    );
+    let (_, names) = exposure
+        .search(
+            &registry,
+            &serde_json::json!({"query":"select:mcp__fake__ping"}),
+        )
+        .unwrap();
+    assert!(
+        exposure
+            .specs(&registry, &names.into_iter().collect())
+            .iter()
+            .any(|tool| tool.name == "mcp__fake__ping")
+    );
+
+    let calls = vec![rness_engine::tools::ToolCall {
+        call: "permission".into(),
+        name: "mcp__fake__ping".into(),
+        args: serde_json::json!({}),
+    }];
+    registry.approvals().set_rules(
+        [(
+            "mcp__fake__ping".into(),
+            rness_engine::approval::ToolPolicy::Deny,
+        )]
+        .into(),
+    );
+    let result = registry
+        .dispatch(&"s".into(), &calls, 1, &CancellationToken::new())
+        .await;
     assert!(result[0].is_error);
     assert!(!marker.exists(), "denied MCP call reached the server");
     registry.approvals().set_rules(Default::default());
-    let result = registry.dispatch(&"s".into(), &calls, 1, &CancellationToken::new()).await;
+    let result = registry
+        .dispatch(&"s".into(), &calls, 1, &CancellationToken::new())
+        .await;
     assert!(!result[0].is_error);
     assert_eq!(std::fs::read_to_string(&marker).unwrap(), "called\n");
 
@@ -129,11 +174,8 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
     assert_eq!(tool.execute(serde_json::json!({})).await.unwrap(), "pong!");
 
     // Disconnect from Lua unregisters the bridged tools.
-    host.load(
-        "bye.lua",
-        r#"assert(rness.mcp.disconnect("fake") == true)"#,
-    )
-    .await
-    .unwrap();
+    host.load("bye.lua", r#"assert(rness.mcp.disconnect("fake") == true)"#)
+        .await
+        .unwrap();
     assert!(registry.get("mcp__fake__ping").is_none());
 }

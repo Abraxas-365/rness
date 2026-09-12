@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+fs2 = "0.4"
+ulid.workspace = true
 rness-kernel.workspace = true
 rness-protocol.workspace = true
 rness-engine.workspace = true

@@ -105,6 +105,7 @@ struct Live {
     operation: Arc<tokio::sync::Mutex<()>>,
     command: Mutex<Option<CancellationToken>>,
     inbox: Mutex<Inbox>,
+    job_pending: Mutex<std::collections::HashSet<String>>,
     job_wakes: Mutex<u32>,
     /// Token of the current (or last) burst. Replaced on each new burst.
     cancel: Mutex<CancellationToken>,
@@ -118,6 +119,7 @@ impl Default for Live {
             operation: Arc::new(tokio::sync::Mutex::new(())),
             command: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
+            job_pending: Default::default(),
             job_wakes: Mutex::new(0),
             cancel: Mutex::new(CancellationToken::new()),
             handle: Mutex::new(None),
@@ -658,7 +660,23 @@ impl SessionService {
         self.send_or_retry(session, UserIntent::Followup, vec![], true, false, None)
     }
 
+    pub async fn notify_job_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
+        let activity = self.lifecycle.clone().read_owned().await;
+        let live = self.live(session);
+        let operation = live.operation.clone().lock_owned().await;
+        if self.store.history(session)?.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(message) if matches!(&message.source, Some(rness_protocol::events::MessageSource::JobCompletion { id: key }) if key == id))) { return Ok(true); }
+        let mut pending = live.job_pending.lock().unwrap();
+        if live.inbox.lock().unwrap().phase() == Phase::Idle { pending.remove(id); }
+        if pending.contains(id) { return Ok(false); }
+        self.send_or_retry_sourced(session, UserIntent::Steer, vec![ContentPart::Text {text}], false, true, Some((activity,operation)), Some(rness_protocol::events::MessageSource::JobCompletion {id:id.into()}))?;
+        pending.insert(id.into());
+        Ok(false)
+    }
+
     fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, job_notice: bool, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>) -> Result<Disposition, ServiceError> {
+        self.send_or_retry_sourced(session,intent,content,retry,job_notice,reservation,None)
+    }
+    fn send_or_retry_sourced(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, job_notice: bool, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>, source: Option<rness_protocol::events::MessageSource>) -> Result<Disposition, ServiceError> {
         if !job_notice {
             if let [ContentPart::Text { text }] = content.as_slice() {
                 if let Some(command) = self.prepare_command(session, text)? {
@@ -727,14 +745,14 @@ impl SessionService {
         } else {
             intent
         };
-        let (intent, disposition) = inbox.submit(intent, content.clone());
+        let (intent, disposition) = inbox.submit_sourced(intent, content.clone(), source.clone());
         match &disposition {
             Disposition::Command(_) => unreachable!("inbox does not execute commands"),
             Disposition::Queued => {}
             Disposition::LogOnly => {
                 drop(inbox);
                 let mut log = self.store.open(session)?;
-                log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source: None }))?;
+                log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
             }
             Disposition::StartTurn => {
                 // Resolve before committing the prompt or flipping phase:
@@ -759,7 +777,7 @@ impl SessionService {
                     log.append(&SessionEvent::UserMessage(UserMessage {
                         intent,
                         content,
-                        source: None,
+                        source,
                     }))?;
                 }
                 let turns_so_far = log
@@ -1270,7 +1288,7 @@ async fn burst(
                     .append(&SessionEvent::UserMessage(UserMessage {
                         intent: UserIntent::Followup,
                         content: pending.content,
-                        source: None,
+                        source: pending.source,
                     }));
                 if let Err(e) = append {
                     tracing::error!(session = %session, error = %e, "followup commit failed");
@@ -1314,7 +1332,7 @@ async fn burst(
                             &SessionEvent::UserMessage(UserMessage {
                                 intent,
                                 content: pending.content,
-                        source: None,
+                        source: pending.source,
                             }),
                         );
                         if let Err(e) = append {
