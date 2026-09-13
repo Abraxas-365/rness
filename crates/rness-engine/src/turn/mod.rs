@@ -48,8 +48,6 @@ pub enum TurnError {
 pub struct TurnConfig {
     pub max_retries: u32,
     pub max_tool_concurrency: usize,
-    /// Safety valve: maximum steps (model requests) per turn.
-    pub max_steps: u32,
     pub tool_exposure: crate::tools::exposure::Exposure,
     /// System prompt sent with every request.
     pub system: String,
@@ -62,7 +60,6 @@ impl Default for TurnConfig {
         Self {
             max_retries: 2,
             max_tool_concurrency: 4,
-            max_steps: 50,
             tool_exposure: Default::default(),
             system: String::new(),
             compaction: Default::default(),
@@ -127,7 +124,7 @@ async fn drive(
         None => config.system.clone(),
     };
     let mut activated = crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
-    for _step in 0..config.max_steps {
+    loop {
         let tool_specs = config.tool_exposure.specs(tools, &activated);
         if cancel.is_cancelled() {
             log.append(&SessionEvent::AssistantAttempt(AssistantAttempt { model: provider.model().into(), outcome: AttemptOutcome::Cancelled, chunks: vec![] }))?;
@@ -345,8 +342,6 @@ async fn drive(
             }
         }
     }
-    // Step budget exhausted: not an error — the work so far is committed.
-    Ok(TurnOutcome::Completed)
 }
 
 /// Convenience: the errors a provider reports.

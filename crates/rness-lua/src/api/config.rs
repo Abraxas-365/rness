@@ -79,7 +79,7 @@ mod permission_tests {
     fn boundary_compaction_requires_explicit_valid_route_budgets() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
-        let valid = "threshold_tokens=1000, retain_tokens=160, summary_tokens=100, max_overflow_retries=1, max_compactions=2, prune_threshold=8192, prune_head=4096, prune_tail=1024";
+        let valid = "system_prompt='Summarize the conversation.', prompt='Preserve essential context.', threshold_tokens=1000, retain_tokens=160, summary_tokens=100, max_overflow_retries=1, max_compactions=2, prune_threshold=8192, prune_head=4096, prune_tail=1024";
         std::fs::write(
             &path,
             format!("rness.compaction = {{['test/model']={{{valid}}}}}"),
@@ -167,6 +167,7 @@ mod permission_tests {
             "selection_copy",
             "selection_editor",
             "selection_toggle",
+            "selection_stop",
             "selection_close",
         ] {
             for value in [json!("ctrl+f"), json!(false)] {
@@ -379,6 +380,7 @@ fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> 
                 | "selection_copy"
                 | "selection_editor"
                 | "selection_toggle"
+                | "selection_stop"
                 | "selection_close"
                 | "select_message"
                 | "next_tool"

@@ -386,7 +386,12 @@ impl Tool for JobOutputTool {
     fn description(&self) -> &str {
         "Read a background job's output since the previous read. Every \
          response ends with a [status: ...] marker. Non-blocking unless \
-         wait is true, which waits for new output or completion."
+         wait is true, which waits for new output or completion. Do not repeatedly \
+         poll a running job. Continue independent work if available; otherwise \
+         tell the user you are waiting and end your turn. Background jobs keep \
+         running after your turn ends, and completion notifies the owning session \
+         to resume you. Ending a turn to wait does not mean the task is finished; \
+         collect the result before claiming completion."
     }
 
     fn input_schema(&self) -> Value {

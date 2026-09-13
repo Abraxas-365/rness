@@ -3,7 +3,7 @@
 pub fn core_action_scope(name: &str) -> Option<&'static str> {
     match name {
         "core.scroll_up" | "core.scroll_down" | "core.scroll_up_page" | "core.scroll_down_page" | "core.cancel_or_quit" | "core.quit" => Some("global"),
-        "core.promptbox.submit" | "core.promptbox.newline" | "core.promptbox.delete_previous"
+        "core.promptbox.submit" | "core.promptbox.queue" | "core.promptbox.steer" | "core.promptbox.newline" | "core.promptbox.delete_previous"
         | "core.promptbox.cursor_left" | "core.promptbox.cursor_right" | "core.promptbox.cursor_up"
         | "core.promptbox.cursor_down" | "core.promptbox.cursor_home" | "core.promptbox.cursor_end"
         | "core.promptbox.paste_clipboard" | "core.promptbox.external_editor" | "core.promptbox.noop" => Some("promptbox"),

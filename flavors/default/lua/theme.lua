@@ -69,7 +69,10 @@ rness.ui.messagebox = {
     style = { bg = "#504945" },
     marker = { text = "▎", style = { fg = p.blue, bold = true } },
   },
-  padding = { left = 1, right = 1 },
+  keys = {
+    select_message = "alt+m",
+    selection_stop = "x",
+  },
   user = {
     style = { fg = p.fg, bg = p.card }, padding = { left = 1, right = 1 },
     marker = false, label = { text = "You", style = "user_prefix" },
@@ -93,20 +96,41 @@ rness.ui.messagebox = {
   tools = {
     web_fetch = { display = "preview", preview_lines = 12, render = web_card },
     web_search = { display = "preview", preview_lines = 12, render = web_card },
-    subagent = { display = "collapsed", render = function(call)
+    subagent = { display = "preview", preview_lines = 12, render = function(call)
       local p = call.presentation
       if not p or p.kind ~= "subagent_activity" then return nil end
       local a = call.args or {}
       local body = { { text = a.prompt or "", style = "dim" } }
-      for _, line in ipairs(p.lines or {}) do
-        body[#body + 1] = { text = line, style = "tool_output" }
+      local function detail(args)
+        if type(args) ~= "table" then return "" end
+        for _, key in ipairs({ "command", "pattern", "path", "query", "url", "prompt" }) do
+          if type(args[key]) == "string" and args[key] ~= "" then return args[key] end
+        end
+        return ""
       end
-      local streams = {}
-      for id in pairs(p.streams or {}) do streams[#streams + 1] = id end
-      table.sort(streams)
-      for _, id in ipairs(streams) do
-        body[#body + 1] = { text = id .. " (live)", style = "dim" }
-        body[#body + 1] = { text = p.streams[id], style = "tool_output" }
+      local tools = type(p.tools) == "table" and p.tools or {}
+      if #tools > 0 then
+        for _, tool in ipairs(tools) do
+          local state = tool.status or "running"
+          body[#body + 1] = { spans = {
+            { text = "› " .. (tool.name or "tool"), style = "tool_name" },
+            { text = " · " .. state, style = state == "failed" and "error" or "dim" },
+          } }
+          local args = detail(tool.args)
+          if args ~= "" then body[#body + 1] = { text = args, style = "code" } end
+          if tool.stream and tool.stream ~= "" then body[#body + 1] = { text = tool.stream, style = "tool_output" } end
+          if tool.output and tool.output ~= "" then body[#body + 1] = { text = tool.output, style = "tool_output" } end
+        end
+      else
+        -- Histories from before structured activity metadata retain this view.
+        for _, line in ipairs(p.lines or {}) do body[#body + 1] = { text = line, style = "tool_output" } end
+        local streams = {}
+        for id in pairs(p.streams or {}) do streams[#streams + 1] = id end
+        table.sort(streams)
+        for _, id in ipairs(streams) do
+          body[#body + 1] = { text = id .. " (live)", style = "dim" }
+          body[#body + 1] = { text = p.streams[id], style = "tool_output" }
+        end
       end
       if p.live and p.live ~= "" then body[#body + 1] = { text = p.live, style = "assistant_text" } end
       return {
@@ -142,6 +166,82 @@ rness.ui.messagebox = {
         body[#body + 1] = { text = call.output, style = "tool_output" }
       end
       return { header = header, body = body }
+    end },
+    Glob = { render = function(call)
+      local args = type(call.args) == "table" and call.args or {}
+      local duration = call.presentation and tonumber(call.presentation.duration_ms)
+      local status = call.is_error and "failed" or "done"
+      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local body = {}
+      if type(args.pattern) == "string" and args.pattern ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "pattern ", style = "dim" },
+          { text = args.pattern, style = "code" },
+        } }
+      end
+      if type(args.path) == "string" and args.path ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "in ", style = "dim" },
+          { text = args.path, style = "code" },
+        } }
+      end
+      if type(call.output) == "string" and call.output ~= "" then
+        body[#body + 1] = { text = call.output, style = "tool_output" }
+      end
+      return {
+        header = {
+          left = {
+            { text = "Glob", style = "tool_name" },
+            { text = " · ", style = "dim" },
+            { text = status, style = status_style },
+          },
+          right = duration and { { text = string.format("%.0f ms", duration), style = "dim" } } or {},
+        },
+        body = body,
+      }
+    end },
+    Grep = { render = function(call)
+      local args = type(call.args) == "table" and call.args or {}
+      local duration = call.presentation and tonumber(call.presentation.duration_ms)
+      local status = call.is_error and "failed" or "done"
+      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local body = {}
+      if type(args.pattern) == "string" and args.pattern ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "pattern ", style = "dim" },
+          { text = args.pattern, style = "code" },
+        } }
+      end
+      if type(args.path) == "string" and args.path ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "in ", style = "dim" },
+          { text = args.path, style = "code" },
+        } }
+      end
+      if type(args.glob) == "string" and args.glob ~= "" then
+        body[#body + 1] = { spans = {
+          { text = "files ", style = "dim" },
+          { text = args.glob, style = "code" },
+        } }
+      end
+      local mode = type(args.output_mode) == "string" and args.output_mode or "files_with_matches"
+      if mode ~= "files_with_matches" or args.case_insensitive then
+        body[#body + 1] = { text = mode .. (args.case_insensitive and " · case-insensitive" or ""), style = "dim" }
+      end
+      if type(call.output) == "string" and call.output ~= "" then
+        body[#body + 1] = { text = call.output, style = "tool_output" }
+      end
+      return {
+        header = {
+          left = {
+            { text = "Grep", style = "tool_name" },
+            { text = " · ", style = "dim" },
+            { text = status, style = status_style },
+          },
+          right = duration and { { text = string.format("%.0f ms", duration), style = "dim" } } or {},
+        },
+        body = body,
+      }
     end },
     Edit = { render = function(call)
       if call.is_error then return nil end

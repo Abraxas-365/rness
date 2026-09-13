@@ -148,7 +148,10 @@ impl Tool for BashTool {
          No state persists; pass workdir \
          instead of using cd. Set run_in_background for long-running \
          commands: the call returns a job id immediately; read output \
-         with job_output, stop with job_kill."
+         with job_output, stop with job_kill. Do not repeatedly poll running jobs. \
+         If no independent work remains, tell the user you are waiting and end \
+         your turn; the job continues and completion resumes the owning session. \
+         Do not claim the task is finished until you have checked the result."
     }
 
     fn input_schema(&self) -> Value {

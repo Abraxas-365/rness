@@ -372,7 +372,7 @@ fn no_steers() -> impl FnMut() -> Vec<Pending> + Send {
 
 // -- tests -----------------------------------------------------------------
 
-struct RestrictedRequest;
+struct RestrictedRequest(AtomicUsize);
 
 #[async_trait]
 impl Provider for RestrictedRequest {
@@ -380,6 +380,9 @@ impl Provider for RestrictedRequest {
     async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
         assert!(request.system.ends_with("Only review"));
         assert!(request.tools.is_empty());
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            return StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]));
+        }
         StepOutcome::Committed(assistant("try forbidden", StopReason::ToolUse, vec![("denied", "Echo")]))
     }
 }
@@ -403,8 +406,8 @@ async fn agent_instructions_and_ceiling_apply_to_schema_and_dispatch() {
         })).unwrap();
         let tools = ToolRegistry::default();
         tools.register(Arc::new(Echo));
-        run_turn(&store, &mut log, &RestrictedRequest, &tools,
-            &TurnConfig { max_steps: 1, ..Default::default() },
+        run_turn(&store, &mut log, &RestrictedRequest(AtomicUsize::new(0)), &tools,
+            &TurnConfig::default(),
             &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
         let history = store.history(log.session()).unwrap();
         assert!(history.iter().any(|event| matches!(&event.event, SessionEvent::ToolResult(result) if result.is_error)));
@@ -452,17 +455,45 @@ async fn final_tool_result_notifies_after_persistence_without_another_model_step
     let tools = ToolRegistry::default();
     tools.register(Arc::new(Echo));
     let observed = Mutex::new(false);
+    let cancel = CancellationToken::new();
     let frames = |frame| {
         if let Frame::HistoryChanged { session } = frame {
             let history = replay(&store, &session).unwrap().history;
             assert!(history.iter().any(|event| matches!(&event.event, SessionEvent::ToolResult(result) if result.call == "last")));
             *observed.lock().unwrap() = true;
+            cancel.cancel();
         }
     };
-    run_turn(&store, &mut log, &provider, &tools,
-        &TurnConfig { max_steps: 1, ..Default::default() },
-        &CancellationToken::new(), &mut no_steers(), 1, &frames).await.unwrap();
+    let outcome = run_turn(&store, &mut log, &provider, &tools,
+        &TurnConfig::default(),
+        &cancel, &mut no_steers(), 1, &frames).await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Cancelled);
     assert!(*observed.lock().unwrap(), "final tool result did not trigger history/card refresh");
+}
+
+#[tokio::test]
+async fn tool_roundtrips_continue_beyond_fifty_model_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let mut steps: Vec<_> = (0..60).map(|index| {
+        StepOutcome::Committed(assistant("calling", StopReason::ToolUse, vec![(&format!("call-{index}"), "Echo")]))
+    }).collect();
+    steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+    let provider = Scripted::new(steps);
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(Echo));
+    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
+        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    assert_eq!(provider.seen_contexts.lock().unwrap().len(), 61);
+    assert!(provider.steps.lock().unwrap().is_empty());
+    let history = store.history(log.session()).unwrap();
+    assert_eq!(history.iter().filter(|event| matches!(event.event, SessionEvent::ToolResult(_))).count(), 60);
+    assert!(matches!(&history[history.len() - 2].event,
+        SessionEvent::AssistantMessage(message) if message.stop == StopReason::EndTurn));
+    assert!(matches!(history.last().unwrap().event,
+        SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }));
 }
 
 #[tokio::test]

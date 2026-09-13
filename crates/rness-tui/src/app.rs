@@ -41,6 +41,9 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
     fn complete(&self, _session: &SessionId, _text: String) {}
+    fn stop_subagent(&self, _parent: &SessionId, _call: &ToolCallId) -> Result<(), String> {
+        Err("stopping subagents is not supported by this backend".into())
+    }
     fn command_running(&self, _session: &SessionId) -> bool {
         false
     }
@@ -476,6 +479,8 @@ pub enum FrameEffect {
 pub enum PluginOperation {
     CloseApp(String),
     InsertPrompt(String),
+    QueuePrompt,
+    SteerPrompt,
 }
 
 /// Component-emitted commands, applied by the shell after input handling.
@@ -501,7 +506,9 @@ pub enum Action {
         text: String,
     },
     Submit(String),
+    Steer(String),
     SubmitImages(String, Vec<rness_protocol::events::ImageRef>),
+    SteerImages(String, Vec<rness_protocol::events::ImageRef>),
     PreviewHistoryImage,
     PasteClipboard,
     Cancel,
@@ -986,6 +993,9 @@ impl App {
             self.input_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+        let intent = if matches!(&action, Action::Steer(_) | Action::SteerImages(_, _)) {
+            UserIntent::Steer
+        } else { UserIntent::Followup };
         match action {
             Action::PluginBatch {
                 request,
@@ -1021,6 +1031,8 @@ impl App {
                 }
                 // Validate the entire batch before changing either app or prompt state.
                 if operations.iter().any(|op| matches!(op, PluginOperation::CloseApp(name) if request.app.as_ref().is_none_or(|(owner, _)| owner != name))) { return; }
+                if request.app.is_some() && operations.iter().any(|op| matches!(op, PluginOperation::QueuePrompt | PluginOperation::SteerPrompt)) { return; }
+                let mut submissions = Vec::new();
                 let apply_operations = || {
                     let mut close = false;
                     for operation in operations {
@@ -1030,6 +1042,12 @@ impl App {
                                 "input:clipboard-text",
                                 &serde_json::json!(text),
                             ),
+                            PluginOperation::QueuePrompt | PluginOperation::SteerPrompt => {
+                                let binding = if matches!(operation, PluginOperation::SteerPrompt) { "steer" } else { "queue" };
+                                if let Some(component) = self.slots.focused_mut(&ctx) {
+                                    submissions.extend(component.on_binding(&ctx, binding).actions);
+                                }
+                            }
                             PluginOperation::CloseApp(_) => close = true,
                         }
                     }
@@ -1041,6 +1059,7 @@ impl App {
                     let mut apply_operations = apply_operations;
                     apply_operations();
                 }
+                for submission in submissions { self.apply(submission); }
             }
             Action::PluginAppClose {
                 input_epoch,
@@ -1210,7 +1229,7 @@ impl App {
                     ))),
                 }
             }
-            Action::SubmitImages(text, images) => {
+            Action::SubmitImages(text, images) | Action::SteerImages(text, images) => {
                 if text.trim_start().starts_with('/') {
                     self.apply(Action::Notice(
                         "Send images with a prompt, not a slash command".into(),
@@ -1225,7 +1244,7 @@ impl App {
                 );
                 match self.backend.submit(ClientRequest::Send {
                     session: self.model.session.clone(),
-                    intent: UserIntent::Followup,
+                    intent,
                     content: content.clone(),
                 }) {
                     Ok(None) => {
@@ -1239,7 +1258,7 @@ impl App {
                     Err(error) => self.apply(Action::Notice(error)),
                 }
             }
-            Action::Submit(text) => {
+            Action::Submit(text) | Action::Steer(text) => {
                 if text.trim().is_empty() {
                     return;
                 }
@@ -1338,7 +1357,7 @@ impl App {
                 };
                 match self.backend.submit(ClientRequest::Send {
                     session: self.model.session.clone(),
-                    intent: UserIntent::Followup,
+                    intent,
                     content: content.clone(),
                 }) {
                     Ok(None) => self.model.entries.push(Entry::User { content }),
@@ -1412,6 +1431,20 @@ impl App {
                 }
                 if name == "terminal:edit-prompt" {
                     self.edit_prompt = Some(payload);
+                    return;
+                }
+                if name == "terminal:stop-subagent" {
+                    let result = (|| {
+                        let call = payload["call"].as_str().ok_or_else(|| "Missing subagent call".to_owned())?;
+                        if payload["session"].as_str() != Some(self.model.session.as_str()) {
+                            return Err("Subagent selection is no longer in this session".into());
+                        }
+                        self.backend.stop_subagent(&self.model.session, &call.into())
+                    })();
+                    self.apply(Action::Notice(match result {
+                        Ok(()) => "Subagent stop requested".into(),
+                        Err(error) => format!("Cannot stop subagent: {error}"),
+                    }));
                     return;
                 }
                 let ctx = Ctx {
@@ -1873,6 +1906,29 @@ mod tests {
                 .entries
                 .contains(&Entry::Notice("saved result".into()))
         );
+    }
+
+    #[test]
+    fn queue_and_steer_send_distinct_intents_for_text_and_images() {
+        struct Capture(std::sync::Mutex<Vec<ClientRequest>>);
+        impl Backend for Capture {
+            fn request(&self, request: ClientRequest) { self.0.lock().unwrap().push(request); }
+            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+        }
+        let backend = Arc::new(Capture(Default::default()));
+        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), backend.clone());
+        for busy in [false, true] {
+            app.model.busy = busy;
+            app.apply(Action::Submit("later".into()));
+            app.apply(Action::Steer("correction".into()));
+            app.apply(Action::SubmitImages("later image".into(), vec![]));
+            app.apply(Action::SteerImages("correct image".into(), vec![]));
+        }
+        for (i, request) in backend.0.lock().unwrap().iter().enumerate() {
+            assert!(matches!(request, ClientRequest::Send { intent, .. }
+                if *intent == if i % 2 == 0 { UserIntent::Followup } else { UserIntent::Steer }));
+        }
+        assert_eq!(backend.0.lock().unwrap().len(), 8);
     }
 
     #[test]
@@ -2532,6 +2588,50 @@ mod tests {
             !help.contains("→ submit (when applicable)"),
             "disabled submit is still advertised"
         );
+    }
+
+    #[test]
+    fn queue_and_steer_core_remaps_and_plugin_batches_submit_drafts() {
+        use crossterm::event::KeyCode;
+        use crate::keymaps::{BindingLayer, Scope, ScopedBinding, ScopedKeymap};
+        struct Capture(std::sync::Mutex<Vec<ClientRequest>>);
+        impl Backend for Capture {
+            fn request(&self, request: ClientRequest) { self.0.lock().unwrap().push(request); }
+            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+        }
+        let backend = Arc::new(Capture(Default::default()));
+        let mut slots = Slots::default();
+        crate::modules::input::install(&mut slots);
+        let mut app = App::new(Model::new("s".into(), "m".into()), slots, backend.clone());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.plugin_actions = Some(tx);
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[
+            ("enter", "core.promptbox.steer"), ("f8", "core.promptbox.queue"),
+        ].into_iter().map(|(key, action)| ScopedBinding {
+            owner: "core".into(), scope: Scope::Promptbox,
+            chord: crate::keys::Chord::parse(key).unwrap(), action: action.into(), layer: BindingLayer::User,
+        }).collect::<Vec<_>>()).unwrap();
+        app.route_key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::Enter)).as_slice(), [Action::Steer(text)] if text == "s"));
+        app.route_key(KeyEvent::from(KeyCode::Char('q')));
+        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Submit(text)] if text == "q"));
+        for (operation, intent) in [(PluginOperation::QueuePrompt, UserIntent::Followup), (PluginOperation::SteerPrompt, UserIntent::Steer)] {
+            let request = PluginActionRequest {
+                input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: None,
+                generation: app.plugin_generation.load(std::sync::atomic::Ordering::SeqCst),
+                name: "delivery".into(), session: "s".into(), epoch: app.model.history_epoch,
+            };
+            app.apply(Action::PluginBatch { request, operations: vec![PluginOperation::InsertPrompt("draft".into()), operation] });
+            assert!(matches!(backend.0.lock().unwrap().last(), Some(ClientRequest::Send { intent: actual, content, .. })
+                if *actual == intent && matches!(content.as_slice(), [ContentPart::Text { text }] if text == "draft")));
+        }
+        let request = PluginActionRequest {
+            input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) + 1, app: None,
+            generation: app.plugin_generation.load(std::sync::atomic::Ordering::SeqCst),
+            name: "delivery".into(), session: "s".into(), epoch: app.model.history_epoch,
+        };
+        app.apply(Action::PluginBatch { request, operations: vec![PluginOperation::InsertPrompt("stale".into()), PluginOperation::SteerPrompt] });
+        assert_eq!(backend.0.lock().unwrap().len(), 2);
     }
 
     #[test]

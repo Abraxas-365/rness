@@ -96,7 +96,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 7);
+    assert_eq!(config.plugin_specs.len(), 9);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
     assert_eq!(policy.prune_threshold, 8192);
@@ -123,6 +123,13 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert!(errors.is_empty(), "{errors:?}");
     assert!(sessions.reference_service().enabled());
     host.validate_bindings().await.unwrap();
+    for (name, key, operation) in [
+        ("delivery.queue", "<F8>", rness_lua::runtime::UiActionOperation::QueuePrompt),
+        ("delivery.steer", "<F9>", rness_lua::runtime::UiActionOperation::SteerPrompt),
+    ] {
+        assert_eq!(host.call_action(name, "promptbox", serde_json::json!({})).await.unwrap(), vec![operation]);
+        assert!(host.binding_specs().await.iter().any(|binding| binding.keys == vec![key]));
+    }
 }
 
 #[tokio::test]
@@ -407,7 +414,7 @@ async fn region_confirmation_reuses_only_its_own_command_reservation() {
             local view = rness.session.compaction_view(ctx.session)
             local changed = rness.session.compact_region(ctx.session, {
                 start=1, ['end']=1, sources=view.sources,
-                policy={threshold_tokens=24000,retain_tokens=4000,summary_tokens=200,
+                policy={system_prompt='Summarize.',prompt='Preserve context.',threshold_tokens=24000,retain_tokens=4000,summary_tokens=200,
                     max_overflow_retries=1,max_compactions=2,prune_threshold=8192,prune_head=4096,prune_tail=1024}
             })
             return {message=changed and 'changed' or 'unchanged'}
@@ -417,6 +424,7 @@ async fn region_confirmation_reuses_only_its_own_command_reservation() {
     assert!(sessions.prepare_command(&session, "/region").is_err());
     assert!(sessions.try_extension_maintenance().is_err());
     let policy: rness_engine::turn::compaction::Policy = serde_json::from_value(serde_json::json!({
+        "system_prompt":"Summarize.","prompt":"Preserve context.",
         "threshold_tokens":24000,"retain_tokens":4000,"summary_tokens":200,"max_overflow_retries":1,
         "max_compactions":2,"prune_threshold":8192,"prune_head":4096,"prune_tail":1024
     })).unwrap();

@@ -18,6 +18,7 @@ rness.web = {
 }
 
 rness.plugins.setup({
+  { name = "delivery", file = "plugins/delivery.lua", keys = { queue = "<F8>", steer = "<F9>" } },
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20, allow_parent = false, allow_home = false, allow_absolute = false } },
   { name = "spinner", file = "plugins/spinner.lua" },
   { name = "sessions", file = "plugins/sessions.lua" },

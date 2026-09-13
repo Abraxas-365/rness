@@ -711,6 +711,7 @@ struct LocalBackend {
     reference_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
+    subagents: Arc<rness_engine::subagent::SubagentRuntime>,
 }
 
 /// Bridges engine approval checks to the TUI overlay: sends the pending
@@ -854,6 +855,12 @@ impl rness_tui::app::Backend for LocalBackend {
                 Err(error) => { let _ = tx.send(rness_tui::app::Action::CommandResult(session, format!("Completion failed: {error}"))); }
             }
         });
+    }
+
+    fn stop_subagent(&self, parent: &SessionId, call: &rness_protocol::events::ToolCallId) -> Result<(), String> {
+        let child = self.subagents.activity.child_for_call(parent, call)
+            .ok_or_else(|| "subagent is no longer active in this session".to_owned())?;
+        self.subagents.interrupt(parent, &child).map_err(|error| error.to_string())
     }
 
     fn command_running(&self, session: &SessionId) -> bool {
@@ -1199,6 +1206,8 @@ async fn run_tui(
                     Ok(operations) => {
                         let operations = operations.into_iter().map(|operation| match operation {
                             rness_lua::runtime::UiActionOperation::CloseApp(name) => rness_tui::app::PluginOperation::CloseApp(name),
+                            rness_lua::runtime::UiActionOperation::QueuePrompt => rness_tui::app::PluginOperation::QueuePrompt,
+                            rness_lua::runtime::UiActionOperation::SteerPrompt => rness_tui::app::PluginOperation::SteerPrompt,
                             rness_lua::runtime::UiActionOperation::InsertPrompt(text) => rness_tui::app::PluginOperation::InsertPrompt(text),
                         }).collect();
                         let _ = host_tx.send(rness_tui::app::Action::PluginBatch { request, operations });
@@ -1208,7 +1217,7 @@ async fn run_tui(
             }
         })
     };
-    let backend = Arc::new(LocalBackend { completion_lock: Default::default(), completion_generation: Default::default(), reference_cancel: Default::default(), sessions: Arc::clone(&sessions), results: host_tx.clone() });
+    let backend = Arc::new(LocalBackend { completion_lock: Default::default(), completion_generation: Default::default(), reference_cancel: Default::default(), sessions: Arc::clone(&sessions), subagents: subagents.clone(), results: host_tx.clone() });
 
     // Drive view/key round-trips for the mounted apps from a host task.
     // The TUI stays Lua-agnostic — it renders published lines and

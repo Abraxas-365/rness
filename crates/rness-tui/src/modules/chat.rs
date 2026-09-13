@@ -646,6 +646,7 @@ const SELECTION_KEYS: &[(&str, &[&str], &str)] = &[
     ("selection_copy", &["y"], "copy"),
     ("selection_editor", &["e"], "editor"),
     ("selection_toggle", &["enter", "space"], "expand"),
+    ("selection_stop", &["x"], "stop subagent"),
     ("selection_close", &["esc"], "close"),
 ];
 
@@ -701,6 +702,29 @@ impl Component for Chat {
                 self.selected_message = None;
                 return KeyOutcome::consumed();
             }
+            let selected_action = SELECTION_KEYS.iter().find_map(|(action, defaults, _)| {
+                self.selection_keys(action, defaults).iter().any(|value| {
+                    crate::keys::Chord::parse(value).is_some_and(|chord| {
+                        crate::keymaps::ComponentBinding { action, chord }.matches_key(&key)
+                    })
+                }).then_some(*action)
+            });
+            if let Some(name) = ctx.model.live.as_ref().and_then(|live| live.running_tools.iter()
+                .find(|(call, _)| call == &id).map(|(_, name)| name)) {
+                match selected_action {
+                    Some("selection_close") => self.selected_message = None,
+                    Some("selection_toggle") => {
+                        let expanded = self.expanded.get(&id).copied().unwrap_or(false);
+                        self.expanded.insert(id.clone(), !expanded);
+                        self.message_scroll = 0;
+                    }
+                    Some("selection_stop") if name == "subagent" => return KeyOutcome::act(vec![Action::Custom(
+                        "terminal:stop-subagent".into(), serde_json::json!({"session":ctx.model.session,"call":id}),
+                    )]),
+                    _ => {}
+                }
+                return KeyOutcome::consumed();
+            }
             let targets: Vec<_> = ctx
                 .model
                 .entry_ids
@@ -741,6 +765,16 @@ impl Component for Chat {
                 }
                 Some("selection_scroll_up") => {
                     self.message_scroll = self.message_scroll.saturating_sub(10)
+                }
+                Some("selection_stop") => {
+                    if let Entry::ToolResult { call, name, .. } = &ctx.model.entries[targets[index].0] {
+                        if name == "subagent" {
+                            return KeyOutcome::act(vec![Action::Custom(
+                                "terminal:stop-subagent".into(),
+                                serde_json::json!({"session":ctx.model.session,"call":call}),
+                            )]);
+                        }
+                    }
                 }
                 Some("selection_toggle") => {
                     if let Entry::ToolResult { call, .. } = &ctx.model.entries[targets[index].0] {
@@ -814,19 +848,12 @@ impl Component for Chat {
             self.card_rows.clear();
         }
         if action == "select_message" {
-            self.selected_message = ctx
-                .model
-                .entry_ids
-                .iter()
-                .enumerate()
-                .rev()
-                .find(|(i, _)| {
-                    ctx.model
-                        .entries
-                        .get(*i)
-                        .is_some_and(|entry| !message_text(entry).is_empty())
-                })
-                .map(|(_, id)| id.clone());
+            self.selected_message = ctx.model.live.as_ref().and_then(|live| {
+                live.running_tools.iter().rev().find(|(_, name)| name == "subagent")
+                    .map(|(call, _)| call.clone())
+            }).or_else(|| ctx.model.entry_ids.iter().enumerate().rev().find(|(i, _)| {
+                ctx.model.entries.get(*i).is_some_and(|entry| !message_text(entry).is_empty())
+            }).map(|(_, id)| id.clone()));
             self.message_expanded = true;
             self.message_scroll = 0;
             return KeyOutcome::consumed();

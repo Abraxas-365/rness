@@ -144,6 +144,8 @@ mod tests {
             if mods.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) {
                 assert!(result.actions.is_empty());
                 assert!(input.editor.text().contains('\n'));
+            } else if mods == KeyModifiers::CONTROL {
+                assert!(matches!(result.actions.as_slice(), [Action::Steer(text)] if text == "b"));
             } else {
                 assert!(matches!(result.actions.as_slice(), [Action::Submit(text)] if text == "b"));
             }
@@ -242,6 +244,10 @@ mod tests {
         assert_eq!(input.images.len(), 2);
         let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(&outcome.actions[..], [Action::SubmitImages(text, images)] if text == "describe" && images.len() == 2));
+        let outcome = input.on_binding(&ctx, "steer");
+        assert!(matches!(&outcome.actions[..], [Action::SteerImages(text, images)] if text == "describe" && images.len() == 2));
+        let outcome = input.on_binding(&ctx, "queue");
+        assert!(matches!(&outcome.actions[..], [Action::SubmitImages(_, images)] if images.len() == 2));
         assert_eq!(input.editor.text(), "describe");
         assert_eq!(input.images.len(), 2);
         input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
@@ -718,7 +724,7 @@ impl Component for Input {
                 ("tab", "completion_accept"), ("enter", "completion_accept"), ("esc", "completion_dismiss")]
         } else { Vec::new() };
         bindings.extend(keys.into_iter().chain([
-            ("enter", "submit"), ("alt+enter", "newline"), ("shift+enter", "newline"),
+            ("enter", "submit"), ("ctrl+enter", "steer"), ("alt+enter", "newline"), ("shift+enter", "newline"),
             ("backspace", "delete_previous"), ("left", "cursor_left"), ("right", "cursor_right"),
             ("up", "cursor_up"), ("down", "cursor_down"), ("home", "cursor_home"), ("end", "cursor_end"),
         ]).map(|(key, action)| crate::keymaps::ComponentBinding { action, chord: crate::keys::Chord::parse(key).expect("editor chord") }));
@@ -740,6 +746,7 @@ impl Component for Input {
         }
         let mut lines = vec![
             "Prompt: text inserts; Up/Down navigate history or multiline text".into(),
+            "Queue (submit): later turn; Steer: next model step. Both start a turn when idle.".into(),
         ];
         let completion = !self.matches().is_empty();
         let bindings = self.bindings();
@@ -755,6 +762,7 @@ impl Component for Input {
     }
 
     fn on_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> KeyOutcome {
+        let action = if action == "queue" { "submit" } else { action };
         if action == "noop" { return KeyOutcome::consumed(); }
         let Some(binding) = self.bindings().into_iter().find(|binding| binding.action == action) else { return KeyOutcome::pass(); };
         self.handle_key(ctx, KeyEvent::new(binding.chord.code, binding.chord.mods), Some(action))
@@ -788,8 +796,10 @@ impl Input {
             return KeyOutcome::consumed();
         }
         if self.image_preview { return KeyOutcome::consumed(); }
-        if !self.images.is_empty() && self.preview.is_none() && key.code == KeyCode::Enter && key.modifiers.is_empty() {
-            return KeyOutcome::act(vec![Action::SubmitImages(self.editor.text(), self.images.clone())]);
+        if !self.images.is_empty() && self.preview.is_none() && (matched("submit") || matched("steer")) {
+            return KeyOutcome::act(vec![if matched("steer") {
+                Action::SteerImages(self.editor.text(), self.images.clone())
+            } else { Action::SubmitImages(self.editor.text(), self.images.clone()) }]);
         }
         if matched("external_editor") {
             return KeyOutcome::act(vec![Action::Custom("terminal:edit-prompt".into(), serde_json::json!({"text": self.editor.text(), "editor": self.external_editor}))]);
@@ -893,11 +903,11 @@ impl Input {
                 self.editor.insert_newline();
                 KeyOutcome::consumed()
             }
-            _ if matched("submit") => {
+            _ if matched("submit") || matched("steer") => {
                 if self.editor.is_empty() {
                     return KeyOutcome::consumed();
                 }
-                // Submitting while busy queues a followup (inbox semantics).
+                // Queue waits for a later turn; Steer reaches the next model step.
                 self.scroll_top = 0;
                 let snapshot = self.editor.clone();
                 let text = self.editor.take();
@@ -907,7 +917,7 @@ impl Input {
                 self.history_index = None;
                 self.draft = Editor::new();
                 self.dismissed = false;
-                KeyOutcome::act(vec![Action::Submit(text)])
+                KeyOutcome::act(vec![if matched("steer") { Action::Steer(text) } else { Action::Submit(text) }])
             }
             (KeyCode::Char(c), m)
                 if action.is_none() && !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>

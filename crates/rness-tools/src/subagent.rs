@@ -63,8 +63,10 @@ impl Tool for SubagentTool {
          as a one-shot job — read it with job_output, cancel with job_kill. \
          Job IDs cannot be used with send_message. Continue independent work, \
          avoid busy-polling or duplicating the child task, and collect relevant \
-         results before dependent decisions or your final answer. Use \
-         job_output(wait=true) when blocked on a one-shot result. With \
+         results before dependent decisions or claiming task completion. If no \
+         independent work remains, tell the user you are waiting and end your \
+         turn instead of repeatedly polling job_output; the background job \
+         continues and completion resumes the owning session. With \
          background_mode 'continuable' the child keeps running as a named \
          agent: message it with send_message, stop its turn with \
          interrupt_agent, list with list_agents; its results arrive as \

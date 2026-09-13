@@ -57,6 +57,8 @@ pub struct LuaActionSpec {
 pub enum UiActionOperation {
     CloseApp(String),
     InsertPrompt(String),
+    QueuePrompt,
+    SteerPrompt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -496,6 +498,17 @@ impl LuaRuntime {
                 pending.lock().unwrap().push(UiActionOperation::InsertPrompt(text));
                 Ok(())
             })?)?;
+            if scope == "promptbox" {
+                for (name, operation) in [("queue", UiActionOperation::QueuePrompt), ("steer", UiActionOperation::SteerPrompt)] {
+                    let pending = operations.clone();
+                    let available = active.clone();
+                    promptbox.set(name, self.lua.create_function(move |_, ()| {
+                        if !available.load(std::sync::atomic::Ordering::Relaxed) { return Err(mlua::Error::runtime("action context expired")); }
+                        pending.lock().unwrap().push(operation.clone());
+                        Ok(())
+                    })?)?;
+                }
+            }
             context.set("promptbox", promptbox)?;
             if let Some(name) = scope.strip_prefix("app:") {
                 let app = self.lua.create_table()?;
@@ -1755,6 +1768,39 @@ fn user_message(e: &mlua::Error) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn queue_and_steer_actions_are_scoped_buffered_and_expire() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("delivery", r#"
+            local p = __rness_plugin_context()
+            p.action('queue', {scope='promptbox', description='Queue', run=function(ctx)
+                saved_queue = ctx.promptbox.queue
+                ctx.promptbox.insert('later')
+                ctx.promptbox.queue()
+            end})
+            p.action('steer', {scope='promptbox', description='Steer', run=function(ctx)
+                saved_steer = ctx.promptbox.steer
+                ctx.promptbox.steer()
+            end})
+            p.action('global', {scope='global', description='No submission', run=function(ctx)
+                assert(ctx.promptbox.queue == nil and ctx.promptbox.steer == nil)
+            end})
+            p.action('fail', {scope='promptbox', description='Fail', run=function(ctx)
+                ctx.promptbox.steer()
+                error('discard operations')
+            end})
+        "#).unwrap();
+        assert_eq!(rt.call_action("delivery.queue", "promptbox", json!({})).unwrap(),
+            vec![UiActionOperation::InsertPrompt("later".into()), UiActionOperation::QueuePrompt]);
+        assert_eq!(rt.call_action("delivery.steer", "promptbox", json!({})).unwrap(), vec![UiActionOperation::SteerPrompt]);
+        assert!(rt.call_action("delivery.global", "global", json!({})).unwrap().is_empty());
+        assert!(rt.call_action("delivery.fail", "promptbox", json!({})).is_err());
+        rt.load("verify_delivery", "assert(not pcall(saved_queue)); assert(not pcall(saved_steer))").unwrap();
+        for name in ["queue", "steer"] {
+            assert!(rness_kernel::presentation::core_action_matches_scope(&format!("core.promptbox.{name}"), "promptbox"));
+        }
+    }
 
     #[test]
     fn action_context_buffers_operations_and_expires_after_callback() {
