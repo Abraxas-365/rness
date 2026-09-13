@@ -217,16 +217,32 @@ fn card_rows_limited(
     } else {
         usize::MAX
     };
+    // Sanitize whole source lines before highlighting: tabs must use source
+    // columns, not restart at each syntax span (or include the line-number gutter).
+    // Keep the original block intact for diffing and copy/editor snapshots.
+    let safe_source = |source: &str, limit: usize| {
+        source
+            .lines()
+            .take(limit)
+            .map(|line| format!("{}\n", sanitize(line)))
+            .collect::<String>()
+    };
     let before_colors = if block["kind"] == "code" {
         None
     } else {
-        crate::core::highlight::highlight_code(block["before"].as_str().unwrap_or(""), language)
+        crate::core::highlight::highlight_code(
+            &safe_source(block["before"].as_str().unwrap_or(""), usize::MAX),
+            language,
+        )
     };
     let after_colors = crate::core::highlight::highlight_code_limited(
-        block["after"]
-            .as_str()
-            .or_else(|| block["text"].as_str())
-            .unwrap_or(""),
+        &safe_source(
+            block["after"]
+                .as_str()
+                .or_else(|| block["text"].as_str())
+                .unwrap_or(""),
+            code_limit,
+        ),
         language,
         code_limit,
     );
@@ -239,7 +255,7 @@ fn card_rows_limited(
         let highlighted = vec![
             colored
                 .cloned()
-                .unwrap_or_else(|| Line::raw(text.to_owned())),
+                .unwrap_or_else(|| Line::raw(sanitize(text))),
         ];
         for code in highlighted {
             let gutter = if block["line_numbers"] == false {
@@ -3488,6 +3504,42 @@ mod tests {
             card_rows_limited(oversized.clone(), 40, &theme, 0),
             card_rows(oversized, 40, &theme),
         );
+    }
+
+    #[test]
+    fn structured_code_and_diffs_are_terminal_safe() {
+        use super::*;
+        use crate::theme::Theme;
+        let theme = Theme::default();
+        let source = "\tfunc main() {\n\t界\tprintln(\"hi\")\x1b[31m\x07\r\n}\n\n\t\n";
+        let clean = source.lines().map(sanitize).collect::<Vec<_>>().join("\n");
+        for kind in ["code", "diff"] {
+            for language in ["go", "unknown"] {
+                for highlight in [true, false] {
+                    let card = |text: &str| crate::modules::tool_cards::CardLine {
+                        block: Some(serde_json::json!({
+                            "kind":kind, "text":text, "before":"", "after":text,
+                            "language":language, "syntax_highlight":highlight,
+                            "line_numbers":true, "fragment":true
+                        })),
+                        ..Default::default()
+                    };
+                    let rows = card_rows(card(source), 80, &theme);
+                    assert_eq!(
+                        rows,
+                        card_rows(card(&clean), 80, &theme),
+                        "kind={kind}, language={language}, highlight={highlight}"
+                    );
+                    let area = Rect::new(0, 0, 80, 10);
+                    let mut buf = Buffer::empty(area);
+                    render_bottom_anchored(&rows, 0, area, &mut buf);
+                    assert!(buf
+                        .content
+                        .iter()
+                        .all(|cell| !cell.symbol().chars().any(char::is_control)));
+                }
+            }
+        }
     }
 
     #[test]
