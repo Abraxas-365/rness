@@ -101,6 +101,7 @@ enum Cmd {
     Action { guard: Box<dyn FnOnce() -> bool + Send>, generation: u64, name: String, scope: String, context: serde_json::Value, reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>> },
     Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<String>, String>> },
     Command { name: String, context: serde_json::Value, permit: rness_engine::service::CommandPermit, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
+    ResumeCommand { id: u64, result: Result<bool, String> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
     CoordinatedUnload {
         name: String,
@@ -250,6 +251,56 @@ fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak
     Ok(())
 }
 
+struct PendingCommand {
+    thread: crate::runtime::CommandThread,
+    permit: rness_engine::service::CommandPermit,
+    cancel: tokio_util::sync::CancellationToken,
+    // Keeping this unanswered keeps PreparedCommand (and its engine locks) alive.
+    reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>>,
+}
+
+struct CompactionCompletion {
+    tx: std::sync::Arc<mpsc::Sender<Cmd>>,
+    id: u64,
+    result: Option<Result<bool, String>>,
+}
+
+impl Drop for CompactionCompletion {
+    fn drop(&mut self) {
+        let result = self.result.take().unwrap_or_else(|| Err("compaction task stopped".into()));
+        let _ = self.tx.send(Cmd::ResumeCommand { id: self.id, result });
+    }
+}
+
+fn command_step(
+    id: u64, command: PendingCommand, step: Result<crate::runtime::CommandStep, String>,
+    pending: &mut std::collections::HashMap<u64, PendingCommand>,
+    runtime: Option<&tokio::runtime::Handle>, tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
+) {
+    match step {
+        Ok(crate::runtime::CommandStep::Pending(future)) => {
+            let Some((runtime, tx)) = runtime.zip(tx.upgrade()) else {
+                let _ = command.reply.send(Err("compaction runtime unavailable".into()));
+                return;
+            };
+            pending.insert(id, command);
+            // A dropped/panicking runtime task must also release the parked command.
+            let mut completion = CompactionCompletion { tx, id, result: None };
+            runtime.spawn(async move {
+                completion.result = Some(future.await);
+                drop(completion);
+            });
+        }
+        result => {
+            let result = result.map(|step| match step {
+                crate::runtime::CommandStep::Complete(result) => result,
+                crate::runtime::CommandStep::Pending(_) => unreachable!(),
+            });
+            let _ = command.reply.send(result);
+        }
+    }
+}
+
 impl LuaHost {
     /// Spawn the VM actor. Fails fast if the VM can't be built.
     pub fn spawn() -> Result<Self, String> {
@@ -298,6 +349,8 @@ impl LuaHost {
                 let mut installed_commands = Vec::new();
                 let mut session_binding: Option<SessionBinding> = None;
                 let mut questions_ref: Option<std::sync::Arc<rness_engine::questions::Questions>> = None;
+                let mut pending_commands = std::collections::HashMap::new();
+                let mut next_command_id = 0u64;
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         Cmd::ValidateBindings { reply } => { let _ = reply.send(rt.validate_bindings(false)); }
@@ -313,19 +366,33 @@ impl LuaHost {
                             let _ = reply.send(result);
                         }
                         Cmd::Command { name, context, permit, cancel, reply } => {
-                            rt.lua().set_app_data(permit);
-                            rt.lua().set_app_data(cancel.clone());
-                            let token = cancel.clone();
-                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-                                if token.is_cancelled() { Err(mlua::Error::runtime("command cancelled")) } else { Ok(mlua::VmState::Continue) }
-                            });
-                            let result = if cancel.is_cancelled() { Err("command cancelled".into()) } else { rt.call_command(&name, context) };
-                            rt.lua().remove_hook();
-                            rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
-                            rt.lua().remove_app_data::<rness_engine::service::CommandPermit>();
-                            let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
+                            use mlua::LuaSerdeExt;
+                            let thread = match rt.command_thread(&name) {
+                                Ok(thread) => thread,
+                                Err(error) => { let _ = reply.send(Err(error)); continue; }
+                            };
+                            let id = next_command_id;
+                            next_command_id = next_command_id.checked_add(1).expect("command ID exhausted");
+                            let mut command = PendingCommand { thread, permit, cancel, reply };
+                            let step = rt.lua().to_value(&context).map_err(|e| e.to_string()).and_then(|args|
+                                rt.resume_command(&mut command.thread, args, command.permit.clone(), &command.cancel));
+                            command_step(id, command, step, &mut pending_commands,
+                                session_binding.as_ref().map(|b| &b.rt), &command_tx);
+                        }
+                        Cmd::ResumeCommand { id, result } => {
+                            let Some(mut command) = pending_commands.remove(&id) else { continue; };
+                            let step = match result {
+                                Ok(result) => rt.resume_command(&mut command.thread, (true, result), command.permit.clone(), &command.cancel),
+                                Err(error) => rt.resume_command(&mut command.thread, (false, error), command.permit.clone(), &command.cancel),
+                            };
+                            command_step(id, command, step, &mut pending_commands,
+                                session_binding.as_ref().map(|b| &b.rt), &command_tx);
                         }
                         Cmd::Load { name, source, dependencies, reply } => {
+                            if !pending_commands.is_empty() {
+                                let _ = reply.send(Err("extension runtime is busy".into()));
+                                continue;
+                            }
                             let staged = questions_ref.as_ref().map(|qs| {
                                 let staged = std::sync::Arc::new(rness_engine::questions::Questions::default());
                                 staged.set_overlay_config(qs.overlay_config());

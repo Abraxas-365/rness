@@ -9,7 +9,8 @@ rness.commands.register {
     local policies = rness.compaction or {}
     local policy = (model and policies[model.route .. "/" .. model.model]) or policies.default
     assert(policy, "Configure a compaction policy first")
-    local changed = rness.session.compact_region(ctx.session, {
+    -- Suspend this command, not the Lua host: hooks/status keep refreshing.
+    local changed = rness.session.compact_region_async(ctx.session, {
       start = 1, ["end"] = #view.messages, sources = view.sources, policy = policy,
     })
     return { message = changed and "Context compacted." or "No smaller summary produced; history unchanged." }

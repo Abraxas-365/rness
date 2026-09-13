@@ -71,6 +71,18 @@ pub struct LuaBindingSpec {
     pub user: bool,
 }
 
+/// Coroutine handles and callback ownership remain on the VM actor.
+pub(crate) struct CommandThread {
+    thread: mlua::Thread,
+    owner: LuaValue,
+    depth: LuaValue,
+}
+
+pub(crate) enum CommandStep {
+    Pending(crate::api::session::CompactionFuture),
+    Complete(rness_engine::interaction::CommandResult),
+}
+
 /// VM-side state: the interpreter plus everything plugins registered.
 pub struct LuaRuntime {
     lua: Lua,
@@ -569,6 +581,90 @@ impl LuaRuntime {
         let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
         let context = self.lua.to_value(&context).map_err(|e| e.to_string())?;
         let result: LuaValue = run.call(context).map_err(|e| e.to_string())?;
+        self.command_result(result)
+    }
+
+    pub(crate) fn command_thread(&self, name: &str) -> Result<CommandThread, String> {
+        let (_, key) = self.commands.get(name).ok_or_else(|| format!("command unavailable: {name}"))?;
+        let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
+        Ok(CommandThread {
+            thread: self.lua.create_thread(run).map_err(|e| e.to_string())?,
+            owner: LuaValue::Nil, depth: LuaValue::Nil,
+        })
+    }
+
+    /// Install command-local state only while executing Lua, never while parked.
+    pub(crate) fn resume_command(&self, command: &mut CommandThread, args: impl mlua::IntoLuaMulti,
+        permit: rness_engine::service::CommandPermit, cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<CommandStep, String> {
+        let invoke = || -> mlua::Result<mlua::MultiValue> {
+            let globals = self.lua.globals();
+            let owner: LuaValue = globals.get("__rness_callback_owner")?;
+            let depth: LuaValue = globals.get("__rness_callback_depth")?;
+            globals.set("__rness_callback_owner", command.owner.clone())?;
+            globals.set("__rness_callback_depth", command.depth.clone())?;
+            self.lua.set_app_data(permit);
+            self.lua.set_app_data(cancel.clone());
+            let token = cancel.clone();
+            command.thread.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                if token.is_cancelled() { Err(mlua::Error::runtime("command cancelled")) } else { Ok(mlua::VmState::Continue) }
+            });
+            let mut result = if cancel.is_cancelled() { Err(mlua::Error::runtime("command cancelled")) }
+                else { command.thread.resume::<mlua::MultiValue>(args) };
+            // Decide cancellation while command context is installed so every
+            // cancelled exit goes through coroutine cleanup below. Cancellation
+            // after this point is handled on the next resume of a pending call.
+            if cancel.is_cancelled() { result = Err(mlua::Error::runtime("command cancelled")); }
+            let supported_yield = result.as_ref().is_ok_and(|values| {
+                values.len() == 1 && matches!(values.front(), Some(LuaValue::UserData(request))
+                    if request.is::<crate::api::session::CompactionRequest>())
+            });
+            if result.is_err()
+                || (command.thread.status() == mlua::ThreadStatus::Resumable && !supported_yield)
+            {
+                // Cancellation closes the coroutine rather than running arbitrary
+                // post-yield command code (including pcall-based cleanup).
+                // Close abandoned Lua 5.4 frames while their command context is
+                // still installed. This cooperative instruction budget stops ordinary
+                // runaway closers; trusted Lua can catch hook errors or block in
+                // native calls, so it is not a hard execution-time sandbox.
+                let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                command.thread.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                    if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 10 {
+                        Err(mlua::Error::runtime("command cleanup instruction limit exceeded"))
+                    } else { Ok(mlua::VmState::Continue) }
+                });
+                if let Ok(noop) = self.lua.create_function(|_, ()| Ok(())) {
+                    let _ = command.thread.reset(noop);
+                }
+            }
+            self.lua.remove_hook();
+            self.lua.remove_app_data::<tokio_util::sync::CancellationToken>();
+            self.lua.remove_app_data::<rness_engine::service::CommandPermit>();
+            let saved_owner = globals.get("__rness_callback_owner");
+            let saved_depth = globals.get("__rness_callback_depth");
+            globals.set("__rness_callback_owner", owner)?;
+            globals.set("__rness_callback_depth", depth)?;
+            command.owner = saved_owner?;
+            command.depth = saved_depth?;
+            result
+        };
+        let mut values = invoke().map_err(|e| e.to_string())?;
+        if command.thread.status() == mlua::ThreadStatus::Resumable {
+            if values.len() == 1 {
+                if let Some(LuaValue::UserData(request)) = values.pop_front() {
+                    if request.is::<crate::api::session::CompactionRequest>() {
+                        return request.take::<crate::api::session::CompactionRequest>()
+                            .map(|request| CommandStep::Pending(request.0)).map_err(|e| e.to_string());
+                    }
+                }
+            }
+            return Err("unsupported Lua command yield".into());
+        }
+        self.command_result(values.pop_front().unwrap_or(LuaValue::Nil)).map(CommandStep::Complete)
+    }
+
+    fn command_result(&self, result: LuaValue) -> Result<rness_engine::interaction::CommandResult, String> {
         match result {
             LuaValue::Nil => Ok(Default::default()),
             LuaValue::String(text) => Ok(rness_engine::interaction::CommandResult { message: text.to_str().map_err(|e| e.to_string())?.to_owned(), ..Default::default() }),
@@ -1164,6 +1260,25 @@ fn owned_callback(lua: &Lua, callback: Function) -> mlua::Result<Function> {
     })
 }
 
+/// Commands need a Lua frame so pcall can propagate coroutine yields.
+fn owned_command(lua: &Lua, callback: Function) -> mlua::Result<Function> {
+    let owner = lua.globals().get::<Option<Table>>("__rness_callback_owner")?
+        .or(lua.globals().get::<Option<Table>>("__rness_load_owner")?);
+    lua.load(r#"
+        local callback, owner = ...
+        local pack, unpack, pcall, raise = table.pack, table.unpack, pcall, error
+        return function(...)
+            local previous, depth = __rness_callback_owner, __rness_callback_depth
+            __rness_callback_owner = owner
+            __rness_callback_depth = (depth or 0) + 1
+            local result = pack(pcall(callback, ...))
+            __rness_callback_owner, __rness_callback_depth = previous, depth
+            if not result[1] then raise(result[2], 0) end
+            return unpack(result, 2, result.n)
+        end
+    "#).call((callback, owner))
+}
+
 fn require_declaration_phase(lua: &Lua) -> mlua::Result<()> {
     if lua.globals().get::<Option<u32>>("__rness_callback_depth")?.unwrap_or(0) != 0 {
         return Err(mlua::Error::runtime("registrations are only allowed during startup or plugin loading, not callbacks"));
@@ -1332,7 +1447,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         let arguments: Vec<_> = arguments.into_iter().map(|value| (value, String::new())).collect();
         entry.set("arguments", lua.to_value(&arguments)?)?;
         if let Some(complete) = spec.get::<Option<Function>>("complete")? { entry.set("complete", owned_callback(lua, complete)?)?; }
-        entry.set("run", owned_callback(lua, spec.get::<Function>("run")?)?)?;
+        entry.set("run", owned_command(lua, spec.get::<Function>("run")?)?)?;
         let pending: Table = lua.globals().get("__rness_pending")?;
         pending.get::<Table>("commands")?.push(entry)?;
         names.set(name, true)?;
@@ -1793,6 +1908,134 @@ fn user_message(e: &mlua::Error) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn command_coroutine_can_yield_private_requests_repeatedly() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let prepare = rt.lua().create_function(|_, ()| {
+            Ok(crate::api::session::CompactionRequest(Box::pin(async { Ok(false) })))
+        }).unwrap();
+        rt.lua().globals().set("compact_test", crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap()).unwrap();
+        rt.load("async-test", r#"
+            rness.commands.register{name='async-test', run=function(ctx)
+                assert(compact_test() == false)
+                assert(compact_test() == true)
+                return {message=ctx.message, data={changed=true}}
+            end}
+        "#).unwrap();
+        let command = rt.command_thread("async-test").unwrap();
+        let request: mlua::AnyUserData = command.thread.resume(rt.lua().to_value(&json!({"message":"done"})).unwrap()).unwrap();
+        assert!(request.take::<crate::api::session::CompactionRequest>().is_ok());
+        assert!(request.take::<crate::api::session::CompactionRequest>().is_err(), "single use");
+        let request: mlua::AnyUserData = command.thread.resume((true, false)).unwrap();
+        assert!(request.is::<crate::api::session::CompactionRequest>());
+        let returned = command.thread.resume::<LuaValue>((true, true)).unwrap();
+        assert_eq!(command.thread.status(), mlua::ThreadStatus::Finished);
+        let result = rt.command_result(returned).unwrap();
+        assert_eq!(result.message, "done");
+        assert_eq!(result.data, json!({"changed":true}));
+        assert!(rt.lua().globals().get::<Option<Table>>("__rness_callback_owner").unwrap().is_none());
+        assert!(rt.lua().globals().get::<Option<usize>>("__rness_callback_depth").unwrap().is_none());
+    }
+
+    #[test]
+    fn compaction_wrapper_raises_failure_in_command_coroutine() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let prepare = rt.lua().create_function(|_, ()| {
+            Ok(crate::api::session::CompactionRequest(Box::pin(async { Ok(true) })))
+        }).unwrap();
+        rt.lua().globals().set("compact_test", crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap()).unwrap();
+        rt.load("async-test", "rness.commands.register{name='async-test', run=function() compact_test(); error('unreachable') end}").unwrap();
+        let command = rt.command_thread("async-test").unwrap();
+        let _: mlua::AnyUserData = command.thread.resume(()).unwrap();
+        let error = command.thread.resume::<LuaValue>((false, "summary failed")).unwrap_err().to_string();
+        assert!(error.contains("summary failed"), "{error}");
+        assert!(!error.contains("unreachable"), "{error}");
+        assert!(rt.lua().globals().get::<Option<Table>>("__rness_callback_owner").unwrap().is_none());
+        assert!(rt.lua().globals().get::<Option<usize>>("__rness_callback_depth").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_resumes_isolate_state_and_reject_unsupported_yields() {
+        use rness_engine::{interaction::{Command, CommandInvocation, CommandResult}, service::{SessionService, ServiceError}};
+        use std::sync::Arc;
+        struct Provider;
+        #[async_trait::async_trait]
+        impl rness_engine::turn::provider::Provider for Provider {
+            fn model(&self) -> &str { "test" }
+            async fn step(&self, _: rness_engine::turn::provider::StepRequest<'_>, _: &tokio_util::sync::CancellationToken)
+                -> rness_engine::turn::provider::StepOutcome { unreachable!() }
+        }
+        struct TestCommand;
+        impl Command for TestCommand {
+            fn name(&self) -> &str { "test" }
+            fn description(&self) -> &str { "test" }
+            fn execute(&self, _: &SessionService, input: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
+                let mut rt = LuaRuntime::new().unwrap();
+                let prepare = rt.lua().create_function(|lua, ()| {
+                    assert!(lua.app_data_ref::<rness_engine::service::CommandPermit>().is_some());
+                    assert!(lua.app_data_ref::<tokio_util::sync::CancellationToken>().is_some());
+                    Ok(crate::api::session::CompactionRequest(Box::pin(async { Ok(true) })))
+                }).unwrap();
+                rt.lua().globals().set("compact_test", crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap()).unwrap();
+                let token = input.cancel.clone();
+                rt.lua().globals().set("cancel_test", rt.lua().create_function(move |_, ()| { token.cancel(); Ok(()) }).unwrap()).unwrap();
+                rt.load("async-test", r#"
+                    rness.commands.register{name='test', run=function()
+                        assert(compact_test())
+                        assert(compact_test())
+                        return 'done'
+                    end}
+                    rness.commands.register{name='unsupported', run=function()
+                        local guard <close> = setmetatable({}, {__close=function() closed=true end})
+                        coroutine.yield('not a request')
+                    end}
+                    rness.commands.register{name='parked', run=function()
+                        local guard <close> = setmetatable({}, {__close=function() closed=true end})
+                        compact_test()
+                    end}
+                    rness.commands.register{name='cancel', run=function() cancel_test(); while true do end end}
+                "#).unwrap();
+                let clean = || {
+                    assert!(rt.lua().app_data_ref::<rness_engine::service::CommandPermit>().is_none());
+                    assert!(rt.lua().app_data_ref::<tokio_util::sync::CancellationToken>().is_none());
+                    assert!(rt.lua().globals().get::<Option<Table>>("__rness_callback_owner").unwrap().is_none());
+                    assert!(rt.lua().globals().get::<Option<usize>>("__rness_callback_depth").unwrap().is_none());
+                    // A cancelled coroutine hook must not poison subsequent VM callbacks.
+                    rt.lua().load("local n = 0; for i=1,10000 do n=n+i end").exec().unwrap();
+                };
+                let mut command = rt.command_thread("test").unwrap();
+                assert!(matches!(rt.resume_command(&mut command, (), input.permit.clone(), &input.cancel), Ok(CommandStep::Pending(_))));
+                clean();
+                assert!(matches!(rt.resume_command(&mut command, (true, true), input.permit.clone(), &input.cancel), Ok(CommandStep::Pending(_))));
+                clean();
+                assert!(matches!(rt.resume_command(&mut command, (true, true), input.permit.clone(), &input.cancel), Ok(CommandStep::Complete(result)) if result.message == "done"));
+                clean();
+                let mut command = rt.command_thread("unsupported").unwrap();
+                assert!(matches!(rt.resume_command(&mut command, (), input.permit.clone(), &input.cancel), Err(error) if error.contains("unsupported Lua command yield")));
+                assert!(rt.lua().globals().get::<bool>("closed").unwrap());
+                clean();
+                rt.lua().globals().set("closed", false).unwrap();
+                let mut parked = rt.command_thread("parked").unwrap();
+                assert!(matches!(rt.resume_command(&mut parked, (), input.permit.clone(), &input.cancel), Ok(CommandStep::Pending(_))));
+                clean();
+                let mut command = rt.command_thread("cancel").unwrap();
+                assert!(matches!(rt.resume_command(&mut command, (), input.permit.clone(), &input.cancel), Err(error) if error.contains("command cancelled")));
+                clean();
+                assert!(matches!(rt.resume_command(&mut parked, (false, "command cancelled"), input.permit.clone(), &input.cancel), Err(error) if error.contains("command cancelled")));
+                assert!(rt.lua().globals().get::<bool>("closed").unwrap());
+                clean();
+                Ok(CommandResult { message: "tested".into(), ..Default::default() })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = rness_engine::session::branch::SessionStore::new(dir.path());
+        let session = store.create(None).unwrap().session().clone();
+        let service = SessionService::new(store, Arc::new(Provider), Arc::new(rness_engine::tools::ToolRegistry::default()),
+            rness_engine::turn::TurnConfig::default(), Arc::new(rness_kernel::EventBus::default()));
+        service.commands().register(Arc::new(TestCommand)).unwrap();
+        service.prepare_command(&session, "/test").unwrap().unwrap().execute(&service).unwrap();
+    }
 
     #[test]
     fn queue_and_steer_actions_are_scoped_buffered_and_expire() {

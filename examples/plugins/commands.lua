@@ -70,7 +70,7 @@ rness.commands.register {
       local selection = regions[ctx.session]
       assert(selection, "Preview a range with /compact-region start end first")
       regions[ctx.session] = nil
-      local changed = rness.session.compact_region(ctx.session, selection)
+      local changed = rness.session.compact_region_async(ctx.session, selection)
       return { message = changed and "Selected region compacted." or "No smaller summary produced; history unchanged." }
     end
     local view = rness.session.compaction_view(ctx.session)

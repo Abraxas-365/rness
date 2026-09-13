@@ -27,6 +27,24 @@ use rness_engine::inbox::{Disposition, Phase};
 use rness_engine::service::SessionService;
 use rness_protocol::events::{ContentPart, UserIntent};
 
+/// Private, single-use handoff; no Lua values cross onto the binding runtime.
+pub(crate) type CompactionFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>;
+pub(crate) struct CompactionRequest(pub(crate) CompactionFuture);
+impl mlua::UserData for CompactionRequest {}
+
+/// Yield from Lua rather than through a non-yieldable Rust callback frame.
+pub(crate) fn compaction_wrapper(lua: &Lua, prepare: mlua::Function) -> mlua::Result<mlua::Function> {
+    lua.load(r#"
+        local prepare = ...
+        local yield, raise = coroutine.yield, error
+        return function(...)
+            local ok, result = yield(prepare(...))
+            if not ok then raise(result, 0) end
+            return result
+        end
+    "#).call(prepare)
+}
+
 fn err(e: impl std::fmt::Display) -> mlua::Error {
     mlua::Error::runtime(e.to_string())
 }
@@ -306,6 +324,33 @@ pub fn install(
         let cancel = lua.app_data_ref::<tokio_util::sync::CancellationToken>().map(|cancel| cancel.clone()).unwrap_or_default();
         block_rt.block_on(s.compact_region_with_permit(&id, opts.start - 1, opts.end, opts.sources, opts.policy, permit, cancel)).map_err(err)
     })?)?;
+
+    let s = Arc::clone(&sessions);
+    let prepare = lua.create_function(move |lua, (id, opts): (String, Table)| {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Options {
+            start: usize, end: usize,
+            sources: Vec<rness_protocol::events::EventId>,
+            policy: rness_engine::turn::compaction::Policy,
+        }
+        let opts: Options = lua.from_value(mlua::Value::Table(opts))?;
+        if opts.start == 0 || opts.end < opts.start {
+            return Err(err("region uses one-based inclusive message indices"));
+        }
+        opts.policy.validate().map_err(err)?;
+        let permit = lua.app_data_ref::<rness_engine::service::CommandPermit>()
+            .map(|permit| permit.clone()).ok_or_else(|| err("compact_region_async requires a command"))?;
+        let cancel = lua.app_data_ref::<tokio_util::sync::CancellationToken>()
+            .map(|cancel| cancel.clone()).ok_or_else(|| err("compact_region_async requires command cancellation"))?;
+        if cancel.is_cancelled() { return Err(err("command cancelled")); }
+        let s = s.clone();
+        Ok(CompactionRequest(Box::pin(async move {
+            s.compact_region_with_permit(&id, opts.start - 1, opts.end, opts.sources, opts.policy, Some(permit), cancel)
+                .await.map_err(|e| e.to_string())
+        })))
+    })?;
+    session.set("compact_region_async", compaction_wrapper(lua, prepare)?)?;
 
     let s = Arc::clone(&sessions);
     session.set(

@@ -14,7 +14,10 @@ async fn default_spinner_shows_session_compaction_and_restores_activity() {
     host.fire_hook("frame", json!({"type":"compaction_started","session":"s2"}));
     assert!(!host.status(context.clone()).await.unwrap().to_string().contains("compacting context"));
     host.fire_hook("frame", json!({"type":"compaction_started","session":"s1"}));
-    assert!(host.status(context.clone()).await.unwrap().to_string().contains("compacting context"));
+    for frame in ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠋"] {
+        let during = host.status(context.clone()).await.unwrap().to_string();
+        assert!(during.contains(&format!("{frame} compacting context")), "{during}");
+    }
     host.fire_hook("frame", json!({"type":"compaction_finished","session":"s1","changed":false}));
     let after = host.status(context.clone()).await.unwrap().to_string();
     assert!(!after.contains("compacting context"));

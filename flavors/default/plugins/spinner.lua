@@ -59,7 +59,7 @@ rness.hook.on("frame", function(f)
   elseif f.type == "tool_started" then
     doing[f.session] = f.name
   elseif f.type == "compaction_started" then
-    compacting[f.session] = os.time()
+    compacting[f.session] = { started = os.time(), frame = 1 }
   elseif f.type == "compaction_finished" then
     compacting[f.session] = nil
   elseif f.type == "turn_idle" then
@@ -78,10 +78,13 @@ rness.ui.statusline = {
       refresh(ctx.session)
     end
     local parts = { { text = ctx.model or "", style = { fg = "#83a598" } } }
-    local compact_started = ctx.session and compacting[ctx.session]
-    if compact_started then
-      local secs = os.time() - compact_started
-      parts[#parts + 1] = { text = frames[(secs % #frames) + 1] .. " compacting context", style = { fg = "#fabd2f" } }
+    local compact = ctx.session and compacting[ctx.session]
+    if compact then
+      local secs = os.time() - compact.started
+      -- Advance on each status refresh; os.time() only changes once a second.
+      local spin = frames[compact.frame]
+      compact.frame = (compact.frame % #frames) + 1
+      parts[#parts + 1] = { text = spin .. " compacting context", style = { fg = "#fabd2f" } }
       parts[#parts + 1] = { text = tostring(secs) .. "s" }
       parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
       parts[#parts + 1] = tokens[ctx.session] or ""

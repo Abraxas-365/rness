@@ -27,6 +27,16 @@ fn theme() -> &'static syntect::highlighting::Theme {
 /// Highlight `code` as `lang`. Returns one styled Line per source line,
 /// or None when the language isn't recognized (caller falls back).
 pub fn highlight_code(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
+    highlight_code_limited(code, lang, usize::MAX)
+}
+
+/// Highlight at most `max_lines` physical source lines, preserving syntax state
+/// from the beginning of the source without processing the remaining lines.
+pub fn highlight_code_limited(
+    code: &str,
+    lang: &str,
+    max_lines: usize,
+) -> Option<Vec<Line<'static>>> {
     if lang.is_empty() {
         return None;
     }
@@ -37,7 +47,7 @@ pub fn highlight_code(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
 
     let mut highlighter = HighlightLines::new(syntax, theme());
     let mut out = Vec::new();
-    for source_line in code.lines() {
+    for source_line in code.lines().take(max_lines) {
         // syntect state machines expect the trailing newline.
         let with_nl = format!("{source_line}\n");
         let regions = highlighter.highlight_line(&with_nl, set).ok()?;
@@ -106,6 +116,26 @@ mod tests {
     fn unknown_language_falls_back() {
         assert!(highlight_code("whatever", "notalanguage").is_none());
         assert!(highlight_code("whatever", "").is_none());
+    }
+
+    #[test]
+    fn limited_highlighting_matches_full_prefix() {
+        for source in [
+            "",
+            "/* Unicode 界🙂\ncontinued comment\n*/\nlet café = \"é\";\n",
+            "\n\r\nlet x = 1;\r\n",
+        ] {
+            let full = highlight_code(source, "rust").unwrap();
+            for limit in [0, 1, 2, 3, 4, usize::MAX] {
+                let bounded = highlight_code_limited(source, "rust", limit).unwrap();
+                assert_eq!(bounded, full[..full.len().min(limit)]);
+            }
+        }
+        for language in ["", "notalanguage"] {
+            for limit in [0, 1, usize::MAX] {
+                assert!(highlight_code_limited("界\ntext", language, limit).is_none());
+            }
+        }
     }
 
     #[test]

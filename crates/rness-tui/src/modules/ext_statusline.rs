@@ -3,8 +3,8 @@
 //!
 //! Protocol purity: the TUI knows nothing about Lua — it renders a
 //! shared string slot. Mounted above the built-in statusline; `wants()`
-//! selects it only while a provider has published text (chain pattern),
-//! so with no plugins the built-in renders untouched.
+//! selects it only while a provider has published text (chain pattern).
+//! With no plugins the built-in renders untouched.
 
 use std::sync::{Arc, RwLock};
 
@@ -253,6 +253,33 @@ mod tests {
             provider.release.notify_one();
         });
         assert_eq!(cell.get().as_deref(), Some("replacement"));
+    }
+
+    #[test]
+    fn provider_can_animate_during_compaction() {
+        use rness_protocol::frames::Frame;
+
+        let mut slots = Slots::default();
+        crate::modules::statusline::install(&mut slots);
+        let handle = install(&mut slots);
+        let mut model = Model::new("s".into(), "m".into());
+        let theme = Theme::default();
+        model.apply_frame(&Frame::CompactionStarted {
+            session: "s".into(), events: 42, estimated_tokens: 73000,
+        });
+        let render = |slots: &mut Slots| {
+            let area = Rect::new(0, 0, 80, 1);
+            let mut buf = Buffer::empty(area);
+            slots.render(&Ctx { model: &model, theme: &theme }, area, &mut buf);
+            (0..area.width).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+        };
+        for frame in ["⠋", "⠙"] {
+            let text = format!("{frame} compacting context");
+            handle.set(Some(text.clone()));
+            assert!(render(&mut slots).contains(&text));
+        }
+        handle.set(None);
+        assert!(render(&mut slots).contains("compacting 42 events · ~73k tok"));
     }
 
     #[test]

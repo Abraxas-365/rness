@@ -183,6 +183,17 @@ fn card_rows(
     width: u16,
     theme: &crate::theme::Theme,
 ) -> Vec<Line<'static>> {
+    card_rows_limited(row, width, theme, usize::MAX)
+}
+
+/// Bound code blocks by physical lines; diffs and ordinary rows retain their
+/// full rendering behavior. The caller budgets one extra row for truncation.
+fn card_rows_limited(
+    row: crate::modules::tool_cards::CardLine,
+    width: u16,
+    theme: &crate::theme::Theme,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
     let Some(block) = &row.block else {
         return vec![card_line(row, width, theme)];
     };
@@ -201,14 +212,23 @@ fn card_rows(
     } else {
         block["language"].as_str().unwrap_or("")
     };
-    let before_colors =
-        crate::core::highlight::highlight_code(block["before"].as_str().unwrap_or(""), language);
-    let after_colors = crate::core::highlight::highlight_code(
+    let code_limit = if block["kind"] == "code" {
+        max_lines
+    } else {
+        usize::MAX
+    };
+    let before_colors = if block["kind"] == "code" {
+        None
+    } else {
+        crate::core::highlight::highlight_code(block["before"].as_str().unwrap_or(""), language)
+    };
+    let after_colors = crate::core::highlight::highlight_code_limited(
         block["after"]
             .as_str()
             .or_else(|| block["text"].as_str())
             .unwrap_or(""),
         language,
+        code_limit,
     );
     let mut result = Vec::new();
     let mut push = |text: &str,
@@ -336,7 +356,13 @@ fn card_rows(
         }
     } else {
         let start = block["start_line"].as_u64().unwrap_or(1) as usize;
-        for (index, text) in block["text"].as_str().unwrap_or("").lines().enumerate() {
+        for (index, text) in block["text"]
+            .as_str()
+            .unwrap_or("")
+            .lines()
+            .take(code_limit)
+            .enumerate()
+        {
             push(
                 text,
                 start + index,
@@ -1698,7 +1724,13 @@ impl Component for Chat {
                                         };
                                         let mut rows = Vec::new();
                                         for row in card.iter().take(row_limit) {
-                                            let rendered = card_rows(row.clone(), inner, theme);
+                                            // Each physical code line occupies at least one
+                                            // visual row. Keep one extra to detect truncation.
+                                            let remaining =
+                                                limit.saturating_add(1).saturating_sub(rows.len());
+                                            let rendered = card_rows_limited(
+                                                row.clone(), inner, theme, remaining,
+                                            );
                                             if row.is_header {
                                                 rows.extend(rendered.into_iter().map(|line| {
                                                     visual_rows(line, usize::from(inner), false)
@@ -2234,6 +2266,344 @@ impl Component for Chat {
 #[cfg(test)]
 mod tests {
     use super::sanitize;
+
+    /// Render-only diagnostic: no terminal I/O, event loop, or Lua card publication.
+    /// Run alone with --ignored --nocapture (prefer --release for useful timings).
+    #[test]
+    #[ignore = "diagnostic performance workload; prints timings without timing assertions"]
+    fn diagnostic_streaming_resize_performance() {
+        use super::*;
+        use crate::{
+            app::{LiveStep, Model},
+            theme::Theme,
+        };
+        use std::time::{Duration, Instant};
+
+        fn measure(
+            chat: &mut Chat,
+            model: &mut Model,
+            theme: &Theme,
+            area: Rect,
+            phase: &str,
+            samples: usize,
+            delta: bool,
+        ) {
+            let mut buffer = Buffer::empty(area);
+            let visits = chat.entry_visits;
+            let mut times = Vec::new();
+            for i in 0..samples {
+                if delta {
+                    model.live.as_mut().unwrap().text.push_str(&format!(
+                        "\n\nStream delta {i}: another **result** with `inline code`.\n"
+                    ));
+                }
+                buffer.reset();
+                let start = Instant::now();
+                chat.render(&Ctx { model, theme }, area, &mut buffer);
+                times.push(start.elapsed());
+                std::hint::black_box(&buffer);
+            }
+            let total: Duration = times.iter().sum();
+            times.sort();
+            eprintln!(
+                "  {phase:24} {w}x{h} n={samples} median={:.3}ms max={:.3}ms total={:.3}ms entry_visits={} builds=n/a retained={}KiB evicted={}",
+                times[times.len() / 2].as_secs_f64() * 1000.0,
+                times.last().unwrap().as_secs_f64() * 1000.0,
+                total.as_secs_f64() * 1000.0,
+                chat.entry_visits - visits,
+                chat.retained_bytes / 1024,
+                chat.evicted.len(),
+                w = area.width,
+                h = area.height,
+            );
+        }
+
+        // Unique sources prevent identical fixture entries from turning rebuilds
+        // into unrealistic Markdown-cache hits. Include many fenced Rust snippets.
+        fn markdown(label: &str, sections: usize) -> String {
+            (0..sections).map(|i| format!(
+                "## {label}: section {i}\n\n{}\n\n```rust\nfn inspect_{i}(values: &[usize]) -> usize {{\n    values.iter().filter(|value| **value > {i}).sum()\n}}\n```\n\n- Check **results** and `cache_width` before continuing.\n\n",
+                "Long streamed analysis with Unicode café 漢字, **emphasis**, and `inline code`; inspect the tool output and preserve unrelated work. ".repeat(6),
+            )).collect()
+        }
+
+        let theme = Theme::default();
+        // Separate one-time lazy syntect initialization from history scaling.
+        let start = Instant::now();
+        std::hint::black_box(crate::core::highlight::highlight_code(
+            "fn warmup() {}",
+            "rust",
+        ));
+        eprintln!(
+            "syntax initialization: {:.3}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        eprintln!("entry_visits is a per-phase delta; no build counter exists in this checkout.");
+        eprintln!(
+            "Theme::default, flavor-like structured 100-line code cards (no Lua execution), default cache budget; render time excludes fixture creation, buffer reset, and delta append."
+        );
+        for count in [100, 500] {
+            for display in ["preview", "collapsed"] {
+                let mut model = Model::new(format!("perf-{count}-{display}"), "fake".into());
+                model.history_epoch = 1;
+                model.history_revision = 1;
+                let mut payload_bytes = 0;
+                // Each group is an assistant with four calls and their four results.
+                for group in 0..count / 5 {
+                    let text = markdown(&format!("{count}-{display}-assistant-{group}"), 12);
+                    let thinking = markdown(&format!("{count}-{display}-thinking-{group}"), 8);
+                    payload_bytes += text.len() + thinking.len();
+                    let mut content = vec![
+                        ContentPart::Thinking {
+                            text: thinking,
+                            signature: None,
+                        },
+                        ContentPart::Text { text },
+                    ];
+                    for tool in 0..4 {
+                        content.push(ContentPart::ToolUse {
+                            call: format!("call-{group}-{tool}"), name: "Read".into(),
+                            args: serde_json::json!({"path":format!("src/module_{group}_{tool}.rs")}),
+                        });
+                    }
+                    model.assistant_ids.insert(model.entries.len(), group);
+                    model.entries.push(Entry::Assistant {
+                        model: "fake".into(),
+                        content,
+                    });
+                    for tool in 0..4 {
+                        let output =
+                            markdown(&format!("{count}-{display}-output-{group}-{tool}"), 24);
+                        payload_bytes += output.len();
+                        model.entries.push(Entry::ToolResult {
+                            call: format!("call-{group}-{tool}"),
+                            name: "Read".into(),
+                            output,
+                            is_error: false,
+                        });
+                    }
+                }
+                model.entry_ids = (0..count).map(|i| format!("event-{i}")).collect();
+                model.next_assistant_id = count / 5;
+                // Match relevant flavors/default/lua/theme.lua layout and preview
+                // defaults; also test both thinking and tools fully collapsed.
+                let mut chat = Chat {
+                    config: serde_json::json!({
+                        "assistant": {"style":"assistant_text", "marker":false},
+                        "thinking": {"display":display, "preview_lines":3, "style":"thinking"},
+                        "tool": {
+                            "border":{"kind":"rounded"},
+                            "padding":{"left":1,"right":1},
+                            "display":display, "preview_lines":8,
+                            "header":{"show_name":true,"show_status":true,"show_duration":true},
+                            "states":{"error":{"display":"expanded","style":"error"}}
+                        }
+                    }),
+                    ..Default::default()
+                };
+                // Simulate host-published structured Read cards: highlighting
+                // receives the whole 100-line block even with an 8-row preview.
+                for group in 0..count / 5 {
+                    for tool in 0..4 {
+                        let source: String = (0..100).map(|line| format!(
+                            "let value_{line} = inspect(&items[{group}..{tool}]); // source line\n"
+                        )).collect();
+                        chat.cards.insert(
+                            format!("call-{group}-{tool}"),
+                            vec![
+                                crate::modules::tool_cards::CardLine {
+                                    text: "Read · done".into(),
+                                    structured: true,
+                                    is_header: true,
+                                    ..Default::default()
+                                },
+                                crate::modules::tool_cards::CardLine {
+                                    structured: true,
+                                    block: Some(serde_json::json!({
+                                        "kind":"code", "text":source, "language":"rust",
+                                        "syntax_highlight":true, "line_numbers":true
+                                    })),
+                                    ..Default::default()
+                                },
+                            ],
+                        );
+                    }
+                }
+                let wide = Rect::new(0, 0, 169, 46);
+                let narrow = Rect::new(0, 0, 86, 32);
+                eprintln!(
+                    "\nhistory={count} tools={} display={display} payload={}KiB",
+                    count / 5 * 4,
+                    payload_bytes / 1024
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "initial-idle",
+                    1,
+                    false,
+                );
+                measure(&mut chat, &mut model, &theme, wide, "warm-idle", 5, false);
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    narrow,
+                    "resized-idle",
+                    1,
+                    false,
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    narrow,
+                    "warm-resized-idle",
+                    5,
+                    false,
+                );
+
+                model.live_assistant_id = Some(count / 5);
+                model.live = Some(LiveStep {
+                    text: markdown(&format!("{count}-{display}-live"), 24),
+                    thinking: markdown("live-thinking", 12),
+                    running_tools: vec![("running-current".into(), "Read".into())],
+                    ..Default::default()
+                });
+                eprintln!(
+                    "  live text={}KiB thinking={}KiB running_tools=1",
+                    model.live.as_ref().unwrap().text.len() / 1024,
+                    model.live.as_ref().unwrap().thinking.len() / 1024
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    narrow,
+                    "initial-live",
+                    1,
+                    false,
+                );
+                measure(&mut chat, &mut model, &theme, narrow, "warm-live", 5, false);
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "resized-live",
+                    1,
+                    false,
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "warm-resized-live",
+                    5,
+                    false,
+                );
+                measure(&mut chat, &mut model, &theme, wide, "live-delta", 5, true);
+
+                // Ablation: leave thinking and running cards intact, omit only
+                // live Markdown. No history revision change or durable rebuild.
+                let text = std::mem::take(&mut model.live.as_mut().unwrap().text);
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "live-without-text",
+                    5,
+                    false,
+                );
+                model.live.as_mut().unwrap().text = text;
+                // Isolate Markdown from panel/viewport work. First call is warm
+                // after live-delta; each appended byte then forces a source miss.
+                for delta in [false, true] {
+                    let mut times = Vec::new();
+                    for _ in 0..5 {
+                        let live = model.live.as_mut().unwrap();
+                        if delta {
+                            live.text.push('x');
+                        }
+                        let start = Instant::now();
+                        let rows = crate::core::render::render_markdown_configured(
+                            &live.text,
+                            wide.width,
+                            &theme,
+                            &serde_json::Value::Null,
+                        );
+                        std::hint::black_box(&rows);
+                        drop(rows);
+                        times.push(start.elapsed());
+                    }
+                    times.sort();
+                    eprintln!(
+                        "  markdown-only delta={delta} n=5 median={:.3}ms max={:.3}ms builds=n/a",
+                        times[2].as_secs_f64() * 1000.0,
+                        times[4].as_secs_f64() * 1000.0
+                    );
+                }
+
+                // Commit the stream, then compare truly idle redraws/resizes.
+                let live = model.live.take().unwrap();
+                model.live_assistant_id = None;
+                model.assistant_ids.insert(model.entries.len(), count / 5);
+                model.next_assistant_id += 1;
+                model.entries.push(Entry::Assistant {
+                    model: "fake".into(),
+                    content: vec![
+                        ContentPart::Thinking {
+                            text: live.thinking,
+                            signature: None,
+                        },
+                        ContentPart::Text { text: live.text },
+                    ],
+                });
+                model.entry_ids.push("committed-live".into());
+                model.history_revision += 1;
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "commit-to-idle",
+                    1,
+                    false,
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    wide,
+                    "post-stream-warm-idle",
+                    5,
+                    false,
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    narrow,
+                    "post-stream-resized-idle",
+                    1,
+                    false,
+                );
+                measure(
+                    &mut chat,
+                    &mut model,
+                    &theme,
+                    narrow,
+                    "post-resize-warm-idle",
+                    5,
+                    false,
+                );
+            }
+        }
+    }
 
     #[test]
     fn selected_compaction_toggle_refreshes_without_leaving_selection() {
@@ -3002,6 +3372,144 @@ mod tests {
         let plain = card_rows(plain, 60, &theme);
         assert_eq!(plain[1].spans[1].content, "continued");
         assert_eq!(plain[1].spans[1].style.fg, theme.code_block.fg);
+    }
+
+    #[test]
+    fn limited_code_cards_match_full_prefix_and_preserve_fallbacks() {
+        use super::*;
+        let theme = crate::theme::Theme::default();
+        let source = "/* 界🙂\ncontinued\n*/\nlet café = 1;\n".repeat(25);
+        for (language, enabled) in [("rust", true), ("unknown", true), ("rust", false)] {
+            let row = crate::modules::tool_cards::CardLine {
+                block: Some(serde_json::json!({
+                    "kind":"code", "text":source, "language":language,
+                    "syntax_highlight":enabled, "start_line":42
+                })),
+                ..Default::default()
+            };
+            let full = card_rows(row.clone(), 40, &theme);
+            assert_eq!(full.len(), 100);
+            for limit in [0, 1, 2, 3, 6, 100, usize::MAX] {
+                let bounded = card_rows_limited(row.clone(), 40, &theme, limit);
+                assert_eq!(bounded.len(), limit.min(100));
+                assert_eq!(bounded, full[..full.len().min(limit)]);
+            }
+            assert_eq!(row.block.as_ref().unwrap()["text"], source);
+        }
+        for block in [
+            None,
+            Some(serde_json::json!({"kind":"diff", "language":"rust",
+                "before":"/* old\ncomment */\n", "after":"/* new\ncomment */",
+                "summary":true, "context_lines":1})),
+        ] {
+            let row = crate::modules::tool_cards::CardLine {
+                text: "ordinary row".into(),
+                block,
+                ..Default::default()
+            };
+            let full = card_rows(row.clone(), 40, &theme);
+            for limit in [0, 1, 2] {
+                assert_eq!(card_rows_limited(row.clone(), 40, &theme, limit), full);
+            }
+        }
+        let oversized = crate::modules::tool_cards::CardLine {
+            block: Some(serde_json::json!({"kind":"code", "text":"界".repeat(100_000)})),
+            ..Default::default()
+        };
+        assert_eq!(
+            card_rows_limited(oversized.clone(), 40, &theme, 0),
+            card_rows(oversized, 40, &theme),
+        );
+    }
+
+    #[test]
+    fn code_preview_matches_full_layout_and_expansion_restores_source() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("qa".into(), "fake".into());
+        model.entries.push(Entry::ToolResult {
+            call: "c".into(),
+            name: "Read".into(),
+            output: String::new(),
+            is_error: false,
+        });
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        for source in [
+            "/* 界🙂\ncontinued comment\n*/\nlet café = 1;\n".repeat(25),
+            format!("let text = \"{}\";", "界🙂é".repeat(100)),
+            "one\ntwo".into(),
+        ] {
+            for width in [16, 60] {
+                for wrap in [false, true] {
+                    let card = vec![
+                        crate::modules::tool_cards::CardLine {
+                            text: "Read".into(),
+                            is_header: true,
+                            structured: true,
+                            ..Default::default()
+                        },
+                        crate::modules::tool_cards::CardLine {
+                            block: Some(serde_json::json!({"kind":"code", "text":source,
+                                "language":"rust", "line_numbers":false})),
+                            structured: true,
+                            ..Default::default()
+                        },
+                    ];
+                    let full: Vec<_> = card
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(i, row)| {
+                            card_rows(row.clone(), width, &theme).into_iter().flat_map(
+                                move |line| visual_rows(line, usize::from(width), i != 0 && wrap),
+                            )
+                        })
+                        .collect();
+                    let mut chat = Chat {
+                        config: serde_json::json!({"tool":{"display":"preview", "output":{"wrap":wrap}}}),
+                        ..Default::default()
+                    };
+                    chat.cards.insert("c".into(), card);
+                    let area = Rect::new(0, 0, width, 10);
+                    for preview in [0usize, 1, 3, 100] {
+                        chat.config["tool"]["preview_lines"] = serde_json::json!(preview);
+                        for expanded in [false, true, false] {
+                            chat.expanded.insert("c".into(), expanded);
+                            chat.render(&ctx, area, &mut Buffer::empty(area));
+                            let mut expected = full.clone();
+                            let limit = if expanded { usize::MAX } else { preview + 1 };
+                            if expected.len() > limit {
+                                expected.truncate(limit);
+                                if limit > 1 {
+                                    expected.push(Line::styled("… more lines", theme.dim));
+                                }
+                            }
+                            let expected = panel(
+                                expected,
+                                &chat.config["tool"],
+                                width,
+                                &theme,
+                                theme.tool_output,
+                            );
+                            assert_eq!(
+                                chat.entry_cache[0].2, expected,
+                                "width={width}, wrap={wrap}, preview={preview}, expanded={expanded}"
+                            );
+                            assert_eq!(
+                                chat.cards.get(&"c".into()).unwrap()[1]
+                                    .block
+                                    .as_ref()
+                                    .unwrap()["text"],
+                                source
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
