@@ -38,14 +38,18 @@ pub enum QuestionEvent {
 impl QuestionEvent {
     pub fn session(&self) -> &str { match self { Self::QuestionRequested { session, .. } | Self::QuestionResolved { session, .. } => session } }
 }
+pub mod ui;
+pub use ui::QuestionUiConfig;
+
 #[derive(Clone, Debug)]
 pub struct OverlayConfig {
     pub priority: i32,
     pub height: u16,
     pub title: String,
+    pub ui: QuestionUiConfig,
 }
 impl Default for OverlayConfig {
-    fn default() -> Self { Self { priority: 99, height: 20, title: "AskUser".into() } }
+    fn default() -> Self { Self { priority: 99, height: 20, title: "AskUser".into(), ui: QuestionUiConfig::default() } }
 }
 
 pub struct Questions {

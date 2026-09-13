@@ -11,6 +11,16 @@ pub struct QuestionOverlayConfig {
     pub priority: i32,
     pub height: u16,
     pub title: String,
+    pub ui: rness_engine::questions::QuestionUiConfig,
+}
+impl QuestionOverlayConfig {
+    pub fn validate(&mut self) -> Result<(), String> {
+        if self.height < 10 || self.title.trim().is_empty() || self.title.chars().any(char::is_control) {
+            return Err("questions height must be >= 10 and title nonempty single-line text".into());
+        }
+        self.ui.normalize();
+        self.ui.validate()
+    }
 }
 impl Default for QuestionOverlayConfig {
     fn default() -> Self {
@@ -19,6 +29,7 @@ impl Default for QuestionOverlayConfig {
             priority: 99,
             height: 20,
             title: "AskUser".into(),
+            ui: Default::default(),
         }
     }
 }
@@ -460,15 +471,11 @@ pub fn evaluate(
     questions.set(
         "enable",
         lua.create_function(move |lua, options: Option<Table>| {
-            let config: QuestionOverlayConfig = match options {
+            let mut config: QuestionOverlayConfig = match options {
                 Some(table) => lua.from_value(mlua::Value::Table(table))?,
                 None => Default::default(),
             };
-            if config.height < 10 || config.title.trim().is_empty() {
-                return Err(mlua::Error::runtime(
-                    "questions height must be >= 10 and title nonempty",
-                ));
-            }
+            config.validate().map_err(mlua::Error::runtime)?;
             let mut state = s.lock().unwrap();
             state.ask_user = true;
             state.question_overlay = config;
@@ -1123,6 +1130,31 @@ mod tests {
         .await
         .unwrap();
         host.load("verify", "assert(invoked == 'called'); assert(order == 'inlinefile'); assert(not pcall(rness.plugins.setup, {}))").await.unwrap();
+    }
+
+    #[test]
+    fn question_style_validation_matches_terminal_style_resolution() {
+        for color in ["red", "bright-black", "grey", "silver", "lightwhite", "default", "reset", "#abcdef", "255", "256", "Default", "#ggffff", "invalid"] {
+            let style = serde_json::json!({"fg": color});
+            let mut config = QuestionOverlayConfig::default();
+            config.ui.styles.insert("panel".into(), style.clone());
+            assert_eq!(config.validate().is_ok(), rness_tui::theme::Theme::default().resolve_style(&style, Default::default()).is_ok(), "{color}");
+        }
+    }
+
+    #[test]
+    fn question_ui_startup_matches_runtime_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.questions.enable {ui={width=90, keys={down='j'}, styles={border='overlay_border'}}}").unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.question_overlay.ui.width, Some(90));
+        assert_eq!(config.question_overlay.ui.keys["down"], "j");
+        assert_eq!(config.question_overlay.ui.keys["submit"], "enter");
+        for ui in ["{width=5}", "{keys={submit='tab'}}", "{styles={border={fg='invalid'}}}"] {
+            std::fs::write(&path, format!("rness.questions.enable {{ui={ui}}}")).unwrap();
+            assert!(load(&path).is_err(), "accepted {ui}");
+        }
     }
 
     #[test]

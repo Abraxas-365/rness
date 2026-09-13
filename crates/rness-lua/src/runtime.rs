@@ -218,13 +218,11 @@ impl LuaRuntime {
         let rness: Table = self.lua.globals().get("rness")?;
         let q_table = self.lua.create_table()?;
         q_table.set("enable", self.lua.create_function(move |lua, options: Option<Table>| {
-            let config: crate::api::config::QuestionOverlayConfig = match options {
+            let mut config: crate::api::config::QuestionOverlayConfig = match options {
                 Some(table) => lua.from_value(mlua::Value::Table(table))?,
                 None => Default::default(),
             };
-            if config.height < 10 || config.title.trim().is_empty() {
-                return Err(mlua::Error::runtime("questions height must be >= 10 and title nonempty"));
-            }
+            config.validate().map_err(mlua::Error::runtime)?;
             require_declaration_phase(lua)?;
             let pending: Table = lua.globals().get("__rness_pending")?;
             pending.set("questions", lua.to_value(&config)?)?;
@@ -313,7 +311,7 @@ impl LuaRuntime {
             match declaration {
                 LuaValue::Table(table) => {
                     let config: crate::api::config::QuestionOverlayConfig = self.lua.from_value(LuaValue::Table(table))?;
-                    qs.set_overlay_config(rness_engine::questions::OverlayConfig { priority: config.priority, height: config.height, title: config.title });
+                    qs.set_overlay_config(rness_engine::questions::OverlayConfig { priority: config.priority, height: config.height, title: config.title, ui: config.ui });
                     qs.set_available(config.enabled);
                     qs.set_owner(Some(name.to_owned()));
                 }
@@ -2876,6 +2874,38 @@ mod tests {
         )
         .unwrap();
         rt.load("check", r#"assert(encoded == '{"b":"x"}')"#).unwrap();
+    }
+
+    #[test]
+    fn question_ui_settings_validate_and_apply_transactionally() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let qs = std::sync::Arc::new(rness_engine::questions::Questions::default());
+        rt.install_questions(qs.clone()).unwrap();
+        rt.load("questions", r##"rness.questions.enable { ui = {
+            width = 80, padding = {left=2}, border='rounded', option_spacing=1,
+            descriptions='always', show_help=false,
+            styles={selected={fg='#ffffff', bg='#333333', bold=true}, question='heading'},
+            symbols={cursor='→ '}, labels={other='Write your own'}, keys={down='j', up='k'}
+        }}"##).unwrap();
+        let original = serde_json::to_value(qs.overlay_config().ui).unwrap();
+        assert_eq!(original["keys"]["submit"], "enter");
+        assert_eq!(original["padding"]["right"], 0);
+        for body in [
+            "{width=12}", "{unknown=true}", "{border='wavy'}", "{descriptions='maybe'}",
+            "{padding={left=11}}", "{option_spacing=6}", "{styles={missing={}}}",
+            "{styles={selected={fg='not-a-color'}}}", "{styles={input={typo=true}}}",
+            "{keys={submit='tab'}}", "{keys={up='ctrl+c'}}", "{keys={up='ctrl+shift+c'}}", "{keys={down='not-a-key'}}",
+            "{keys={surprise='f1'}}", "{labels={other=''}}", "{symbols={cursor='\\n'}}",
+        ] {
+            assert!(rt.load("bad", &format!("rness.questions.enable {{ ui = {body} }}")).is_err(), "accepted {body}");
+            assert_eq!(serde_json::to_value(qs.overlay_config().ui).unwrap(), original);
+            assert_eq!(qs.owner().as_deref(), Some("questions"));
+        }
+        assert!(rt.load("bad", "rness.questions.enable {ui={border='double'}}; error('rollback')").is_err());
+        assert_eq!(serde_json::to_value(qs.overlay_config().ui).unwrap(), original);
+        rt.load("replacement", "rness.questions.enable()").unwrap();
+        assert_eq!(qs.overlay_config().ui.width, None);
+        assert_eq!(qs.overlay_config().ui.keys["down"], "down");
     }
 
     #[test]

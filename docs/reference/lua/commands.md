@@ -15,7 +15,103 @@ rness.questions.enable {
 
 Calling `enable()` without arguments uses these defaults. No tool is registered unless explicitly enabled. `enable` and `disable` are plugin-load declarations, not callback APIs. The last successful enabling plugin owns the configuration; unloading that owner removes the tool and dismisses pending questions. For the explicitly named source above, use `/unload questions`. Unloading another plugin does not disable questions. Failed loads and failed reloads do not apply question changes. Successful reload replaces the owner/configuration from the new plugin set. Startup declarations in `init.lua` remain supported.
 
-The stock renderer remains mounted but inactive without pending questions. It reads title, height and priority dynamically and uses the active theme. An explicitly opened Lua overlay (such as the session picker) temporarily takes focus; closing it restores the question. Drafts are preserved per session/call. Closing the local frontend dismisses pending questions and removes the tool. Headless prompt mode removes AskUser because it has no human answer frontend.
+### Question UI configuration
+
+Customize the local AskUser and Plan review overlays by passing a `ui` table to `rness.questions.enable` in your questions plugin. These settings affect the terminal UI only, not HTTP payloads or remote frontends.
+
+For example, replace the existing `enable()` call with:
+
+```lua
+rness.questions.enable {
+  title = "Your input",
+  height = 24,
+  ui = {
+    width = 90,
+    border = "rounded",
+    padding = { left = 2, right = 2 },
+    option_spacing = 1,
+    descriptions = "always",
+    styles = {
+      border = { fg = "#83a598" },
+      question = { fg = "#fabd2f", bold = true },
+      selected = { fg = "#282828", bg = "#b8bb26" },
+    },
+    symbols = { cursor = "❯ ", selected = "[✓]" },
+    labels = { other = "Write a custom answer" },
+    keys = { up = "k", down = "j" },
+  },
+}
+```
+
+Reduce padding or enlarge the panel if a resize notice appears. A panel background override is inherited by child slots unless their own style specifies a background.
+
+`enabled`, `title`, `height`, and `priority` remain **top-level** options; all presentation settings below belong inside `ui = { ... }`, not `rness.ui`. Omitted fields use defaults, so `enable { ui = {} }` preserves the stock appearance and keys. Each declaration starts from defaults, rather than patching the previous declaration.
+
+| Top-level field | Default | Contract |
+| --- | --- | --- |
+| `enabled` | `true` | Boolean; `false` removes the tool and dismisses pending questions. |
+| `title` | `"AskUser"` | Nonblank, single-line string with no control characters. |
+| `height` | `20` | Integer terminal rows, 10–65535; clipped to available terminal space. |
+| `priority` | `99` | Signed 32-bit integer slot priority; below approval by default. |
+| `ui` | `{}` | Optional presentation settings; defaults below. |
+
+| `ui` field | Default | Contract |
+| --- | --- | --- |
+| `width` | omitted / `nil` | Full available width; otherwise integer terminal columns, 30–65535. The panel is horizontally centered and clipped to available width. |
+| `padding` | `{ left = 0, right = 0, top = 0, bottom = 0 }` | Interior padding after the border: left/right in columns, top/bottom in rows; each integer 0–10. |
+| `option_spacing` | `0` | Integer blank rows between options, 0–5; limited by available space. |
+| `border` | `"plain"` | `"plain"`, `"rounded"`, `"double"`, `"thick"`, or `"none"`. |
+| `descriptions` | `"auto"` | `"auto"` hides inline option descriptions in compact layouts (inner height below 14 rows), but keeps them in details; `"always"` includes them inline even in compact layouts; `"never"` hides them in both. Text can still wrap, scroll, or be clipped. |
+| `show_help` | `true` | Boolean; show binding-aware hints. Hiding help does not hide validation errors or disable keys. |
+| `styles` | `{}` | Empty override map inherits the active theme; supported slots below. |
+| `symbols` | See below | Partial table of presentation markers. |
+| `labels` | See below | Partial table of UI text; does not change answer labels or tool results. |
+| `keys` | `{}` overrides | Empty map retains all stock bindings below; omitted actions are filled from defaults. |
+
+`ui.symbols` defaults are `cursor = "> "`, `selected = "[x]"`, `unselected = "[ ]"`, and `custom = "[+]"`. Each is a string of at most 8 Unicode characters, without control characters; empty strings are allowed. Character limits are not terminal-column widths.
+
+`ui.labels` defaults are `other = "Other / write an answer"`, `feedback = "Request changes / feedback"` (the custom choice for plan/Markdown review), `custom = "Custom: "`, and `editing = "Editing > "`. Each must be nonblank, single-line text of at most 120 Unicode characters, without control characters. Trailing spaces in prefixes are intentional.
+
+#### Styles
+
+Every `ui.styles` value may be a **named theme style** or an **inline override**, e.g. `styles = { title = "heading", selected = { fg = "#fabd2f", bold = true } }`. Both overlay the slot's inherited style; unspecified attributes remain inherited. Named references follow the active theme; explicit colors stay fixed.
+
+| Style slot | Default theme style / purpose |
+| --- | --- |
+| `panel` | `overlay`: panel background, including padding and empty rows |
+| `border` | `overlay_border` |
+| `title` | `overlay` |
+| `question` | `heading` for question text; `overlay` beneath themed Markdown review |
+| `option` | `overlay` |
+| `selected` | `statusline_accent`: cursor-highlighted option |
+| `description` | `dim`: option descriptions and details |
+| `input` | `editor_prompt`: custom-answer text |
+| `help` | `dim` |
+| `error` | `error`: validation and resize notices |
+
+Named styles are `added`, `removed`, `user_prefix`, `user_message`, `assistant_text`, `thinking`, `tool_name` (alias `title`), `tool_output`, `error`, `statusline`, `statusline_accent`, `editor_prompt`, `heading`, `code`, `code_block`, `dim`, `overlay`, and `overlay_border`. Inline tables accept only `fg`, `bg` (color strings such as `"red"`, `"#abcdef"`, or `"default"` to reset the terminal color), and boolean `bold`, `italic`, `underline`, `reverse`. `false` removes an inherited modifier. Markdown retains its theme-specific span styling.
+
+#### Keys and editing safety
+
+| `ui.keys` action | Default chord | Action |
+| --- | --- | --- |
+| `up` / `down` | `"up"` / `"down"` | Move option cursor; scroll Markdown review by one line. |
+| `select` | `"space"` | Toggle selection, or edit the custom choice. |
+| `submit` | `"enter"` | Advance/submit answers; finish editing; leave Markdown reading for choices (not approval). |
+| `next` / `previous` | `"tab"` / `"shift+tab"` | Revisit questions without losing answers; `next` also leaves Markdown reading for choices. |
+| `dismiss` | `"esc"` | Leave editing/details first; otherwise dismiss the request. In Markdown reading, dismiss the request. |
+| `cancel` | `"ctrl+c"` | Cancel the turn. |
+| `details` | `"pagedown"` | Open/scroll question or option details; page down in Markdown review. |
+| `page_up` | `"pageup"` | Scroll details back; page up in Markdown review. |
+| `first` / `last` | `"home"` / `"end"` | Jump to the start/end of Markdown review. |
+
+Bindings are single chord strings, not sequences, arrays, or `false`. Markdown review also retains `j`/`k` navigation when the corresponding arrow binding is unchanged and the letter is not assigned to another action. Use `ctrl+`, `alt+`, and/or `shift+` with a printable ASCII key, `enter`, `esc`, `tab`, `space`, arrows, `pageup`, `pagedown`, `home`, `end`, `backspace`, `delete`, or `f1`–`f24`; bracket notation such as `<C-j>` is also accepted. Bindings must be unique after normalization, **including inherited defaults**: moving an action onto another action's default requires remapping that action too.
+
+While editing custom text, printable keys (including Space and Shift-modified characters) insert text instead of triggering remapped actions. Backspace deletes the last character; only submit/dismiss/cancel bindings are handled as actions in the editor. Enter/Esc remain finish/back fallbacks if submit/dismiss are remapped to printable keys or Backspace, so those remaps cannot trap editing. **Ctrl+C always cancels**, even when `cancel` is remapped, and cannot be assigned to another action.
+
+Unknown fields, invalid types/ranges, bad styles/colors, malformed chords, duplicate bindings, and assigning Ctrl+C to a non-cancel action reject the configuration **transactionally**: a failed load/reload does not partially apply question settings or replace the working configuration. The repository examples keep `enable()` active and offer a commented replacement; editing them does not update `~/.rness` or any home configuration automatically.
+
+The stock renderer remains mounted but inactive without pending questions. It reads title, height, priority and UI settings dynamically and uses the active theme. An explicitly opened Lua overlay (such as the session picker) temporarily takes focus; closing it restores the question. Drafts are preserved per session/call. Closing the local frontend dismisses pending questions and removes the tool. Headless prompt mode removes AskUser because it has no human answer frontend.
 
 `AskUser` accepts `questions`, an array of 1–16 objects with unique `id`, `question`, optional `header`, `options` (`label`, optional `description`), and `multi_select`. Custom text is always allowed. Results contain `answers`, each with `id`, `selected` labels and optional `custom`. Invalid answers leave the question pending for correction; cancellation or dismissal removes it and returns a tool error. Headless execution without a question frontend fails immediately.
 

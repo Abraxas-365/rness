@@ -454,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
             priority: startup.question_overlay.priority,
             height: startup.question_overlay.height,
             title: startup.question_overlay.title.clone(),
+            ui: startup.question_overlay.ui.clone(),
         });
     }
     tools.approvals().set_policy(policy);
