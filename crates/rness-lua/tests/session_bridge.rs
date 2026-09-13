@@ -339,7 +339,7 @@ async fn lua_delegates_to_a_subagent() {
     let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(
         Arc::clone(&sessions),
         3,
-    ));
+    ).with_allow_generic(true));
     subagents.register(Arc::new(rness_engine::subagent::SpawnProvider));
     subagents.register(Arc::new(rness_engine::subagent::ForkProvider));
     let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();

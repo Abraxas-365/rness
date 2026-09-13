@@ -628,6 +628,8 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
     let _d = bus.on::<rness_engine::service::FrameEv>(move |frame| {
         use rness_protocol::frames::Frame;
         f.lock().unwrap().push(match frame {
+            // Usage telemetry is independent of the lifecycle ordering checked here.
+            Frame::ContextUsage { .. } => return,
             Frame::StepStarted { .. } => "step".into(),
             Frame::Delta { chunk, .. } => match chunk {
                 ChunkDelta::Text { t } => format!("delta:{t}"),

@@ -20,20 +20,37 @@ Returns a mapping from enabled agent name to description. Principal-only definit
 
 ## `start(provider, spec)`
 
+Pass the role name in `spec.agent`. The first argument (`"spawn"` or `"fork"`) selects how the child starts, not its role: `spawn` starts a fresh conversation, while `fork` inherits completed parent history. Both support named roles, as does `start_continuable`.
+
+First declare the role in startup configuration (`~/.rness/init.lua` or a required module):
+
+```lua
+rness.agents.allow_generic = false -- default; named delegation still works
+rness.agents.declare("worker", {
+  description = "Implements scoped changes.",
+  instructions = "Implement the assigned task and verify it with tests.",
+  subagent = true,
+})
+```
+
+After engine mount, a plugin can delegate using that role:
+
 ```lua
 local result = rness.subagents.start("spawn", {
   parent = session_id,
   agent = "worker",
-  prompt = "Review the specified function and report edge cases.",
+  prompt = "Implement the agreed change and run the relevant tests.",
 })
 ```
+
+Unknown names and roles without `subagent = true` are rejected; passing a name does not create a new role. The default flavor already enables `scout` and `reviewer`; its `worker` declaration is commented out and must be enabled before using the example above. If no eligible role fits, do not delegate.
 
 | Argument | Type | Required |
 | --- | --- | --- |
 | `provider` | string | Yes |
 | `spec.parent` | session ID string | Yes |
 | `spec.prompt` | string | Yes |
-| `spec.agent` | string | No |
+| `spec.agent` | string | Unless generic children are enabled |
 
 Returns a table with `session`, `stop`, and `output`. `stop` is `completed`, `aborted`, or `error`. `output` is the child's last nonempty assistant text after the activation boundary; inherited fork output is not reused as the new result.
 
@@ -119,6 +136,8 @@ Returns child records containing `session`, `parent`, `depth`, and `running`. Di
 Returns lineage metadata with `parent`, `depth`, and `mode`, or no delegation value for an ordinary root session. Lua mode strings here are `one_shot` and `continuable`; the model tool's background-mode spelling is `one-shot`.
 
 ## Configuration and authority
+
+Generic children are disabled by default. Both `start` and `start_continuable` reject omitted `agent` unless startup configuration explicitly sets `rness.agents.allow_generic = true`. With the default policy, select a declared role enabled with `subagent = true`, or do not delegate.
 
 A named role is applied before the child's first prompt. Its optional profile replaces generation settings; without a profile those settings are inherited. An unnamed child inherits generation settings but no active role. All children receive a durable tool ceiling from the parent.
 

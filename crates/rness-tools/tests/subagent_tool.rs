@@ -34,6 +34,10 @@ impl Provider for OneAnswer {
 }
 
 fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
+    compose_with_policy(dir, true)
+}
+
+fn compose_with_policy(dir: &std::path::Path, allow_generic: bool) -> (Arc<SessionService>, Arc<ToolRegistry>) {
     let tools = Arc::new(ToolRegistry::default());
     let sessions = Arc::new(SessionService::new(
         SessionStore::new(dir),
@@ -45,7 +49,7 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
         subagent: true, description: "Implementation".into(), instructions: "Implement carefully".into(),
         profile: None, tools: None, sandbox: None,
     })].into(), Default::default()));
-    let runtime = Arc::new(SubagentRuntime::new(Arc::clone(&sessions), 3));
+    let runtime = Arc::new(SubagentRuntime::new(Arc::clone(&sessions), 3).with_allow_generic(allow_generic));
     runtime.register(Arc::new(SpawnProvider));
     runtime.register(Arc::new(ForkProvider));
     let jobs = rness_tools::jobs::JobRegistry::new();
@@ -213,6 +217,59 @@ async fn subagent_tool_delegates_through_dispatch() {
     assert_eq!(sessions.config(&child).unwrap().agent.unwrap().name, "worker");
     let schema = tools.get("subagent").unwrap().input_schema();
     assert_eq!(schema["properties"]["agent"]["enum"], serde_json::json!(["worker"]));
+    assert!(!schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
+}
+
+#[tokio::test]
+async fn roster_only_policy_rejects_generic_calls_before_background_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sessions, tools) = compose_with_policy(dir.path(), false);
+    let schema = tools.get("subagent").unwrap().input_schema();
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
+    assert_eq!(schema["properties"]["agent"]["enum"], serde_json::json!(["worker"]));
+    assert!(schema["properties"]["agent"]["description"].as_str().unwrap().contains("do not delegate"));
+    let parent = sessions.create(None).unwrap();
+    for provider in ["spawn", "fork"] {
+        let before = sessions.list().unwrap();
+        for mode in ["foreground", "background", "continuable"] {
+            for agent in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("invented")] {
+                let call = ToolCall {
+                    call: "blocked".into(), name: "subagent".into(),
+                    args: serde_json::json!({"provider":provider, "prompt":"task", "agent":agent,
+                        "run_in_background":mode == "background",
+                        "background_mode":if mode == "continuable" { "continuable" } else { "one-shot" }}),
+                };
+                let results = tools.dispatch(&parent, &[call], 1, &Default::default()).await;
+                assert!(results[0].is_error, "{}", results[0].output);
+                assert_eq!(sessions.list().unwrap(), before);
+            }
+        }
+        let call = ToolCall {
+            call: "named".into(), name: "subagent".into(),
+            args: serde_json::json!({"provider":provider, "prompt":"task", "agent":"worker"}),
+        };
+        let results = tools.dispatch(&parent, &[call], 1, &Default::default()).await;
+        assert!(!results[0].is_error, "{}", results[0].output);
+    }
+}
+
+#[test]
+fn empty_roster_without_generic_children_marks_delegation_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let tools = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()), Arc::new(OneAnswer), tools.clone(),
+        TurnConfig::default(), Arc::new(EventBus::default()),
+    ));
+    let runtime = Arc::new(SubagentRuntime::new(sessions, 3).with_allow_generic(false));
+    assert!(runtime.validate_agent(None).is_err());
+    assert!(runtime.validate_agent(Some("invented")).is_err());
+    rness_tools::register_subagent(&tools, runtime, rness_tools::jobs::JobRegistry::new());
+    let tool = tools.get("subagent").unwrap();
+    assert!(tool.description().contains("Delegation is unavailable"));
+    let schema = tool.input_schema();
+    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
+    assert!(schema["properties"]["agent"].get("enum").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread")]

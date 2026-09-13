@@ -375,7 +375,7 @@ async fn named_and_unnamed_spawn_and_fork_inherit_parent_restriction() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     let sessions = Arc::new(roles(service(dir.path())));
-    let runtime = SubagentRuntime::new(sessions.clone(), 3);
+    let runtime = SubagentRuntime::new(sessions.clone(), 3).with_allow_generic(true);
     runtime.register(Arc::new(SpawnProvider));
     runtime.register(Arc::new(ForkProvider));
     let parent = sessions

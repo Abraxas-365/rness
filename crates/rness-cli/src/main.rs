@@ -521,7 +521,7 @@ async fn main() -> anyhow::Result<()> {
     let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(
         Arc::clone(&sessions),
         3, // max delegation depth: parent -> child -> grandchild, then stop
-    ));
+    ).with_allow_generic(startup.allow_generic_subagents));
     subagents.register(Arc::new(rness_engine::subagent::SpawnProvider));
     subagents.register(Arc::new(rness_engine::subagent::ForkProvider));
     jobs.attach_sessions(&sessions);

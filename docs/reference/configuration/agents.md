@@ -63,6 +63,18 @@ The snapshot contains `name`, `instructions`, and optional `tools`. It is not a 
 
 An unnamed child inherits generation settings without copying the parent's active role. Enabling a role for delegation does not prevent using it as the principal.
 
+### Restrict delegation to the roster
+
+Generic (unnamed) children are **disabled by default**. Omission is equivalent to this setting in `~/.rness/init.lua`:
+
+```lua
+rness.agents.allow_generic = false
+```
+
+This global, startup-only boolean is separate from individual agent declarations; restart to apply changes. Only roles declared with `subagent = true` may be used while generic children are disabled. The model-facing tool requires `agent` and tells the model not to delegate if no configured role fits. Unknown names cannot create new roles. If the delegable roster is empty, the tool explicitly reports delegation as unavailable and all requests are rejected; it remains registered so existing role tool allowlists stay valid.
+
+The runtime rejects unnamed requests before child creation for both `spawn` and `fork`, including foreground, background one-shot, continuable, and Lua delegation. The policy applies to new delegation from all sessions and descendants, including resumed sessions; it does not terminate existing children or prevent messaging them. To opt in to generic delegation, set `rness.agents.allow_generic = true`. The default flavor exposes `rness.agents.allow_generic = false` at the top of `lua/agents.lua` so users can easily change it.
+
 ## Tool enforcement
 
 Each turn restricts both advertised tool schemas and actual dispatch. A model request for a forbidden tool produces an error result rather than executing that tool.

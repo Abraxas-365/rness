@@ -1,3 +1,6 @@
+-- Delegate only to configured roles. Set true to also allow generic children.
+rness.agents.allow_generic = false
+
 rness.agents.declare("coding", {
   description = "Focused coding assistant with explicit, bounded delegation.",
   instructions = [[Complete the requested task; continue until done or genuinely blocked. Always finish with a brief user-facing text response after tools: summarize the outcome, actual validation, and any blockers. Never end silently on a tool result or mistake command completion for task success.

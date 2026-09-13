@@ -44,7 +44,7 @@ Selecting the same role after editing its declaration requires restarting first 
 
 ## Delegation
 
-A child begins with the parent's generation settings. A requested agent profile replaces them. The child gets a newly captured effective tool ceiling; the role can narrow but cannot expand it. Omitted `agent` means no role snapshot, even when the parent has a role.
+A child begins with the parent's generation settings. A requested agent profile replaces them. The child gets a newly captured effective tool ceiling; the role can narrow but cannot expand it. Omitted `agent` is rejected by default. When startup configuration sets `rness.agents.allow_generic = true`, omission means no role snapshot, even when the parent has a role. This global startup policy applies to new delegation from resumed sessions too; it is not a per-session request option.
 
 ## Persistence versus connections
 

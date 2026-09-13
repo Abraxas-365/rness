@@ -62,6 +62,8 @@ pub struct StartupConfig {
     pub stream_idle_timeouts: BTreeMap<String, u64>,
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
+    /// Generic children are disabled unless explicitly enabled at startup.
+    pub allow_generic_subagents: bool,
     pub question_overlay: QuestionOverlayConfig,
     pub ask_user: bool,
     pub default_agent: Option<String>,
@@ -1029,6 +1031,11 @@ pub fn evaluate(
         )?;
     }
     let mut config = state.lock().unwrap().clone();
+    config.allow_generic_subagents = match rness.get::<Table>("agents")?.get::<mlua::Value>("allow_generic")? {
+        mlua::Value::Nil => false,
+        mlua::Value::Boolean(allow) => allow,
+        _ => return Err("agents.allow_generic must be a boolean".into()),
+    };
     config.default_agent = rness.get("default_agent")?;
     if config
         .default_agent
@@ -1408,6 +1415,23 @@ mod tests {
         host.load("check", "assert(executions == 1); assert(ready)")
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn generic_subagent_policy_requires_a_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        assert!(!StartupConfig::default().allow_generic_subagents);
+        assert!(!load(&path).unwrap().allow_generic_subagents);
+        for allow in [true, false] {
+            std::fs::write(&path, format!("rness.agents.allow_generic = {allow}")).unwrap();
+            assert_eq!(load(&path).unwrap().allow_generic_subagents, allow);
+        }
+        for invalid in ["'false'", "0", "{}"] {
+            std::fs::write(&path, format!("rness.agents.allow_generic = {invalid}")).unwrap();
+            assert!(load(&path).is_err());
+        }
     }
 
     #[test]

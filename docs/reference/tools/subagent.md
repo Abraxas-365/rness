@@ -8,11 +8,11 @@
 | --- | --- | --- | --- |
 | `provider` | string | Yes | `spawn` for fresh conversation; `fork` for completed parent history |
 | `prompt` | string | Yes | Task instructions for this activation |
-| `agent` | string | No | Declared role enabled with `subagent = true` |
+| `agent` | string | Unless generic children are enabled | Declared role enabled with `subagent = true` |
 | `run_in_background` | boolean | No | Defaults to false |
 | `background_mode` | string | No | `one-shot` or `continuable` |
 
-The generated schema includes enabled agent names and descriptions. With an empty roster, it omits the `agent` property. Runtime validation still rejects disabled or unknown names if supplied manually.
+The generated schema includes enabled agent names and descriptions. By default `agent` is required: generic children are disabled. Set `rness.agents.allow_generic = true` at startup to allow omission. With an empty roster and generic children enabled, the schema omits the `agent` property; otherwise an empty roster marks delegation unavailable. Runtime validation rejects unnamed requests when disabled and always rejects disabled or unknown role names. If no configured role fits, do not delegate.
 
 ## Foreground
 
@@ -34,7 +34,7 @@ Waits for the child's turn to settle. Success returns its session ID and final a
 }
 ```
 
-Returns a job ID. Observe it with `job_output`. Role validation occurs inside the background task, so a returned job ID does not prove that child creation succeeded; inspect the job's result.
+Returns a job ID. Observe it with `job_output`. Role and generic-child policy validation occurs before accepting a background job. A returned job ID still does not prove child creation or execution succeeded; inspect the job's result.
 
 ## Continuable
 

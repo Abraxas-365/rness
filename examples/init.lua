@@ -126,7 +126,10 @@ rness.profiles.declare("router-sonnet", {
 --   },
 -- }
 
--- Roles are selectable as the principal agent; delegation requires opt-in.
+-- Roles are selectable as the principal agent; named delegation requires opt-in.
+-- Generic children are disabled by default; use only configured roster roles.
+-- Set true to opt in to generic children. Restart to apply.
+rness.agents.allow_generic = false
 -- You can move these declarations to ~/.rness/lua/agents.lua and require('agents').
 -- For scout, planner, worker, reviewer, researcher, context-builder, oracle,
 -- and delegate examples, copy examples/lua/roles.lua to ~/.rness/lua/roles.lua.

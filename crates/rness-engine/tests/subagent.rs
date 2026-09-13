@@ -51,10 +51,38 @@ fn service(dir: &std::path::Path) -> Arc<SessionService> {
 }
 
 fn runtime(sessions: &Arc<SessionService>, max_depth: u32) -> SubagentRuntime {
-    let rt = SubagentRuntime::new(Arc::clone(sessions), max_depth);
+    let rt = SubagentRuntime::new(Arc::clone(sessions), max_depth).with_allow_generic(true);
     rt.register(Arc::new(SpawnProvider));
     rt.register(Arc::new(ForkProvider));
     rt
+}
+
+#[tokio::test]
+async fn generic_children_require_explicit_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = SubagentRuntime::new(sessions.clone(), 3);
+    rt.register(Arc::new(SpawnProvider));
+    rt.register(Arc::new(ForkProvider));
+    assert!(!rt.allows_generic());
+    let parent = sessions.create(None).unwrap();
+    one_completed_turn(&sessions, &parent).await;
+    for provider in ["spawn", "fork"] {
+        let request = SubagentRequest { agent: None, parent: parent.clone(), prompt: "task".into() };
+        let before = sessions.list().unwrap();
+        assert!(rt.start(provider, request.clone()).await.unwrap_err().to_string()
+            .contains("generic subagents are disabled"));
+        assert!(rt.start_continuable(provider, request).is_err());
+        assert_eq!(sessions.list().unwrap(), before);
+    }
+    let rt = rt.with_allow_generic(true);
+    for provider in ["spawn", "fork"] {
+        let request = SubagentRequest { agent: None, parent: parent.clone(), prompt: "task".into() };
+        let run = rt.start(provider, request.clone()).await.unwrap();
+        assert!(sessions.config(&run.session).unwrap().agent.is_none());
+        let child = rt.start_continuable(provider, request).unwrap();
+        sessions.join(&child).await;
+    }
 }
 
 /// Run one parent turn so there is a completed prefix to inherit.
@@ -214,6 +242,22 @@ async fn named_roles_are_opt_in_and_inherit_generation_without_widening_tools() 
         agent: None, parent, prompt: "task".into(),
     }).await.unwrap();
     assert!(sessions.config(&run.session).unwrap().agent.is_none());
+    let rt = rt.with_allow_generic(false);
+    for provider in ["spawn", "fork"] {
+        // The policy also applies when an existing child delegates again.
+        let request = SubagentRequest {
+            agent: None, parent: run.session.clone(), prompt: "task".into(),
+        };
+        let before = sessions.list().unwrap();
+        let error = rt.start(provider, request.clone()).await.unwrap_err();
+        assert!(error.to_string().contains("generic subagents are disabled"));
+        assert!(rt.start_continuable(provider, request.clone()).is_err());
+        assert_eq!(sessions.list().unwrap(), before);
+        let named = SubagentRequest { agent: Some("worker".into()), ..request };
+        rt.start(provider, named.clone()).await.unwrap();
+        let child = rt.start_continuable(provider, named).unwrap();
+        sessions.join(&child).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

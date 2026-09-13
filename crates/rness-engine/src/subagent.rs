@@ -161,6 +161,7 @@ pub struct SubagentRuntime {
     /// Hard ceiling on delegation depth (root = 0). Runaway recursive
     /// delegation dies here, not in a stack.
     max_depth: u32,
+    allow_generic: bool,
     /// Per-root user aliases, retained as tombstones when sessions disappear.
     user_aliases: std::sync::Mutex<HashMap<SessionId, Vec<SessionId>>>,
     pub activity: SubagentActivity,
@@ -175,6 +176,7 @@ impl SubagentRuntime {
             sessions: Arc::clone(&sessions),
             providers: RwLock::new(HashMap::new()),
             max_depth,
+            allow_generic: false,
             user_aliases: Default::default(),
             activity: SubagentActivity::default(),
             watchers: std::sync::Mutex::new(Vec::new()),
@@ -228,6 +230,29 @@ impl SubagentRuntime {
             .insert(provider.name().to_string(), provider);
     }
 
+    /// Startup policy shared by all callers and descendants.
+    pub fn with_allow_generic(mut self, allow: bool) -> Self {
+        self.allow_generic = allow;
+        self
+    }
+
+    pub fn allows_generic(&self) -> bool {
+        self.allow_generic
+    }
+
+    /// Validate before creating a child (or accepting a background job).
+    pub fn validate_agent(&self, agent: Option<&str>) -> Result<(), SubagentError> {
+        match agent {
+            None if !self.allow_generic => Err(SubagentError::NotAuthorized(
+                "generic subagents are disabled (rness.agents.allow_generic = false); select a configured agent enabled for delegation. If no role fits, do not delegate".into(),
+            )),
+            Some(name) if !self.sessions.agents().get(name).is_some_and(|agent| agent.subagent) => {
+                Err(SubagentError::NotAuthorized(format!("agent is not enabled for delegation: {name}")))
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub fn roster(&self) -> std::collections::BTreeMap<String, String> {
         self.sessions.agents().iter().filter(|(_, agent)| agent.subagent)
             .map(|(name, agent)| (name.clone(), agent.description.clone())).collect()
@@ -259,6 +284,7 @@ impl SubagentRuntime {
         &self, provider: &str, request: SubagentRequest,
         presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SubagentRun, SubagentError> {
+        self.validate_agent(request.agent.as_deref())?;
         let provider = self
             .providers
             .read()
@@ -325,6 +351,7 @@ impl SubagentRuntime {
         &self, provider: &str, request: SubagentRequest,
         presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SessionId, SubagentError> {
+        self.validate_agent(request.agent.as_deref())?;
         let provider = self
             .providers
             .read()

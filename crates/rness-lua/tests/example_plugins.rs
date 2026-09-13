@@ -240,6 +240,9 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();
     assert_eq!(config.colorscheme.as_deref(), Some("gruvbox"));
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
+    assert!(!config.allow_generic_subagents);
+    assert!(std::fs::read_to_string(root.join("lua/agents.lua")).unwrap()
+        .contains("rness.agents.allow_generic = false"));
     assert!(!config.agents.contains_key("worker"), "the optional worker role stays disabled by default");
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
     assert_eq!(config.plugin_specs.len(), 12);
@@ -540,8 +543,8 @@ async fn agents_command_lists_completes_and_stops_while_parent_runs() {
     let prepared = sessions.prepare_command(&parent, "/agents stop ").unwrap().unwrap();
     let service = sessions.clone();
     let choices = tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap();
-    assert!(choices.contains(&format!("stop {child}")));
-    assert!(choices.contains(&format!("stop {grandchild}")));
+    assert!(choices.contains(&"stop a1".into()));
+    assert!(choices.contains(&"stop a2".into()));
     assert!(!choices.contains(&format!("stop {unrelated}")));
     async fn command(sessions: &Arc<SessionService>, parent: &str, text: String) -> Result<Disposition, rness_engine::service::ServiceError> {
         // Child settlement briefly reserves the parent operation lock. Wait for
@@ -559,7 +562,7 @@ async fn agents_command_lists_completes_and_stops_while_parent_runs() {
     assert!(matches!(result, Disposition::Command(result)
         if result.data == serde_json::json!({"action":"agents:open", "session":parent})));
     let result = command(&sessions, &parent, "/agents stop".into()).await.unwrap();
-    assert!(matches!(result, Disposition::Command(result) if result.message.contains(&child) && result.message.contains(&grandchild)));
+    assert!(matches!(result, Disposition::Command(result) if result.message.contains("a1  depth=1") && result.message.contains("a2  depth=2")));
     for id in [&parent, &unrelated, &"unknown".to_string()] {
         assert!(command(&sessions, &parent, format!("/agents stop {id}")).await.is_err());
     }
@@ -590,7 +593,8 @@ async fn agents_command_lists_completes_and_stops_while_parent_runs() {
     let service = sessions.clone();
     let choices = tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap();
     assert!(choices.contains(&"a1".into()));
-    assert!(!choices.contains(&format!("stop {child}")));
+    assert!(!choices.contains(&"stop a1".into()));
+    assert!(!choices.contains(&"stop a2".into()));
     for id in [&parent, &unrelated] { sessions.cancel(id); sessions.join(id).await; }
     assert!(sessions.prepare_command(&parent, "/ordinary").unwrap().is_some());
 }

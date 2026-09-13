@@ -60,6 +60,9 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &str {
+        if !self.runtime.allows_generic() && self.runtime.roster().is_empty() {
+            return "Delegation is unavailable: generic children are disabled and no configured roles are enabled for delegation. Do not call this tool; perform the task yourself or explain the limitation.";
+        }
         "Delegate a task to a child agent running in its own session. \
          provider 'fork' seeds the child with this conversation's completed \
          history (it knows what you know); provider 'spawn' starts fresh \
@@ -108,8 +111,19 @@ impl Tool for SubagentTool {
             },
             "required": ["provider", "prompt"],
         });
-        if self.runtime.roster().is_empty() {
+        if !self.runtime.allows_generic() {
+            schema["required"].as_array_mut().unwrap().push(json!("agent"));
+            schema["properties"]["agent"]["description"] = json!(format!(
+                "Required named role. Generic children are disabled. If no configured role fits the task, do not delegate. Available agents: {}",
+                serde_json::to_string(&self.runtime.roster()).unwrap(),
+            ));
+        } else if self.runtime.roster().is_empty() {
             schema["properties"].as_object_mut().unwrap().remove("agent");
+        }
+        // Avoid an empty enum (invalid for some provider schema validators).
+        // Runtime validation still rejects every name when the roster is empty.
+        if self.runtime.roster().is_empty() && !self.runtime.allows_generic() {
+            schema["properties"]["agent"].as_object_mut().unwrap().remove("enum");
         }
         schema
     }
@@ -140,6 +154,7 @@ impl SubagentTool {
             Some(Value::String(name)) => Some(name.clone()),
             Some(_) => return Err("agent must be a string".into()),
         };
+        self.runtime.validate_agent(agent.as_deref()).map_err(|e| e.to_string())?;
         let request = SubagentRequest { agent, parent: session.clone(), prompt };
 
         if continuable {
