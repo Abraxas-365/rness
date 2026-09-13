@@ -63,8 +63,14 @@ impl StatusText {
     }
 
     fn context(&self, ctx: &Ctx<'_>) {
-        let context = serde_json::json!({"session": ctx.model.session, "model": ctx.model.model_name,
-            "busy": ctx.model.busy, "activity": if ctx.model.busy { "working" } else { "idle" }});
+        let context = serde_json::json!({
+            "session": ctx.model.session,
+            "model": ctx.model.model_name,
+            "profile": ctx.model.profile_name,
+            "agent": ctx.model.agent_name,
+            "busy": ctx.model.busy,
+            "activity": if ctx.model.busy { "working" } else { "idle" },
+        });
         let mut state = self.0.write().expect("status text lock");
         if state.context != context {
             if !ctx.model.busy { state.busy_since = None; }
@@ -73,8 +79,6 @@ impl StatusText {
             }
             state.context = context;
             state.context_revision = state.context_revision.wrapping_add(1);
-            state.view = None;
-            state.text = None;
         }
     }
 
@@ -187,6 +191,35 @@ mod tests {
         }
         cell.0.write().unwrap().view = Some(serde_json::json!({"visible":false}));
         assert_eq!(component.height(&ctx, 20), Some(0));
+    }
+
+    #[test]
+    fn status_context_includes_profile_and_agent() {
+        let cell = StatusText::default();
+        let mut model = Model::new("s".into(), "provider/model".into());
+        model.profile_name = Some("fast".into());
+        model.agent_name = Some("coder".into());
+        let theme = Theme::default();
+        cell.context(&Ctx { model: &model, theme: &theme });
+
+        let state = cell.0.read().unwrap();
+        assert_eq!(state.context["model"], "provider/model");
+        assert_eq!(state.context["profile"], "fast");
+        assert_eq!(state.context["agent"], "coder");
+    }
+
+    #[test]
+    fn context_change_keeps_published_view_until_refresh_replaces_it() {
+        let cell = StatusText::default();
+        let mut model = Model::new("s".into(), "provider/model".into());
+        let theme = Theme::default();
+        cell.context(&Ctx { model: &model, theme: &theme });
+        cell.set(Some("published".into()));
+
+        model.busy = true;
+        cell.context(&Ctx { model: &model, theme: &theme });
+
+        assert_eq!(cell.get().as_deref(), Some("published"));
     }
 
     #[tokio::test]

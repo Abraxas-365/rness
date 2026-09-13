@@ -183,6 +183,7 @@ impl ModelRegistry {
                 route: provider.into(),
                 model: model.clone(),
             }),
+            profile: Some(name.into()),
             reasoning: options.reasoning.clone(),
             max_output_tokens: options.max_output_tokens,
             temperature: options.temperature,
@@ -297,6 +298,7 @@ mod tests {
         }).unwrap();
         let config = registry.resolve_profile("local").unwrap();
         assert_eq!(config.selection.unwrap().model, "qwen3:14b");
+        assert_eq!(config.profile.as_deref(), Some("local"));
         assert_eq!(config.reasoning, None);
         assert!(registry.resolve_profile("missing").is_err());
     }

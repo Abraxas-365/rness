@@ -232,6 +232,9 @@ pub struct CallConfig {
     /// Durable route/model choice used by the service's provider resolver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
+    /// Name of the profile that produced the current selection, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     /// Provider-independent reasoning mode, mapped by each adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,

@@ -1,8 +1,8 @@
-//! Background jobs, dsh-style: tools that run long work register it as a
-//! job; the model reads, lists, and kills it through kind-independent
-//! controls (`job_output`, `job_list`, `job_kill`). Producers (today:
-//! `bash` with `run_in_background`) start jobs; these tools only observe
-//! and cancel them.
+//! Background jobs, dsh-style: producers (today `bash` with
+//! `run_in_background`) start jobs, and the owning session is automatically
+//! notified when one settles. The model must not poll jobs: after that notice,
+//! it reads the result with `job_output`; `job_list` is only for explicit
+//! inspection, and `job_kill` cancels a job.
 //!
 //! Output reads are incremental: `job_output` returns only what arrived
 //! since the previous read, and every response ends with a
@@ -481,14 +481,11 @@ impl Tool for JobOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Read a background job's output since the previous read. Every \
-         response ends with a [status: ...] marker. Non-blocking unless \
-         wait is true, which waits for new output or completion. Do not repeatedly \
-         poll a running job. Continue independent work if available; otherwise \
-         tell the user you are waiting and end your turn. Background jobs keep \
-         running after your turn ends, and completion notifies the owning session \
-         to resume you. Ending a turn to wait does not mean the task is finished; \
-         collect the result before claiming completion."
+        "Read a background job's output since the previous read. Do not use this \
+         tool to poll or wait for a running job: completion automatically notifies \
+         the owning session. After receiving that notification, call this once to \
+         retrieve the result before reporting completion. Every response ends with \
+         a [status: ...] marker."
     }
 
     fn input_schema(&self) -> Value {
@@ -496,8 +493,8 @@ impl Tool for JobOutputTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "The job to read" },
-                "wait": { "type": "boolean", "description": "Wait for new output or completion (default false)" },
-                "timeout_ms": { "type": "integer", "description": "Max wait in milliseconds (default 30000)" },
+                "wait": { "type": "boolean", "description": "Reserved for explicit synchronous use; do not use it to wait for job completion" },
+                "timeout_ms": { "type": "integer", "description": "Max explicit wait in milliseconds (default 30000)" },
             },
             "required": ["job_id"],
         })
@@ -568,7 +565,9 @@ impl Tool for JobListTool {
     }
 
     fn description(&self) -> &str {
-        "List background jobs: <id> [<kind>] <status> — <label>, one per line."
+        "List background jobs for explicit inspection. Do not use this tool to \
+         poll for completion: the owning session is notified automatically when a \
+         job settles."
     }
 
     fn input_schema(&self) -> Value {

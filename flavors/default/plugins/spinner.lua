@@ -1,6 +1,6 @@
--- Structured statusline: aggregate activity on the left, active session model
--- and cached token usage on the right. Explicitly loaded by init.lua.
--- Usage is loaded once per displayed session, then refreshed on turn_end.
+-- Structured statusline: active model, live status, session ID, and cached
+-- context usage. Token usage is loaded the first time a session is rendered
+-- (including resumed sessions), then refreshed on turn_end.
 local function max_input_tokens(session)
   local selection = rness.session.config(session).selection
   local policies = rness.compaction or {}
@@ -8,7 +8,7 @@ local function max_input_tokens(session)
   return policy and policy.threshold_tokens or 165000
 end
 
-local frames = { "|", "/", "-", "\\\\" }
+local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
 -- session id → start time; several sessions can run at once
 -- (subagents, server clients) — busy means ANY turn is live.
@@ -73,13 +73,19 @@ rness.ui.statusline = {
   padding = { left = 1, right = 1 },
   separator = " · ",
   left = function(ctx)
+    if ctx.session and tokens[ctx.session] == nil then
+      tokens[ctx.session] = ""
+      refresh(ctx.session)
+    end
+    local parts = { { text = ctx.model or "", style = { fg = "#83a598" } } }
     local compact_started = ctx.session and compacting[ctx.session]
     if compact_started then
       local secs = os.time() - compact_started
-      return {
-        { text = frames[(secs % #frames) + 1] .. " compacting context", style = { fg = "#fabd2f" } },
-        { text = tostring(secs) .. "s" },
-      }
+      parts[#parts + 1] = { text = frames[(secs % #frames) + 1] .. " compacting context", style = { fg = "#fabd2f" } }
+      parts[#parts + 1] = { text = tostring(secs) .. "s" }
+      parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
+      parts[#parts + 1] = tokens[ctx.session] or ""
+      return parts
     end
     local count, oldest, act = 0, nil, nil
     for id, started in pairs(running) do
@@ -88,20 +94,23 @@ rness.ui.statusline = {
         oldest, act = started, doing[id]
       end
     end
-    if count == 0 then return "idle" end
-    local secs = os.time() - oldest
-    local spin = frames[(secs % #frames) + 1]
-    return {
-      { text = spin .. " " .. (act or "working"), style = { fg = "#83a598" } },
-      { text = tostring(secs) .. "s" },
-      { text = count > 1 and (count .. " agents") or "" },
-    }
+    if count == 0 then
+      parts[#parts + 1] = "idle"
+    else
+      local secs = os.time() - oldest
+      local spin = frames[(secs % #frames) + 1]
+      parts[#parts + 1] = { text = spin .. " " .. (act or "working"), style = { fg = "#83a598" } }
+      parts[#parts + 1] = { text = tostring(secs) .. "s" }
+      parts[#parts + 1] = { text = count > 1 and (count .. " agents") or "" }
+    end
+    parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
+    parts[#parts + 1] = tokens[ctx.session] or ""
+    return parts
   end,
   right = function(ctx)
-    if ctx.session and tokens[ctx.session] == nil then
-      tokens[ctx.session] = ""
-      refresh(ctx.session)
-    end
-    return { { text = ctx.model or "" }, { text = tokens[ctx.session] or "" } }
+    return {
+      { text = ctx.profile or "" },
+      { text = ctx.agent or "" },
+    }
   end,
 }

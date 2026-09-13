@@ -49,10 +49,12 @@ local function update(session, field, value)
     local preset = rness.session.profile_config(value, config.selection and config.selection.route)
     config.selection, config.reasoning = preset.selection, preset.reasoning
     config.temperature, config.max_output_tokens = preset.temperature, preset.max_output_tokens
+    config.profile = value
   elseif field == "model" then
     local route, model = value:match("^([^/%s]+)/(%S+)$")
     assert(route and model, "Use provider/model (model IDs may contain slashes)")
     config.selection = { route = route, model = model }
+    config.profile = nil
     local support = supported(config)
     if not support.temperature then config.temperature = nil end
     if not support["max-output-tokens"] then config.max_output_tokens = nil end

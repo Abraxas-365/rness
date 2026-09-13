@@ -129,6 +129,8 @@ pub struct Model {
     pub compaction: Option<CompactionStatus>,
     pub busy: bool,
     pub model_name: String,
+    pub profile_name: Option<String>,
+    pub agent_name: Option<String>,
     /// Scrollback offset from the bottom (0 = pinned to latest).
     pub scroll_from_bottom: u16,
     /// A sensitive tool call paused for a decision. The approval overlay
@@ -166,6 +168,8 @@ impl Model {
             compaction: None,
             busy: false,
             model_name,
+            profile_name: None,
+            agent_name: None,
             scroll_from_bottom: 0,
             pending_approval: None,
             should_quit: false,
@@ -286,6 +290,8 @@ impl Model {
                     if let Some(selection) = &config.selection {
                         self.model_name = format!("{}/{}", selection.route, selection.model);
                     }
+                    self.profile_name = config.profile.clone();
+                    self.agent_name = config.agent.as_ref().map(|agent| agent.name.clone());
                 }
                 SessionEvent::UserMessage(m) => self.entries.push(Entry::User {
                     content: m.content.clone(),
@@ -1991,6 +1997,35 @@ mod tests {
             at: "2026-01-01T00:00:00.000Z".into(),
             event,
         }
+    }
+
+    #[test]
+    fn request_config_updates_statusline_identity() {
+        use rness_protocol::events::{AgentSnapshot, ModelSelection};
+
+        let mut model = Model::new("s".into(), "initial/model".into());
+        model.load_history(&History {
+            session: "s".into(),
+            envelopes: vec![env(SessionEvent::RequestConfig(
+                rness_protocol::events::CallConfig {
+                    selection: Some(ModelSelection {
+                        route: "provider".into(),
+                        model: "model".into(),
+                    }),
+                    profile: Some("fast".into()),
+                    agent: Some(AgentSnapshot {
+                        name: "coder".into(),
+                        instructions: String::new(),
+                        tools: None,
+                    }),
+                    ..Default::default()
+                },
+            ))],
+        });
+
+        assert_eq!(model.model_name, "provider/model");
+        assert_eq!(model.profile_name.as_deref(), Some("fast"));
+        assert_eq!(model.agent_name.as_deref(), Some("coder"));
     }
 
     #[test]

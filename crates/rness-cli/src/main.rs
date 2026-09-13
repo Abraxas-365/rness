@@ -347,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(selected) = cli_selection {
         let selected = ModelSelection { route: selected.route, model: selected.model };
         if creation_seed.selection.as_ref() != Some(&selected) {
-            creation_seed = CallConfig { selection: Some(selected), agent: creation_seed.agent.clone(), ..Default::default() };
+            creation_seed = CallConfig { selection: Some(selected), profile: None, agent: creation_seed.agent.clone(), ..Default::default() };
         }
     }
     creation_seed.tool_ceiling = inherited_ceiling;
