@@ -1139,9 +1139,7 @@ impl SessionService {
         let progress_session = session.clone();
         let progress_bus = Arc::clone(&self.bus);
         let on_compaction = move |progress: crate::turn::compaction::CompactionProgress| {
-            progress_bus.emit::<FrameEv>(&Frame::CompactionStarted {
-                session: progress_session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens,
-            });
+            progress_bus.emit::<FrameEv>(&progress.frame(progress_session.clone()));
         };
         let changed = crate::turn::compaction::reduce_region_with_progress(&self.store, &mut log, provider.as_ref(),
             "", &[], &policy, false, Some(start..end), &cancel, &on_compaction).await

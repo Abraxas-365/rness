@@ -79,7 +79,7 @@ impl Meter {
             + tools.iter().map(|t| self.text(&t.name) + self.text(&t.description)
                 + self.text(&t.input_schema.to_string()) + self.message_tokens).sum::<u64>()
     }
-    fn pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
+    pub fn pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
         self.measure(context, system, tools).saturating_add(self.output_reserve.max(u64::from(context.config.max_output_tokens.unwrap_or(0))))
     }
 }
@@ -142,9 +142,23 @@ pub async fn reduce_with_progress(store: &SessionStore, log: &mut SessionLog, pr
     reduce_region_with_progress(store, log, provider, system, tools, policy, overflow, None, cancel, progress).await
 }
 
-pub struct CompactionProgress {
-    pub events: usize,
-    pub estimated_tokens: u64,
+pub enum CompactionProgress {
+    Measuring { estimated_tokens: u64, threshold_tokens: u64 },
+    Summarizing { events: usize, estimated_tokens: u64 },
+}
+
+impl CompactionProgress {
+    pub fn frame(self, session: rness_protocol::events::SessionId) -> rness_protocol::frames::Frame {
+        use rness_protocol::frames::Frame;
+        match self {
+            Self::Measuring { estimated_tokens, threshold_tokens } => Frame::ContextUsage {
+                session, estimated_tokens, threshold_tokens: Some(threshold_tokens),
+            },
+            Self::Summarizing { events, estimated_tokens } => Frame::CompactionStarted {
+                session, events, estimated_tokens,
+            },
+        }
+    }
 }
 
 /// Explicit half-open region of model messages; endpoints preserve tool pairs.
@@ -194,7 +208,13 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
             changed = true;
         }
         replayed = replay(store, log.session())?;
-        if region.is_none() && ((!overflow && policy.meter.pressure(&replayed.context, system, tools) < policy.threshold_tokens) || (changed && overflow)) { break; }
+        let pressure = policy.meter.pressure(&replayed.context, system, tools);
+        // Manual regions lack the main request's system/tools; do not publish
+        // their partial measurement as the automatic compaction estimate.
+        if region.is_none() {
+            progress(CompactionProgress::Measuring { estimated_tokens: pressure, threshold_tokens: policy.threshold_tokens });
+        }
+        if region.is_none() && ((!overflow && pressure < policy.threshold_tokens) || (changed && overflow)) { break; }
         let cut = region.as_ref().map_or_else(|| prefix(&replayed.context, policy.retain_tokens, &policy.meter), |r| r.end);
         let start = region.as_ref().map_or(0, |r| r.start);
         if cut == 0 { break; }
@@ -219,7 +239,7 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
         let replaces: Vec<_> = replayed.history.iter().filter(|e| selected.contains(&e.id)).map(|e| e.id.clone()).collect();
         let mut context = ModelContext { turns: replayed.context.turns[start..cut].to_vec(), ..Default::default() };
         let before = policy.meter.measure(&context, "", &[]);
-        progress(CompactionProgress { events: replaces.len(), estimated_tokens: before });
+        progress(CompactionProgress::Summarizing { events: replaces.len(), estimated_tokens: before });
         context.config = if let Some(selection) = &policy.summary_selection {
             rness_protocol::events::CallConfig { selection: Some(selection.clone()), ..Default::default() }
         } else { replayed.context.config.clone() };

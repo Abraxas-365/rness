@@ -223,6 +223,34 @@ the legacy display, while `nil` declines to the built-in statusline. Callback
 errors also fall back and are logged. Plugin unload removes its declaration;
 in-flight output is discarded when presentation or session context changes.
 
+### Default flavor context usage
+
+The default `statusline` plugin shows two independent segments, for example
+`46.3k/150.0k est tok · 120.0k last input`:
+
+- `est tok` is the engine's context pressure estimate (including system/tool
+  overhead and reserved output), with the active compaction policy's threshold
+  as denominator. It is a **boundary snapshot, not a live token count**:
+  `context_usage` frames arrive at the post-prune threshold check and before a
+  model request after context reduction. Streaming output and pending tool results
+  do not continuously update it. The threshold is not the model's context window.
+- With no compaction policy, the estimate has no denominator (`46.3k est tok`).
+- `last input` is the latest recorded provider input usage, not an estimate of the
+  next request. It is never compared with the compaction threshold. The plugin
+  loads it once on first render (including resumed sessions), then refreshes it
+  on `step_committed` frames and `turn_end`, rather than replaying logs each render.
+
+Estimates are cached independently per session, including while compacting and
+idle. A `history_changed` frame clears that session's stale estimate until the
+next pre-step snapshot. Before the first frame, after resume/plugin reload, or
+with an older binary that does not emit `context_usage`, the plugin gracefully
+shows `? est tok` alongside available `last input` usage; it never substitutes
+provider usage or an assumed threshold. These ephemeral estimates are not
+recovered from session logs.
+
+The frame wire shape is `{type="context_usage", session=..., estimated_tokens=...,
+threshold_tokens=...}`; `threshold_tokens` is optional/null when no policy applies.
+
 ## Messagebox presentation
 
 Startup configuration in `init.lua` can style messages and built-in tool cards:

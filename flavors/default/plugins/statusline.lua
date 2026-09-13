@@ -1,12 +1,6 @@
 -- Structured statusline: active model, live status, session ID, and cached
--- context usage. Token usage is loaded the first time a session is rendered
--- (including resumed sessions), then refreshed on turn_end.
-local function max_input_tokens(session)
-  local selection = rness.session.config(session).selection
-  local policies = rness.compaction or {}
-  local policy = (selection and policies[selection.route .. "/" .. selection.model]) or policies.default
-  return policy and policy.threshold_tokens or 165000
-end
+-- context estimates / last provider input. Estimates are boundary snapshots,
+-- not a live token counter; only the engine's context_usage frame sets them.
 
 local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
@@ -19,11 +13,11 @@ local running = {}
 local doing = {}
 local compacting = {}
 
--- "46.3k/150.0k tok" for the last session that finished a turn.
--- Cached: usage() replays the log, too heavy for a 2/s poll. Recorded
--- usage only moves when a request commits, so turn_end is the right
--- moment to refresh.
+-- Cached per session: usage() replays the log, too heavy for a 2/s poll.
+-- Load once on first render (including resume), then at commit / turn end.
+-- Never compare provider usage with a compaction threshold.
 local tokens = {}
+local estimates = {}
 
 local function k(n)
   return string.format("%.1fk", n / 1000)
@@ -32,7 +26,13 @@ end
 local function refresh(session)
   local ok, usage = pcall(rness.session.usage, session)
   if not ok then return end
-  tokens[session] = string.format("%s/%s tok", k(usage.input), k(max_input_tokens(session)))
+  tokens[session] = k(usage.input) .. " last input"
+end
+
+local function append_usage(parts, session)
+  if not session then return end
+  parts[#parts + 1] = estimates[session] or "? est tok"
+  parts[#parts + 1] = tokens[session] or ""
 end
 
 rness.hook.on("turn_start", function(ev)
@@ -48,7 +48,18 @@ end)
 
 -- The live frame stream (same wire shapes SSE clients get).
 rness.hook.on("frame", function(f)
-  if f.type == "delta" then
+  if f.type == "context_usage" then
+    local text = k(f.estimated_tokens)
+    -- None may arrive as nil or a JSON-null sentinel. Only numbers are limits.
+    if type(f.threshold_tokens) == "number" then
+      text = text .. "/" .. k(f.threshold_tokens)
+    end
+    estimates[f.session] = text .. " est tok"
+  elseif f.type == "history_changed" then
+    estimates[f.session] = nil
+  elseif f.type == "step_committed" then
+    refresh(f.session)
+  elseif f.type == "delta" then
     if f.chunk.d == "thinking" then
       doing[f.session] = "thinking"
     elseif f.chunk.d == "text" then
@@ -87,7 +98,7 @@ rness.ui.statusline = {
       parts[#parts + 1] = { text = spin .. " compacting context", style = { fg = "#fabd2f" } }
       parts[#parts + 1] = { text = tostring(secs) .. "s" }
       parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
-      parts[#parts + 1] = tokens[ctx.session] or ""
+      append_usage(parts, ctx.session)
       return parts
     end
     local count, oldest, act = 0, nil, nil
@@ -107,7 +118,7 @@ rness.ui.statusline = {
       parts[#parts + 1] = { text = count > 1 and (count .. " agents") or "" }
     end
     parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
-    parts[#parts + 1] = tokens[ctx.session] or ""
+    append_usage(parts, ctx.session)
     return parts
   end,
   right = function(ctx)

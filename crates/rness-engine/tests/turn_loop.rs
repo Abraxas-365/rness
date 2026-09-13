@@ -199,9 +199,31 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
         // Keep only the latest message in this fixture.
         let mut config = config;
         config.compaction.get_mut(policy_key).unwrap().retain_tokens = 1;
+        let frames = Mutex::new(Vec::new());
         let outcome = run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
-            &CancellationToken::new(), &mut Vec::new, 1, &|_| {}).await.unwrap();
+            &CancellationToken::new(), &mut Vec::new, 1, &|frame| frames.lock().unwrap().push(frame)).await.unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
+        let frames = frames.into_inner().unwrap();
+        use rness_protocol::frames::Frame;
+        let estimates: Vec<_> = frames.iter().filter_map(|f| match f {
+            Frame::ContextUsage { session, estimated_tokens, threshold_tokens } => {
+                assert_eq!(session, log.session());
+                assert_eq!(*threshold_tokens, Some(config.compaction[policy_key].threshold_tokens));
+                Some(*estimated_tokens)
+            }
+            _ => None,
+        }).collect();
+        assert!(estimates.first().unwrap() > estimates.last().unwrap());
+        for (index, frame) in frames.iter().enumerate() {
+            if matches!(frame, Frame::StepStarted { .. }) {
+                assert!(matches!(frames[index - 1], Frame::ContextUsage { .. }));
+            }
+        }
+        if !overflow {
+            let start = frames.iter().position(|f| matches!(f, Frame::CompactionStarted { .. })).unwrap();
+            assert!(matches!(frames[start - 1], Frame::ContextUsage { estimated_tokens, threshold_tokens: Some(threshold), .. } if estimated_tokens >= threshold));
+            assert!(estimates.last().unwrap() < &config.compaction[policy_key].threshold_tokens);
+        }
         let history = store.history(log.session()).unwrap();
         assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::Compaction(_))).count(), 1);
         let started = history.iter().find(|e| matches!(e.event, SessionEvent::CompactionStarted { .. })).unwrap();
@@ -214,6 +236,61 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
         assert!(texts.last().unwrap().contains("recent"));
         assert!(!texts.last().unwrap().contains("old old"));
         assert!(provider.steps.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn context_usage_matches_request_meter_not_reported_usage() {
+    use rness_protocol::frames::Frame;
+    use rness_engine::turn::compaction::Meter;
+    for policy_key in [None, Some("default"), Some("test/fake-1")] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::RequestConfig(CallConfig {
+            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            max_output_tokens: Some(200),
+            ..Default::default()
+        })).unwrap();
+        let mut previous = assistant("previous", StopReason::EndTurn, vec![]);
+        previous.usage.input_tokens = 179300;
+        log.append(&SessionEvent::AssistantMessage(previous)).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "small context".into() }], source: None,
+        })).unwrap();
+        let mut config = TurnConfig { system: "system overhead".into(), ..Default::default() };
+        let mut meter = Meter::default();
+        if let Some(key) = policy_key {
+            let mut policy = compact_policy(165000);
+            policy.meter = Meter { bytes_per_token: 2, output_reserve: 300, ..Default::default() };
+            meter = policy.meter.clone();
+            config.compaction.insert(key.into(), policy);
+            if key != "default" {
+                config.compaction.insert("default".into(), compact_policy(100000));
+            }
+        }
+        let context = replay(&store, log.session()).unwrap().context;
+        let expected = meter.pressure(&context, &config.system, &[]);
+        assert_eq!(expected, meter.measure(&context, &config.system, &[]) + meter.output_reserve.max(200));
+        let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
+        let observed = Mutex::new(Vec::new());
+        run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
+            &CancellationToken::new(), &mut Vec::new, 1, &|f| observed.lock().unwrap().push(f)).await.unwrap();
+        let frames = observed.into_inner().unwrap();
+        let usage = frames.iter().filter_map(|f| match f {
+            Frame::ContextUsage { estimated_tokens, threshold_tokens, .. } => Some((*estimated_tokens, *threshold_tokens)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert!(!usage.is_empty());
+        assert!(usage.iter().all(|v| *v == (expected, policy_key.map(|_| 165000))));
+        assert_ne!(expected, 179300);
+        assert!(!frames.iter().any(|f| matches!(f, Frame::CompactionStarted { .. })));
+        // The new metadata remains ephemeral and has a stable wire shape.
+        let frame = frames.iter().find(|f| matches!(f, Frame::ContextUsage { .. })).unwrap();
+        let wire = serde_json::to_value(frame).unwrap();
+        assert_eq!(wire["type"], "context_usage");
+        assert_eq!(serde_json::from_value::<Frame>(wire).unwrap(), *frame);
     }
 }
 
@@ -256,9 +333,19 @@ async fn boundary_pruning_remeasures_without_summarizing_or_splitting_tools() {
     let mut policy = compact_policy(165000);
     assert!(rness_engine::turn::compaction::measure(&replay(&store, log.session()).unwrap().context, "", &[]) < policy.threshold_tokens);
     policy.retain_tokens = 1;
-    assert!(rness_engine::turn::compaction::reduce(&store, &mut log, &provider, "", &[], &policy,
-        false, &CancellationToken::new()).await.unwrap());
+    let estimates = Mutex::new(Vec::new());
+    assert!(rness_engine::turn::compaction::reduce_with_progress(&store, &mut log, &provider, "", &[], &policy,
+        false, &CancellationToken::new(), &|progress| {
+            match progress {
+                rness_engine::turn::compaction::CompactionProgress::Measuring { estimated_tokens, threshold_tokens } => {
+                    assert_eq!(threshold_tokens, policy.threshold_tokens);
+                    estimates.lock().unwrap().push(estimated_tokens);
+                }
+                _ => panic!("pruning alone should suffice"),
+            }
+        }).await.unwrap());
     let replayed = replay(&store, log.session()).unwrap();
+    assert_eq!(*estimates.lock().unwrap(), vec![policy.meter.pressure(&replayed.context, "", &[])]);
     assert!(rness_engine::turn::compaction::measure(&replayed.context, "", &[]) < 2000);
     assert_eq!(replayed.history.iter().filter(|e| matches!(e.event, SessionEvent::Prune(_))).count(), 1);
     assert!(!replayed.history.iter().any(|e| matches!(e.event, SessionEvent::Compaction(_))));

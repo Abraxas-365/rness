@@ -48,6 +48,7 @@ pub async fn session_events(
 fn frame_session(frame: &Frame) -> &str {
     match frame {
         Frame::StepStarted { session, .. }
+        | Frame::ContextUsage { session, .. }
         | Frame::Delta { session, .. }
         | Frame::ToolStarted { session, .. }
         | Frame::ToolOutput { session, .. }

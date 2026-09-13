@@ -183,7 +183,7 @@ async fn drive(
             .or_else(|| config.compaction.get("default"));
         if let Some(policy) = policy {
             let on_compaction = |progress: compaction::CompactionProgress| {
-                frames(Frame::CompactionStarted { session: session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens });
+                frames(progress.frame(session.clone()));
             };
             let compacted = compaction::reduce_with_progress(store, log, provider, &step_system, &tool_specs, policy, false, cancel, &on_compaction).await;
             frames(Frame::CompactionFinished { session: session.clone(), changed: matches!(compacted, Ok(true)) });
@@ -198,6 +198,13 @@ async fn drive(
         let mut overflow_retries = 0u32;
         let message = loop {
             attempts += 1;
+            let default_meter = compaction::Meter::default();
+            let meter = policy.map_or(&default_meter, |p| &p.meter);
+            frames(Frame::ContextUsage {
+                session: session.clone(),
+                estimated_tokens: meter.pressure(&replayed.context, &step_system, &tool_specs),
+                threshold_tokens: policy.map(|p| p.threshold_tokens),
+            });
             frames(Frame::StepStarted { session: session.clone(), turn: turn_no });
             let on_delta = |delta: &rness_protocol::events::ChunkDelta| {
                 frames(Frame::Delta { session: session.clone(), chunk: delta.clone() });
@@ -235,7 +242,7 @@ async fn drive(
                     if error.code == "CONTEXT_OVERFLOW" {
                         if let Some(policy) = policy.filter(|p| overflow_retries < p.max_overflow_retries) {
                             let on_compaction = |progress: compaction::CompactionProgress| {
-                                frames(Frame::CompactionStarted { session: session.clone(), events: progress.events, estimated_tokens: progress.estimated_tokens });
+                                frames(progress.frame(session.clone()));
                             };
                             let compacted = compaction::reduce_with_progress(store, log, provider, &step_system, &tool_specs, policy, true, cancel, &on_compaction).await;
                             frames(Frame::CompactionFinished { session: session.clone(), changed: matches!(compacted, Ok(true)) });

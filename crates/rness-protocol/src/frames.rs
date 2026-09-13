@@ -15,6 +15,9 @@ use crate::events::{ChunkDelta, EventId, SessionId, ToolCallId};
 pub enum Frame {
     /// A model request opened.
     StepStarted { session: SessionId, turn: u32 },
+    /// Boundary snapshot from the compaction meter, including reserved output.
+    /// Not provider usage or a live token counter. No threshold means no policy.
+    ContextUsage { session: SessionId, estimated_tokens: u64, threshold_tokens: Option<u64> },
     /// Streaming delta from the model (text/thinking/tool args).
     Delta { session: SessionId, chunk: ChunkDelta },
     /// A tool started executing.

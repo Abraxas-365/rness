@@ -463,6 +463,8 @@ impl Model {
             }
             // Compaction (or any out-of-turn durable change): reload.
             Frame::HistoryChanged { .. } => FrameEffect::Reconcile,
+            // Context estimates are consumed by the Lua statusline, not the transcript.
+            Frame::ContextUsage { .. } => FrameEffect::None,
             // Remote-approval announcements: the in-process TUI gets its
             // questions over the answerer channel, not from frames.
             Frame::ApprovalRequested { .. } | Frame::ApprovalResolved { .. } => FrameEffect::None,
@@ -616,6 +618,7 @@ impl App {
     pub fn apply_frame(&mut self, frame: &Frame) {
         let session = match frame {
             Frame::StepStarted { session, .. }
+            | Frame::ContextUsage { session, .. }
             | Frame::Delta { session, .. }
             | Frame::ToolStarted { session, .. }
             | Frame::ToolOutput { session, .. }

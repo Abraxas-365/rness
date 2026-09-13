@@ -308,6 +308,7 @@ impl AgentMonitorState {
     pub fn observe(&self, frame: &Frame) {
         let session = match frame {
             Frame::StepStarted { session, .. }
+            | Frame::ContextUsage { session, .. }
             | Frame::Delta { session, .. }
             | Frame::ToolStarted { session, .. }
             | Frame::ToolOutput { session, .. }
