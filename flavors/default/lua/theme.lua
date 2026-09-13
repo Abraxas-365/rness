@@ -71,7 +71,6 @@ rness.ui.messagebox = {
   },
   keys = {
     select_message = "alt+m",
-    selection_stop = "x",
   },
   user = {
     style = { fg = p.fg, bg = p.card }, padding = { left = 1, right = 1 },

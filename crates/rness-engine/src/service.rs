@@ -872,7 +872,7 @@ impl SessionService {
         let live = self.live(session);
         let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
         let mut active = live.command.lock().unwrap();
-        if active.is_some() || self.phase(session) != Phase::Idle {
+        if active.is_some() || (!command.allow_busy() && self.phase(session) != Phase::Idle) {
             return Err(ServiceError::Busy);
         }
         let cancel = CancellationToken::new();

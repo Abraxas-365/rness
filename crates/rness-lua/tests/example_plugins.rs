@@ -96,7 +96,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 9);
+    assert_eq!(config.plugin_specs.len(), 10);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
     assert_eq!(policy.prune_threshold, 8192);
@@ -347,6 +347,83 @@ async fn coordinated_unload_holds_engine_reservation_through_ui_update() {
     rx.await.unwrap();
     assert!(sessions.try_extension_maintenance().is_ok());
     assert!(!host.unload_coordinated("owned", vec![], |_| panic!("already removed")).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_command_lists_completes_and_stops_while_parent_runs() {
+    use rness_engine::inbox::{Disposition, Phase};
+    use rness_protocol::branch::{Delegation, DelegationMode};
+    struct Waiting;
+    #[async_trait]
+    impl Provider for Waiting {
+        fn model(&self) -> &str { "waiting" }
+        async fn step(&self, _: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+            cancel.cancelled().await;
+            StepOutcome::Cancelled { partial: vec![] }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(Waiting),
+        registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
+    let runtime = Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3));
+    let host = LuaHost::spawn().unwrap();
+    host.install_session(sessions.clone(), runtime.clone(), registry, Default::default(),
+        tokio::runtime::Handle::current(), "waiting".into()).await.unwrap();
+    host.load("controls", include_str!("../../../flavors/default/plugins/agent-controls.lua")).await.unwrap();
+    host.load("ordinary", "rness.commands.register{name='ordinary',run=function() return 'ok' end}").await.unwrap();
+    let parent = sessions.create(None).unwrap();
+    let unrelated = sessions.create(None).unwrap();
+    let child = sessions.create_delegated(None, Delegation { parent: parent.clone(), depth: 1,
+        call: None, mode: DelegationMode::Continuable }).unwrap();
+    let grandchild = sessions.create_delegated(None, Delegation { parent: child.clone(), depth: 2,
+        call: None, mode: DelegationMode::OneShot }).unwrap();
+    for id in [&parent, &child, &grandchild, &unrelated] {
+        sessions.send(id, UserIntent::Followup, vec![ContentPart::Text { text: "wait".into() }]).unwrap();
+    }
+    assert!(sessions.prepare_command(&parent, "/ordinary").is_err());
+    assert_eq!(runtime.list_children(&parent, true).unwrap().len(), 1);
+    assert_eq!(runtime.list_agents(&parent).unwrap().len(), 2);
+    let prepared = sessions.prepare_command(&parent, "/agents stop ").unwrap().unwrap();
+    let service = sessions.clone();
+    let choices = tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap();
+    assert!(choices.contains(&format!("stop {child}")));
+    assert!(choices.contains(&format!("stop {grandchild}")));
+    assert!(!choices.contains(&format!("stop {unrelated}")));
+    async fn command(sessions: &Arc<SessionService>, parent: &str, text: String) -> Result<Disposition, rness_engine::service::ServiceError> {
+        // Child settlement briefly reserves the parent operation lock. Wait for
+        // that independent notification to retire, not for the parent turn.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let result = sessions.send_async(parent.into(), UserIntent::Followup,
+                    vec![ContentPart::Text { text: text.clone() }]).await;
+                if !matches!(result, Err(rness_engine::service::ServiceError::Busy)) { break result; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.expect("command admission")
+    }
+    for input in ["/agents", "/agents stop"] {
+        let result = command(&sessions, &parent, input.into()).await.unwrap();
+        assert!(matches!(result, Disposition::Command(result) if result.message.contains(&child) && result.message.contains(&grandchild)));
+    }
+    for id in [&parent, &unrelated, &"unknown".to_string()] {
+        assert!(command(&sessions, &parent, format!("/agents stop {id}")).await.is_err());
+    }
+    assert!(command(&sessions, &parent, "/agents stop extra args".into()).await.is_err());
+    command(&sessions, &parent, format!("/agents stop {child}")).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), sessions.join(&child)).await.unwrap();
+    assert_eq!(sessions.phase(&parent), Phase::Running);
+    assert_eq!(sessions.phase(&grandchild), Phase::Running);
+    // Only one running descendant remains, so omitting the ID is unambiguous.
+    command(&sessions, &parent, "/agents stop".into()).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), sessions.join(&grandchild)).await.unwrap();
+    let result = command(&sessions, &parent, "/agents stop".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result) if result.message == "No running subagents."));
+    let prepared = sessions.prepare_command(&parent, "/agents stop ").unwrap().unwrap();
+    let service = sessions.clone();
+    assert_eq!(tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap(), vec!["stop"]);
+    for id in [&parent, &unrelated] { sessions.cancel(id); sessions.join(id).await; }
+    assert!(sessions.prepare_command(&parent, "/ordinary").unwrap().is_some());
 }
 
 struct Silent;

@@ -196,6 +196,7 @@ pub struct LuaHost {
 struct LuaCommand {
     name: String,
     usage: String,
+    allow_busy: bool,
     arguments: Vec<(String, String)>,
     description: String,
     tx: std::sync::Weak<mpsc::Sender<Cmd>>,
@@ -204,6 +205,7 @@ struct LuaCommand {
 impl rness_engine::interaction::Command for LuaCommand {
     fn name(&self) -> &str { &self.name }
     fn usage(&self) -> &str { &self.usage }
+    fn allow_busy(&self) -> bool { self.allow_busy }
     fn arguments(&self) -> Vec<(String, String)> { self.arguments.clone() }
     fn description(&self) -> &str { &self.description }
     fn complete(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<String>, rness_engine::service::ServiceError> {
@@ -239,8 +241,8 @@ fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak
     });
     for (name, description) in specs {
         if installed.iter().any(|c| c.name() == name) { continue; }
-        let (usage, arguments) = rt.command_metadata(&name);
-        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, usage, arguments, description, tx: tx.clone() });
+        let (usage, arguments, allow_busy) = rt.command_metadata(&name);
+        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, usage, arguments, allow_busy, description, tx: tx.clone() });
         binding.sessions.commands().register(command.clone())?;
         installed.push(command);
     }
@@ -493,8 +495,8 @@ impl LuaHost {
                             let r = rt.reload_plugins(&sources, |fresh| {
                                 if let Some(binding) = &session_binding {
                                     let replacements = fresh.command_specs().into_iter().map(|(name, description)| {
-                                        let (usage, arguments) = fresh.command_metadata(&name);
-                                        std::sync::Arc::new(LuaCommand { name, description, usage, arguments, tx: command_tx.clone() }) as std::sync::Arc<dyn rness_engine::interaction::Command>
+                                        let (usage, arguments, allow_busy) = fresh.command_metadata(&name);
+                                        std::sync::Arc::new(LuaCommand { name, description, usage, arguments, allow_busy, tx: command_tx.clone() }) as std::sync::Arc<dyn rness_engine::interaction::Command>
                                     }).collect::<Vec<_>>();
                                     binding.sessions.commands().replace_owned(&installed_commands, &replacements)?;
                                     installed_commands = replacements;

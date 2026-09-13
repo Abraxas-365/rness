@@ -26,6 +26,7 @@ rness.plugins.setup({
   { name = "tasks", file = "plugins/tasks.lua" },
   { name = "plan", file = "plugins/plan.lua" },
   { name = "commands", file = "plugins/commands.lua" },
+  { name = "agent-controls", file = "plugins/agent-controls.lua" },
   { name = "models", file = "plugins/models.lua" },
 })
 rness.keymap.setup({})

@@ -349,6 +349,24 @@ mod tests {
     }
 
     #[test]
+    fn agents_stop_id_completes_as_a_multiword_argument_while_busy() {
+        let mut model = crate::app::Model::new("s".into(), "m".into());
+        model.busy = true;
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:commands", &serde_json::json!([["agents", "Stop children"]]));
+        input.editor.insert_str("/agents stop ch");
+        input.on_action(&ctx, "input:completion", &serde_json::json!({
+            "text":"/agents stop ch", "values":["stop", "stop child-123", "stop other-456"]
+        }));
+        assert_eq!(input.matches().len(), 1);
+        assert_eq!(input.matches()[0].0, "agents stop child-123");
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(input.editor.text().trim(), "/agents stop child-123");
+    }
+
+    #[test]
     fn dynamic_completion_ignores_stale_queries() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();

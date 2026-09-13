@@ -454,12 +454,22 @@ impl SubagentRuntime {
         root: &SessionId,
         descendants: bool,
     ) -> Result<Vec<ChildAgent>, SubagentError> {
+        self.list_delegated(root, descendants, false)
+    }
+
+    /// All delegated descendants, including one-shot children, for user controls.
+    /// Model-facing list_children intentionally remains continuable-only.
+    pub fn list_agents(&self, root: &SessionId) -> Result<Vec<ChildAgent>, SubagentError> {
+        self.list_delegated(root, true, true)
+    }
+
+    fn list_delegated(&self, root: &SessionId, descendants: bool, include_one_shot: bool) -> Result<Vec<ChildAgent>, SubagentError> {
         // Delegation stamps only name the parent, so build the child
         // index by scanning the store once.
         let mut by_parent: HashMap<SessionId, Vec<(SessionId, Delegation)>> = HashMap::new();
         for id in self.sessions.store().list()? {
             if let Some(d) = self.sessions.store().delegation(&id)? {
-                if d.mode == DelegationMode::Continuable {
+                if include_one_shot || d.mode == DelegationMode::Continuable {
                     by_parent.entry(d.parent.clone()).or_default().push((id, d));
                 }
             }

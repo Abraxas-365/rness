@@ -26,6 +26,8 @@ pub struct CommandInvocation<'a> {
 pub trait Command: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    /// Opt in only for commands safe to execute alongside the session writer.
+    fn allow_busy(&self) -> bool { false }
     fn usage(&self) -> &str { "" }
     fn arguments(&self) -> Vec<(String, String)> { Vec::new() }
     fn complete(&self, _service: &SessionService, _invocation: CommandInvocation<'_>) -> Result<Vec<String>, ServiceError> {

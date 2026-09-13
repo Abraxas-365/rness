@@ -17,6 +17,7 @@ local running = {}
 -- session id → what it is doing ("thinking", "writing", a tool name).
 -- Frames are ephemeral display state — exactly what this is for.
 local doing = {}
+local compacting = {}
 
 -- "46.3k/150.0k tok" for the last session that finished a turn.
 -- Cached: usage() replays the log, too heavy for a 2/s poll. Recorded
@@ -41,6 +42,7 @@ end)
 rness.hook.on("turn_end", function(ev)
   running[ev.session] = nil
   doing[ev.session] = nil
+  compacting[ev.session] = nil
   refresh(ev.session)
 end)
 
@@ -56,8 +58,13 @@ rness.hook.on("frame", function(f)
     -- with tool_started once the call executes.
   elseif f.type == "tool_started" then
     doing[f.session] = f.name
+  elseif f.type == "compaction_started" then
+    compacting[f.session] = os.time()
+  elseif f.type == "compaction_finished" then
+    compacting[f.session] = nil
   elseif f.type == "turn_idle" then
     doing[f.session] = nil
+    compacting[f.session] = nil
   end
 end)
 
@@ -66,6 +73,14 @@ rness.ui.statusline = {
   padding = { left = 1, right = 1 },
   separator = " · ",
   left = function(ctx)
+    local compact_started = ctx.session and compacting[ctx.session]
+    if compact_started then
+      local secs = os.time() - compact_started
+      return {
+        { text = frames[(secs % #frames) + 1] .. " compacting context", style = { fg = "#fabd2f" } },
+        { text = tostring(secs) .. "s" },
+      }
+    end
     local count, oldest, act = 0, nil, nil
     for id, started in pairs(running) do
       count = count + 1

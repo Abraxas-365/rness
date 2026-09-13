@@ -146,6 +146,18 @@ pub fn install(
         })?,
     )?;
 
+    let r = Arc::clone(&runtime);
+    subagents.set("list", lua.create_function(move |lua, root: String| {
+        let out = lua.create_table()?;
+        for (i, child) in r.list_agents(&root).map_err(err)?.into_iter().enumerate() {
+            out.set(i + 1, lua.to_value(&serde_json::json!({
+                "session": child.session, "parent": child.parent,
+                "depth": child.depth, "running": child.running,
+            }))?)?;
+        }
+        Ok(out)
+    })?)?;
+
     rness.set("subagents", subagents)?;
     Ok(())
 }

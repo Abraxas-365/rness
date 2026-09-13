@@ -41,9 +41,6 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
     fn complete(&self, _session: &SessionId, _text: String) {}
-    fn stop_subagent(&self, _parent: &SessionId, _call: &ToolCallId) -> Result<(), String> {
-        Err("stopping subagents is not supported by this backend".into())
-    }
     fn command_running(&self, _session: &SessionId) -> bool {
         false
     }
@@ -1431,20 +1428,6 @@ impl App {
                 }
                 if name == "terminal:edit-prompt" {
                     self.edit_prompt = Some(payload);
-                    return;
-                }
-                if name == "terminal:stop-subagent" {
-                    let result = (|| {
-                        let call = payload["call"].as_str().ok_or_else(|| "Missing subagent call".to_owned())?;
-                        if payload["session"].as_str() != Some(self.model.session.as_str()) {
-                            return Err("Subagent selection is no longer in this session".into());
-                        }
-                        self.backend.stop_subagent(&self.model.session, &call.into())
-                    })();
-                    self.apply(Action::Notice(match result {
-                        Ok(()) => "Subagent stop requested".into(),
-                        Err(error) => format!("Cannot stop subagent: {error}"),
-                    }));
                     return;
                 }
                 let ctx = Ctx {

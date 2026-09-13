@@ -84,7 +84,7 @@ pub struct LuaRuntime {
     keymap_binds: Vec<(String, Option<String>, Option<String>)>,
     registration_owners: HashMap<(&'static str, String), String>,
     command_completers: HashMap<String, RegistryKey>,
-    command_metadata: HashMap<String, (String, Vec<(String, String)>)>,
+    command_metadata: HashMap<String, (String, Vec<(String, String)>, bool)>,
     bindings: Vec<LuaBindingSpec>,
     actions: HashMap<String, (LuaActionSpec, RegistryKey)>,
     commands: HashMap<String, (String, RegistryKey)>,
@@ -419,7 +419,7 @@ impl LuaRuntime {
 
     pub(crate) fn lua(&self) -> &Lua { &self.lua }
 
-    pub fn command_metadata(&self, name: &str) -> (String, Vec<(String, String)>) {
+    pub fn command_metadata(&self, name: &str) -> (String, Vec<(String, String)>, bool) {
         self.command_metadata.get(name).cloned().unwrap_or_default()
     }
 
@@ -995,7 +995,7 @@ impl LuaRuntime {
             let run: Function = entry.get("run")?;
             let key = self.lua.create_registry_value(run)?;
             let arguments: LuaValue = entry.get("arguments")?;
-            self.command_metadata.insert(name.clone(), (entry.get("usage")?, self.lua.from_value(arguments)?));
+            self.command_metadata.insert(name.clone(), (entry.get("usage")?, self.lua.from_value(arguments)?, entry.get("allow_busy")?));
             if let Some(complete) = entry.get::<Option<Function>>("complete")? {
                 self.command_completers.insert(name.clone(), self.lua.create_registry_value(complete)?);
             }
@@ -1303,6 +1303,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         entry.set("name", name.clone())?;
         entry.set("description", spec.get::<Option<String>>("description")?.unwrap_or_default())?;
         entry.set("usage", spec.get::<Option<String>>("usage")?.unwrap_or_default())?;
+        entry.set("allow_busy", spec.get::<Option<bool>>("allow_busy")?.unwrap_or(false))?;
         let arguments = spec.get::<Option<Table>>("arguments")?.map(|table| table.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>()).transpose()?.unwrap_or_default();
         let arguments: Vec<_> = arguments.into_iter().map(|value| (value, String::new())).collect();
         entry.set("arguments", lua.to_value(&arguments)?)?;

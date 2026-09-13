@@ -82,15 +82,6 @@ impl SubagentActivity {
         }
     }
 
-    pub fn child_for_call(&self, parent: &str, call: &str) -> Option<String> {
-        self.runs
-            .lock()
-            .unwrap()
-            .values()
-            .find(|run| run.parent == parent && run.call == call)
-            .map(|run| run.child.clone())
-    }
-
     fn tool_start(run: &mut Run, call: &str, name: &str, args: Value) {
         if let Some(tool) = run.tools.iter_mut().find(|tool| tool["call"] == call) {
             tool["name"] = json!(name);
