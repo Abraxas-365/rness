@@ -333,10 +333,9 @@ async fn drive(
                         call: result.call.clone(),
                         output: result.output.clone(),
                     });
-                    let tasks_changed = result.tasks.is_some();
                     tools.file_references.invalidate();
                     log.append(&SessionEvent::ToolResult(result))?;
-                    if tasks_changed { frames(Frame::HistoryChanged { session: session.clone() }); }
+                    frames(Frame::HistoryChanged { session: session.clone() });
                 }
                 if dismissed { return Ok(TurnOutcome::Completed); }
                 // Cancellation between steps: commit and stop cleanly.

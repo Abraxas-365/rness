@@ -3,6 +3,43 @@ local p = {
   border = "#665c54", yellow = "#fabd2f", green = "#b8bb26",
   red = "#fb4934", blue = "#83a598", purple = "#d3869b",
 }
+local function web_card(call)
+  local search = call.name == "web_search"
+  local title = search and "Web search" or "Web fetch"
+  local args = call.args or {}
+  local output = call.output or ""
+  local payload = output:match("^%s*({.*})%s*$") or output:match("\n%s*({.*})%s*$")
+  local ok, data = pcall(rness.json.decode, payload or "")
+  local body = {}
+  local function line(text, style)
+    if type(text) == "string" and text ~= "" then
+      body[#body + 1] = { text = text, style = style or "tool_output" }
+    end
+  end
+  line(search and args.query or args.url, "tool_name")
+  if call.is_error or not ok or type(data) ~= "table" then
+    line(output, call.is_error and "error" or "tool_output")
+  else
+    line("External web content · untrusted", "dim")
+    if search then
+      local sources = type(data.sources) == "table" and data.sources or {}
+      title = title .. " · " .. #sources .. " sources"
+      if #sources == 0 then line("No sources returned", "dim") end
+      for i, source in ipairs(sources) do
+        line(string.format("%d. %s", i, source.title or source.url or "Source"), "tool_name")
+        line(source.url, "dim")
+        line(source.snippet)
+      end
+    else
+      if data.url ~= args.url then line(data.url, "dim") end
+      line(data.contentType, "dim")
+    end
+    line(data.content)
+    if data.truncated then line("Content truncated by web tool limits", "dim") end
+  end
+  return { header = { text = title .. (call.is_error and " · failed" or ""), style = call.is_error and "error" or "tool_name" }, body = body }
+end
+
 rness.ui.colorscheme.register("gruvbox", {
   assistant_text = { fg = p.fg, bg = p.bg },
   user_prefix = { fg = p.yellow, bold = true },
@@ -48,6 +85,8 @@ rness.ui.messagebox = {
   },
   error = { style = "error", display = "expanded" },
   tools = {
+    web_fetch = { display = "preview", preview_lines = 12, render = web_card },
+    web_search = { display = "preview", preview_lines = 12, render = web_card },
     subagent = { display = "collapsed", render = function(call)
       local p = call.presentation
       if not p or p.kind ~= "subagent_activity" then return nil end

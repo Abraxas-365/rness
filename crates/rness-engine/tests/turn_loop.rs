@@ -443,6 +443,29 @@ async fn tasks_commit_in_model_order_and_survive_compaction_and_resume() {
 }
 
 #[tokio::test]
+async fn final_tool_result_notifies_after_persistence_without_another_model_step() {
+    use rness_protocol::frames::Frame;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("calling", StopReason::ToolUse, vec![("last", "Echo")]))]);
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(Echo));
+    let observed = Mutex::new(false);
+    let frames = |frame| {
+        if let Frame::HistoryChanged { session } = frame {
+            let history = replay(&store, &session).unwrap().history;
+            assert!(history.iter().any(|event| matches!(&event.event, SessionEvent::ToolResult(result) if result.call == "last")));
+            *observed.lock().unwrap() = true;
+        }
+    };
+    run_turn(&store, &mut log, &provider, &tools,
+        &TurnConfig { max_steps: 1, ..Default::default() },
+        &CancellationToken::new(), &mut no_steers(), 1, &frames).await.unwrap();
+    assert!(*observed.lock().unwrap(), "final tool result did not trigger history/card refresh");
+}
+
+#[tokio::test]
 async fn tool_roundtrip_turn_commits_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());

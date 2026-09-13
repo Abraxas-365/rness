@@ -1112,12 +1112,12 @@ async fn run_tui(
             }
         })
     };
-    // Feed it from the frame stream: StepCommitted is the only moment
-    // new tool results can appear.
+    // Tool results commit after the assistant step; refresh without waiting for another step.
     let card_feed = Arc::clone(&watched);
     let card_tx_sub = card_tx.clone();
     let _card_sub = kernel.bus().on::<FrameEv>(move |frame| {
-        if let rness_protocol::frames::Frame::StepCommitted { session, .. } = frame {
+        if let rness_protocol::frames::Frame::StepCommitted { session, .. }
+            | rness_protocol::frames::Frame::HistoryChanged { session } = frame {
             if *session == *card_feed.read().unwrap() {
                 let _ = card_tx_sub.send(session.clone());
             }

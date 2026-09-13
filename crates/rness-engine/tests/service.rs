@@ -666,6 +666,7 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
             "committed",
             "tool:Echo",
             "out:echo-output",
+            "history",
             "step",
             "delta:done",
             "committed",
