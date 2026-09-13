@@ -162,7 +162,7 @@ Profiles and agents must exist in your Lua configuration. Resume restores the se
 
 ### Switching models inside a session
 
-The default flavor's `models` Lua plugin provides **Alt+M**, an interactive editor
+The default flavor's `models` Lua plugin provides slash commands with autocomplete
 for profiles, provider/model, reasoning effort or token budget, temperature, and output limits.
 Only declared supported settings are shown: model capabilities `temperature = true`
 enable temperature; `output_token_limit = true` or a declared `max_output_tokens`
@@ -170,14 +170,14 @@ limit enables output limits (`output_token_limit = false` explicitly disables th
 Reasoning fields require declared `reasoning.efforts` or `reasoning.budget_tokens`.
 Unknown capabilities are hidden, not guessed; slash commands also reject undeclared
 settings, but `default` can always clear an old override.
-Use `/profile` to list presets or `/profile NAME` to apply one (also available in
-Alt+M). Applying a profile replaces all generation options, clearing absent overrides,
+Use `/profile` to list presets or `/profile NAME` to apply one.
+Applying a profile replaces all generation options, clearing absent overrides,
 while preserving the agent and tool permissions. It never edits the profile definition.
 Provider-specific profiles use the session's current provider connection.
-Use j/k to select a field, Enter to edit/save, and Escape to close. Enter models as
-`provider/model`; the provider must already be configured. Model IDs can contain slashes.
+Enter models as `provider/model`; the provider must already be configured.
+Model IDs can contain slashes.
 
-The same settings are available through commands:
+Examples:
 
 ```text
 /model chatgpt/gpt-6-astra

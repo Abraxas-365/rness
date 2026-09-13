@@ -86,7 +86,7 @@ rness.commands.register {
   complete = function() return rness.session.model_names() end,
   run = function(ctx)
     local value = trim(ctx.raw_input)
-    return { message = value == "" and (describe(rness.session.config(ctx.session)) .. "\nUse /model provider/model, or Alt+M for the settings editor.")
+    return { message = value == "" and (describe(rness.session.config(ctx.session)) .. "\nUse /model provider/model.")
       or update(ctx.session, "model", value) }
   end,
 }
@@ -115,7 +115,7 @@ rness.commands.register {
   end,
   run = function(ctx)
     local input = trim(ctx.raw_input)
-    if input == "" then return { message = describe(rness.session.config(ctx.session)) .. "\nAlt+M opens the settings editor. Use default to clear an override." } end
+    if input == "" then return { message = describe(rness.session.config(ctx.session)) .. "\nUse default to clear an override." } end
     local field, value = input:match("^(%S+)%s+(.+)$")
     assert(field, "Usage: /model-settings setting value|default")
     return { message = update(ctx.session, field, value) }
@@ -131,70 +131,5 @@ rness.commands.register {
     local name = trim(ctx.raw_input)
     if name == "" then return { message = "Profiles: " .. table.concat(rness.session.profiles(), ", ") } end
     return { message = update(ctx.session, "profile", name) }
-  end,
-}
-
-local fields = { "profile", "model" }
-local cursor, editing, input, message, session = 1, false, "", "", nil
-rness.ui.app {
-  name = "models",
-  slot = "overlay",
-  title = "Model settings · j/k select · enter edit/save · esc close",
-  keymap = "alt+m",
-  view = function(ctx)
-    if session ~= ctx.session then
-      session, cursor, editing, input, message = ctx.session, 1, false, "", ""
-    end
-    local config = rness.session.config(ctx.session)
-    fields = available_fields(config)
-    cursor = math.min(cursor, #fields)
-    local lines = {}
-    for line in describe(config):gmatch("[^\n]+") do lines[#lines + 1] = line end
-    lines[#lines + 1] = "Profiles: " .. table.concat(rness.session.profiles(), ", ")
-    local caps = config.selection and rness.session.model_capabilities(config.selection)
-    if type(caps) == "table" then
-      if type(caps.max_output_tokens) == "number" and caps.output_token_limit ~= false then
-        lines[#lines + 1] = "Output token maximum: " .. caps.max_output_tokens
-      end
-      if type(caps.reasoning) == "table" then
-        if type(caps.reasoning.efforts) == "table" then
-          lines[#lines + 1] = "Reasoning efforts: " .. table.concat(caps.reasoning.efforts, ", ")
-        end
-        if type(caps.reasoning.budget_tokens) == "table" then
-          local range = caps.reasoning.budget_tokens
-          lines[#lines + 1] = "Reasoning budget: " .. range.min .. "–" .. range.max
-        end
-      end
-    end
-    lines[#lines + 1] = ""
-    for i, field in ipairs(fields) do
-      lines[#lines + 1] = (cursor == i and "> " or "  ") .. field
-        .. (cursor == i and editing and (": " .. input .. "_") or "")
-    end
-    lines[#lines + 1] = ""
-    lines[#lines + 1] = "Type provider/model or a setting value; default clears an override."
-    lines[#lines + 1] = message
-    return lines
-  end,
-  on_key = function(key, ctx)
-    if key == "esc" then
-      editing, input, message = false, "", ""
-      return "close"
-    end
-    if editing then
-      if key == "enter" then
-        local ok, result = pcall(update, ctx.session, fields[cursor], input)
-        if ok then editing, input, message = false, "", "Saved for this session; applies to the next turn."
-        else message = tostring(result) end
-      elseif key == "backspace" then
-        local start = utf8.offset(input, -1)
-        if start then input = input:sub(1, start - 1) end
-      elseif key == "ctrl+u" then input = ""
-      elseif key == "space" then input = input .. " "
-      elseif utf8.len(key) == 1 then input = input .. key end
-    elseif key == "j" or key == "down" then cursor = math.min(#fields, cursor + 1)
-    elseif key == "k" or key == "up" then cursor = math.max(1, cursor - 1)
-    elseif key == "enter" then editing, input, message = true, "", "" end
-    return true
   end,
 }
