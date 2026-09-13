@@ -1,5 +1,6 @@
 //! Built-in TUI features as slot-mounted plugins (deepseek ui-* pattern).
 
+pub mod agents;
 pub mod approval;
 pub mod branch_ui;
 pub mod chat;

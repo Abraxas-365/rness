@@ -691,10 +691,24 @@ impl App {
             }
             // Wheel scroll goes to the transcript regardless of focus —
             // the editor never owns vertical scrolling.
-            TermEvent::Mouse(m) => match m.kind {
-                crossterm::event::MouseEventKind::ScrollUp => self.apply(Action::ScrollUp(3)),
-                crossterm::event::MouseEventKind::ScrollDown => self.apply(Action::ScrollDown(3)),
-                _ => {}
+            TermEvent::Mouse(m) => {
+                let direction = match m.kind {
+                    crossterm::event::MouseEventKind::ScrollUp => Some(true),
+                    crossterm::event::MouseEventKind::ScrollDown => Some(false),
+                    _ => None,
+                };
+                if let Some(up) = direction {
+                    let ctx = Ctx { model: &self.model, theme: &self.theme };
+                    if self.slots.overlay_active(&ctx) {
+                        // A read-only monitor owns scrolling while open. Never
+                        // move the hidden principal transcript under an overlay.
+                        if let Some(component) = self.slots.focused_mut(&ctx) {
+                            component.on_action(&ctx, "viewport:wheel", &serde_json::json!({"up":up}));
+                        }
+                    } else {
+                        self.apply(if up { Action::ScrollUp(3) } else { Action::ScrollDown(3) });
+                    }
+                }
             },
             _ => {}
         }
@@ -1865,6 +1879,24 @@ mod tests {
                 .entries
                 .contains(&Entry::Notice("other help".into()))
         );
+    }
+
+    #[test]
+    fn agent_overlay_wheel_never_scrolls_principal_transcript() {
+        let mut slots = Slots::default();
+        let cards = crate::modules::chat::install(&mut slots);
+        let monitor = crate::modules::agents::install(&mut slots, cards);
+        let mut app = App::new(Model::new("s".into(), "m".into()), slots,
+            Arc::new(FakeBackend { history: prior_history("s") }));
+        app.model.scroll_from_bottom = 17;
+        app.apply(Action::Custom("agents:open".into(), serde_json::json!({"session":"s"})));
+        assert!(monitor.requested().is_some());
+        app.on_term_event(TermEvent::Mouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp, column: 2, row: 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }));
+        assert_eq!(app.model.scroll_from_bottom, 17);
+        assert_eq!(app.model.session, "s");
     }
 
     #[test]

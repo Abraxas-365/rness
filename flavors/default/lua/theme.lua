@@ -9,6 +9,26 @@ local function file_language(path)
   return path:match("%.([^./\\]+)$")
 end
 
+-- Compact summaries stay single-line and never split a UTF-8 character.
+local function preview(text, limit, fallback)
+  if type(text) ~= "string" then return fallback or "" end
+  text = text:gsub("%s+", " "):match("^%s*(.-)%s*$")
+  if text == "" then return fallback or "" end
+  local beyond = utf8.offset(text, limit + 1)
+  if beyond and beyond <= #text then
+    return text:sub(1, utf8.offset(text, limit) - 1) .. "…"
+  end
+  return text
+end
+
+local function tool_status(call)
+  if call.is_error then return "failed", "error" end
+  if type(call.presentation) == "table" and call.presentation.status == "running" then
+    return "running", { fg = p.yellow, bold = true }
+  end
+  return "done", { fg = p.green, bold = true }
+end
+
 local function web_card(call)
   local search = call.name == "web_search"
   local title = search and "Web search" or "Web fetch"
@@ -43,7 +63,8 @@ local function web_card(call)
     line(data.content)
     if data.truncated then line("Content truncated by web tool limits", "dim") end
   end
-  return { header = { text = title .. (call.is_error and " · failed" or ""), style = call.is_error and "error" or "tool_name" }, body = body }
+  local status = tool_status(call)
+  return { header = { text = title .. (status == "failed" and " · failed" or status == "running" and " · running" or ""), style = call.is_error and "error" or "tool_name" }, body = body }
 end
 
 rness.ui.colorscheme.register("gruvbox", {
@@ -95,46 +116,66 @@ rness.ui.messagebox = {
   tools = {
     web_fetch = { display = "preview", preview_lines = 12, render = web_card },
     web_search = { display = "preview", preview_lines = 12, render = web_card },
-    subagent = { display = "preview", preview_lines = 12, render = function(call)
-      local p = call.presentation
-      if not p or p.kind ~= "subagent_activity" then return nil end
-      local a = call.args or {}
-      local body = { { text = a.prompt or "", style = "dim" } }
-      local function detail(args)
-        if type(args) ~= "table" then return "" end
-        for _, key in ipairs({ "command", "pattern", "path", "query", "url", "prompt" }) do
-          if type(args[key]) == "string" and args[key] ~= "" then return args[key] end
-        end
-        return ""
+    subagent = { display = "preview", preview_lines = 6, render = function(call)
+      local meta = call.presentation
+      if type(meta) ~= "table" or meta.kind ~= "subagent_activity" then return nil end
+      local args = type(call.args) == "table" and call.args or {}
+      local failed = call.is_error or meta.status == "error" or meta.status == "failed"
+      local state = call.is_error and "failed" or preview(meta.status, 24, "unknown")
+      if state == "completed" then
+        state = (meta.mode or args.background_mode or args.mode) == "continuable" and "idle" or "finished"
       end
-      local tools = type(p.tools) == "table" and p.tools or {}
-      if #tools > 0 then
-        for _, tool in ipairs(tools) do
-          local state = tool.status or "running"
-          body[#body + 1] = { spans = {
-            { text = "› " .. (tool.name or "tool"), style = "tool_name" },
-            { text = " · " .. state, style = state == "failed" and "error" or "dim" },
-          } }
-          local args = detail(tool.args)
-          if args ~= "" then body[#body + 1] = { text = args, style = "code" } end
-          if tool.stream and tool.stream ~= "" then body[#body + 1] = { text = tool.stream, style = "tool_output" } end
-          if tool.output and tool.output ~= "" then body[#body + 1] = { text = tool.output, style = "tool_output" } end
-        end
-      else
-        -- Histories from before structured activity metadata retain this view.
-        for _, line in ipairs(p.lines or {}) do body[#body + 1] = { text = line, style = "tool_output" } end
-        local streams = {}
-        for id in pairs(p.streams or {}) do streams[#streams + 1] = id end
-        table.sort(streams)
-        for _, id in ipairs(streams) do
-          body[#body + 1] = { text = id .. " (live)", style = "dim" }
-          body[#body + 1] = { text = p.streams[id], style = "tool_output" }
+      local identity = preview(args.agent, 48, "subagent")
+      local session = type(meta.session) == "string" and meta.session or ""
+      local length = utf8.len(session)
+      if length and length > 8 then session = session:sub(utf8.offset(session, -8)) end
+      session = preview(session, 9)
+      if session ~= "" then identity = identity .. " · " .. session end
+      local elapsed = tonumber(meta.elapsed_ms)
+      local duration = elapsed and elapsed >= 0 and elapsed < math.huge
+        and string.format(" · %ds", math.floor(elapsed / 1000)) or ""
+      local body = { { text = "Task: " .. preview(args.prompt, 240, "Not available"), style = "dim" } }
+      local tools = type(meta.tools) == "table" and meta.tools or nil
+      local counts = { running = 0, done = 0, failed = 0, cancelled = 0 }
+      local total, current = 0, nil
+      for _, tool in ipairs(tools or {}) do
+        if type(tool) == "table" then
+          total = total + 1
+          local status = type(tool.status) == "string" and tool.status or "running"
+          if counts[status] then counts[status] = counts[status] + 1 end
+          if status == "running" then current = preview(tool.name, 80, "tool") end
         end
       end
-      if p.live and p.live ~= "" then body[#body + 1] = { text = p.live, style = "assistant_text" } end
+      -- Older metadata has only activity/live text. Never flatten lines,
+      -- streams, or nested tool arguments/results into the parent card.
+      body[#body + 1] = { text = "Activity: " .. (current or preview(meta.activity, 160, state)), style = "tool_name" }
+      if tools then
+        body[#body + 1] = { text = string.format("Recent tools: %d · %d running · %d done · %d failed · %d cancelled",
+          total, counts.running, counts.done, counts.failed, counts.cancelled), style = counts.failed > 0 and "error" or "dim" }
+      end
+      local live = preview(meta.live, 160)
+      if live ~= "" then body[#body + 1] = { text = live, style = "assistant_text" } end
+      if call.is_error then
+        body[#body + 1] = { text = preview(call.output, 200, "Subagent failed"), style = "error" }
+      end
+      body[#body + 1] = { text = "Inspect: select card, i", style = "dim" }
       return {
-        header = { text = string.format("%s · %s · %ds · %s",
-          a.agent or "subagent", p.status, math.floor(p.elapsed_ms / 1000), p.activity), style = "tool_name" },
+        header = { text = identity .. " · " .. state .. duration, style = failed and "error" or "tool_name" },
+        body = body,
+      }
+    end },
+    send_message = { display = "preview", preview_lines = 4, render = function(call)
+      local args = type(call.args) == "table" and call.args or {}
+      local meta = type(call.presentation) == "table" and call.presentation or {}
+      local failed = call.is_error or meta.accepted == false
+      local state = failed and "failed" or meta.status == "running" and "running" or "Accepted"
+      local recipient = preview(args.agent_id, 80, preview(meta.agent_id, 80, "Unknown recipient"))
+      local body = { { text = type(args.message) == "string" and args.message or "Message unavailable", style = "tool_output" } }
+      if failed then
+        body[#body + 1] = { text = type(call.output) == "string" and call.output ~= "" and call.output or "Message not accepted", style = "error" }
+      end
+      return {
+        header = { text = "Send message → " .. recipient .. " · " .. state, style = failed and "error" or "tool_name" },
         body = body,
       }
     end },
@@ -142,8 +183,7 @@ rness.ui.messagebox = {
       local args = type(call.args) == "table" and call.args or {}
       local command = type(args.command) == "string" and args.command or ""
       local duration = call.presentation and tonumber(call.presentation.duration_ms)
-      local status = call.is_error and "failed" or "done"
-      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local status, status_style = tool_status(call)
       local header = {
         left = {
           { text = "Bash", style = "tool_name" },
@@ -169,8 +209,7 @@ rness.ui.messagebox = {
     Glob = { render = function(call)
       local args = type(call.args) == "table" and call.args or {}
       local duration = call.presentation and tonumber(call.presentation.duration_ms)
-      local status = call.is_error and "failed" or "done"
-      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local status, status_style = tool_status(call)
       local body = {}
       if type(args.pattern) == "string" and args.pattern ~= "" then
         body[#body + 1] = { spans = {
@@ -202,8 +241,7 @@ rness.ui.messagebox = {
     Grep = { render = function(call)
       local args = type(call.args) == "table" and call.args or {}
       local duration = call.presentation and tonumber(call.presentation.duration_ms)
-      local status = call.is_error and "failed" or "done"
-      local status_style = call.is_error and "error" or { fg = p.green, bold = true }
+      local status, status_style = tool_status(call)
       local body = {}
       if type(args.pattern) == "string" and args.pattern ~= "" then
         body[#body + 1] = { spans = {
@@ -276,16 +314,18 @@ rness.ui.messagebox = {
           notices[#notices + 1] = { text = line, style = "dim" }
         end
       end
-      if not start then return nil end
-      local body = {
-        { kind = "code", text = table.concat(source, "\n") .. "\n", language = file_language(a.path),
-          syntax_highlight = true, line_numbers = true, start_line = start },
-      }
+      local status, status_style = tool_status(call)
+      if not start and status ~= "running" then return nil end
+      local body = {}
+      if start then
+        body[#body + 1] = { kind = "code", text = table.concat(source, "\n") .. "\n", language = file_language(a.path),
+          syntax_highlight = true, line_numbers = true, start_line = start }
+      end
       for _, notice in ipairs(notices) do body[#body + 1] = notice end
       return {
         header = {
           left = { { text = "Read", style = "tool_name" }, { text = "  " .. a.path, style = "code" } },
-          right = { { text = "done", style = { fg = p.green, bold = true } } },
+          right = { { text = status, style = status_style } },
         },
         body = body,
       }
@@ -294,13 +334,14 @@ rness.ui.messagebox = {
       if call.is_error then return nil end
       local a = call.args
       if type(a) ~= "table" or type(a.path) ~= "string" or type(a.content) ~= "string" then return nil end
+      local status, status_style = tool_status(call)
       return {
         header = {
           left = {
             { text = "Write", style = "tool_name" },
             { text = "  " .. a.path, style = "code" },
           },
-          right = { { text = "done", style = { fg = p.green, bold = true } } },
+          right = { { text = status, style = status_style } },
         },
         body = {
           { kind = "code", text = a.content, language = file_language(a.path), syntax_highlight = true, line_numbers = true },

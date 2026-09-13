@@ -106,6 +106,21 @@ impl CardCache {
         true
     }
 
+    /// Remove a stale live card when a completed renderer declines; readers
+    /// must invalidate cached rows and use the built-in completed-result card.
+    pub fn remove_if_current(&self, generation: u64, call: &ToolCallId) -> bool {
+        let mut inner = self.inner.write().expect("card cache lock");
+        if inner.generation != generation { return false; }
+        if inner.cards.remove(call).is_some() {
+            inner.revision += 1;
+            let revision = inner.revision;
+            inner.revisions.insert(call.clone(), revision);
+            inner.changes.push_back((revision, call.clone()));
+            if inner.changes.len() > 1024 { inner.changes.pop_front(); }
+        }
+        true
+    }
+
     pub fn insert(&self, call: ToolCallId, lines: Vec<CardLine>) {
         let mut inner = self.inner.write().expect("card cache lock");
         inner.revision += 1;

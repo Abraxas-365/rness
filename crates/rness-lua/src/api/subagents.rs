@@ -11,6 +11,8 @@
 //!   rness.subagents.delegation(id)       -> {parent=, depth=, mode=} | nil
 //!   rness.subagents.start_continuable(provider, {parent=, prompt=}) -> child id
 //!   rness.subagents.send_message(sender, target, text)
+//!   rness.subagents.steer_user(caller, target, text) -- trusted user controls
+//!   rness.subagents.list(root) -> all descendants, including one-shot
 //!   rness.subagents.interrupt(caller, target)
 //!   rness.subagents.children(root, scope?) -> { {session=, parent=, depth=, running=} }
 
@@ -120,6 +122,17 @@ pub fn install(
     )?;
 
     let r = Arc::clone(&runtime);
+    let handle = rt.clone();
+    subagents.set(
+        "steer_user",
+        lua.create_function(move |_, (caller, target, text): (String, String, String)| {
+            let _g = handle.enter();
+            r.steer_user(&caller, &target, text).map_err(err)?;
+            Ok(())
+        })?,
+    )?;
+
+    let r = Arc::clone(&runtime);
     subagents.set(
         "interrupt",
         lua.create_function(move |_, (caller, target): (String, String)| {
@@ -151,6 +164,7 @@ pub fn install(
         let out = lua.create_table()?;
         for (i, child) in r.list_agents(&root).map_err(err)?.into_iter().enumerate() {
             out.set(i + 1, lua.to_value(&serde_json::json!({
+                "alias": child.alias,
                 "session": child.session, "parent": child.parent,
                 "depth": child.depth, "running": child.running,
             }))?)?;

@@ -217,6 +217,11 @@ impl Slots {
 
         // Overlay: centered box over everything.
         if let Some(c) = self.winner_mut(OVERLAY, ctx) {
+            // Modal content must not leave bright, clipped fragments of the
+            // conversation in the margins around its centered panel.
+            use ratatui::widgets::{Clear, Widget};
+            Clear.render(area, buf);
+            buf.set_style(area, ctx.theme.overlay);
             let h = c.height(ctx, area.width).unwrap_or(area.height / 2).min(area.height);
             let w = if area.width < 60 { area.width } else { area.width.saturating_sub(8) };
             let rect = Rect::new(
@@ -256,6 +261,20 @@ mod tests {
 
     fn ctx_fixture() -> (Model, Theme) {
         (Model::new("s".into(), "m".into()), Theme::default())
+    }
+
+    #[test]
+    fn overlay_clears_clipped_conversation_from_centered_panel_margins() {
+        let (model, theme) = ctx_fixture();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        for cell in &mut buf.content { cell.set_symbol("X").set_bg(ratatui::style::Color::Red); }
+        let mut slots = Slots::default();
+        slots.mount(OVERLAY, 1, Box::new(Probe { name: "modal", wants: true }));
+        slots.render(&ctx, area, &mut buf);
+        assert!(buf.content.iter().all(|cell| cell.symbol() == " "));
+        assert_eq!(buf[(0, 0)].bg, theme.overlay.bg.unwrap_or(ratatui::style::Color::Reset));
     }
 
     #[test]

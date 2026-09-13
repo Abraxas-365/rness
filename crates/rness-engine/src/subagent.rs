@@ -161,6 +161,8 @@ pub struct SubagentRuntime {
     /// Hard ceiling on delegation depth (root = 0). Runaway recursive
     /// delegation dies here, not in a stack.
     max_depth: u32,
+    /// Per-root user aliases, retained as tombstones when sessions disappear.
+    user_aliases: std::sync::Mutex<HashMap<SessionId, Vec<SessionId>>>,
     pub activity: SubagentActivity,
     /// Live settle-watch subscriptions for continuable children;
     /// dropped with the runtime.
@@ -173,6 +175,7 @@ impl SubagentRuntime {
             sessions: Arc::clone(&sessions),
             providers: RwLock::new(HashMap::new()),
             max_depth,
+            user_aliases: Default::default(),
             activity: SubagentActivity::default(),
             watchers: std::sync::Mutex::new(Vec::new()),
         };
@@ -412,6 +415,45 @@ impl SubagentRuntime {
         )?)
     }
 
+    /// User intervention, deliberately separate from model-facing send_message.
+    /// Trusted frontends supply the invoking conversation, not an agent sender.
+    /// Existing user-message content durably records the user origin and scope.
+    pub fn steer_user(
+        &self,
+        caller: &SessionId,
+        target: &SessionId,
+        text: String,
+    ) -> Result<Disposition, SubagentError> {
+        if text.trim().is_empty() {
+            return Err(ServiceError::InvalidConfig("user steering requires a message".into()).into());
+        }
+        self.authorize_descendant(caller, target)?;
+        if self.sessions.store().delegation(target)?.is_none_or(|d| d.mode != DelegationMode::Continuable) {
+            return Err(SubagentError::NotAuthorized(
+                "user steering requires a continuable subagent; one-shot children cannot receive messages".into(),
+            ));
+        }
+        let disposition = self.sessions.send(
+            target,
+            UserIntent::Steer,
+            vec![ContentPart::Text {
+                text: format!("User steering from conversation {caller}:\n{text}"),
+            }],
+        )?;
+        // The invoking command owns caller's operation reservation. Reuse the
+        // reservation-aware notice path asynchronously, never wait on the Lua
+        // actor and never impersonate the principal agent.
+        let sessions = Arc::clone(&self.sessions);
+        let caller = caller.clone();
+        let notice = format!("User intervened in subagent {target} with steering:\n{text}");
+        tokio::spawn(async move {
+            if let Err(error) = sessions.notify_user_intervention(&caller, notice).await {
+                tracing::error!(session = %caller, %error, "user intervention notice failed");
+            }
+        });
+        Ok(disposition)
+    }
+
     /// Stop only the target's current turn (dsh interrupt_agent): queued
     /// followups stay parked, descendants keep running, the child stays
     /// available. Caller must be a delegation ancestor of the target.
@@ -421,29 +463,25 @@ impl SubagentRuntime {
         caller: &SessionId,
         target: &SessionId,
     ) -> Result<(), SubagentError> {
-        // Walk the durable delegation chain from target up to caller.
-        let mut cursor = target.clone();
-        let mut hops = 0u32;
-        let authorized = loop {
-            match self.sessions.store().delegation(&cursor)? {
-                Some(d) if &d.parent == caller => break true,
-                Some(d) => {
-                    cursor = d.parent;
-                    hops += 1;
-                    if hops > self.max_depth {
-                        break false;
-                    }
-                }
-                None => break false,
-            }
-        };
-        if !authorized {
-            return Err(SubagentError::NotAuthorized(format!(
-                "{caller} is not a delegation ancestor of {target}"
-            )));
-        }
+        self.authorize_descendant(caller, target)?;
         self.sessions.cancel(target);
         Ok(())
+    }
+
+    fn authorize_descendant(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
+        // Follow durable ancestry, not caller-supplied depth or UI membership.
+        // A visited set rejects malformed cycles without relying on today's
+        // max-depth setting (which may differ from the creation-time setting).
+        let mut cursor = target.clone();
+        let mut seen = std::collections::HashSet::from([target.clone()]);
+        while let Some(d) = self.sessions.store().delegation(&cursor)? {
+            if !seen.insert(d.parent.clone()) { break; }
+            if &d.parent == caller { return Ok(()); }
+            cursor = d.parent;
+        }
+        Err(SubagentError::NotAuthorized(format!(
+            "{caller} is not a delegation ancestor of {target}"
+        )))
     }
 
     /// The continuable children below `root`: direct children, or the
@@ -457,10 +495,23 @@ impl SubagentRuntime {
         self.list_delegated(root, descendants, false)
     }
 
-    /// All delegated descendants, including one-shot children, for user controls.
-    /// Model-facing list_children intentionally remains continuable-only.
+    /// All descendants for user controls with append-only aliases per root.
+    /// First observation sorts full IDs; later discoveries append, never reuse
+    /// deleted entries. Aliases last for this runtime, full IDs across restarts.
+    /// Model-facing list_children intentionally retains its tree ordering.
     pub fn list_agents(&self, root: &SessionId) -> Result<Vec<ChildAgent>, SubagentError> {
-        self.list_delegated(root, true, true)
+        let mut aliases = self.user_aliases.lock().expect("user aliases lock");
+        let ids = aliases.entry(root.clone()).or_default();
+        let mut agents = self.list_delegated(root, true, true)?;
+        agents.sort_by(|a, b| a.session.cmp(&b.session));
+        for child in &agents {
+            if !ids.contains(&child.session) { ids.push(child.session.clone()); }
+        }
+        agents.sort_by_key(|child| ids.iter().position(|id| id == &child.session).unwrap());
+        for child in &mut agents {
+            child.alias = Some(format!("a{}", ids.iter().position(|id| id == &child.session).unwrap() + 1));
+        }
+        Ok(agents)
     }
 
     fn list_delegated(&self, root: &SessionId, descendants: bool, include_one_shot: bool) -> Result<Vec<ChildAgent>, SubagentError> {
@@ -484,6 +535,7 @@ impl SubagentRuntime {
             let Some(children) = by_parent.get(&node) else { continue };
             for (id, d) in children {
                 out.push(ChildAgent {
+                    alias: None,
                     session: id.clone(),
                     parent: d.parent.clone(),
                     depth: d.depth,
@@ -504,6 +556,8 @@ impl SubagentRuntime {
 /// One continuable child in a discovery listing ([`SubagentRuntime::list_children`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildAgent {
+    /// User-list alias only, stable per root for this runtime's lifetime.
+    pub alias: Option<String>,
     pub session: SessionId,
     /// Durable direct-parent session id.
     pub parent: SessionId,

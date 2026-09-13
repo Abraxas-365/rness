@@ -738,6 +738,15 @@ impl SessionService {
         self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, Notice::Job, Some((activity, operation)))
     }
 
+    /// Record user intervention without waking an idle principal. Await the
+    /// invoking command's reservation and use the normal single-writer inbox.
+    pub(crate) async fn notify_user_intervention(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+        let activity = self.lifecycle.clone().read_owned().await;
+        let operation = self.live(session).operation.clone().lock_owned().await;
+        self.send_or_retry(session, UserIntent::Inject, vec![ContentPart::Text { text }], false,
+            Notice::Subagent, Some((activity, operation)))
+    }
+
     /// Deliver a continuable child's closing answer, without the job wake
     /// budget. Wait out command reservations instead of dropping busy notices.
     pub async fn notify_subagent_settled(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {

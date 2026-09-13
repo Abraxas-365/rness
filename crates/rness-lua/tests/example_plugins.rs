@@ -37,17 +37,163 @@ async fn structured_statusline_callbacks_replace_and_unload() {
 }
 
 #[tokio::test]
-async fn default_subagent_renderer_shows_task_command_and_live_text() {
+async fn default_subagent_renderer_bounds_activity_without_nested_dumps() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    let lines = host.tool_card_presented("subagent",
+        serde_json::json!({"agent":"scout", "prompt":"Inspect 日本語\n".repeat(100)}), "RAW-CALL-OUTPUT", false,
+        Some(serde_json::json!({"kind":"subagent_activity", "session":"01M2DTFV0CNHXA1QKQ02V5Q2J4", "status":"running",
+            "activity":"RAW-ACTIVITY-ARGS", "elapsed_ms":2000,
+            "lines":["> Bash RAW-LINES", "RAW-RESULT"], "streams":{"c":"RAW-STREAM"},
+            "live":"Checking next file\n".repeat(100),
+            "tools":[
+                {"name":"Read", "status":"done", "args":{"path":"RAW-PATH"}, "output":"RAW-OUTPUT"},
+                {"name":"Bash", "status":"running", "args":{"command":"RAW-COMMAND"}, "stream":"RAW-TOOL-STREAM"},
+                {"name":"Grep", "status":"failed"}, {"name":"Bash", "status":"cancelled"}
+            ]}))).await.unwrap();
+    assert_eq!(lines.len(), 6);
+    assert!(lines.iter().all(|line| line.structured && line.block.is_none()));
+    assert!(lines[0].is_header);
+    assert_eq!(lines[0].text, "scout · 02V5Q2J4 · running · 2s");
+    assert!(lines[1].text.starts_with("Task: Inspect 日本語 Inspect"));
+    assert!(lines[1].text.ends_with('…'));
+    assert!(lines[1].text.chars().count() <= 246);
+    assert_eq!(lines[2].text, "Activity: Bash");
+    assert_eq!(lines[3].text, "Recent tools: 4 · 1 running · 1 done · 1 failed · 1 cancelled");
+    assert_eq!(lines[3].style, "error");
+    assert!(lines[4].text.ends_with('…'));
+    assert!(lines[4].text.chars().count() <= 160);
+    assert!(lines.iter().all(|line| !line.text.contains("RAW-")));
+}
+
+#[tokio::test]
+async fn default_subagent_renderer_preserves_bounded_old_metadata_fallback() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
     let (host, _) = LuaHost::spawn_from_init(root).unwrap();
     let lines = host.tool_card_presented("subagent", serde_json::json!({"agent":"scout", "prompt":"Inspect tests"}), "", false,
-        Some(serde_json::json!({"kind":"subagent_activity", "status":"running", "activity":"Bash cargo test", "elapsed_ms":2000,
-            "lines":["> Bash cargo test", "passed"], "live":"Checking next file"}))).await.unwrap();
-    assert!(lines[0].is_header);
-    assert!(lines[0].text.contains("scout · running · 2s"));
-    assert!(lines.iter().any(|line| line.text == "Inspect tests"));
-    assert!(lines.iter().any(|line| line.text == "> Bash cargo test"));
-    assert!(lines.iter().any(|line| line.text == "Checking next file"));
+        Some(serde_json::json!({"kind":"subagent_activity", "status":"running", "activity":"Bash cargo test\n".repeat(100), "elapsed_ms":2000,
+            "lines":["> Bash RAW-DUMP", "RAW-DUMP"], "streams":{"c":"RAW-DUMP"}, "live":"Checking next file"}))).await.unwrap();
+    assert_eq!(lines[0].text, "scout · running · 2s");
+    assert_eq!(lines[1].text, "Task: Inspect tests");
+    assert!(lines[2].text.starts_with("Activity: Bash cargo test"));
+    assert!(lines[2].text.ends_with('…'));
+    assert!(lines[2].text.chars().count() <= 170);
+    assert_eq!(lines[3].text, "Checking next file");
+    assert_eq!(lines.len(), 5);
+    assert!(lines.iter().all(|line| !line.text.contains("RAW-DUMP")));
+}
+
+#[tokio::test]
+async fn default_subagent_renderer_handles_missing_metadata_and_errors() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    for meta in [None, Some(serde_json::json!("invalid")), Some(serde_json::json!({"kind":"other"}))] {
+        assert!(host.tool_card_presented("subagent", serde_json::json!({}), "original failure", true, meta).await.is_none());
+    }
+    let lines = host.tool_card_presented("subagent", serde_json::Value::Null, "", false,
+        Some(serde_json::json!({"kind":"subagent_activity"}))).await.unwrap();
+    assert_eq!(lines[0].text, "subagent · unknown");
+    assert_eq!(lines[1].text, "Task: Not available");
+    assert_eq!(lines[2].text, "Activity: unknown");
+    for status in ["completed", "cancelled", "error", "failed"] {
+        let lines = host.tool_card_presented("subagent", serde_json::json!({}), "", false,
+            Some(serde_json::json!({"kind":"subagent_activity", "status":status, "tools":[]}))).await.unwrap();
+        assert_eq!(lines[0].text, format!("subagent · {}", if status == "completed" { "finished" } else { status }));
+        assert_eq!(lines[0].style, if matches!(status, "error" | "failed") { "error" } else { "tool_name" });
+        assert!(lines[3].text.starts_with("Recent tools: 0"));
+    }
+    let lines = host.tool_card_presented("subagent", serde_json::json!({"prompt":42}), &"failure\n".repeat(100), true,
+        Some(serde_json::json!({"kind":"subagent_activity", "status":"running", "elapsed_ms":"invalid", "tools":[null, 42, {}], "live":false}))).await.unwrap();
+    assert_eq!(lines[0].text, "subagent · failed");
+    assert_eq!(lines[0].style, "error");
+    assert_eq!(lines[lines.len() - 2].style, "error");
+    assert!(lines[lines.len() - 2].text.chars().count() <= 200);
+    assert_eq!(lines.last().unwrap().text, "Inspect: select card, i");
+    for (args, meta) in [
+        (serde_json::json!({"background_mode":"continuable"}), serde_json::json!({"kind":"subagent_activity", "status":"completed"})),
+        (serde_json::json!({}), serde_json::json!({"kind":"subagent_activity", "status":"completed", "mode":"continuable"})),
+    ] {
+        let lines = host.tool_card_presented("subagent", args, "", false, Some(meta)).await.unwrap();
+        assert_eq!(lines[0].text, "subagent · idle");
+    }
+}
+
+#[tokio::test]
+async fn default_send_message_renderer_preserves_actual_long_multiline_message() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, config) = LuaHost::spawn_from_init(root).unwrap();
+    assert_eq!(config.messagebox["tools"]["send_message"]["display"], "preview");
+    assert_eq!(config.messagebox["tools"]["send_message"]["preview_lines"], 4);
+    for message in ["日本語 café ".repeat(1000), "First line\n\n  preserve indentation\n".repeat(30)] {
+        for meta in [None, Some(serde_json::json!({"kind":"send_message", "agent_id":"stale-recipient", "accepted":true, "message":"not the actual message"}))] {
+            let lines = host.tool_card_presented("send_message", serde_json::json!({"agent_id":"child-123", "message":message}),
+                "message accepted by child-123", false, meta).await.unwrap();
+            assert_eq!(lines[0].text, "Send message → child-123 · Accepted");
+            assert!(lines[0].is_header);
+            assert!(lines.iter().all(|line| line.structured));
+            // The existing card preview/expand mechanism receives all message text.
+            assert_eq!(lines[1..].iter().map(|line| line.text.as_str()).collect::<Vec<_>>().join("\n"), message);
+        }
+    }
+}
+
+#[tokio::test]
+async fn default_send_message_renderer_handles_errors_and_metadata_fallback() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    for (is_error, meta) in [
+        (true, None),
+        (true, Some(serde_json::json!({"accepted":true}))),
+        (false, Some(serde_json::json!({"accepted":false}))),
+    ] {
+        let lines = host.tool_card_presented("send_message", serde_json::json!({"agent_id":"child-123", "message":"Please review\nnext file"}),
+            "message not delivered: unknown agent", is_error, meta).await.unwrap();
+        assert_eq!(lines[0].text, "Send message → child-123 · failed");
+        assert_eq!(lines[0].style, "error");
+        assert_eq!(lines[1].text, "Please review");
+        assert_eq!(lines[2].text, "next file");
+        assert_eq!(lines[3].text, "message not delivered: unknown agent");
+        assert_eq!(lines[3].style, "error");
+    }
+    let lines = host.tool_card_presented("send_message", serde_json::Value::Null, "", false,
+        Some(serde_json::json!({"kind":"send_message", "agent_id":"legacy-child", "accepted":true}))).await.unwrap();
+    assert_eq!(lines[0].text, "Send message → legacy-child · Accepted");
+    assert_eq!(lines[1].text, "Message unavailable");
+    let lines = host.tool_card_presented("send_message", serde_json::json!({"agent_id":42, "message":false}), "", true,
+        Some(serde_json::json!("invalid"))).await.unwrap();
+    assert_eq!(lines[0].text, "Send message → Unknown recipient · failed");
+    assert_eq!(lines[1].text, "Message unavailable");
+    assert_eq!(lines[2].text, "Message not accepted");
+}
+
+#[tokio::test]
+async fn default_tool_renderers_respect_live_status() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    for (name, args) in [
+        ("Bash", serde_json::json!({"command":"cargo test"})),
+        ("Glob", serde_json::json!({"pattern":"*.rs"})),
+        ("Grep", serde_json::json!({"pattern":"test"})),
+        ("Read", serde_json::json!({"path":"src/lib.rs"})),
+        ("Write", serde_json::json!({"path":"src/lib.rs", "content":"// test"})),
+        ("send_message", serde_json::json!({"agent_id":"child", "message":"Review"})),
+        ("web_search", serde_json::json!({"query":"Rust"})),
+        ("web_fetch", serde_json::json!({"url":"https://example.com"})),
+    ] {
+        let lines = host.tool_card_presented(name, args, "", false,
+            Some(serde_json::json!({"kind":"tool_live", "status":"running", "duration_ms":1200}))).await.unwrap();
+        let header = &lines[0];
+        assert!(header.is_header);
+        assert!(header.text.contains("running") || header.spans.iter().chain(&header.right).any(|s| s.text == "running"), "{name}");
+        assert!(!header.spans.iter().chain(&header.right).any(|s| s.text == "done"));
+        if name == "Bash" {
+            assert_eq!(header.right[0].text, "1200 ms");
+            assert_eq!(lines[1].block.as_ref().unwrap()["text"], "cargo test");
+        }
+    }
+    let lines = host.tool_card_presented("Bash", serde_json::json!({"command":"false"}), "failure", true,
+        Some(serde_json::json!({"kind":"tool_live", "status":"running"}))).await.unwrap();
+    assert!(lines[0].spans.iter().any(|span| span.text == "failed"));
 }
 
 #[tokio::test]
@@ -382,6 +528,7 @@ async fn agents_command_lists_completes_and_stops_while_parent_runs() {
     let unrelated = sessions.create(None).unwrap();
     let child = sessions.create_delegated(None, Delegation { parent: parent.clone(), depth: 1,
         call: None, mode: DelegationMode::Continuable }).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     let grandchild = sessions.create_delegated(None, Delegation { parent: child.clone(), depth: 2,
         call: None, mode: DelegationMode::OneShot }).unwrap();
     for id in [&parent, &child, &grandchild, &unrelated] {
@@ -408,26 +555,42 @@ async fn agents_command_lists_completes_and_stops_while_parent_runs() {
             }
         }).await.expect("command admission")
     }
-    for input in ["/agents", "/agents stop"] {
-        let result = command(&sessions, &parent, input.into()).await.unwrap();
-        assert!(matches!(result, Disposition::Command(result) if result.message.contains(&child) && result.message.contains(&grandchild)));
-    }
+    let result = command(&sessions, &parent, "/agents".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result)
+        if result.data == serde_json::json!({"action":"agents:open", "session":parent})));
+    let result = command(&sessions, &parent, "/agents stop".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result) if result.message.contains(&child) && result.message.contains(&grandchild)));
     for id in [&parent, &unrelated, &"unknown".to_string()] {
         assert!(command(&sessions, &parent, format!("/agents stop {id}")).await.is_err());
     }
     assert!(command(&sessions, &parent, "/agents stop extra args".into()).await.is_err());
+    assert!(command(&sessions, &parent, "/agents a2 steer".into()).await.is_err());
+    assert!(command(&sessions, &parent, "/agents a2 steer redirect work".into()).await.is_err());
+    let result = command(&sessions, &parent, "/agents a1 steer redirect work".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result) if result.message.contains("User steering sent")));
+    let result = command(&sessions, &parent, "/agents a2".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result)
+        if result.data == serde_json::json!({"action":"agents:open", "session":parent, "agent":grandchild})));
     command(&sessions, &parent, format!("/agents stop {child}")).await.unwrap();
+    assert_eq!(sessions.phase(&child), Phase::Running);
+    command(&sessions, &parent, format!("/agents {child} stop confirm")).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), sessions.join(&child)).await.unwrap();
     assert_eq!(sessions.phase(&parent), Phase::Running);
     assert_eq!(sessions.phase(&grandchild), Phase::Running);
-    // Only one running descendant remains, so omitting the ID is unambiguous.
-    command(&sessions, &parent, "/agents stop".into()).await.unwrap();
+    // Only one running descendant remains, so omitting the ID selects it for confirmation.
+    let result = command(&sessions, &parent, "/agents stop".into()).await.unwrap();
+    assert!(matches!(result, Disposition::Command(result)
+        if result.message.contains(&format!("/agents {grandchild} stop confirm"))));
+    assert_eq!(sessions.phase(&grandchild), Phase::Running);
+    command(&sessions, &parent, format!("/agents {grandchild} stop confirm")).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), sessions.join(&grandchild)).await.unwrap();
     let result = command(&sessions, &parent, "/agents stop".into()).await.unwrap();
     assert!(matches!(result, Disposition::Command(result) if result.message == "No running subagents."));
     let prepared = sessions.prepare_command(&parent, "/agents stop ").unwrap().unwrap();
     let service = sessions.clone();
-    assert_eq!(tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap(), vec!["stop"]);
+    let choices = tokio::task::spawn_blocking(move || prepared.complete(&service)).await.unwrap().unwrap();
+    assert!(choices.contains(&"a1".into()));
+    assert!(!choices.contains(&format!("stop {child}")));
     for id in [&parent, &unrelated] { sessions.cancel(id); sessions.join(id).await; }
     assert!(sessions.prepare_command(&parent, "/ordinary").unwrap().is_some());
 }

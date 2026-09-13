@@ -676,6 +676,11 @@ const SELECTION_KEYS: &[(&str, &[&str], &str)] = &[
 ];
 
 impl Chat {
+    /// Independent interaction state backed by a host-published card cache.
+    pub fn with_cards(cards: CardCache) -> Self {
+        Self { cards, ..Default::default() }
+    }
+
     fn selection_keys(&self, action: &str, defaults: &[&str]) -> Vec<String> {
         match &self.config["keys"][action] {
             serde_json::Value::Bool(false) => Vec::new(),
@@ -720,6 +725,46 @@ impl Component for Chat {
         ctx: &Ctx<'_>,
         key: crossterm::event::KeyEvent,
     ) -> crate::component::KeyOutcome {
+        if key.code == crossterm::event::KeyCode::Char('i')
+            && key.modifiers.is_empty()
+            && key.kind != crossterm::event::KeyEventKind::Release
+        {
+            let selected_call = self.selected_message.as_ref().and_then(|id| {
+                ctx.model.entry_ids.iter().position(|entry| entry == id)
+                    .and_then(|index| ctx.model.entries.get(index))
+                    .and_then(|entry| match entry {
+                        Entry::ToolResult { call, .. } => Some(call),
+                        Entry::Assistant { content, .. } => content.iter().find_map(|part| match part {
+                            ContentPart::ToolUse { call, name, .. } if name == "subagent" || name == "send_message" => Some(call),
+                            _ => None,
+                        }),
+                        _ => None,
+                    }).or(Some(id))
+            });
+            if let Some(call) = selected_call.or(self.focused_call.as_ref()) {
+                let durable = ctx.model.entries.iter().find_map(|entry| {
+                    if let Entry::Assistant { content, .. } = entry {
+                        content.iter().find_map(|part| match part {
+                            ContentPart::ToolUse { call: id, name, args } if id == call => Some((name.as_str(), args.clone())),
+                            _ => None,
+                        })
+                    } else { None }
+                });
+                let tool = durable.or_else(|| {
+                    let live = ctx.model.live.as_ref()?;
+                    let (_, name) = live.running_tools.iter().find(|(id, _)| id == call)?;
+                    let args = live.tool_args.iter().find(|(id, _)| id == call)
+                        .and_then(|(_, args)| serde_json::from_str(args).ok()).unwrap_or_default();
+                    Some((name.as_str(), args))
+                });
+                if let Some(("subagent" | "send_message", args)) = tool {
+                    return crate::component::KeyOutcome::act(vec![crate::app::Action::Custom(
+                        "agents:inspect".into(),
+                        serde_json::json!({"session":ctx.model.session,"call":call,"target":args["agent_id"]}),
+                    )]);
+                }
+            }
+        }
         if let Some(id) = self.selected_message.clone() {
             use crate::app::Action;
             use crate::component::KeyOutcome;
@@ -2266,6 +2311,29 @@ impl Component for Chat {
 #[cfg(test)]
 mod tests {
     use super::sanitize;
+
+    #[test]
+    fn inspect_agent_from_focused_or_selected_tool() {
+        use super::*;
+        use crate::{app::{Action, Model}, theme::Theme};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut model = Model::new("root".into(), String::new());
+        model.entries.push(Entry::Assistant { model: "m".into(), content: vec![ContentPart::ToolUse {
+            call: "call".into(), name: "send_message".into(), args: serde_json::json!({"agent_id":"child"}),
+        }] });
+        model.entries.push(Entry::ToolResult { call: "call".into(), name: "send_message".into(), output: "ok".into(), is_error: false });
+        model.entry_ids = vec!["assistant".into(), "result".into()];
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        for selected in [None, Some("assistant"), Some("result")] {
+            let mut chat = Chat::with_cards(CardCache::default());
+            chat.focused_call = Some("call".into());
+            chat.selected_message = selected.map(str::to_owned);
+            let outcome = chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+            assert!(matches!(outcome.actions.as_slice(), [Action::Custom(name, payload)]
+                if name == "agents:inspect" && payload["call"] == "call" && payload["target"] == "child" && payload["session"] == "root"));
+        }
+    }
 
     /// Render-only diagnostic: no terminal I/O, event loop, or Lua card publication.
     /// Run alone with --ignored --nocapture (prefer --release for useful timings).

@@ -9,6 +9,7 @@
 //! Currently: TUI (default) or headless one-shot with -p.
 
 mod activity_recovery;
+mod agent_monitor;
 
 use std::sync::Arc;
 
@@ -884,7 +885,16 @@ impl rness_tui::app::Backend for LocalBackend {
                     tokio::spawn(async move {
                         let result = tokio::task::spawn_blocking(move || command.execute(&sessions)).await;
                         let message = match result {
-                            Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => result.message,
+                            Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => {
+                                // Command data is not a generic UI-action capability. Only the
+                                // read-only agent monitor route is accepted here, session-scoped.
+                                if result.data["action"] == "agents:open" {
+                                    let mut payload = result.data.clone();
+                                    payload["session"] = serde_json::json!(session);
+                                    let _ = tx.send(rness_tui::app::Action::Custom("agents:open".into(), payload));
+                                }
+                                result.message
+                            },
                             Ok(Ok(_)) => unreachable!("prepared command always returns a command result"),
                             Ok(Err(error)) => error.to_string(),
                             Err(error) => format!("Command failed: {error}"),
@@ -960,6 +970,10 @@ async fn run_tui(
     // components will use (priority + wants() selection).
     let mut slots = Slots::default();
     let card_cache = chat::install(&mut slots);
+    let agent_monitor = rness_tui::modules::agents::install(&mut slots, card_cache.clone());
+    let monitor_frames = agent_monitor.clone();
+    let _monitor_sub = kernel.bus().on::<FrameEv>(move |frame| monitor_frames.observe(frame));
+    let monitor_task = agent_monitor::spawn(sessions.clone(), subagents.clone(), lua.clone(), agent_monitor.clone());
     let mut candidates = vec![("unload".into(), "Command: unload a plugin".into()), ("agent".into(), "Command: choose an agent".into()), ("skill".into(), "Command: invoke a skill".into())];
     for (name, definition) in sessions.agents() {
         candidates.push((format!("agent {name}"), definition.description.clone()));
@@ -1277,6 +1291,7 @@ async fn run_tui(
         let epoch = presentation_epoch.clone();
         let status = status_text.clone();
         let cards = card_cache.clone();
+        let monitor = agent_monitor.clone();
         let keys = keymap.clone();
         let lua = lua.clone();
         let state = apps_state.clone();
@@ -1316,6 +1331,7 @@ async fn run_tui(
                         let epoch = epoch.clone();
                         let status = status.clone();
                         let cards = cards.clone();
+                        let monitor = monitor.clone();
                         let keys = keys.clone();
                         let apps = state.clone();
                         let result = lua.unload_coordinated(&name, installed_lua_tools.clone(), move |snapshot| {
@@ -1323,6 +1339,7 @@ async fn run_tui(
                             *generation = generation.checked_add(1).expect("presentation generation exhausted");
                             status.invalidate();
                             cards.invalidate();
+                            monitor.invalidate_cards();
                             apps.invalidate();
                             apps.set_apps(snapshot.apps.into_iter().map(|s| ext_apps::AppInfo {
                                 name: s.name, slot: s.slot, title: s.title, keymap: s.keymap,
@@ -1416,6 +1433,7 @@ async fn run_tui(
     status_task.abort();
     card_task.abort();
     activity_task.abort();
+    monitor_task.abort();
     apps_task.abort();
 
     // Suppress child-result wakes before letting the in-flight turn settle.
