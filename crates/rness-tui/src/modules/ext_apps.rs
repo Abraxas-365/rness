@@ -25,7 +25,7 @@ use crate::component::{Component, Ctx, KeyOutcome};
 use crate::slots::{Slots, OVERLAY, SIDEBAR};
 
 /// One registered external app (mirrors the provider's spec).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppInfo {
     pub name: String,
     /// "sidebar" or "overlay".
@@ -33,6 +33,9 @@ pub struct AppInfo {
     pub title: String,
     /// Toggle key, e.g. "ctrl+e" (parsed by [`matches_keymap`]).
     pub keymap: Option<String>,
+    pub refresh_ms: Option<u64>,
+    pub capture_escape: bool,
+    pub config: serde_json::Value,
 }
 
 /// What the components send the host.
@@ -58,6 +61,8 @@ struct Inner {
     viewports: std::collections::HashMap<String, (u16, u16)>,
     /// The one visible app per slot kind (single-active keeps focus sane).
     active: Option<String>,
+    session: Option<String>,
+    runtime_generation: u64,
 }
 
 /// Shared cell: host writes roster + views, components read; toggle flips.
@@ -68,6 +73,48 @@ pub struct AppsState {
 }
 
 impl AppsState {
+    pub fn session(&self) -> Option<String> {
+        self.inner.read().expect("apps lock").session.clone()
+    }
+
+    pub fn set_session(&self, session: String) {
+        let mut inner = self.inner.write().expect("apps lock");
+        if inner.session.as_ref() == Some(&session) { return; }
+        inner.session = Some(session);
+        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.views.clear();
+        inner.active = None;
+    }
+
+    /// Snapshot context and activation under one lock, never dispatching an old
+    /// key with a newly selected session's identity.
+    pub fn context_if_current(&self, generation: u64, name: &str) -> Option<serde_json::Value> {
+        let inner = self.inner.read().expect("apps lock");
+        if inner.generation != generation || inner.active.as_deref() != Some(name) { return None; }
+        let app = inner.apps.iter().find(|app| app.name == name)?;
+        let mut ctx = serde_json::json!({"session":inner.session.as_ref()?});
+        if let Some((rows, cols)) = inner.viewports.get(&app.slot) {
+            ctx["rows"] = serde_json::json!(rows);
+            ctx["cols"] = serde_json::json!(cols);
+        }
+        Some(ctx)
+    }
+
+    pub fn runtime_generation(&self) -> u64 {
+        self.inner.read().expect("apps lock").runtime_generation
+    }
+
+    /// Reload may replace callbacks without changing any app metadata.
+    pub fn set_runtime_generation(&self, generation: u64) {
+        let mut inner = self.inner.write().expect("apps lock");
+        if inner.runtime_generation == generation { return; }
+        inner.runtime_generation = generation;
+        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.views.clear();
+    }
+
     pub fn track_input_epoch(&self, epoch: Arc<std::sync::atomic::AtomicU64>) {
         self.inner.write().expect("apps lock").input_epoch = Some(epoch);
     }
@@ -189,6 +236,14 @@ impl AppsState {
         true
     }
 
+    /// Refresh only the activation whose action batch was just applied.
+    pub fn refresh_if_current(&self, generation: u64, name: &str) {
+        let inner = self.inner.read().expect("apps lock");
+        if inner.generation == generation && inner.active.as_deref() == Some(name) {
+            self.send(AppEvent::Shown(name.into()));
+        }
+    }
+
     pub fn request_unload(&self, name: String) {
         self.send(AppEvent::Unload(name));
     }
@@ -197,6 +252,26 @@ impl AppsState {
         if let Some(tx) = self.events.read().expect("apps lock").as_ref() {
             let _ = tx.send(ev);
         }
+    }
+
+    /// Open only a registered app. Reopening starts a fresh activation, so stale
+    /// views and key effects from a previous command cannot leak into it.
+    pub fn open(&self, name: &str) -> bool {
+        let mut inner = self.inner.write().expect("apps lock");
+        if !inner.apps.iter().any(|app| app.name == name) { return false; }
+        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.active = Some(name.into());
+        inner.views.remove(name);
+        drop(inner);
+        self.send(AppEvent::Shown(name.into()));
+        true
+    }
+
+    pub fn refresh_ms(&self) -> Option<u64> {
+        let inner = self.inner.read().expect("apps lock");
+        let active = inner.active.as_ref()?;
+        inner.apps.iter().find(|app| &app.name == active)?.refresh_ms.map(|ms| ms.clamp(50, 60_000))
     }
 
     /// Toggle the app bound to this key, if any. Returns true if handled.
@@ -300,49 +375,55 @@ impl Component for ExtApp {
     }
 
     fn height(&self, _ctx: &Ctx<'_>, width: u16) -> Option<u16> {
+        let app = self.state.active_in_slot(self.slot)?;
         match self.slot {
             // Reinterpreted as width by the sidebar slot.
-            SIDEBAR => Some(34.min(width / 3)),
+            SIDEBAR => Some(app.config["width"].as_u64().unwrap_or(u64::from(34.min(width / 3))).min(u64::from(width)) as u16),
             _ => {
-                let app = self.state.active_in_slot(self.slot)?;
-                let lines = self.state.view_of(&app.name).len() as u16;
-                Some((lines + 2).clamp(5, 30)) // + borders
+                let lines = self.state.view_of(&app.name).len().saturating_add(2).clamp(5, 30);
+                Some(app.config["height"].as_u64().unwrap_or(lines as u64).min(u64::from(u16::MAX)) as u16)
             }
         }
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
         let Some(app) = self.state.active_in_slot(self.slot) else { return };
-        // Record the viewport (content rows inside borders) so the host
-        // can hand it to the app's next view as `ctx.rows`.
-        let viewport = (area.height.saturating_sub(2), area.width.saturating_sub(2));
+        use crate::core::terminal_text::sanitize;
+        use ratatui::widgets::BorderType;
+        let width = app.config["width"].as_u64().unwrap_or(u64::from(area.width)).min(u64::from(area.width)) as u16;
+        let area = Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height);
+        let resolve = |value: &serde_json::Value, fallback| ctx.theme.resolve_style(value, fallback).unwrap_or(fallback);
+        let style = resolve(&app.config["style"], ctx.theme.overlay);
+        let border = &app.config["border"];
+        let kind = border["kind"].as_str().unwrap_or("plain");
+        let block = Block::default()
+            .borders(if kind == "none" { Borders::NONE } else { Borders::ALL })
+            .border_type(match kind { "rounded" => BorderType::Rounded, "double" => BorderType::Double, _ => BorderType::Plain })
+            .border_style(resolve(&border["style"], ctx.theme.overlay_border))
+            .title(Line::styled(format!(" {} ", sanitize(&app.title)), resolve(&app.config["title_style"], style)));
+        let content = block.inner(area);
+        let viewport = (content.height, content.width);
         let previous = self.state.inner.write().expect("apps lock")
             .viewports.insert(self.slot.into(), viewport);
         if previous != Some(viewport) { self.state.send(AppEvent::Shown(app.name.clone())); }
-        let lines: Vec<Line> =
-            self.state.view_of(&app.name).into_iter().map(Line::from).collect();
-        // Solid background: overlays float over the chat.
+        let lines: Vec<Line> = self.state.view_of(&app.name).into_iter()
+            .map(|line| Line::from(sanitize(&line))).collect();
+        // Clear symbols AND old style flags before painting the opaque panel.
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
-                buf[(x, y)].set_style(ctx.theme.overlay).set_symbol(" ");
+                buf[(x, y)].reset();
+                buf[(x, y)].set_style(style);
             }
         }
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(ctx.theme.overlay_border)
-                    .title(format!(" {} ", app.title)),
-            )
-            .render(area, buf);
+        Paragraph::new(lines).style(style).block(block).render(area, buf);
     }
 
     fn on_key(&mut self, _ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
         let Some(app) = self.state.active_in_slot(self.slot) else {
             return KeyOutcome::pass();
         };
-        // Esc always closes locally — instant, even if the VM is stuck.
-        if key.code == KeyCode::Esc {
+        // Legacy apps close locally. Opted-in apps can use Esc for back navigation.
+        if key.code == KeyCode::Esc && !app.capture_escape {
             self.state.close();
             return KeyOutcome::consumed();
         }
@@ -379,11 +460,75 @@ mod tests {
     use crate::theme::Theme;
 
     #[test]
+    fn command_open_refresh_and_escape_are_opt_in_and_generation_safe() {
+        let mut slots = Slots::default();
+        let state = install(&mut slots);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.connect(tx);
+        state.set_apps(vec![AppInfo { name: "jobs".into(), slot: OVERLAY.into(),
+            refresh_ms: Some(250), capture_escape: true, ..Default::default() }]);
+        assert_eq!(state.refresh_ms(), None);
+        assert!(!state.open("missing"));
+        assert!(state.open("jobs"));
+        assert_eq!(state.refresh_ms(), Some(250));
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("jobs".into()));
+        let old = state.generation();
+        assert!(state.open("jobs"));
+        assert!(!state.publish_if_current(old, "jobs", vec!["stale".into()]));
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("jobs".into()));
+        let model = Model::new("s".into(), "m".into());
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        slots.focused_mut(&ctx).unwrap().on_key(&ctx, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(rx.try_recv().unwrap(), AppEvent::Key("jobs".into(), "esc".into(), state.generation()));
+        assert_eq!(state.active().as_deref(), Some("jobs"));
+        let generation = state.generation();
+        state.set_session("s".into());
+        assert_eq!(state.context_if_current(generation, "jobs"), None);
+        state.open("jobs");
+        let generation = state.generation();
+        assert_eq!(state.context_if_current(generation, "jobs").unwrap()["session"], "s");
+        state.set_runtime_generation(7);
+        assert_eq!(state.context_if_current(generation, "jobs"), None);
+        assert_eq!(state.active().as_deref(), Some("jobs"));
+        let generation = state.generation();
+        state.set_session("other".into());
+        assert_eq!(state.active(), None);
+        assert_eq!(state.refresh_ms(), None);
+        assert!(!state.publish_if_current(generation, "jobs", vec!["old session".into()]));
+    }
+
+    #[test]
+    fn app_layout_styles_and_output_are_safe() {
+        let state = AppsState::default();
+        state.set_apps(vec![AppInfo { name: "jobs".into(), slot: OVERLAY.into(),
+            title: "jobs\x1b[2J".into(), config: serde_json::json!({"width":20,"height":8,
+                "style":{"fg":"red"}, "border":{"kind":"none"}}), ..Default::default() }]);
+        state.open("jobs");
+        state.publish("jobs", vec!["a\tb\x1b[2J\x07".into()]);
+        let mut component = ExtApp { state: state.clone(), slot: OVERLAY };
+        let model = Model::new("s".into(), "m".into());
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        assert_eq!(component.height(&ctx, 80), Some(8));
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buf = Buffer::empty(area);
+        component.render(&ctx, area, &mut buf);
+        assert_eq!(state.cols_for("jobs"), Some(20));
+        assert!(buf.content.iter().all(|cell| !cell.symbol().chars().any(char::is_control)));
+        assert!(buf.content.iter().any(|cell| cell.symbol() == "b"));
+        for width in 0..3 {
+            let tiny = Rect::new(0, 0, width, 1);
+            component.render(&ctx, tiny, &mut Buffer::empty(tiny));
+        }
+    }
+
+    #[test]
     fn roster_refresh_requests_visible_content_even_with_same_metadata() {
         let state = AppsState::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.connect(tx);
-        let app = AppInfo { name: "probe".into(), slot: "overlay".into(), title: "Before".into(), keymap: Some("ctrl+y".into()) };
+        let app = AppInfo { name: "probe".into(), slot: "overlay".into(), title: "Before".into(), keymap: Some("ctrl+y".into()), ..Default::default() };
         state.set_apps(vec![app.clone()]);
         state.toggle_by_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
@@ -443,12 +588,14 @@ mod tests {
                 slot: SIDEBAR.into(),
                 title: "files".into(),
                 keymap: Some("ctrl+e".into()),
+                ..Default::default()
             },
             AppInfo {
                 name: "sessions".into(),
                 slot: OVERLAY.into(),
                 title: "sessions".into(),
                 keymap: Some("ctrl+s".into()),
+                ..Default::default()
             },
         ]
     }

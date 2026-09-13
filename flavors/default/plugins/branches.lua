@@ -13,6 +13,7 @@ local targets = {}  -- row index -> session id
 
 rness.ui.app{
   name = "branches",
+  refresh_ms = 500, -- keep external session changes live while visible
   slot = "overlay",
   title = "branches · enter switch · f fork",
   keymap = "ctrl+b",

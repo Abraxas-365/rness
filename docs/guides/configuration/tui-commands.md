@@ -6,7 +6,9 @@ Type `/` at the beginning of the input to open completion above the editor. Matc
 
 | Input | Behavior |
 | --- | --- |
-| `/jobs [list]`, `/jobs <job_id>`, `/jobs stop <job_id>` | With the default jobs plugin: list, inspect non-consuming output, or request cancellation, even while busy. See [background jobs](../background-jobs.md). |
+| `/jobs`, `/jobs <job_id>` | With the default jobs plugin: open the live monitor or a job's non-consuming output, including retained finished jobs, even while busy. See [background jobs](../background-jobs.md). |
+| `/jobs list`, `/jobs stop <job_id>` | Print active jobs or request cancellation of an explicit job. |
+| `/agents`, `/agents steer <id> <message>`, `/agents stop <id> [confirm]` | With agent controls: inspect descendants, steer, or request a confirmed stop. ID-first forms are also supported. See [subagent commands](../subagent-commands.md). |
 | `/agent <name>` | Select a declared role in an idle session, persisting its configuration without a model turn. |
 | `/skill <name> <input>` | Append skill instructions to the submitted content while preserving the original text. |
 | `/<skill-name> <input>` | Shorthand for a discovered skill; use `/skill` when a name conflicts with a command. |

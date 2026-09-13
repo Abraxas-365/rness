@@ -86,6 +86,19 @@ rness.ui.colorscheme.register("gruvbox", {
 })
 rness.ui.colorscheme.set("gruvbox")
 rness.ui.messagebox = {
+  -- Read-only agent drawer; omitted fields retain built-in defaults.
+  agents = {
+    keys = {
+      back = "esc", previous_agent = "shift+tab", next_agent = "tab",
+      list_up = { "up", "k" }, list_down = { "down", "j" }, open_detail = "enter",
+      metadata_up = "alt+pageup", metadata_down = "alt+pagedown",
+      page_up = "pageup", page_down = "pagedown", follow = "end",
+      scroll_up = "up", scroll_down = "down", toggle_tool = { "enter", "ctrl+o" },
+    },
+    layout = { metadata_rows = 3, wheel_lines = 3, page_lines = 10, metadata_scroll_lines = 3 },
+    text = { title = "Agents", incoming_label = "Incoming message" },
+    styles = { frame = "overlay", border = "overlay_border", heading = "heading", hint = "dim" },
+  },
   selection = {
     style = { bg = "#504945" },
     marker = { text = "▎", style = { fg = p.blue, bold = true } },

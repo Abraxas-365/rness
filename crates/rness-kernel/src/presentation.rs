@@ -96,6 +96,12 @@ pub struct AppSpec {
     pub slot: String,
     pub title: String,
     pub keymap: Option<String>,
+    /// Optional visible-only refresh interval; absent means event-driven.
+    pub refresh_ms: Option<u64>,
+    /// Let on_key handle Escape before the host's close fallback.
+    pub capture_escape: bool,
+    /// Host layout and theme styles; content/navigation remain provider-owned.
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq)]

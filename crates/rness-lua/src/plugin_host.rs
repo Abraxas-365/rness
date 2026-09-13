@@ -154,11 +154,13 @@ enum Cmd {
         reply: tokio::sync::oneshot::Sender<Vec<(String, Option<String>)>>,
     },
     AppView {
+        guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
         name: String,
         ctx: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Result<Vec<String>, String>>,
     },
     AppKey {
+        guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
         name: String,
         key: String,
         ctx: serde_json::Value,
@@ -529,12 +531,17 @@ impl LuaHost {
                         Cmd::KeymapBinds { reply } => {
                             let _ = reply.send(rt.keymap_binds());
                         }
-                        Cmd::AppView { name, ctx, reply } => {
-                            let _ = reply.send(rt.app_view(&name, &ctx).map_err(|e| e.to_string()));
+                        Cmd::AppView { guard, name, ctx, reply } => {
+                            let result = if guard.as_ref().is_some_and(|guard| !guard()) {
+                                Err("stale app request".into())
+                            } else { rt.app_view(&name, &ctx).map_err(|e| e.to_string()) };
+                            let _ = reply.send(result);
                         }
-                        Cmd::AppKey { name, key, ctx, reply } => {
-                            let _ =
-                                reply.send(rt.app_key(&name, &key, &ctx).map_err(|e| e.to_string()));
+                        Cmd::AppKey { guard, name, key, ctx, reply } => {
+                            let result = if guard.as_ref().is_some_and(|guard| !guard()) {
+                                Err("stale app request".into())
+                            } else { rt.app_key(&name, &key, &ctx).map_err(|e| e.to_string()) };
+                            let _ = reply.send(result);
                         }
                         Cmd::InstallSession { binding, reply } => {
                             let r = rt
@@ -795,7 +802,7 @@ impl LuaHost {
     ) -> Result<Vec<String>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::AppView { name: name.into(), ctx, reply })
+            .send(Cmd::AppView { guard: None, name: name.into(), ctx, reply })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
@@ -808,7 +815,29 @@ impl LuaHost {
     ) -> Result<AppKeyOutcome, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::AppKey { name: name.into(), key: key.into(), ctx, reply })
+            .send(Cmd::AppKey { guard: None, name: name.into(), key: key.into(), ctx, reply })
+            .map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
+    }
+
+    /// Check activation/context on the VM thread immediately before calling Lua.
+    pub async fn app_view_guarded(
+        &self, name: &str, ctx: serde_json::Value,
+        guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<Vec<String>, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::AppView { guard: Some(guard), name: name.into(), ctx, reply })
+            .map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
+    }
+
+    /// A queued key must not run side effects after its activation expires.
+    pub async fn app_key_guarded(
+        &self, name: &str, key: &str, ctx: serde_json::Value,
+        guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<AppKeyOutcome, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::AppKey { guard: Some(guard), name: name.into(), key: key.into(), ctx, reply })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
@@ -870,6 +899,28 @@ impl LuaHost {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn guarded_app_callbacks_reject_stale_requests_before_lua_side_effects() {
+        let host = LuaHost::spawn().unwrap();
+        host.load("probe", r#"
+            local calls = 0
+            rness.ui.app { name = 'probe', slot = 'overlay',
+                view = function() calls = calls + 1; return {tostring(calls)} end,
+                on_key = function() calls = calls + 1; return true end }
+        "#).await.unwrap();
+        let guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(|| false);
+        assert_eq!(host.app_key_guarded("probe", "enter", json!({}), guard.clone()).await.unwrap_err(), "stale app request");
+        assert_eq!(host.app_view_guarded("probe", json!({}), guard).await.unwrap_err(), "stale app request");
+        // Both rejected callbacks must leave Lua state untouched.
+        assert_eq!(host.app_view("probe", json!({})).await.unwrap(), vec!["1"]);
+        let generation = host.action_generation();
+        let captured = generation.load(std::sync::atomic::Ordering::SeqCst);
+        let guard = std::sync::Arc::new(move || generation.load(std::sync::atomic::Ordering::SeqCst) == captured);
+        host.load("other", "").await.unwrap();
+        assert_eq!(host.app_key_guarded("probe", "enter", json!({}), guard).await.unwrap_err(), "stale app request");
+        assert_eq!(host.app_view("probe", json!({})).await.unwrap(), vec!["2"]);
+    }
 
     #[tokio::test]
     async fn queued_action_rejects_reloaded_registration_generation() {

@@ -20,6 +20,7 @@ end
 
 rness.ui.app{
   name = "sessions",
+  refresh_ms = 500, -- keep external session changes live while visible
   slot = "overlay",
   title = "sessions · enter switch · f fork",
   keymap = "ctrl+s",

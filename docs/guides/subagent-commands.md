@@ -3,17 +3,21 @@
 The default flavor enables `plugins/agent-controls.lua`:
 
 - `/agents` opens the agent monitor; `/agents <id>` focuses one descendant.
-- `/agents <id> steer <message>` sends a separate user-origin steering message
+- `/agents steer <id> <message>` sends a separate user-origin steering message
   to a continuable descendant; one-shot targets are rejected by the runtime.
   Missing text returns usage, not a composer.
-- `/agents <id> stop` asks for confirmation to cancel that child's current turn.
-- `/agents <full-id> stop confirm` performs the cancellation. The notice supplies
-  this exact command and explains that queued messages and descendants remain.
-- `/agents stop <id>` remains a compatibility spelling for requesting confirmation.
+- `/agents stop <id>` asks for confirmation to cancel that child's current turn.
+- `/agents stop <full-id> confirm` performs the cancellation.
+- ID-first forms remain supported: `/agents <id> steer <message>` and
+  `/agents <id> stop [confirm]`. The confirmation notice supplies an exact
+  full-ID command and explains that queued messages and descendants remain.
 - `/agents stop` selects the child when exactly one descendant is running. With
   several running children it lists them instead; with none it reports that.
 
 Use the normal slash-command completion menu to select an alias such as `a1`.
+Action-first suggestions match `/jobs stop <job_id>`; typing an agent ID also
+reveals its ID-first shortcuts. `/jobs` suggestions show the job kind, status,
+and a short label preview alongside each ID.
 Each agent suggestion shows its role and a short preview of its assigned task;
 the preview is display-only and is never inserted into the command. Full session
 IDs remain accepted when entered manually, but are not duplicate suggestions.
@@ -69,6 +73,35 @@ its coordinator notice is injected without waking an idle main agent.
 Existing installations need both the updated command plugin and the agent/message
 renderers in `flavors/default/lua/theme.lua` to get the new default cards. Merge
 the theme changes into custom themes rather than overwriting local customization.
+
+## Customizing the read-only drawer
+
+Set `rness.ui.messagebox.agents` in your theme (restart to apply startup
+configuration). This is separate from `rness.agents`, which declares roles.
+The drawer still inherits the main messagebox's Markdown, tool cards, and
+message-selection/copy bindings; its own navigation is now configurable:
+
+```lua
+rness.ui.messagebox.agents = {
+  keys = {
+    back = "q", list_up = { "up", "k" }, list_down = { "down", "j" },
+    page_up = "ctrl+u", page_down = "ctrl+d", toggle_tool = "enter",
+  },
+  layout = { list_rows = 12, metadata_rows = 5, page_lines = 15 },
+  text = { title = "Workers", incoming_label = "Assignment" },
+  styles = { border = { fg = "cyan" }, hint = "dim" },
+}
+```
+
+Omitted options retain defaults. A key accepts a chord, a nonempty list of
+chords replacing all defaults for that action, or `false` to disable it.
+Footer/help shortcuts reflect these bindings. Keep a usable `back` binding:
+disabling it also disables the usual Escape exit. Unknown fields, invalid
+chords, and out-of-range sizes fail startup validation.
+
+See the [monitor option reference](../reference/configuration/agents.md#monitor-presentation)
+for all fields and interaction precedence. These settings cannot enable
+submission, steering, stop, or editor actions inside the drawer.
 
 ## Lua extension API
 

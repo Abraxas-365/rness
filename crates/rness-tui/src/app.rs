@@ -1075,7 +1075,11 @@ impl App {
                     close
                 };
                 if let (Some(apps), Some((name, activation))) = (&self.apps, &request.app) {
-                    apps.apply_key_if_current(*activation, name, apply_operations);
+                    if apps.apply_key_if_current(*activation, name, apply_operations) {
+                        // Actions can mutate plugin-local view state without host operations.
+                        // Refresh only after application, and never a closed/replaced activation.
+                        apps.refresh_if_current(*activation, name);
+                    }
                 } else {
                     let mut apply_operations = apply_operations;
                     apply_operations();
@@ -1425,6 +1429,7 @@ impl App {
                 }
             }
             Action::CommandResult(session, message) => {
+                if message.is_empty() { return; }
                 self.command_results
                     .entry(session.clone())
                     .or_default()
@@ -1435,6 +1440,15 @@ impl App {
             }
             Action::Notice(text) => self.model.entries.push(Entry::Notice(text)),
             Action::Custom(name, payload) => {
+                if name == "app:open" {
+                    if payload["session"].as_str() != Some(self.model.session.as_str()) { return; }
+                    if let Some(name) = payload["app"].as_str() {
+                        if !self.apps.as_ref().is_some_and(|apps| apps.open(name)) {
+                            self.model.entries.push(Entry::Notice(format!("App is not registered: {name}")));
+                        }
+                    }
+                    return;
+                }
                 if name == "terminal:copy-text" {
                     let result = payload["text"]
                         .as_str()
@@ -1470,6 +1484,7 @@ impl App {
                 if session == self.model.session {
                     return;
                 }
+                if let Some(apps) = &self.apps { apps.set_session(session.clone()); }
                 let next = self
                     .background_models
                     .remove(&session)
@@ -1799,6 +1814,34 @@ mod tests {
             .unwrap()
             .unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn lua_app_commands_are_session_scoped_and_do_not_add_empty_notices() {
+        let mut slots = Slots::default();
+        let apps = crate::modules::ext_apps::install(&mut slots);
+        apps.set_apps(vec![crate::modules::ext_apps::AppInfo {
+            name: "jobs".into(), slot: "overlay".into(), ..Default::default()
+        }]);
+        apps.set_session("s1".into());
+        let mut app = App::new(Model::new("s1".into(), "m".into()), slots,
+            Arc::new(FakeBackend { history: prior_history("s1") }));
+        app.apps = Some(apps.clone());
+        let open = |session: &str, name: &str| Action::Custom("app:open".into(),
+            serde_json::json!({"session":session,"app":name}));
+        app.apply(open("other", "jobs"));
+        assert_eq!(apps.active(), None);
+        app.apply(open("s1", "jobs"));
+        assert_eq!(apps.active().as_deref(), Some("jobs"));
+        let count = app.model.entries.len();
+        app.apply(Action::CommandResult("s1".into(), String::new()));
+        assert_eq!(app.model.entries.len(), count);
+        app.apply(open("s1", "unknown"));
+        assert_eq!(apps.active().as_deref(), Some("jobs"));
+        app.apply(Action::SwitchSession("s2".into()));
+        assert_eq!(apps.active(), None);
+        app.apply(open("s1", "jobs"));
+        assert_eq!(apps.active(), None);
     }
 
     #[test]
@@ -2452,6 +2495,7 @@ mod tests {
             slot: crate::slots::SIDEBAR.into(),
             title: "Review".into(),
             keymap: Some("f6".into()),
+            ..Default::default()
         }]);
         let mut app = App::new(Model::new("s1".into(), "m".into()), slots, backend);
         app.apps = Some(apps.clone());
@@ -2576,6 +2620,7 @@ mod tests {
             slot: crate::slots::SIDEBAR.into(),
             title: "Review".into(),
             keymap: Some("f6".into()),
+            ..Default::default()
         }]);
         let mut app = App::new(
             Model::new("s1".into(), "m".into()),
@@ -2745,6 +2790,7 @@ mod tests {
             slot: crate::slots::SIDEBAR.into(),
             title: "Review".into(),
             keymap: Some("f6".into()),
+            ..Default::default()
         }]);
         let mut app = App::new(
             Model::new("s1".into(), "m".into()),
@@ -2773,6 +2819,75 @@ mod tests {
     }
 
     #[test]
+    fn app_scoped_plugin_batch_refreshes_only_current_open_activation() {
+        use crate::modules::ext_apps::{AppEvent, AppInfo};
+        use std::sync::atomic::Ordering;
+
+        for case in ["empty", "insert", "close", "invalid", "input", "runtime", "session", "history", "activation", "reopened", "closed"] {
+            let mut slots = Slots::default();
+            crate::modules::input::install(&mut slots);
+            let apps = crate::modules::ext_apps::install(&mut slots);
+            apps.set_apps(vec![AppInfo {
+                name: "review".into(),
+                slot: crate::slots::SIDEBAR.into(),
+                title: "Review".into(),
+                ..Default::default()
+            }]);
+            let mut app = App::new(
+                Model::new("s1".into(), "m".into()),
+                slots,
+                Arc::new(FakeBackend { history: prior_history("s1") }),
+            );
+            app.apps = Some(apps.clone());
+            apps.track_input_epoch(app.input_epoch.clone());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            apps.connect(tx);
+            assert!(apps.open("review"));
+            assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("review".into()));
+            let mut request = PluginActionRequest {
+                input_epoch: app.input_epoch.load(Ordering::SeqCst),
+                app: Some(("review".into(), apps.activation().1)),
+                generation: app.plugin_generation.load(Ordering::SeqCst),
+                name: "review.inspect".into(),
+                session: app.model.session.clone(),
+                epoch: app.model.history_epoch,
+            };
+            let operations = match case {
+                "insert" => vec![PluginOperation::InsertPrompt("updated".into())],
+                "close" => vec![PluginOperation::CloseApp("review".into())],
+                "invalid" => vec![PluginOperation::CloseApp("other".into())],
+                "input" => { request.input_epoch += 1; vec![] }
+                "runtime" => { request.generation += 1; vec![] }
+                "session" => { request.session = "s2".into(); vec![] }
+                "history" => { request.epoch += 1; vec![] }
+                "activation" => { request.app.as_mut().unwrap().1 += 1; vec![] }
+                "reopened" => {
+                    assert!(apps.open("review"));
+                    assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("review".into()));
+                    vec![]
+                }
+                "closed" => { apps.close(); vec![] }
+                _ => vec![],
+            };
+            app.apply(Action::PluginBatch { request, operations });
+            if matches!(case, "empty" | "insert") {
+                assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("review".into()), "{case}");
+            }
+            assert!(rx.try_recv().is_err(), "unexpected refresh for {case}");
+            if case == "close" {
+                assert!(apps.active().is_none());
+            }
+            if case == "insert" {
+                apps.close();
+                assert!(matches!(
+                    app.route_key(KeyEvent::from(crossterm::event::KeyCode::Enter)).as_slice(),
+                    [Action::Submit(text)] if text == "updated"
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn plugin_batch_validates_all_operations_before_mutation() {
         use crossterm::event::KeyCode;
         for invalid in [false, true] {
@@ -2784,6 +2899,7 @@ mod tests {
                 slot: crate::slots::SIDEBAR.into(),
                 title: "Review".into(),
                 keymap: Some("f6".into()),
+                ..Default::default()
             }]);
             let mut app = App::new(
                 Model::new("s1".into(), "m".into()),

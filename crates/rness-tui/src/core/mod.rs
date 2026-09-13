@@ -5,3 +5,4 @@ pub mod editor;
 pub mod highlight;
 pub mod render;
 pub mod viewport;
+pub mod terminal_text;

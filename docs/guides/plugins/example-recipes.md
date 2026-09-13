@@ -589,6 +589,55 @@ Use `bottomline` as an alternative to the spinner, not as a second independent b
 
 `text_stats` measures bytes, not Unicode characters. Its words are whitespace-delimited. A trailing newline produces a final empty line. Invalid input becomes a tool error; the example does not assume JSON Schema alone enforces inputs.
 
+## Live Lua applications
+
+`rness.ui.app` supports command-driven opening and opt-in refresh in the local TUI:
+
+```lua
+rness.ui.app {
+  name = "activity", slot = "overlay", title = "Activity",
+  refresh_ms = 500, -- optional integer 50..60000; only refreshes while visible
+  capture_escape = true, -- optional; let on_key handle Back before close
+  config = {
+    width = 100, height = 24,
+    style = "overlay", title_style = "title",
+    border = { kind = "rounded", style = "dim" },
+  },
+  view = function(ctx) return { "Session: " .. ctx.session } end,
+  on_key = function(key, ctx)
+    -- false/nil passes; an unhandled Escape closes a captured app.
+    return false
+  end,
+}
+rness.commands.register {
+  name = "activity", allow_busy = true,
+  run = function(ctx)
+    return { data = { action = "app:open", app = "activity", session = ctx.session } }
+  end,
+}
+```
+
+Views receive `session` and available content dimensions `rows`/`cols` (dimensions
+may be absent before the first render). Return plain strings, not ANSI markup.
+The renderer sanitizes terminal control sequences. `config.width`/`height` are
+positive cell dimensions clipped to the available slot; overlay width is centered.
+Border kinds are `none`, `plain` (default), `rounded`, and `double`. Styles resolve
+against the active theme. Without explicit height, the legacy content-sized panel
+is retained. Without `refresh_ms`, apps remain event-driven. Configuration is
+snapshotted when declared; later mutations to the supplied table do not change
+the registered app. Existing custom apps that depend on background changes should
+set `refresh_ms` explicitly; roster polling is no longer an implicit refresh source.
+The shipped Tasks, Sessions, and Branches views opt into 500 ms refresh. Update
+those copied plugins when upgrading an existing configuration.
+
+Refreshes are serial and stop when hidden. Session switches close the app and
+invalidate pending views/keys. Opening is restricted to registered apps in the
+command's invoking session; command data is not a general action dispatcher.
+Legacy apps close on Escape locally. `capture_escape=true` opts into Lua handling,
+with host close on a passed Escape; explicit user key bindings still take priority.
+Use `rness.ui.replace_app` for declaration-phase replacement. The jobs plugin is a
+complete example with [configuration and callbacks](../background-jobs.md).
+
 ## Persistent tasks
 
 Copy `examples/plugins/tasks.lua` into `~/.rness/plugins/tasks.lua` and add

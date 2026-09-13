@@ -273,6 +273,10 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let errors = rness_lua::loader::load_all(&host, &specs).await;
     assert!(errors.is_empty(), "{errors:?}");
     assert!(questions.is_available());
+    let apps = host.app_specs().await;
+    for name in ["branches", "sessions", "tasks"] {
+        assert_eq!(apps.iter().find(|a| a.name == name).unwrap().refresh_ms, Some(500));
+    }
     let plan = host.tool_specs().await.into_iter().find(|spec| spec.name == "exit_plan_mode").unwrap().plan.unwrap();
     assert!(Arc::ptr_eq(&plan.questions, &questions));
     assert!(sessions.reference_service().enabled());
@@ -870,6 +874,10 @@ async fn example_plugins_load_and_register_five_apps() {
     let apps = host.app_specs().await;
     let names: Vec<_> = apps.iter().map(|a| a.name.as_str()).collect();
     assert_eq!(names, vec!["branches", "compact-region", "sessions", "tasks", "tree"]);
+    for name in ["branches", "sessions", "tasks"] {
+        assert_eq!(apps.iter().find(|a| a.name == name).unwrap().refresh_ms, Some(500));
+    }
+    assert_eq!(apps.iter().find(|a| a.name == "tree").unwrap().refresh_ms, None);
     let region = apps.iter().find(|a| a.name == "compact-region").unwrap();
     assert_eq!(region.key_help, vec!["j/k: move", "space: anchor", "enter: review", "r: refresh", "esc: close"]);
 

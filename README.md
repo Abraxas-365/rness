@@ -24,16 +24,16 @@ Start with the included Gruvbox flavor. Keep what you like. Rewrite the rest.
 
 ## Why rness?
 
+**Your coding agent should adapt to how you work—not the other way around.** rness is for developers who want to build their own setup, not just customize a prompt.
+
 | You want to… | rness gives you… |
 | :--- | :--- |
 | **Own the workflow** | Lua configuration for agents, plugins, actions, keybindings, hooks, and presentation. |
-| **Choose your models** | Named provider connections and explicit model profiles, including provider-specific profiles for delegated work. |
-| **Keep exploration focused** | Specialist agents with bounded tool access, fresh conversations or forked context, and background completion notices. |
-| **Pick up where you left off** | Append-only session logs, resumable conversations, and branching. |
-| **Manage long conversations** | Configurable tool-output pruning and summarization, plus manual region compaction. |
-| **Make the terminal feel like home** | A Gruvbox starter with tool cards, diff rendering, and session, branch, task, and plan views. |
+| **Build the missing pieces** | Add your own tools, slash commands, and terminal views through Lua plugins. Extend the workflow without modifying the Rust engine. |
+| **Decide who does the work** | Define the roles available for delegation, their instructions, model profiles, and tool access. Generic children are off by default: the agent must choose from your roster, not create an unnamed substitute. |
+| **Compose your agent from plugins** | Session pickers, plan review, task views, and agent controls are Lua plugins—not a fixed workflow. Load only what you want, change how it works, or replace it with your own. |
 
-**Rust handles the mechanisms. Lua lets you shape the experience.**
+**Rust handles the mechanisms. Lua lets you shape the experience.** You take responsibility for your setup, including reviewing plugins and configuration changes. If you enjoy maintaining your editor's dotfiles, rness brings that same approach to your coding agent.
 
 ## Get started
 

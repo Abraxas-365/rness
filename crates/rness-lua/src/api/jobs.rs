@@ -10,11 +10,20 @@ pub fn install_unmounted(lua: &Lua, rness: &Table) -> mlua::Result<()> {
             Err(mlua::Error::runtime("rness.jobs is not installed"))
         })?)?;
     }
+    jobs.set("setup", lua.create_function(|lua, config: Table| {
+        if lua.globals().get::<Option<String>>("__rness_loading_plugin")?.is_some()
+            || lua.globals().get::<Option<Table>>("__rness_messagebox_renderers")?.is_some() {
+            return Err(mlua::Error::runtime("jobs.setup is startup-only; configure it in init.lua"));
+        }
+        let rness: Table = lua.globals().get("rness")?;
+        rness.get::<Table>("jobs")?.set("config", config)
+    })?)?;
     rness.set("jobs", jobs)
 }
 
 pub fn install(lua: &Lua, rness: &Table, registry: JobRegistry) -> mlua::Result<()> {
-    let jobs = lua.create_table()?;
+    // Preserve startup configuration and the stable setup API.
+    let jobs = rness.get::<Table>("jobs")?;
     let r = registry.clone();
     jobs.set("count", lua.create_function(move |_, session: String| {
         Ok(r.count(&session))

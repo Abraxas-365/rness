@@ -69,7 +69,17 @@ impl Theme {
             let Some(fields) = value.as_object() else { return Ok(()); };
             for (key, value) in fields {
                 let path = format!("{path}.{key}");
-                if key == "style" || matches!(key.as_str(), "heading" | "link" | "quote" | "inline_code") {
+                if path == "ui.messagebox.agents" {
+                    // Monitor keys allow arrays and context-specific duplicates;
+                    // startup validation checks their shape and chord syntax.
+                    // Resolve every monitor style against the selected theme.
+                    if let Some(styles) = value["styles"].as_object() {
+                        for (name, style) in styles {
+                            theme.resolve_style(style, Style::default())
+                                .map_err(|e| format!("{path}.styles.{name}: {e}"))?;
+                        }
+                    }
+                } else if key == "style" || matches!(key.as_str(), "heading" | "link" | "quote" | "inline_code") {
                     theme.resolve_style(value, Style::default()).map_err(|e| format!("{path}: {e}"))?;
                 } else if key == "tools" {
                     if let Some(tools) = value.as_object() {
@@ -195,6 +205,22 @@ mod tests {
         assert!(theme.validate_messagebox(&json!({"keys":{"toggle_tool":"nonsense"}})).is_err());
         assert!(theme.validate_messagebox(&json!({"keys":{"toggle_tool":"ctrl+o","next_tool":"ctrl+o"}})).is_err());
         assert!(theme.validate_messagebox(&json!({"keys":{"toggle_tool":false}})).is_ok());
+    }
+
+    #[test]
+    fn agents_monitor_styles_resolve_and_context_keys_allow_arrays_and_reuse() {
+        let theme = Theme::default();
+        assert!(theme.validate_messagebox(&json!({"agents": {
+            "keys": {"list_up":["up","k"],"scroll_up":"k","back":false},
+            "styles": {"frame":"overlay","border":"overlay_border","heading":"heading","hint":"dim"}
+        }})).is_ok());
+        for role in ["frame", "border", "heading", "hint"] {
+            for style in [json!("unknown"), json!({"fg":"bad-color"})] {
+                let mut value = json!({"agents":{"styles":{}}});
+                value["agents"]["styles"][role] = style;
+                assert!(theme.validate_messagebox(&value).is_err(), "{value}");
+            }
+        }
     }
 
     #[test]

@@ -888,12 +888,8 @@ impl rness_tui::app::Backend for LocalBackend {
                         let result = tokio::task::spawn_blocking(move || command.execute(&sessions)).await;
                         let message = match result {
                             Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => {
-                                // Command data is not a generic UI-action capability. Only the
-                                // read-only agent monitor route is accepted here, session-scoped.
-                                if result.data["action"] == "agents:open" {
-                                    let mut payload = result.data.clone();
-                                    payload["session"] = serde_json::json!(session);
-                                    let _ = tx.send(rness_tui::app::Action::Custom("agents:open".into(), payload));
+                                if let Some(action) = command_app_action(&result.data, &session) {
+                                    let _ = tx.send(action);
                                 }
                                 result.message
                             },
@@ -906,7 +902,12 @@ impl rness_tui::app::Backend for LocalBackend {
                     return Ok(Some("Command running".into()));
                 }
                 match self.sessions.send(&session, intent, content).map_err(|e| e.to_string())? {
-                    rness_engine::inbox::Disposition::Command(result) => Ok(Some(if result.message.is_empty() { "Command completed".into() } else { result.message })),
+                    rness_engine::inbox::Disposition::Command(result) => {
+                        if let Some(action) = command_app_action(&result.data, &session) {
+                            let _ = self.results.send(action);
+                        }
+                        Ok(Some(if result.message.is_empty() { "Command completed".into() } else { result.message }))
+                    }
                     _ => Ok(None),
                 }
             }
@@ -1002,6 +1003,7 @@ async fn run_tui(
     // External (Lua) apps: mount the renderer early so the status poll
     // below can re-sync the roster after hot reloads.
     let apps_state = ext_apps::install(&mut slots);
+    apps_state.set_session(session.clone());
     let mut question_overlay = questions::QuestionOverlay::new(questions.clone());
     question_overlay.apps = Some(apps_state.clone());
     slots.mount(rness_tui::slots::OVERLAY, overlay_priority, Box::new(question_overlay));
@@ -1041,24 +1043,20 @@ async fn run_tui(
         let plugin_keymap = plugin_keymap.clone();
         let keymap = keymap.clone();
         tokio::spawn(async move {
+            let mut previous_roster = None;
             loop {
                 let generation = *epoch.lock().unwrap();
                 cell.refresh(&lua).await;
                 // Roster re-sync piggybacks on the same poll: after a hot
                 // reload the fresh VM's apps replace the old set.
+                let action_generation = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
                 let specs = lua.app_specs().await;
                 let key_help = specs.iter().map(|spec| (spec.name.clone(), spec.key_help.clone())).collect();
                 let roster: Vec<rness_tui::modules::ext_apps::AppInfo> = specs
                     .into_iter()
-                    .map(|s| rness_tui::modules::ext_apps::AppInfo {
-                        name: s.name,
-                        slot: s.slot,
-                        title: s.title,
-                        keymap: s.keymap,
-                    })
+                    .map(app_info)
                     .collect();
                 let binds = lua.keymap_binds().await;
-                let action_generation = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
                 let mut declarations = Vec::new();
                 for binding in lua.binding_specs().await {
                     use rness_tui::keymaps::{Scope, BindingLayer, ScopedBinding};
@@ -1079,7 +1077,7 @@ async fn run_tui(
                 let resolved = rness_tui::keymaps::ScopedKeymap::resolve(&declarations);
                 {
                     let current = epoch.lock().unwrap();
-                    if *current == generation {
+                    if *current == generation && lua.action_generation().load(std::sync::atomic::Ordering::SeqCst) == action_generation {
                         match resolved {
                             Ok(mut resolved) => {
                                 resolved.generation = action_generation;
@@ -1091,7 +1089,15 @@ async fn run_tui(
                             }
                         }
                         apps.set_key_help(key_help);
-                        apps.set_apps(roster);
+                        // set_apps requests a visible view even for identical metadata.
+                        // Polling alone must not refresh event-driven apps; a changed
+                        // runtime generation still refreshes same-metadata reloads.
+                        let signature = (action_generation, roster);
+                        if previous_roster.as_ref() != Some(&signature) {
+                            apps.set_runtime_generation(signature.0);
+                            apps.set_apps(signature.1.clone());
+                            previous_roster = Some(signature);
+                        }
                         for err in keymap.rebuild(&binds) {
                             tracing::warn!(target: "lua", "{err}");
                         }
@@ -1297,11 +1303,12 @@ async fn run_tui(
             }
         })
     };
+    apps_state.set_runtime_generation(lua.action_generation().load(std::sync::atomic::Ordering::SeqCst));
     let roster: Vec<ext_apps::AppInfo> = lua
         .app_specs()
         .await
         .into_iter()
-        .map(|s| ext_apps::AppInfo { name: s.name, slot: s.slot, title: s.title, keymap: s.keymap })
+        .map(app_info)
         .collect();
     apps_state.set_apps(roster);
     let apps_task = {
@@ -1316,33 +1323,19 @@ async fn run_tui(
         let card_tx = card_tx.clone();
         let watched = Arc::clone(&watched);
         tokio::spawn(async move {
-            // App ctx: what Lua views receive. `rows` is the slot's
-            // content viewport at last render — apps window long lists
-            // with it (nil before first render; apps must tolerate that).
-            let ctx_of = |app: &str,
-                          watched: &Arc<std::sync::RwLock<SessionId>>,
-                          state: &rness_tui::modules::ext_apps::AppsState| {
-                let mut ctx =
-                    serde_json::json!({ "session": watched.read().unwrap().clone() });
-                // Absent (not null) before the first render: json null
-                // surfaces in Lua as userdata, not nil.
-                if let Some(rows) = state.rows_for(app) {
-                    ctx["rows"] = rows.into();
-                }
-                if let Some(cols) = state.cols_for(app) { ctx["cols"] = cols.into(); }
-                ctx
-            };
-            let refresh = |app: String,
-                           lua: rness_lua::plugin_host::LuaHost,
-                           state: rness_tui::modules::ext_apps::AppsState,
-                           ctx: serde_json::Value| async move {
-                let generation = state.generation();
-                match rness_kernel::presentation::Applications::app_view(&lua, &app, ctx).await {
-                    Ok(lines) => state.publish_if_current(generation, &app, lines),
-                    Err(e) => state.publish_if_current(generation, &app, vec![format!("error: {e}")]),
+            // One serial worker: a busy VM cannot accumulate overlapping refreshes.
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(50));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_refresh = tokio::time::Instant::now();
+            loop {
+                let ev = tokio::select! {
+                    ev = app_ev_rx.recv() => match ev { Some(ev) => ev, None => break },
+                    _ = tick.tick() => {
+                        if !app_refresh_due(state.refresh_ms(), last_refresh.elapsed()) { continue; }
+                        let Some(app) = state.active() else { continue; };
+                        ext_apps::AppEvent::Shown(app)
+                    }
                 };
-            };
-            while let Some(ev) = app_ev_rx.recv().await {
                 match ev {
                     ext_apps::AppEvent::Unload(name) => {
                         let epoch = epoch.clone();
@@ -1358,9 +1351,7 @@ async fn run_tui(
                             cards.invalidate();
                             monitor.invalidate_cards();
                             apps.invalidate();
-                            apps.set_apps(snapshot.apps.into_iter().map(|s| ext_apps::AppInfo {
-                                name: s.name, slot: s.slot, title: s.title, keymap: s.keymap,
-                            }).collect());
+                            apps.set_apps(snapshot.apps.into_iter().map(app_info).collect());
                             for err in keys.rebuild(&snapshot.keymap_binds) {
                                 tracing::warn!(target: "lua", "{err}");
                             }
@@ -1376,18 +1367,22 @@ async fn run_tui(
                         let _ = host_tx.send(rness_tui::app::Action::Notice(notice));
                     }
                     ext_apps::AppEvent::Shown(app) => {
-                        let ctx = ctx_of(&app, &watched, &state); refresh(app, lua.clone(), state.clone(), ctx).await;
+                        refresh_lua_app(&lua, &state, &app).await;
+                        last_refresh = tokio::time::Instant::now();
                     }
                     ext_apps::AppEvent::Key(app, key, generation) => {
                         use rness_lua::runtime::AppKeyOutcome;
-                        if !state.apply_key_if_current(generation, &app, || false) { continue; }
-                        let outcome = rness_kernel::presentation::Applications::app_key(&lua, &app, &key, ctx_of(&app, &watched, &state)).await;
+                        let runtime_generation = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+                        let Some(ctx) = state.context_if_current(generation, &app) else { continue; };
+                        let guard = app_request_guard(&lua, &state, &app, generation, runtime_generation, &ctx);
+                        let outcome = lua.app_key_guarded(&app, &key, ctx.clone(), guard.clone()).await;
+                        if !guard() { continue; }
                         let mut refresh_view = false;
                         let mut unload = None;
                         let mut error = None;
                         state.apply_key_if_current(generation, &app, || {
                             match outcome {
-                                Ok(AppKeyOutcome::Pass) => {}
+                                Ok(AppKeyOutcome::Pass) => { if key == "esc" { return true; } }
                                 Ok(AppKeyOutcome::Consumed) => refresh_view = true,
                                 Ok(AppKeyOutcome::Close) => return true,
                                 Ok(AppKeyOutcome::Action { name, payload }) => {
@@ -1408,6 +1403,7 @@ async fn run_tui(
                                         refresh_view = true;
                                     }
                                 }
+                                Err(e) if e.contains("runtime is busy") || e == "stale app request" => {}
                                 Err(e) => error = Some(e),
                             }
                             false
@@ -1419,12 +1415,8 @@ async fn run_tui(
                             state.publish_if_current(generation, &app, vec![format!("error: {e}")]);
                         }
                         if refresh_view {
-                            let ctx = ctx_of(&app, &watched, &state);
-                            let lines = match rness_kernel::presentation::Applications::app_view(&lua, &app, ctx).await {
-                                Ok(lines) => lines,
-                                Err(e) => vec![format!("error: {e}")],
-                            };
-                            state.publish_if_current(generation, &app, lines);
+                            refresh_lua_app(&lua, &state, &app).await;
+                            last_refresh = tokio::time::Instant::now();
                         }
                     }
                 }
@@ -1458,6 +1450,175 @@ async fn run_tui(
     sessions.join(&session).await;
     eprintln!("session: {session}");
     Ok(())
+}
+
+/// Command results can request only these session-scoped presentation routes.
+fn command_app_action(data: &serde_json::Value, session: &SessionId) -> Option<rness_tui::app::Action> {
+    let name = data.get("action")?.as_str()?;
+    if !matches!(name, "app:open" | "agents:open") { return None; }
+    let mut payload = data.clone();
+    payload["session"] = serde_json::json!(session);
+    Some(rness_tui::app::Action::Custom(name.into(), payload))
+}
+
+fn app_info(spec: rness_kernel::presentation::AppSpec) -> rness_tui::modules::ext_apps::AppInfo {
+    rness_tui::modules::ext_apps::AppInfo {
+        name: spec.name, slot: spec.slot, title: spec.title, keymap: spec.keymap,
+        refresh_ms: spec.refresh_ms, capture_escape: spec.capture_escape, config: spec.config,
+    }
+}
+
+fn app_refresh_due(refresh_ms: Option<u64>, elapsed: std::time::Duration) -> bool {
+    refresh_ms.is_some_and(|ms| elapsed >= std::time::Duration::from_millis(ms.max(50)))
+}
+
+fn app_request_guard(
+    lua: &rness_lua::plugin_host::LuaHost,
+    state: &rness_tui::modules::ext_apps::AppsState,
+    app: &str, generation: u64, runtime_generation: u64, ctx: &serde_json::Value,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    let runtime = lua.action_generation();
+    let state = state.clone();
+    let app = app.to_owned();
+    let ctx = ctx.clone();
+    Arc::new(move || runtime.load(std::sync::atomic::Ordering::SeqCst) == runtime_generation
+        && state.runtime_generation() == runtime_generation
+        && state.context_if_current(generation, &app).as_ref() == Some(&ctx))
+}
+
+async fn refresh_lua_app(
+    lua: &rness_lua::plugin_host::LuaHost,
+    state: &rness_tui::modules::ext_apps::AppsState,
+    app: &str,
+) -> bool {
+    let runtime_generation = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+    refresh_app(state, app, |generation, ctx| async move {
+        let guard = app_request_guard(lua, state, app, generation, runtime_generation, &ctx);
+        let result = lua.app_view_guarded(app, ctx, guard.clone()).await;
+        if guard() { result } else { Err("stale app request".into()) }
+    }).await
+}
+
+async fn refresh_app<F, Fut>(
+    state: &rness_tui::modules::ext_apps::AppsState,
+    app: &str,
+    view: F,
+) -> bool
+where
+    F: FnOnce(u64, serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+{
+    let generation = state.generation();
+    let Some(ctx) = state.context_if_current(generation, app) else { return false; };
+    let result = view(generation, ctx.clone()).await;
+    if state.context_if_current(generation, app).as_ref() != Some(&ctx) { return false; }
+    let lines = match result {
+        Ok(lines) => lines,
+        // Retain the last good view; opted-in ticks retry without a backlog.
+        Err(error) if error.contains("runtime is busy") || error == "stale app request" => return false,
+        Err(error) => vec![format!("error: {error}")],
+    };
+    state.publish_if_current(generation, app, lines)
+}
+
+#[cfg(test)]
+mod app_host_tests {
+    use super::*;
+    use rness_kernel::presentation::{AppKeyOutcome, AppSpec, Applications};
+    use rness_tui::modules::ext_apps::AppsState;
+
+    fn spec() -> AppSpec {
+        AppSpec { name: "probe".into(), slot: "overlay".into(), title: "Probe".into(),
+            keymap: None, key_help: vec![], refresh_ms: Some(125), capture_escape: true,
+            config: serde_json::json!({"layout":{"width":72},"styles":{"border":"dim"}}) }
+    }
+
+    #[test]
+    fn command_routes_are_allowlisted_and_bound_to_invoker() {
+        for name in ["app:open", "agents:open"] {
+            let data = serde_json::json!({"action":name,"session":"spoofed","name":"probe"});
+            let Some(rness_tui::app::Action::Custom(route, payload)) = command_app_action(&data, &"invoker".into()) else { panic!("missing route") };
+            assert_eq!(route, name);
+            assert_eq!(payload["session"], "invoker");
+            assert_eq!(payload["name"], "probe");
+        }
+        for data in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!({"action":"session:switch"}), serde_json::json!({"action":"plugin:unload"})] {
+            assert!(command_app_action(&data, &"s".into()).is_none());
+        }
+    }
+
+    #[test]
+    fn metadata_and_refresh_opt_in_are_preserved() {
+        let info = app_info(spec());
+        assert_eq!(info.refresh_ms, Some(125));
+        assert!(info.capture_escape);
+        assert_eq!(info.config, spec().config);
+        let ms = std::time::Duration::from_millis;
+        assert!(!app_refresh_due(None, ms(u64::MAX)));
+        for interval in [0, 1, 49, 50] {
+            assert!(!app_refresh_due(Some(interval), ms(49)));
+            assert!(app_refresh_due(Some(interval), ms(50)));
+        }
+        assert!(!app_refresh_due(Some(125), ms(124)));
+        assert!(app_refresh_due(Some(125), ms(125)));
+    }
+
+    #[tokio::test]
+    async fn request_guard_rejects_unsynchronized_runtime_and_same_metadata_reload() {
+        let lua = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+        let state = AppsState::default();
+        state.set_session("s".into());
+        let runtime = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+        state.set_runtime_generation(runtime);
+        state.set_apps(vec![app_info(spec())]);
+        state.open("probe");
+        let generation = state.generation();
+        let ctx = state.context_if_current(generation, "probe").unwrap();
+        let guard = app_request_guard(&lua, &state, "probe", generation, runtime, &ctx);
+        assert!(guard());
+        lua.load("other", "").await.unwrap();
+        assert!(!guard());
+        let fresh = lua.action_generation().load(std::sync::atomic::Ordering::SeqCst);
+        assert!(!app_request_guard(&lua, &state, "probe", generation, fresh, &ctx)());
+        state.set_runtime_generation(fresh);
+        state.set_apps(vec![app_info(spec())]);
+        assert_eq!(state.active().as_deref(), Some("probe"));
+        assert!(state.context_if_current(generation, "probe").is_none());
+    }
+
+    struct ViewProbe { state: AppsState, change: &'static str }
+    #[async_trait::async_trait]
+    impl Applications for ViewProbe {
+        async fn app_specs(&self) -> Vec<AppSpec> { vec![spec()] }
+        async fn app_key(&self, _: &str, _: &str, _: serde_json::Value) -> Result<AppKeyOutcome, String> { unreachable!() }
+        async fn app_view(&self, _: &str, ctx: serde_json::Value) -> Result<Vec<String>, String> {
+            assert_eq!(ctx["session"], "s");
+            assert!(ctx.get("rows").is_none());
+            match self.change {
+                "closed" => panic!("closed app must not call Lua"),
+                "close" => self.state.close(),
+                "reopen" => { self.state.close(); self.state.open("probe"); }
+                "session" => self.state.set_session("other".into()),
+                "roundtrip" => { self.state.set_session("other".into()); self.state.set_session("s".into()); }
+                "reload" => self.state.set_runtime_generation(2),
+                "busy" => return Err("extension runtime is busy".into()),
+                _ => {}
+            }
+            Ok(vec!["fresh".into()])
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_closed_reopened_switched_and_busy_results() {
+        for change in ["closed", "close", "reopen", "session", "roundtrip", "reload", "busy", "none"] {
+            let state = AppsState::default();
+            state.set_session("s".into());
+            state.set_apps(vec![app_info(spec())]);
+            if change != "closed" { assert!(state.open("probe")); }
+            let probe = ViewProbe { state: state.clone(), change };
+            assert_eq!(refresh_app(&state, "probe", |_, ctx| probe.app_view("probe", ctx)).await, change == "none", "{change}");
+        }
+    }
 }
 
 async fn run_auth(action: AuthAction) -> anyhow::Result<()> {

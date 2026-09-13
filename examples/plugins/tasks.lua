@@ -6,6 +6,7 @@ rness.tasks.enable { allow_parallel_in_progress = true }
 local offsets = {}
 rness.ui.app {
   name = "tasks",
+  refresh_ms = 500, -- keep external session changes live while visible
   slot = "overlay",
   title = "Tasks | j/k PgUp/PgDn | esc",
   keymap = "ctrl+t",

@@ -407,6 +407,24 @@ pub fn install(slots: &mut Slots, _cards: CardCache) -> AgentMonitorState {
     state
 }
 
+// Ordered by dispatch priority. Lists replace (rather than extend) defaults.
+const MONITOR_KEYS: &[(&str, &[&str])] = &[
+    ("back", &["esc"]),
+    ("previous_agent", &["shift+tab"]),
+    ("next_agent", &["tab"]),
+    ("list_up", &["up", "k"]),
+    ("list_down", &["down", "j"]),
+    ("open_detail", &["enter"]),
+    ("metadata_up", &["alt+pageup"]),
+    ("metadata_down", &["alt+pagedown"]),
+    ("page_up", &["pageup"]),
+    ("page_down", &["pagedown"]),
+    ("follow", &["end"]),
+    ("scroll_up", &["up"]),
+    ("scroll_down", &["down"]),
+    ("toggle_tool", &["enter", "ctrl+o"]),
+];
+
 struct Agents {
     state: AgentMonitorState,
     chats: HashMap<String, (u64, Chat)>,
@@ -426,6 +444,49 @@ impl Agents {
             list_offset: 0,
             metadata_scroll: HashMap::new(),
         }
+    }
+
+    fn option(&self, section: &str, name: &str) -> &serde_json::Value {
+        &self.config["agents"][section][name]
+    }
+
+    fn number(&self, name: &str, default: u16) -> u16 {
+        self.option("layout", name).as_u64().map(|n| n.min(1000) as u16).unwrap_or(default)
+    }
+
+    fn text<'a>(&'a self, name: &str, default: &'a str) -> &'a str {
+        self.option("text", name).as_str().unwrap_or(default)
+    }
+
+    fn style(&self, theme: &crate::theme::Theme, name: &str, fallback: ratatui::style::Style) -> ratatui::style::Style {
+        theme.resolve_style(self.option("styles", name), fallback).unwrap_or(fallback)
+    }
+
+    fn keys(&self, action: &str) -> Vec<&str> {
+        match self.option("keys", action) {
+            serde_json::Value::Bool(false) => vec![],
+            serde_json::Value::String(key) => vec![key],
+            serde_json::Value::Array(keys) => keys.iter().filter_map(|v| v.as_str()).collect(),
+            _ => MONITOR_KEYS.iter().find(|(name, _)| *name == action).map(|(_, keys)| keys.to_vec()).unwrap_or_default(),
+        }
+    }
+
+    fn matches(&self, action: &str, key: KeyEvent) -> bool {
+        // Crossterm reports reverse tab as BackTab, while the shared key language
+        // uses shift+tab. Some terminals omit the modifier on BackTab.
+        let key = if key.code == KeyCode::BackTab {
+            KeyEvent::new(KeyCode::Tab, key.modifiers | KeyModifiers::SHIFT)
+        } else { key };
+        self.keys(action).iter().any(|s| crate::keys::Chord::parse(s).is_some_and(|chord| chord.matches(&key)))
+    }
+
+    fn hint(&self, action: &str, label: &str) -> String {
+        let keys = self.keys(action);
+        if keys.is_empty() { return String::new(); }
+        let keys = keys.iter().map(|key| match *key {
+            "esc" => "Esc", "enter" => "Enter", "end" => "End", _ => key,
+        }).collect::<Vec<_>>().join("/");
+        format!("{keys} {label}")
     }
 
     fn chat<'a>(
@@ -500,6 +561,7 @@ impl Component for Agents {
                     .agents
                     .len()
                     .max(1)
+                    .min(usize::from(self.number("list_rows", u16::MAX).max(1)))
                     .saturating_add(3)
                     .min(usize::from(u16::MAX)) as u16,
             )
@@ -518,7 +580,10 @@ impl Component for Agents {
         state.requested.is_some()
     }
     fn binding_help(&self) -> Vec<String> {
-        vec!["Agents (read-only): ↑/↓ list; Enter detail/tools; Tab next agent; Shift+Tab previous; PgUp/PgDn scroll; Alt+PgUp/PgDn full metadata; End follow; Alt+M select/copy; Esc detail → list → close".into()]
+        MONITOR_KEYS.iter().filter_map(|(action, _)| {
+            let hint = self.hint(action, action);
+            (!hint.is_empty()).then(|| format!("Agents (read-only): {hint}"))
+        }).collect()
     }
 
     fn on_action(&mut self, ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
@@ -538,9 +603,9 @@ impl Component for Agents {
                     }
                     let scroll = &mut state.session(&session).model.scroll_from_bottom;
                     *scroll = if up {
-                        scroll.saturating_add(3)
+                        scroll.saturating_add(self.number("wheel_lines", 3))
                     } else {
-                        scroll.saturating_sub(3)
+                        scroll.saturating_sub(self.number("wheel_lines", 3))
                     };
                 } else {
                     self.navigate(if up { -1 } else { 1 });
@@ -594,7 +659,7 @@ impl Component for Agents {
                 if !self.config["user"]["label"].is_object() {
                     self.config["user"]["label"] = serde_json::json!({});
                 }
-                self.config["user"]["label"]["text"] = "Incoming message".into();
+                self.config["user"]["label"]["text"] = self.text("incoming_label", "Incoming message").to_owned().into();
                 // Also suppress the editor hint and key when selecting messages.
                 if !self.config["keys"].is_object() {
                     self.config["keys"] = serde_json::json!({});
@@ -616,7 +681,7 @@ impl Component for Agents {
         let Some((_, detail)) = self.state.requested() else {
             return KeyOutcome::consumed();
         };
-        if key.code == KeyCode::Esc {
+        if self.matches("back", key) {
             let mut state = self.state.0.lock().expect("agent monitor lock");
             if detail.is_some() {
                 if let Some((_, detail)) = &mut state.requested {
@@ -628,21 +693,15 @@ impl Component for Agents {
             }
             return KeyOutcome::consumed();
         }
-        if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-            self.navigate(
-                if key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT) {
-                    -1
-                } else {
-                    1
-                },
-            );
+        if self.matches("previous_agent", key) || self.matches("next_agent", key) {
+            self.navigate(if self.matches("previous_agent", key) { -1 } else { 1 });
             return KeyOutcome::consumed();
         }
         let Some(session) = detail else {
             match key.code {
-                KeyCode::Up | KeyCode::Char('k') => self.navigate(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.navigate(1),
-                KeyCode::Enter => {
+                _ if self.matches("list_up", key) => self.navigate(-1),
+                _ if self.matches("list_down", key) => self.navigate(1),
+                _ if self.matches("open_detail", key) => {
                     let mut state = self.state.0.lock().expect("agent monitor lock");
                     let selected = self
                         .selected
@@ -656,20 +715,20 @@ impl Component for Agents {
             }
             return KeyOutcome::consumed();
         };
-        if key.modifiers == KeyModifiers::ALT {
+        if self.matches("metadata_up", key) || self.matches("metadata_down", key) {
+            let up = self.matches("metadata_up", key);
+            let lines = self.number("metadata_scroll_lines", 3);
             let offset = self.metadata_scroll.entry(session.clone()).or_default();
-            match key.code {
-                KeyCode::PageUp => {
-                    *offset = offset.saturating_sub(3);
-                    return KeyOutcome::consumed();
-                }
-                KeyCode::PageDown => {
-                    *offset = offset.saturating_add(3);
-                    return KeyOutcome::consumed();
-                }
-                _ => {}
-            }
+            *offset = if up { offset.saturating_sub(lines) } else { offset.saturating_add(lines) };
+            return KeyOutcome::consumed();
         }
+        let page_lines = self.number("page_lines", 10);
+        let page_up = self.matches("page_up", key);
+        let page_down = self.matches("page_down", key);
+        let follow = self.matches("follow", key);
+        let scroll_up = self.matches("scroll_up", key);
+        let scroll_down = self.matches("scroll_down", key);
+        let toggle_tool = self.matches("toggle_tool", key);
         let mut state = self.state.0.lock().expect("agent monitor lock");
         if state.root != ctx.model.session || !state.agents.iter().any(|a| a.session == session) {
             return KeyOutcome::consumed();
@@ -678,13 +737,13 @@ impl Component for Agents {
         let chat = Self::chat(&mut self.chats, &self.config, target, ctx.theme);
         let scroll = &mut target.model.scroll_from_bottom;
         match key.code {
-            KeyCode::PageUp => *scroll = scroll.saturating_add(10),
-            KeyCode::PageDown => *scroll = scroll.saturating_sub(10),
-            KeyCode::End => *scroll = 0,
-            KeyCode::Up if key.modifiers.is_empty() && !chat.captures_input() => {
+            _ if page_up => *scroll = scroll.saturating_add(page_lines),
+            _ if page_down => *scroll = scroll.saturating_sub(page_lines),
+            _ if follow => *scroll = 0,
+            _ if scroll_up && !chat.captures_input() => {
                 *scroll = scroll.saturating_add(1)
             }
-            KeyCode::Down if key.modifiers.is_empty() && !chat.captures_input() => {
+            _ if scroll_down && !chat.captures_input() => {
                 *scroll = scroll.saturating_sub(1)
             }
             _ => {
@@ -693,11 +752,11 @@ impl Component for Agents {
                     theme: ctx.theme,
                 };
                 let outcome = if !chat.captures_input()
-                    && (key.code == KeyCode::Enter
-                        || (key.code == KeyCode::Char('o')
-                            && key.modifiers == KeyModifiers::CONTROL))
+                    && toggle_tool
                 {
                     chat.on_binding(&child_ctx, "toggle_tool")
+                } else if !chat.captures_input() && chat.bindings().iter().any(|binding| binding.matches("toggle_tool", &key)) {
+                    KeyOutcome::consumed()
                 } else {
                     chat.on_key(&child_ctx, key)
                 };
@@ -756,11 +815,11 @@ impl Component for Agents {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
-            .style(ctx.theme.overlay)
-            .border_style(ctx.theme.overlay_border)
+            .style(self.style(ctx.theme, "frame", ctx.theme.overlay))
+            .border_style(self.style(ctx.theme, "border", ctx.theme.overlay_border))
             .title(Line::styled(
-                format!(" Agents · {} · read-only ", state.agents.len()),
-                ctx.theme.heading,
+                format!(" {} · {} · read-only ", self.text("title", "Agents"), state.agents.len()),
+                self.style(ctx.theme, "heading", ctx.theme.heading),
             ));
         let inner = block.inner(area);
         block.render(area, buf);
@@ -777,11 +836,14 @@ impl Component for Agents {
         if let Some(session) = detail {
             if state.root != root || !state.agents.iter().any(|a| a.session == session) {
                 Paragraph::new(
-                    "Waiting for an authorized agent entry (or agent not found). Esc: list",
+                    self.text("waiting", "Waiting for an authorized agent entry (or agent not found)."),
                 )
                 .style(ctx.theme.dim)
                 .wrap(Wrap { trim: false })
                 .render(body, buf);
+                Paragraph::new(self.hint("back", "list"))
+                    .style(self.style(ctx.theme, "hint", ctx.theme.dim))
+                    .render(hint, buf);
                 return;
             }
             self.selected = Some(session.clone());
@@ -810,7 +872,7 @@ impl Component for Agents {
                 textwrap::wrap(&info.task, usize::from(body.width.saturating_sub(2).max(1)))
                     .len()
                     .max(1);
-            let metadata_height = (task_rows.min(3) as u16).min(body.height.saturating_sub(1) / 3);
+            let metadata_height = (task_rows.min(usize::from(self.number("metadata_rows", 3))) as u16).min(body.height.saturating_sub(1) / 3);
             let heading = format!(
                 "{}\n\nSession: {}\nParent: {} · depth {}\nCall: {}",
                 info.task,
@@ -871,20 +933,17 @@ impl Component for Agents {
                 buf,
             );
             let follow = if following {
-                "Following"
+                self.text("following", "Following")
             } else if new_activity {
-                "Paused + new"
+                self.text("paused_new", "Paused + new")
             } else {
-                "Paused"
+                self.text("paused", "Paused")
             };
-            let help = if hint.width < 60 {
-                format!("Esc list · {follow} · End follow")
-            } else if hint.width < 110 {
-                format!("Esc list · {follow} · End follow · PgUp/Dn scroll · Enter tools")
-            } else {
-                format!("Esc list · {follow} · End follow · PgUp/Dn scroll · Enter tools · Alt+M copy · Alt+PgUp/Dn metadata")
-            };
-            Paragraph::new(help).style(ctx.theme.dim).render(hint, buf);
+            let help = [self.hint("back", "list"), follow.to_owned(), self.hint("follow", "follow"),
+                self.hint("page_up", "scroll up"), self.hint("page_down", "scroll down"),
+                self.hint("toggle_tool", "tools"), self.hint("metadata_down", "metadata")]
+                .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            Paragraph::new(help).style(self.style(ctx.theme, "hint", ctx.theme.dim)).render(hint, buf);
         } else {
             if !state
                 .agents
@@ -904,7 +963,7 @@ impl Component for Agents {
                 self.list_offset = index + 1 - visible;
             }
             let lines = if state.agents.is_empty() {
-                vec![Line::raw("No agents published yet.")]
+                vec![Line::raw(self.text("empty", "No agents published yet."))]
             } else {
                 state
                     .agents
@@ -979,8 +1038,10 @@ impl Component for Agents {
                     .collect()
             };
             Paragraph::new(lines).render(body, buf);
-            Paragraph::new("Esc close · ↑/↓ select · Enter detail")
-                .style(ctx.theme.dim)
+            Paragraph::new([self.hint("back", "close"), self.hint("list_up", "previous"),
+                self.hint("list_down", "next"), self.hint("open_detail", "detail")]
+                .into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · "))
+                .style(self.style(ctx.theme, "hint", ctx.theme.dim))
                 .render(hint, buf);
         }
     }
@@ -1031,6 +1092,87 @@ mod tests {
     }
     fn key(drawer: &mut Agents, ctx: &Ctx<'_>, code: KeyCode) -> KeyOutcome {
         drawer.on_key(ctx, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn monitor_options_rebind_disable_render_and_keep_child_scroll_isolated() {
+        let state = AgentMonitorState::default();
+        state.publish_agents("root", vec![info("a"), info("b")]);
+        let mut drawer = Agents::new(state.clone());
+        let model = Model::new("root".into(), String::new());
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        drawer.on_action(&ctx, "chat:messagebox-config", &serde_json::json!({
+            "agents": {
+                "keys": {"back":"q", "list_down":["n", "ctrl+j"], "next_agent":false,
+                    "page_up":"u", "toggle_tool":false},
+                "layout": {"list_rows":1, "page_lines":7, "wheel_lines":2, "metadata_rows":0},
+                "text": {"title":"Workers", "incoming_label":"Assignment"},
+                "styles": {"border":{"fg":"red"}}
+            }
+        }));
+        assert_eq!(drawer.config["user"]["label"]["text"], "Assignment");
+        assert_eq!(drawer.config["keys"]["selection_editor"], false);
+        open(&mut drawer, &ctx, None);
+        assert_eq!(drawer.height(&ctx, 80), Some(4));
+        key(&mut drawer, &ctx, KeyCode::Down);
+        key(&mut drawer, &ctx, KeyCode::Tab);
+        assert_eq!(drawer.selected.as_deref(), Some("a"));
+        key(&mut drawer, &ctx, KeyCode::Char('n'));
+        assert_eq!(drawer.selected.as_deref(), Some("b"));
+        let area = Rect::new(0, 0, 90, 20);
+        let mut buf = Buffer::empty(area);
+        drawer.render(&ctx, area, &mut buf);
+        let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text.contains("Workers") && text.contains("q close") && !text.contains("Esc close"));
+        assert_eq!(buf[(0, 1)].fg, ratatui::style::Color::Red);
+        assert!(!drawer.binding_help().iter().any(|s| s.contains("next_agent")));
+        key(&mut drawer, &ctx, KeyCode::Enter);
+        key(&mut drawer, &ctx, KeyCode::PageUp);
+        key(&mut drawer, &ctx, KeyCode::Char('u'));
+        drawer.on_action(&ctx, "viewport:wheel", &serde_json::json!({"up":true}));
+        assert_eq!(state.0.lock().unwrap().sessions["b"].model.scroll_from_bottom, 9);
+        assert_eq!(model.scroll_from_bottom, 0);
+        key(&mut drawer, &ctx, KeyCode::Esc);
+        assert_eq!(state.requested().unwrap().1.as_deref(), Some("b"));
+        key(&mut drawer, &ctx, KeyCode::Char('q'));
+        assert_eq!(state.requested().unwrap().1, None);
+        for width in [0, 1, 8, 60] {
+            let area = Rect::new(0, 0, width, 3);
+            drawer.render(&ctx, area, &mut Buffer::empty(area));
+        }
+        drawer.on_action(&ctx, "chat:messagebox-config", &serde_json::json!({}));
+        assert_eq!(drawer.config["user"]["label"]["text"], "Incoming message");
+        key(&mut drawer, &ctx, KeyCode::Esc);
+        assert!(state.requested().is_none());
+        assert!(drawer.matches("previous_agent", KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn waiting_detail_renders_configured_back_hint() {
+        let mut drawer = Agents::new(AgentMonitorState::default());
+        let model = Model::new("root".into(), String::new());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        drawer.on_action(&ctx, "chat:messagebox-config", &serde_json::json!({
+            "agents": {
+                "keys": {"back": "q"},
+                "styles": {"hint": {"fg": "red"}}
+            }
+        }));
+        open(&mut drawer, &ctx, Some("missing"));
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+        drawer.render(&ctx, area, &mut buf);
+        let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text.contains("Waiting for an authorized agent entry"));
+        assert!(!text.contains("Esc"));
+        let footer = (1..79).map(|x| buf[(x, 8)].symbol()).collect::<String>();
+        assert_eq!(footer.trim(), "q list");
+        assert_eq!(buf[(1, 8)].fg, ratatui::style::Color::Red);
     }
 
     #[test]
@@ -1434,11 +1576,21 @@ mod tests {
             });
             child.model.entry_ids = vec!["message".into(), "result".into()];
         }
-        drawer.on_action(&ctx, "chat:messagebox-config", &serde_json::json!({"tool":{"display":"preview","preview_lines":1},"keys":{"selection_editor":"x"}}));
+        let collapsed_config = serde_json::json!({"tool":{"display":"preview","preview_lines":1},"keys":{"selection_editor":"x"},"agents":{"keys":{"toggle_tool":false}}});
+        drawer.on_action(&ctx, "chat:messagebox-config", &collapsed_config);
         let area = Rect::new(0, 0, 100, 30);
         let mut buf = Buffer::empty(area);
         drawer.render(&ctx, area, &mut buf);
-        assert!(key(&mut drawer, &ctx, KeyCode::Enter).actions.is_empty());
+        key(&mut drawer, &ctx, KeyCode::Enter);
+        drawer.on_key(&ctx, KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        drawer.render(&ctx, area, &mut buf);
+        let screen = buf.content.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(!screen.contains("six"), "disabled tool binding expanded output: {screen}");
+        let mut rebound = collapsed_config;
+        rebound["agents"]["keys"]["toggle_tool"] = "t".into();
+        drawer.on_action(&ctx, "chat:messagebox-config", &rebound);
+        drawer.render(&ctx, area, &mut buf);
+        assert!(key(&mut drawer, &ctx, KeyCode::Char('t')).actions.is_empty());
         drawer.render(&ctx, area, &mut buf);
         let screen = buf
             .content

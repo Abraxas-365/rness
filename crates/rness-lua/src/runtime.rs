@@ -1197,6 +1197,10 @@ impl LuaRuntime {
                 slot: entry.get::<Option<String>>("slot")?.unwrap_or_else(|| "overlay".into()),
                 title: entry.get::<Option<String>>("title")?.unwrap_or_else(|| name.clone()),
                 keymap: entry.get::<Option<String>>("keymap")?,
+                refresh_ms: entry.get("refresh_ms")?,
+                capture_escape: entry.get::<Option<bool>>("capture_escape")?.unwrap_or(false),
+                config: entry.get::<Option<Table>>("config")?
+                    .map(|v| self.lua.from_value(LuaValue::Table(v))).transpose()?.unwrap_or_default(),
             };
             let view_key = self.lua.create_registry_value(view)?;
             let key_key = match on_key {
@@ -1798,6 +1802,29 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             if slot.as_deref().is_some_and(|slot| !matches!(slot, "sidebar" | "overlay")) {
                 return Err(mlua::Error::runtime("app slot must be sidebar or overlay"));
             }
+            let refresh_ms: Option<u64> = spec.get("refresh_ms")?;
+            if refresh_ms.is_some_and(|ms| !(50..=60_000).contains(&ms)) {
+                return Err(mlua::Error::runtime("app refresh_ms must be between 50 and 60000"));
+            }
+            let capture_escape = match spec.get::<LuaValue>("capture_escape")? {
+                LuaValue::Nil => None,
+                LuaValue::Boolean(value) => Some(value),
+                _ => return Err(mlua::Error::runtime("app capture_escape must be a boolean")),
+            };
+            let config: Option<Table> = spec.get("config")?;
+            if let Some(config) = &config {
+                for key in ["width", "height"] {
+                    if config.get::<Option<u16>>(key)?.is_some_and(|n| n == 0) {
+                        return Err(mlua::Error::runtime(format!("app config.{key} must be positive")));
+                    }
+                }
+                if let Some(border) = config.get::<Option<Table>>("border")? {
+                    if border.get::<Option<String>>("kind")?.is_some_and(|kind|
+                        !matches!(kind.as_str(), "none" | "plain" | "rounded" | "double")) {
+                        return Err(mlua::Error::runtime("app border kind must be none, plain, rounded, or double"));
+                    }
+                }
+            }
             let exists = declared.get::<Option<bool>>(name.as_str())?.unwrap_or(false);
             if exists != replacing {
                 return Err(mlua::Error::runtime(if replacing {
@@ -1814,6 +1841,14 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             entry.set("title", title)?;
             entry.set("keymap", keymap)?;
             entry.set("slot", slot)?;
+            entry.set("refresh_ms", refresh_ms)?;
+            entry.set("capture_escape", capture_escape)?;
+            // Freeze the validated data before user Lua resumes executing.
+            let config = config.map(|table| -> mlua::Result<LuaValue> {
+                let value: serde_json::Value = lua.from_value(LuaValue::Table(table))?;
+                lua.to_value(&value)
+            }).transpose()?;
+            entry.set("config", config)?;
             apps.push(entry)?;
             declared.set(name, true)?;
             Ok(())
@@ -2145,6 +2180,32 @@ mod tests {
             assert!(rt.load("review", &source).is_err(), "accepted {overrides}");
             assert!(rt.binding_specs().is_empty());
             assert!(rt.action_specs().is_empty());
+        }
+    }
+
+    #[test]
+    fn app_refresh_layout_and_escape_metadata_are_validated() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("configured-app", r#"
+            local config={width=90,height=24,border={kind='rounded'},style='dim'}
+            rness.ui.app{name='live', refresh_ms=250, capture_escape=true,
+                config=config, view=function() return {} end}
+            config.width=0; config.border.kind='bad'; config.callback=function() end
+            rness.ui.app{name='legacy', view=function() return {} end}
+        "#).unwrap();
+        let apps = rt.app_specs();
+        let live = apps.iter().find(|app| app.name == "live").unwrap();
+        assert_eq!(live.refresh_ms, Some(250));
+        assert!(live.capture_escape);
+        assert_eq!(live.config["width"], 90);
+        assert_eq!(live.config["border"]["kind"], "rounded");
+        let legacy = apps.iter().find(|app| app.name == "legacy").unwrap();
+        assert_eq!(legacy.refresh_ms, None);
+        assert!(!legacy.capture_escape);
+        for fields in ["refresh_ms=0", "refresh_ms=49", "refresh_ms=60001", "refresh_ms=-1",
+            "capture_escape='yes'", "config={width=0}", "config={height=-1}", "config={border={kind='bad'}}"] {
+            assert!(rt.load("invalid-app", &format!("rness.ui.app{{name='invalid', {fields}, view=function() return {{}} end}}")).is_err(), "{fields}");
+            assert_eq!(rt.app_specs().len(), 2);
         }
     }
 

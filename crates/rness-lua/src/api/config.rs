@@ -248,6 +248,32 @@ mod permission_tests {
     }
 
     #[test]
+    fn agents_monitor_options_load_and_reject_invalid_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, r#"rness.ui.messagebox = { agents = {
+            keys = { back = "q", list_up = { "k", "ctrl+p" }, toggle_tool = false },
+            layout = { metadata_rows = 0, list_rows = 12, page_lines = 7 },
+            text = { incoming_label = "Assignment" }, styles = { border = { fg = "red" } }
+        } }"#).unwrap();
+        let config = super::load(&path).unwrap();
+        assert_eq!(config.messagebox["agents"]["keys"]["list_up"][1], "ctrl+p");
+        rness_tui::theme::Theme::default().validate_messagebox(&config.messagebox).unwrap();
+        let default_flavor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+        let flavor = super::load(&default_flavor).unwrap();
+        rness_tui::theme::Theme::default().validate_messagebox(&flavor.messagebox).unwrap();
+        for body in [
+            "keys={surprise='q'}", "keys={back='hyper+q'}", "keys={back=true}",
+            "keys={back={'q', 4}}", "layout={page_lines=0}", "layout={metadata_rows=-1}",
+            "layout={list_rows=1001}", "layout={page_lines=1.5}", "styles={border={unknown=true}}",
+            "text={title=false}", "text={title='bad\\nline'}", "unknown={}",
+        ] {
+            std::fs::write(&path, format!("rness.ui.messagebox={{agents={{{body}}}}}")).unwrap();
+            assert!(super::load(&path).is_err(), "accepted {body}");
+        }
+    }
+
+    #[test]
     fn rules_are_explicit_validated_and_replace_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
@@ -300,12 +326,51 @@ pub enum ProviderAuth {
     OAuth { oauth: String },
 }
 
+/// Monitor-only options ride the existing messagebox configuration broadcast.
+fn validate_agents_monitor(value: &serde_json::Value, path: &str) -> Result<(), String> {
+    let object = value.as_object().ok_or_else(|| format!("{path} must be a table"))?;
+    for (section, values) in object {
+        if !matches!(section.as_str(), "keys" | "layout" | "text" | "styles") {
+            return Err(format!("invalid agents option: {path}.{section}"));
+        }
+        let values = values.as_object().ok_or_else(|| format!("{path}.{section} must be a table"))?;
+        for (key, value) in values {
+            let field = format!("{path}.{section}.{key}");
+            let valid = match section.as_str() {
+                "keys" => {
+                    let known = matches!(key.as_str(), "back" | "previous_agent" | "next_agent"
+                        | "list_up" | "list_down" | "open_detail" | "metadata_up" | "metadata_down"
+                        | "page_up" | "page_down" | "follow" | "scroll_up" | "scroll_down" | "toggle_tool");
+                    let chord = |v: &serde_json::Value| v.as_str().is_some_and(|s| rness_kernel::presentation::canonical_chord(s).is_ok());
+                    known && (value == false || chord(value) || value.as_array().is_some_and(|keys| !keys.is_empty() && keys.iter().all(chord)))
+                }
+                "layout" => {
+                    let min = if key == "metadata_rows" { 0 } else { 1 };
+                    matches!(key.as_str(), "list_rows" | "metadata_rows" | "wheel_lines" | "page_lines" | "metadata_scroll_lines")
+                        && value.as_u64().is_some_and(|n| (min..=1000).contains(&n))
+                }
+                "text" => matches!(key.as_str(), "title" | "empty" | "waiting" | "incoming_label" | "following" | "paused" | "paused_new")
+                    && value.as_str().is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control)),
+                "styles" => matches!(key.as_str(), "frame" | "border" | "heading" | "hint")
+                    && validate_messagebox(&serde_json::json!({"style": value}), &field, "message").is_ok(),
+                _ => false,
+            };
+            if !valid { return Err(format!("invalid agents option: {field}")); }
+        }
+    }
+    Ok(())
+}
+
 fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> Result<(), String> {
     let object = value
         .as_object()
         .ok_or_else(|| format!("{path} must be a table"))?;
     for (key, value) in object {
         let field = format!("{path}.{key}");
+        if section == "root" && key == "agents" {
+            validate_agents_monitor(value, &field)?;
+            continue;
+        }
         let child = match (section, key.as_str()) {
             ("root", "message" | "user" | "assistant" | "thinking" | "notice" | "error") => {
                 Some("message")

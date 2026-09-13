@@ -104,10 +104,10 @@ remain accepted as input and are used in durable stop-confirmation commands.
 
 - `/agents`: open the agent monitor.
 - `/agents <id>`: open the monitor focused on that descendant.
-- `/agents <id> steer <message>`: send user steering separately; missing text returns usage and never opens a composer.
-- `/agents <id> stop`: request confirmation to stop only that child's current turn.
-- `/agents <id> stop confirm`: perform the interrupt. The confirmation notice uses the full ID. Queued messages are not cleared and descendants keep running; idle targets are accepted no-ops.
-- `/agents stop <id>` remains supported as a confirmation request; `/agents stop` selects the sole running descendant for confirmation, otherwise reports the running list.
+- `/agents steer <id> <message>` (or `/agents <id> steer <message>`): send user steering separately; missing text returns usage and never opens a composer.
+- `/agents stop <id>` (or `/agents <id> stop`): request confirmation to stop only that child's current turn.
+- `/agents stop <id> confirm` (or `/agents <id> stop confirm`): perform the interrupt. The confirmation notice uses the full ID. Queued messages are not cleared and descendants keep running; idle targets are accepted no-ops.
+- `/agents stop` selects the sole running descendant for confirmation, otherwise reports the running list.
 
 IDs are exact full session IDs or `a1`, `a2`, … aliases. Prefixes, unrelated sessions, and the current session itself are rejected. Commands remain available while the principal runs. Questions currently has no generic asynchronous command prompt API, so confirmation uses an explicit command rather than a dialog.
 

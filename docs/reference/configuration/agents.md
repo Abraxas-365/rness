@@ -91,4 +91,67 @@ CLI principal seeding and service-based selection do not yet share every validat
 
 The TUI completes declared roles for `/agent <name>`. The service recognizes that command in a send containing exactly one text part, so HTTP and TUI share selection and validation. It persists configuration without a user message or model turn; the current send response uses `log_only`, not a separate command response type. Missing, extra, or unknown names fail. There is no public `rness.agents.list()` query. The mounted `rness.subagents.roster()` query exposes delegable names and descriptions only.
 
+## Monitor presentation
+
+`rness.ui.messagebox.agents` configures the read-only `/agents` drawer, not role
+declarations. It uses the existing messagebox startup configuration; restart
+with the updated binary and theme to apply edits. See the
+[customization example](../../guides/subagent-commands.md#customizing-the-read-only-drawer).
+
+### Keys
+
+Each `keys` field accepts one chord string, a nonempty array of chord strings,
+or `false`. Overrides replace all defaults for that action. Chords use the
+shared key language (`ctrl+u`, `shift+tab`, `<F6>`, etc.).
+
+| Field | Default | Context |
+| --- | --- | --- |
+| `back` | `esc` | Detail → list → close |
+| `previous_agent` / `next_agent` | `shift+tab` / `tab` | List and detail |
+| `list_up` / `list_down` | `{ "up", "k" }` / `{ "down", "j" }` | List only |
+| `open_detail` | `enter` | List only |
+| `metadata_up` / `metadata_down` | `alt+pageup` / `alt+pagedown` | Detail metadata |
+| `page_up` / `page_down` | `pageup` / `pagedown` | Detail transcript |
+| `follow` | `end` | Resume following latest output |
+| `scroll_up` / `scroll_down` | `up` / `down` | Detail, outside message selection |
+| `toggle_tool` | `{ "enter", "ctrl+o" }` | Detail, outside message selection |
+
+Dispatch priority is back, previous/next agent, context-specific list actions,
+metadata, transcript paging/follow, line scrolling/tool expansion, then inherited
+Chat keys. Avoid overlapping bindings in the same context. Message selection,
+copy, thinking, and tool navigation use the main messagebox keys. The monitor's
+`toggle_tool` replaces Chat's tool-toggle shortcut outside message selection;
+selection's own expansion key is unchanged. Footer and binding help derive from
+the configured monitor keys; narrow footers clip to available width.
+
+Keep a usable `back` key. No fixed Escape fallback is retained after rebinding
+or disabling it. Read-only action filtering, descendant authorization, and
+approval/question priority cannot be changed by these options.
+
+### Layout, text, and styles
+
+| `layout` field | Default | Range / behavior |
+| --- | --- | --- |
+| `list_rows` | All agents | 1–1000; maximum requested visible rows, plus border/footer; selection scrolls into view |
+| `metadata_rows` | 3 | 0–1000; maximum task/identity rows; zero hides metadata; also limited to one third of available detail body |
+| `page_lines` | 10 | 1–1000; transcript page step |
+| `wheel_lines` | 3 | 1–1000; detail wheel step; list wheel still moves one agent |
+| `metadata_scroll_lines` | 3 | 1–1000; metadata key step |
+
+`text` supports `title` (`"Agents"`), `empty` (`"No agents published yet."`),
+`waiting` (`"Waiting for an authorized agent entry (or agent not found)."`),
+`incoming_label` (`"Incoming message"`), `following` (`"Following"`),
+`paused` (`"Paused"`), and `paused_new` (`"Paused + new"`). Values are strings
+of at most 256 bytes without control characters; empty strings are allowed.
+The title retains the agent count and read-only indicator.
+
+`styles` supports `frame`, `border`, `heading` (frame title), and `hint`, with
+fallback theme roles `overlay`, `overlay_border`, `heading`, and `dim`.
+Each accepts the usual messagebox style name or inline style table.
+Other message and status colors continue to inherit the shared theme.
+
+This is focused customization, not an arbitrary Lua drawer renderer: responsive
+column widths/order, status mapping, metadata identity labels, rounded border,
+and the read-only safety boundary remain built in.
+
 Implementation: [declarations](../../../crates/rness-lua/src/api/config.rs), [service selection](../../../crates/rness-engine/src/service.rs), [turn enforcement](../../../crates/rness-engine/src/turn/mod.rs).

@@ -66,7 +66,9 @@ fn completion_hints_show_role_and_bounded_task_without_changing_values() {
           found[item.value] = item.description
         end
         assert(found.a1 == 'scout · Trace compaction settings')
-        assert(found['a1 steer'] == found.a1 and found['stop a1'] == found.a1)
+        assert(found['steer a1'] == found.a1 and found['stop a1'] == found.a1)
+        assert(found['a1 steer'] == nil and found['a1 stop'] == nil)
+        assert(found['steer'] == 'Choose an agent to steer')
         assert(found.a2 == 'subagent · ' .. string.rep('界', 120) .. '…')
         local exact = controls.complete({session='main', raw_input=' a1 '})[1]
         assert(exact.value == 'a1 ' and exact.description == found.a1)
@@ -131,6 +133,11 @@ fn monitor_returns_allowlisted_data_action_and_full_ids() {
         "other",
         "a1 unknown",
         "a1 stop extra",
+        "steer",
+        "steer unknown message",
+        "stop a2 extra",
+        "stop a2 confirm extra",
+        "stop confirm",
     ] {
         assert!(
             host.call_command("agents", json!({"session":"main", "raw_input":input}))
@@ -143,19 +150,22 @@ fn monitor_returns_allowlisted_data_action_and_full_ids() {
 #[test]
 fn steering_requires_text_and_stop_retains_compatibility() {
     let mut host = host();
-    for input in ["a2 steer", "a2 steer \n  "] {
+    for input in ["a2 steer", "a2 steer \n  ", "steer a2", "steer a2 \n  "] {
         let error = host
             .call_command("agents", json!({"session":"main", "raw_input":input}))
             .unwrap_err();
-        assert!(error.contains("Usage: /agents <id> steer <message>"));
+        assert!(error.contains("Usage: /agents steer <id> <message>"));
     }
-    let result = host
-        .call_command(
-            "agents",
-            json!({"session":"main", "raw_input":"a2 steer keep  spaces\nand lines"}),
-        )
-        .unwrap();
-    assert_eq!(result.message, "User steering sent to subagent a2");
+    for input in [
+        "a2 steer keep  spaces\nand lines",
+        "steer a2 keep  spaces\nand lines",
+        "steer grandchild-full keep  spaces\nand lines",
+    ] {
+        let result = host
+            .call_command("agents", json!({"session":"main", "raw_input":input}))
+            .unwrap();
+        assert_eq!(result.message, "User steering sent to subagent a2");
+    }
     for input in ["a2 stop", "stop grandchild-full", "stop a2", "stop"] {
         let result = host
             .call_command("agents", json!({"session":"main", "raw_input":input}))
@@ -173,17 +183,15 @@ fn steering_requires_text_and_stop_retains_compatibility() {
     }
     host.load("before-confirm", "assert(steered); assert(stopped == nil)")
         .unwrap();
-    host.call_command(
-        "agents",
-        json!({"session":"main", "raw_input":"grandchild-full stop confirm"}),
-    )
-    .unwrap();
-    host.load("check", "assert(stopped == 1)").unwrap();
+    for (index, input) in ["grandchild-full stop confirm", "stop grandchild-full confirm", "stop a2 confirm"].iter().enumerate() {
+        host.call_command("agents", json!({"session":"main", "raw_input":input})).unwrap();
+        host.load(&format!("check-{index}"), &format!("assert(stopped == {})", index + 1)).unwrap();
+    }
     let choices = host
         .complete_command("agents", json!({"session":"main"}))
         .unwrap();
     assert!(choices.contains(&"a1".into()));
-    assert!(choices.contains(&"a2 steer".into()));
+    assert!(choices.contains(&"steer a2".into()));
     assert!(choices.contains(&"stop a2".into()));
     assert!(!choices.contains(&"stop a1".into()));
     assert!(choices.iter().all(|choice| !choice.contains("-full")));
@@ -224,7 +232,7 @@ fn stop_listing_uses_aliases_and_completion_falls_back_without_aliases() {
         .complete_command("agents", json!({"session":"main"}))
         .unwrap();
     assert!(choices.contains(&"child-full".into()));
-    assert!(choices.contains(&"child-full steer".into()));
+    assert!(choices.contains(&"steer child-full".into()));
     assert!(choices.contains(&"stop child-full".into()));
 }
 
@@ -267,7 +275,11 @@ fn inspect_completion_precedes_stop_and_steer_even_after_trailing_spaces() {
             .complete_command("agents", json!({"session":"main", "raw_input":raw}))
             .unwrap();
         assert!(choices.contains(&"stop".into()));
-        assert!(choices.contains(&"a1 steer".into()));
+        assert!(choices.contains(&"steer a1".into()));
+        if raw.contains("a1") {
+            assert!(choices.contains(&"a1 steer".into()));
+            assert!(choices.contains(&"a1 stop".into()));
+        }
         // Model the host's command prefix and input's prefix filtering. No
         // mutation verb may become the first match for an exact inspect input.
         let typed = format!("agents{raw}");

@@ -128,7 +128,7 @@ mod tests {
         overlay.on_key(&ctx, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(overlay.wants(&ctx));
         let apps = rness_tui::modules::ext_apps::AppsState::default();
-        apps.set_apps(vec![rness_tui::modules::ext_apps::AppInfo { name: "sessions".into(), slot: "overlay".into(), title: "Sessions".into(), keymap: Some("ctrl+s".into()) }]);
+        apps.set_apps(vec![rness_tui::modules::ext_apps::AppInfo { name: "sessions".into(), slot: "overlay".into(), title: "Sessions".into(), keymap: Some("ctrl+s".into()), refresh_ms: None, capture_escape: false, config: serde_json::Value::Null }]);
         overlay.apps = Some(apps.clone());
         rness_tui::modules::ext_apps::handle_global_key(&apps, &KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(!overlay.wants(&ctx));
