@@ -24,20 +24,26 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
     host.load("stub", r#"
         rness.session = {usage=function() return {input=0} end, config=function() return {} end}
         counts = {one=2, two=1}
+        agents = {
+          one={{session='a1',running=true},{session='a2',running=true},{session='a3',running=false}},
+          two={{session='a4',running=true}},
+        }
         rness.jobs = {count=function(session) return counts[session] or 0 end}
+        rness.subagents = {list=function(session) return agents[session] or {} end}
     "#).await.unwrap();
     host.load("statusline", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
     let one = json!({"session":"one","model":"test"});
     let text = host.status(one.clone()).await.unwrap().to_string();
-    assert!(text.contains("idle") && text.contains("2 bg jobs"), "{text}");
+    assert!(text.contains("idle") && text.contains("2 bg jobs") && text.contains("2 bg agents"), "{text}");
     let text = host.status(json!({"session":"two"})).await.unwrap().to_string();
-    assert!(text.contains("1 bg job") && !text.contains("2 bg jobs"), "{text}");
+    assert!(text.contains("1 bg job") && text.contains("1 bg agent") && !text.contains("2 bg jobs"), "{text}");
     host.fire_hook("frame", json!({"type":"compaction_started","session":"one"}));
     let text = host.status(one.clone()).await.unwrap().to_string();
-    assert!(text.contains("compacting context") && text.contains("2 bg jobs"), "{text}");
-    host.load("settle", "counts.one = 0").await.unwrap();
-    assert!(!host.status(one.clone()).await.unwrap().to_string().contains("bg job"));
-    host.load("unavailable", "rness.jobs = nil").await.unwrap();
+    assert!(text.contains("compacting context") && text.contains("2 bg jobs") && text.contains("2 bg agents"), "{text}");
+    host.load("settle", "counts.one = 0; agents.one = {}").await.unwrap();
+    let settled = host.status(one.clone()).await.unwrap().to_string();
+    assert!(!settled.contains("bg job") && !settled.contains("bg agent"), "{settled}");
+    host.load("unavailable", "rness.jobs = nil; rness.subagents = nil").await.unwrap();
     assert!(host.status(one).await.is_some());
 }
 

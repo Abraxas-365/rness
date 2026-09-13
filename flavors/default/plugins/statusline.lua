@@ -112,9 +112,22 @@ rness.ui.statusline = {
   end,
   right = function(ctx)
     local parts = {}
-    -- In-memory metadata only: never consume job_output or replay session logs.
-    -- Jobs remain visible while the model is idle or compacting. Missing APIs
-    -- are tolerated when this plugin is copied to an older binary.
+    -- In-memory metadata only: never consume job output or replay session logs.
+    -- Both counters remain visible while the model is idle or compacting. Missing
+    -- APIs are tolerated when this plugin is copied to an older binary.
+    if ctx.session and rness.subagents then
+      local ok, agents = pcall(rness.subagents.list, ctx.session)
+      if ok and type(agents) == "table" then
+        local count = 0
+        for _, agent in ipairs(agents) do
+          if agent.running then count = count + 1 end
+        end
+        if count > 0 then
+          parts[#parts + 1] = { text = count .. " bg agent" .. (count == 1 and "" or "s"),
+            style = { fg = "#83a598" } }
+        end
+      end
+    end
     if ctx.session and rness.jobs then
       local ok, count = pcall(rness.jobs.count, ctx.session)
       if ok and count > 0 then
