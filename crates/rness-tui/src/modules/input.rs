@@ -349,6 +349,43 @@ mod tests {
     }
 
     #[test]
+    fn exact_agent_completions_submit_on_enter_without_dismissing_picker() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        for text in ["/agents", "/agents ", "/agents a1", "/agents a1 "] {
+            for named in [false, true] {
+                let mut input = Input::new();
+                input.on_action(&ctx, "input:commands", &serde_json::json!([["agents", "Monitor"]]));
+                input.editor.insert_str(text);
+                if text.contains(' ') {
+                    input.on_action(&ctx, "input:completion", &serde_json::json!({
+                        "text":text, "values":[text.strip_prefix("/agents ").unwrap(), "stop", "a1 steer"]
+                    }));
+                }
+                assert!(!input.matches().is_empty());
+                let outcome = if named {
+                    let action = input.bindings().into_iter().find(|b| b.chord.code == KeyCode::Enter && b.chord.mods == KeyModifiers::NONE).unwrap().action;
+                    assert_eq!(action, "submit");
+                    input.on_binding(&ctx, action)
+                } else { input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) };
+                assert!(matches!(outcome.actions.as_slice(), [Action::Submit(sent)] if sent == text), "{text}: {:?}", outcome.actions);
+                assert!(input.editor.is_empty());
+                assert_eq!(input.history.last().unwrap().text(), text);
+            }
+        }
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:commands", &serde_json::json!([["agents", "Monitor"]]));
+        input.editor.insert_str("/agents");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/agents "));
+        input.editor.take();
+        input.editor.insert_str("/agen");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/agents "));
+    }
+
+    #[test]
     fn agents_stop_id_completes_as_a_multiword_argument_while_busy() {
         let mut model = crate::app::Model::new("s".into(), "m".into());
         model.busy = true;
@@ -736,10 +773,16 @@ impl Component for Input {
             (self.image_preview_key, "image_preview"), (self.image_close_key, "close_image_preview"),
             (self.next_image_key, "next_image"), (self.remove_image_key, "remove_image"),
         ].into_iter().filter_map(|(chord, action)| chord.map(|chord| crate::keymaps::ComponentBinding { action, chord })).collect();
-        let keys = if !self.matches().is_empty() {
+        let matches = self.matches();
+        let keys = if !matches.is_empty() {
+            let selected = self.selected.min(matches.len() - 1);
+            // Enter on an exact command is submission, not a no-op completion
+            // loop. Tab still completes; references retain their own behavior.
+            let exact = self.at_token().is_none()
+                && self.editor.text().trim_end() == format!("/{}", matches[selected].0).trim_end();
             vec![("up", "completion_previous"), ("ctrl+p", "completion_previous"),
                 ("down", "completion_next"), ("ctrl+n", "completion_next"),
-                ("tab", "completion_accept"), ("enter", "completion_accept"), ("esc", "completion_dismiss")]
+                ("tab", "completion_accept"), ("enter", if exact { "submit" } else { "completion_accept" }), ("esc", "completion_dismiss")]
         } else { Vec::new() };
         bindings.extend(keys.into_iter().chain([
             ("enter", "submit"), ("ctrl+enter", "steer"), ("alt+enter", "newline"), ("shift+enter", "newline"),
