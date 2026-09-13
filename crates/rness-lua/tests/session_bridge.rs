@@ -92,6 +92,68 @@ impl rness_engine::interaction::Command for BlockingCommand {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn model_plugin_updates_session_settings_durably() {
+    use rness_engine::config::{ModelRegistry, ModelDeclaration, ModelCapabilities, ReasoningCapabilities, Profile, RequestOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Arc::new(ToolRegistry::default());
+    let mut models = ModelRegistry::default();
+    models.declare_model(ModelDeclaration { provider: "test".into(), model: "fake-1".into(), capabilities: ModelCapabilities {
+        temperature: Some(true), max_output_tokens: Some(4096),
+        reasoning: Some(ReasoningCapabilities { efforts: Some(vec!["high".into()]), budget_tokens: None }),
+        ..Default::default()
+    }}).unwrap();
+    models.declare_model(ModelDeclaration { provider: "test".into(), model: "restricted".into(), capabilities: ModelCapabilities {
+        temperature: Some(false), output_token_limit: Some(false), ..Default::default()
+    }}).unwrap();
+    models.declare_profile("restricted".into(), Profile::Fixed { provider: "test".into(), model: "restricted".into(), options: RequestOptions::default() }).unwrap();
+    let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(OneAnswer), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default()))
+        .with_agents(Default::default(), models)
+        .with_provider_resolver(CallConfig { selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }), ..Default::default() }, Arc::new(|selection| {
+            if selection.route != "test" { return Err("unknown provider".into()); }
+            Ok(Arc::new(OneAnswer) as Arc<dyn Provider>)
+        })));
+    let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+    host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "fake-1".into()).await.unwrap();
+    host.load("models", include_str!("../../../flavors/default/plugins/models.lua")).await.unwrap();
+    let id = sessions.create(None).unwrap();
+    for (command, expected) in [("/model ", "test/fake-1"), ("/profile ", "restricted"), ("/model-settings ", "reasoning high")] {
+        let prepared = sessions.prepare_command(&id, command).unwrap().unwrap();
+        assert!(prepared.complete(&sessions).unwrap().contains(&expected.to_string()));
+    }
+    for command in ["/model-settings temperature 0.4", "/model-settings max-output-tokens 2048", "/model-settings reasoning high"] {
+        let result = sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: command.into() }]).unwrap();
+        assert!(matches!(result, rness_engine::inbox::Disposition::Command(_)));
+    }
+    let config = sessions.config(&id).unwrap();
+    assert_eq!(config.temperature, Some(0.4));
+    assert_eq!(config.max_output_tokens, Some(2048));
+    assert_eq!(config.reasoning, Some(Reasoning::Effort { effort: "high".into() }));
+    for command in ["/model malformed", "/model unknown/model", "/model-settings temperature nope", "/model-settings max-output-tokens -1"] {
+        assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: command.into() }]).is_err());
+        assert_eq!(sessions.config(&id).unwrap(), config);
+    }
+    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "/model-settings temperature default".into() }]).unwrap();
+    let replayed = sessions.replay(&id).unwrap();
+    assert_eq!(replayed.context.config.temperature, None);
+    assert_eq!(replayed.context.config.max_output_tokens, Some(2048));
+    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "/profile restricted".into() }]).unwrap();
+    let restricted = sessions.replay(&id).unwrap().context.config;
+    assert_eq!(restricted.selection.as_ref().unwrap().model, "restricted");
+    assert_eq!(restricted.temperature, None);
+    assert_eq!(restricted.max_output_tokens, None);
+    assert_eq!(restricted.reasoning, None);
+    for field in ["temperature", "max-output-tokens", "reasoning", "budget-tokens"] {
+        assert!(sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: format!("/model-settings {field} 1") }]).is_err());
+    }
+    let rness_engine::inbox::Disposition::Command(result) = sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "/model-settings".into() }]).unwrap() else { panic!("expected command") };
+    assert!(!result.message.contains("Temperature:"));
+    assert!(!result.message.contains("Max output tokens:"));
+    assert_eq!(sessions.profile_config("restricted", None).unwrap().temperature, None);
+    assert_eq!(sessions.config(&sessions.create(None).unwrap()).unwrap().selection.unwrap().model, "fake-1");
+    assert!(!replayed.history.iter().any(|env| matches!(env.event, SessionEvent::TurnStarted { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn lua_commands_execute_without_model_turn_and_unload_from_service() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(ToolRegistry::default());

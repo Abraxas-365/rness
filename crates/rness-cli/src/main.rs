@@ -706,6 +706,8 @@ fn print_parts(who: &str, parts: &[ContentPart]) {
 mod questions;
 
 struct LocalBackend {
+    completion_lock: Arc<tokio::sync::Mutex<()>>,
+    completion_generation: Arc<std::sync::atomic::AtomicU64>,
     reference_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
@@ -830,16 +832,23 @@ impl rness_tui::app::Backend for LocalBackend {
             });
             return;
         }
-        let prepared = self.sessions.prepare_command(session, &text);
+        let generation = self.completion_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let current_generation = self.completion_generation.clone();
+        let lock = self.completion_lock.clone();
         let tx = self.results.clone();
         let session = session.clone();
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
+            let _guard = lock.lock().await;
+            if current_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
+            let prepared = sessions.prepare_command(&session, &text);
             let result = match prepared {
                 Ok(Some(command)) => tokio::task::spawn_blocking(move || command.complete(&sessions)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())),
                 Ok(None) => Ok(Vec::new()),
+                Err(rness_engine::service::ServiceError::Busy) => return,
                 Err(error) => Err(error.to_string()),
             };
+            if current_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
             match result {
                 Ok(values) => { let _ = tx.send(rness_tui::app::Action::CompletionResult(session, text, values)); }
                 Err(error) => { let _ = tx.send(rness_tui::app::Action::CommandResult(session, format!("Completion failed: {error}"))); }
@@ -1199,7 +1208,7 @@ async fn run_tui(
             }
         })
     };
-    let backend = Arc::new(LocalBackend { reference_cancel: Default::default(), sessions: Arc::clone(&sessions), results: host_tx.clone() });
+    let backend = Arc::new(LocalBackend { completion_lock: Default::default(), completion_generation: Default::default(), reference_cancel: Default::default(), sessions: Arc::clone(&sessions), results: host_tx.clone() });
 
     // Drive view/key round-trips for the mounted apps from a host task.
     // The TUI stays Lua-agnostic — it renders published lines and

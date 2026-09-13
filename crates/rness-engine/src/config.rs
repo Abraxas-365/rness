@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 pub struct ModelCapabilities {
     /// None leaves support unknown; false explicitly forbids image input.
     pub image_input: Option<bool>,
+    pub temperature: Option<bool>,
+    pub output_token_limit: Option<bool>,
     pub context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub reasoning: Option<ReasoningCapabilities>,
@@ -136,6 +138,10 @@ impl ModelRegistry {
         Ok(())
     }
 
+    pub fn profile_names(&self) -> Vec<String> {
+        self.profiles.keys().cloned().collect()
+    }
+
     pub fn model_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.models.keys().map(|(provider, model)| format!("{provider}/{model}")).collect();
         names.sort();
@@ -193,6 +199,12 @@ impl ModelRegistry {
             return Err("temperature must be finite".into());
         }
         let caps = config.selection.as_ref().and_then(|selection| self.capabilities(selection));
+        if config.temperature.is_some() && caps.and_then(|caps| caps.temperature) == Some(false) {
+            return Err("temperature is not supported by this model".into());
+        }
+        if config.max_output_tokens.is_some() && caps.and_then(|caps| caps.output_token_limit) == Some(false) {
+            return Err("max_output_tokens is not supported by this model".into());
+        }
         if let (Some(requested), Some(limit)) = (
             config.max_output_tokens,
             caps.and_then(|caps| caps.max_output_tokens),
@@ -235,6 +247,25 @@ impl ModelRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicitly_unsupported_generation_controls_are_rejected() {
+        let mut registry = ModelRegistry::default();
+        registry.declare_model(ModelDeclaration {
+            provider: "p".into(), model: "m".into(),
+            capabilities: ModelCapabilities { temperature: Some(false), output_token_limit: Some(false), ..Default::default() },
+        }).unwrap();
+        let mut config = CallConfig {
+            selection: Some(ModelSelection { route: "p".into(), model: "m".into() }),
+            ..Default::default()
+        };
+        assert!(registry.validate(&config).is_ok());
+        config.temperature = Some(0.5);
+        assert!(registry.validate(&config).is_err());
+        config.temperature = None;
+        config.max_output_tokens = Some(100);
+        assert!(registry.validate(&config).is_err());
+    }
 
     #[test]
     fn provider_profile_rejects_ambiguous_or_invalid_shapes() {

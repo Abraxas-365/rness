@@ -81,6 +81,23 @@ pub fn install(
     rness.set("images", images)?;
     let session = lua.create_table()?;
     let s = Arc::clone(&sessions);
+    session.set("model_capabilities", lua.create_function(move |lua, selection: Table| {
+        let selection = lua.from_value(mlua::Value::Table(selection))?;
+        lua.to_value(&s.model_capabilities(&selection))
+    })?)?;
+    let s = Arc::clone(&sessions);
+    session.set("model_names", lua.create_function(move |lua, ()| {
+        lua.to_value(&s.model_names())
+    })?)?;
+    let s = Arc::clone(&sessions);
+    session.set("profiles", lua.create_function(move |lua, ()| {
+        lua.to_value(&s.profile_names())
+    })?)?;
+    let s = Arc::clone(&sessions);
+    session.set("profile_config", lua.create_function(move |lua, (name, provider): (String, Option<String>)| {
+        lua.to_value(&s.profile_config(&name, provider.as_deref()).map_err(err)?)
+    })?)?;
+    let s = Arc::clone(&sessions);
     session.set("plan", lua.create_function(move |lua, (id, active): (String, Option<bool>)| {
         if let Some(active) = active { s.select_plan(&id, active).map_err(err)?; }
         lua.to_value(&s.plan(&id).map_err(err)?)
@@ -239,7 +256,9 @@ pub fn install(
                 let config = mlua::LuaSerdeExt::from_value::<rness_protocol::events::CallConfig>(
                     lua, mlua::Value::Table(new),
                 )?;
-                s.set_config(&id, config).map_err(err)?;
+                let permit = lua.app_data_ref::<rness_engine::service::CommandPermit>()
+                    .map(|permit| permit.clone());
+                s.set_config_with_permit(&id, config, permit).map_err(err)?;
             }
             let config = s.config(&id).map_err(err)?;
             mlua::LuaSerdeExt::to_value(lua, &config)

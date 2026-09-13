@@ -282,6 +282,11 @@ impl Model {
             }
             let previous_len = self.entries.len();
             match &env.event {
+                SessionEvent::RequestConfig(config) => {
+                    if let Some(selection) = &config.selection {
+                        self.model_name = format!("{}/{}", selection.route, selection.model);
+                    }
+                }
                 SessionEvent::UserMessage(m) => self.entries.push(Entry::User {
                     content: m.content.clone(),
                 }),
@@ -2488,7 +2493,7 @@ mod tests {
             app.route_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert!(app.route_key(KeyEvent::from(KeyCode::Enter)).is_empty());
-        assert!(app.route_key(KeyEvent::from(KeyCode::F(8))).is_empty());
+        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Complete(text)] if text == "/unload "));
         app.route_key(KeyEvent::from(KeyCode::F(6)));
         assert_eq!(apps.active().as_deref(), Some("review"));
         app.route_key(KeyEvent::from(KeyCode::Esc));

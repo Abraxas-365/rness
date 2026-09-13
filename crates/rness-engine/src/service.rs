@@ -1125,6 +1125,22 @@ impl SessionService {
         }).unwrap_or_default())
     }
 
+    pub fn model_capabilities(&self, selection: &rness_protocol::events::ModelSelection) -> Option<&crate::config::ModelCapabilities> {
+        self.models.capabilities(selection)
+    }
+
+    pub fn model_names(&self) -> Vec<String> {
+        self.models.model_names()
+    }
+
+    pub fn profile_names(&self) -> Vec<String> {
+        self.models.profile_names()
+    }
+
+    pub fn profile_config(&self, name: &str, provider: Option<&str>) -> Result<CallConfig, ServiceError> {
+        self.models.resolve_profile_for(name, provider).map_err(ServiceError::InvalidConfig)
+    }
+
     /// Commit new request controls (dsh request/header model): a durable
     /// `request/config` event applied to every later model request.
     /// No-op when equal to the effective config — only real changes are
@@ -1134,9 +1150,30 @@ impl SessionService {
         session: &SessionId,
         config: CallConfig,
     ) -> Result<(), ServiceError> {
-        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        self.set_config_with_permit(session, config, None)
+    }
+
+    pub fn set_config_with_permit(
+        &self,
+        session: &SessionId,
+        config: CallConfig,
+        permit: Option<CommandPermit>,
+    ) -> Result<(), ServiceError> {
         let live = self.live(session);
-        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let reservation = match permit {
+            Some(permit) => {
+                let reservation = permit.0.upgrade().ok_or(ServiceError::Busy)?;
+                if !Arc::ptr_eq(&reservation.live, &live) { return Err(ServiceError::Busy); }
+                Some(reservation)
+            }
+            None => None,
+        };
+        let _activity = if reservation.is_none() {
+            Some(self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?)
+        } else { None };
+        let _operation = if reservation.is_none() {
+            Some(live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?)
+        } else { None };
         let inbox = live.inbox.lock().unwrap();
         if inbox.phase() != Phase::Idle {
             return Err(ServiceError::Busy);
@@ -1156,6 +1193,9 @@ impl SessionService {
         }
         let mut log = self.store.open(session)?;
         log.append(&SessionEvent::RequestConfig(config))?;
+        drop(log);
+        drop(inbox);
+        self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() });
         Ok(())
     }
 }

@@ -325,6 +325,24 @@ mod tests {
     }
 
     #[test]
+    fn typing_and_accepting_commands_requests_dynamic_completion() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.editor.insert_str("/model");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/model "));
+        input.on_action(&ctx, "input:completion", &serde_json::json!({"text":"/model ", "values":["chatgpt/test"]}));
+        assert_eq!(input.matches()[0].0, "model chatgpt/test");
+        let mut input = Input::new();
+        input.on_action(&ctx, "input:commands", &serde_json::json!([["model", "Select model"]]));
+        input.editor.insert_str("/mod");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/model "));
+    }
+
+    #[test]
     fn dynamic_completion_ignores_stale_queries() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -404,7 +422,7 @@ mod tests {
         assert!(help.contains("completion_accept"));
         assert!(!help.contains("→ submit"));
         let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(outcome.actions.is_empty());
+        assert!(matches!(outcome.actions.as_slice(), [Action::Complete(text)] if text == "/unload "));
         assert_eq!(input.editor.text(), "/unload ");
         input.editor.take();
         input.dismissed = false;
@@ -828,8 +846,8 @@ impl Input {
                     let replacement = format!("/{} ", matches[selected].0);
                     self.editor.take();
                     self.editor.insert_str(&replacement);
-                    self.dismissed = !self.candidates.iter().any(|(name, _)| name.starts_with(replacement.trim_start_matches('/')));
-                    return KeyOutcome::consumed();
+                    self.dismissed = false;
+                    return KeyOutcome::act(vec![Action::Complete(replacement)]);
                 }
                 Some("completion_dismiss") => {
                     self.dismissed = true;
@@ -931,6 +949,12 @@ impl Input {
         };
         if self.at_token().is_some() && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End) {
             return KeyOutcome::act(vec![Action::Complete(self.editor.before_cursor())]);
+        }
+        let current = self.editor.text();
+        if current != text && current.starts_with('/') && current.contains(' ')
+            && !current.contains('\n') && !self.editor.has_pastes()
+        {
+            return KeyOutcome::act(vec![Action::Complete(current)]);
         }
         outcome
     }

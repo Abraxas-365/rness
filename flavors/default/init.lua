@@ -25,6 +25,7 @@ rness.plugins.setup({
   { name = "tasks", file = "plugins/tasks.lua" },
   { name = "plan", file = "plugins/plan.lua" },
   { name = "commands", file = "plugins/commands.lua" },
+  { name = "models", file = "plugins/models.lua" },
 })
 rness.keymap.setup({})
 rness.ui.promptbox = { paste = { keys = { preview = "alt+g" } } }

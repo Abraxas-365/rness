@@ -160,6 +160,42 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 
 Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
 
+### Switching models inside a session
+
+The default flavor's `models` Lua plugin provides **Alt+M**, an interactive editor
+for profiles, provider/model, reasoning effort or token budget, temperature, and output limits.
+Only declared supported settings are shown: model capabilities `temperature = true`
+enable temperature; `output_token_limit = true` or a declared `max_output_tokens`
+limit enables output limits (`output_token_limit = false` explicitly disables them).
+Reasoning fields require declared `reasoning.efforts` or `reasoning.budget_tokens`.
+Unknown capabilities are hidden, not guessed; slash commands also reject undeclared
+settings, but `default` can always clear an old override.
+Use `/profile` to list presets or `/profile NAME` to apply one (also available in
+Alt+M). Applying a profile replaces all generation options, clearing absent overrides,
+while preserving the agent and tool permissions. It never edits the profile definition.
+Provider-specific profiles use the session's current provider connection.
+Use j/k to select a field, Enter to edit/save, and Escape to close. Enter models as
+`provider/model`; the provider must already be configured. Model IDs can contain slashes.
+
+The same settings are available through commands:
+
+```text
+/model chatgpt/gpt-6-astra
+/model-settings reasoning high
+/model-settings temperature 0.7
+/model-settings max-output-tokens 8192
+/model-settings budget-tokens 4096
+/model-settings temperature default
+```
+
+`/model` and `/model-settings` without arguments show the current settings.
+Changes persist only for the current session (including resume), preserve unrelated
+settings, and are rejected while a turn is running. Use `default` to clear an override;
+reasoning effort and token budget replace one another. Model switching clears options
+not declared supported by the target model; clear any remaining incompatible values
+(such as a different reasoning effort) first. This plugin edits explicit model IDs; it does not
+fetch a remote model catalog or change credentials or defaults for new sessions.
+
 ### Reasoning and request options
 
 ```sh
