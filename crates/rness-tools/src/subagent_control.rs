@@ -132,7 +132,9 @@ impl Tool for ListAgentsTool {
          shows direct children, 'descendants' walks the whole tree in \
          pre-order. Each line: <session id> depth=<n> <running|idle> \
          parent=<id>. One-shot children are absent — they cannot accept \
-         send_message."
+         send_message. Use this to recall children, not poll for completion: \
+         their closing answers arrive automatically as settle notices, at the \
+         next step when working or in a new turn when idle."
     }
 
     fn input_schema(&self) -> Value {

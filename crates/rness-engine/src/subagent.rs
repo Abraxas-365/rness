@@ -178,9 +178,9 @@ impl SubagentRuntime {
         };
         // Settle watch (dsh: "when a resident Activation settles, the
         // manager tells the child's direct parent in the parent's own
-        // turn stream"): every idle of a CONTINUABLE child injects a
-        // settle notice into its parent. One subscription for the
-        // runtime's life; one-shot children are untouched.
+        // turn stream"): every idle of a CONTINUABLE child delivers its
+        // final output to the parent, steering a busy turn or waking an idle
+        // parent. Teardown only logs the notice. One-shot jobs are untouched.
         let watch_sessions = Arc::clone(&sessions);
         let disposer = sessions.bus().on::<SessionIdleEv>(move |child: &SessionId| {
             let Ok(Some(d)) = watch_sessions.store().delegation(child) else {
@@ -205,13 +205,14 @@ impl SubagentRuntime {
                 "[subagent {child} settled: {stop}]\n{}",
                 if run.output.is_empty() { "(no output)" } else { &run.output }
             );
-            if let Err(e) = watch_sessions.send(
-                &d.parent,
-                UserIntent::Inject,
-                vec![ContentPart::Text { text }],
-            ) {
-                tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
-            }
+            // Never block the child's idle event on a parent reservation (the
+            // parent may itself be waiting for this child to finish).
+            let sessions = Arc::clone(&watch_sessions);
+            tokio::spawn(async move {
+                if let Err(e) = sessions.notify_subagent_settled(&d.parent, text).await {
+                    tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
+                }
+            });
         });
         rt.watchers.lock().expect("watchers lock").push(disposer);
         rt

@@ -61,7 +61,10 @@ impl Tool for SubagentTool {
          (describe the task fully). Foreground by default: the result is \
          the child's final answer. With run_in_background the child runs \
          as a one-shot job — read it with job_output, cancel with job_kill. \
-         Job IDs cannot be used with send_message. With \
+         Job IDs cannot be used with send_message. Continue independent work, \
+         avoid busy-polling or duplicating the child task, and collect relevant \
+         results before dependent decisions or your final answer. Use \
+         job_output(wait=true) when blocked on a one-shot result. With \
          background_mode 'continuable' the child keeps running as a named \
          agent: message it with send_message, stop its turn with \
          interrupt_agent, list with list_agents; its results arrive as \

@@ -364,21 +364,26 @@ async fn settle_notice_reaches_the_parent() {
         .unwrap();
     sessions.join(&child).await;
 
-    // The runtime's settle watch injected a notice into the idle parent.
+    // Delivery is asynchronous: wait for the woken turn to finish.
+    wait_for_parent_turns(&sessions, &parent, 1).await;
+    sessions.join(&parent).await;
     let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 1);
+    assert!(history.iter().any(|e| matches!(e.event, SessionEvent::AssistantMessage(_))));
     let notice = history.iter().any(|e| match &e.event {
         SessionEvent::UserMessage(m) => {
-            m.intent == UserIntent::Inject
+            m.intent == UserIntent::Followup
                 && m.content.iter().any(|p| match p {
                     ContentPart::Text { text } => {
                         text.starts_with(&format!("[subagent {child} settled: completed]"))
+                            && text.contains("saw 1 turns")
                     }
                     _ => false,
                 })
         }
         _ => false,
     });
-    assert!(notice, "settle notice injected into the parent log");
+    assert!(notice, "settle notice wakes parent with child output");
     let _ = rt;
 }
 
@@ -400,6 +405,8 @@ async fn message_authority_is_exact_adjacency() {
         rt.send_message(&stranger, &child, "hola".into()),
         Err(SErr::NotAuthorized(_))
     ));
+
+    wait_for_parent_turns(&sessions, &parent, 1).await;
 
     // The child CAN message its direct parent (up edge).
     rt.send_message(&child, &parent, "reporte".into()).unwrap();
@@ -459,6 +466,9 @@ async fn list_children_shows_continuable_only_in_preorder() {
         .unwrap();
     sessions.join(&g1).await;
 
+    // The CLI enables persisted jobs under the same session root.
+    std::fs::create_dir_all(dir.path().join("jobs/job-1")).unwrap();
+    std::fs::write(dir.path().join("jobs/job-1/state.json"), "{}").unwrap();
     let direct = rt.list_children(&parent, false).unwrap();
     assert_eq!(direct.len(), 1);
     assert_eq!(direct[0].session, c1);
@@ -497,11 +507,13 @@ async fn every_settle_reaches_the_parent() {
         .start_continuable("spawn", SubagentRequest { agent: None, parent: parent.clone(), prompt: "uno".into() })
         .unwrap();
     sessions.join(&child).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_parent_turns(&sessions, &parent, 1).await;
+    sessions.join(&parent).await;
 
     rt.send_message(&parent, &child, "dos".into()).unwrap();
     sessions.join(&child).await;
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_parent_turns(&sessions, &parent, 2).await;
+    sessions.join(&parent).await;
 
     let history = sessions.store().history(&parent).unwrap();
     let notices = history
@@ -584,4 +596,138 @@ async fn steer_accepted_during_final_step_is_not_lost() {
         .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
         .count();
     assert_eq!(turns, 2, "the late steer started its own turn");
+}
+
+async fn wait_for_notices(sessions: &SessionService, parent: &SessionId, count: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let history = sessions.store().history(parent).unwrap();
+            let notices = history.iter().filter(|e| matches!(&e.event,
+                SessionEvent::UserMessage(m) if m.content.iter().any(|p|
+                    matches!(p, ContentPart::Text { text } if text.contains("settled")))))
+                .count();
+            if notices >= count { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("settlement delivered");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settlements_wake_repeatedly_and_interrupt_is_not_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let parent = sessions.create(None).unwrap();
+    // Exhaust the separate job budget first.
+    for _ in 0..3 {
+        sessions.notify_job(&parent, "job done".into()).unwrap();
+        sessions.join(&parent).await;
+    }
+    sessions.cancel(&parent);
+    for _ in 0..4 {
+        assert_eq!(sessions.notify_subagent_settled(&parent, "child settled".into()).await.unwrap(),
+            rness_engine::inbox::Disposition::StartTurn);
+        sessions.join(&parent).await;
+    }
+    let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 7);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn teardown_logs_child_output_without_waking_parent_or_ancestor() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let root = sessions.create(None).unwrap();
+    sessions.begin_teardown(&root);
+    let child = rt.start_continuable("spawn", SubagentRequest {
+        agent: None, parent: root.clone(), prompt: "inspect".into(),
+    }).unwrap();
+    sessions.join(&child).await;
+    wait_for_notices(&sessions, &root, 1).await;
+    let history = sessions.store().history(&root).unwrap();
+    assert!(!history.iter().any(|e| matches!(e.event, SessionEvent::TurnStarted { .. })));
+    assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(m)
+        if m.intent == UserIntent::Inject)));
+    assert_eq!(sessions.notify_subagent_settled(&child, "grandchild settled".into()).await.unwrap(),
+        rness_engine::inbox::Disposition::LogOnly);
+    let history = sessions.store().history(&child).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_parent_batches_late_child_settlements() {
+    let dir = tempfile::tempdir().unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()),
+        Arc::new(GatedStep { entered: entered_tx, release: tokio::sync::Mutex::new(release_rx) }),
+        Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()),
+    ));
+    let parent = sessions.create(None).unwrap();
+    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "work".into() }]).unwrap();
+    entered_rx.recv().await.unwrap();
+    for i in 0..2 {
+        assert_eq!(sessions.notify_subagent_settled(&parent, format!("child {i} settled")).await.unwrap(),
+            rness_engine::inbox::Disposition::Queued);
+    }
+    release_tx.send(()).unwrap();
+    sessions.join(&parent).await;
+    let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 2);
+    assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::AssistantMessage(m)
+        if m.content.iter().any(|p| matches!(p, ContentPart::Text { text } if text == "turno con 4 entradas")))));
+}
+
+async fn wait_for_parent_turns(sessions: &SessionService, parent: &SessionId, count: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let history = sessions.store().history(parent).unwrap();
+            if history.iter().filter(|e| matches!(e.event, SessionEvent::TurnEnded { .. })).count() >= count
+                && sessions.phase(parent) == rness_engine::inbox::Phase::Idle { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }).await.expect("parent processed settlements");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settlement_waits_for_maintenance_then_observes_teardown() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let parent = sessions.create(None).unwrap();
+    let maintenance = sessions.try_extension_maintenance().unwrap();
+    let delivery = sessions.notify_subagent_settled(&parent, "child settled".into());
+    tokio::pin!(delivery);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut delivery).await.is_err());
+    sessions.begin_teardown(&parent);
+    drop(maintenance);
+    assert_eq!(delivery.await.unwrap(), rness_engine::inbox::Disposition::LogOnly);
+    assert!(!sessions.store().history(&parent).unwrap().iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnStarted { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settlement_during_running_teardown_is_logged_after_writer_retires() {
+    let dir = tempfile::tempdir().unwrap();
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()),
+        Arc::new(GatedStep { entered: entered_tx, release: tokio::sync::Mutex::new(release_rx) }),
+        Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()),
+    ));
+    let parent = sessions.create(None).unwrap();
+    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "work".into() }]).unwrap();
+    entered_rx.recv().await.unwrap();
+    sessions.begin_teardown(&parent);
+    let delivery = sessions.notify_subagent_settled(&parent, "child settled".into());
+    tokio::pin!(delivery);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(20), &mut delivery).await.is_err());
+    release_tx.send(()).unwrap();
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(5), delivery).await.unwrap().unwrap(),
+        rness_engine::inbox::Disposition::LogOnly);
+    let history = sessions.store().history(&parent).unwrap();
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 1);
+    assert!(matches!(&history.last().unwrap().event, SessionEvent::UserMessage(m)
+        if m.intent == UserIntent::Inject));
 }

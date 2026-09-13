@@ -175,6 +175,9 @@ impl Drop for PreparedCommand {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Notice { None, Job, Subagent }
+
 // -- the service -----------------------------------------------------------
 
 pub type ProviderResolver = dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>, String> + Send + Sync;
@@ -196,6 +199,8 @@ pub struct SessionService {
     bus: Arc<EventBus>,
     live: Mutex<HashMap<SessionId, Arc<Live>>>,
     lifecycle: Arc<tokio::sync::RwLock<()>>,
+    /// Serializes teardown marking with automatic child-result admission.
+    closing: Mutex<std::collections::HashSet<SessionId>>,
     default_workspace: Mutex<Option<String>>,
     commands: crate::interaction::CommandRegistry,
     input_resolver: Mutex<Option<Arc<InputResolver>>>,
@@ -338,6 +343,7 @@ impl SessionService {
             },
             input_resolver: Mutex::new(None),
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
+            closing: Mutex::new(std::collections::HashSet::new()),
             instructions: Mutex::new(None),
         }
     }
@@ -640,24 +646,65 @@ impl SessionService {
         intent: UserIntent,
         content: Vec<ContentPart>,
     ) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, intent, content, false, false, None)
+        self.send_or_retry(session, intent, content, false, Notice::None, None)
     }
 
     /// Deliver a background completion at the next step, waking an idle owner.
     pub fn notify_job(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, true, None)
+        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, Notice::Job, None)
     }
 
     /// Await reservations and retain them through admission, avoiding a retry race.
     pub async fn notify_job_wait(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
-        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, true, Some((activity, operation)))
+        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, Notice::Job, Some((activity, operation)))
+    }
+
+    /// Deliver a continuable child's closing answer, without the job wake
+    /// budget. Wait out command reservations instead of dropping busy notices.
+    pub async fn notify_subagent_settled(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+        let activity = self.lifecycle.clone().read_owned().await;
+        let operation = self.live(session).operation.clone().lock_owned().await;
+        let mut lineage = vec![session.clone()];
+        while let Some(delegation) = self.store.delegation(lineage.last().unwrap())? {
+            if lineage.contains(&delegation.parent) {
+                return Err(ServiceError::InvalidConfig("cyclic subagent lineage".into()));
+            }
+            lineage.push(delegation.parent);
+        }
+        loop {
+            {
+                // Hold through admission: teardown cannot race the idle wake.
+                let closing = self.closing.lock().unwrap();
+                let teardown = lineage.iter().any(|id| closing.contains(id));
+                if !teardown || self.phase(session) == Phase::Idle {
+                    let intent = if teardown { UserIntent::Inject } else { UserIntent::Steer };
+                    return self.send_or_retry(session, intent, vec![ContentPart::Text { text }], false,
+                        Notice::Subagent, Some((activity, operation)));
+                }
+            }
+            // Cancelled bursts park queued input. Let the writer retire before
+            // logging a teardown notice, so the result remains durable.
+            self.cancel(session);
+            self.join(session).await;
+            // Another joiner may already own the handle; do not spin while
+            // waiting for that burst to publish Idle.
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Teardown is distinct from interrupting a turn: suppress automatic wakes
+    /// for this session and its descendants for the remainder of this host.
+    pub fn begin_teardown(&self, session: &SessionId) {
+        let mut closing = self.closing.lock().unwrap();
+        closing.insert(session.clone());
+        self.cancel(session);
     }
 
     /// Continue a failed turn from durable context without appending user content.
     pub fn retry(&self, session: &SessionId) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, UserIntent::Followup, vec![], true, false, None)
+        self.send_or_retry(session, UserIntent::Followup, vec![], true, Notice::None, None)
     }
 
     pub async fn notify_job_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
@@ -668,16 +715,16 @@ impl SessionService {
         let mut pending = live.job_pending.lock().unwrap();
         if live.inbox.lock().unwrap().phase() == Phase::Idle { pending.remove(id); }
         if pending.contains(id) { return Ok(false); }
-        self.send_or_retry_sourced(session, UserIntent::Steer, vec![ContentPart::Text {text}], false, true, Some((activity,operation)), Some(rness_protocol::events::MessageSource::JobCompletion {id:id.into()}))?;
+        self.send_or_retry_sourced(session, UserIntent::Steer, vec![ContentPart::Text {text}], false, Notice::Job, Some((activity,operation)), Some(rness_protocol::events::MessageSource::JobCompletion {id:id.into()}))?;
         pending.insert(id.into());
         Ok(false)
     }
 
-    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, job_notice: bool, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>) -> Result<Disposition, ServiceError> {
-        self.send_or_retry_sourced(session,intent,content,retry,job_notice,reservation,None)
+    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, notice: Notice, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>) -> Result<Disposition, ServiceError> {
+        self.send_or_retry_sourced(session,intent,content,retry,notice,reservation,None)
     }
-    fn send_or_retry_sourced(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, job_notice: bool, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>, source: Option<rness_protocol::events::MessageSource>) -> Result<Disposition, ServiceError> {
-        if !job_notice {
+    fn send_or_retry_sourced(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, notice: Notice, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>, source: Option<rness_protocol::events::MessageSource>) -> Result<Disposition, ServiceError> {
+        if notice == Notice::None {
             if let [ContentPart::Text { text }] = content.as_slice() {
                 if let Some(command) = self.prepare_command(session, text)? {
                     return command.execute(self);
@@ -740,7 +787,7 @@ impl SessionService {
             }
         }
         let mut wakes = live.job_wakes.lock().unwrap();
-        let intent = if job_notice && inbox.phase() == Phase::Idle && *wakes >= 3 {
+        let intent = if notice == Notice::Job && inbox.phase() == Phase::Idle && *wakes >= 3 {
             UserIntent::Inject
         } else {
             intent
@@ -808,9 +855,9 @@ impl SessionService {
                 *live.handle.lock().unwrap() = Some(handle);
             }
         }
-        if job_notice && disposition == Disposition::StartTurn {
+        if notice == Notice::Job && disposition == Disposition::StartTurn {
             *wakes += 1;
-        } else if !job_notice && intent != UserIntent::Inject {
+        } else if notice == Notice::None && intent != UserIntent::Inject {
             *wakes = 0;
         }
         Ok(disposition)

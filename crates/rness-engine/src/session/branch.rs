@@ -7,6 +7,7 @@
 //! acyclic by construction: a fork can only reference an event already
 //! committed in the parent (invariant #4), which existed before the child.
 
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
@@ -229,12 +230,31 @@ impl SessionStore {
         Ok(readers.entry(session.clone()).or_default().read_after(&self.root, session, after)?)
     }
 
-    /// All session ids in the store (unordered scan).
+    /// Session ids with a canonical log and a committed header. Auxiliary
+    /// directories (notably persisted jobs) are not sessions. Inspect only the
+    /// header, not full histories; corrupt later events remain visible on read.
     pub fn list(&self) -> Result<Vec<SessionId>, BranchError> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.root).map_err(LogError::from)? {
             let entry = entry.map_err(LogError::from)?;
-            if entry.file_type().map_err(LogError::from)?.is_dir() {
+            if !entry.file_type().map_err(LogError::from)?.is_dir() {
+                continue;
+            }
+            let path = super::log::log_file(&entry.path());
+            if !path.is_file() {
+                continue;
+            }
+            let file = match std::fs::File::open(path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(LogError::from(error).into()),
+            };
+            let mut header = Vec::new();
+            std::io::BufReader::new(file).read_until(b'\n', &mut header).map_err(LogError::from)?;
+            if !header.ends_with(b"\n") {
+                continue;
+            }
+            if matches!(serde_json::from_slice::<Envelope>(&header), Ok(Envelope { event: SessionEvent::Header(_), .. })) {
                 out.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -264,6 +284,57 @@ mod tests {
             },
             _ => None,
         }
+    }
+
+    #[test]
+    fn list_excludes_auxiliary_directories_without_session_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let first = store.create(None).unwrap();
+        let second = store.create(None).unwrap();
+        let mut expected = vec![first.session().clone(), second.session().clone()];
+        expected.sort();
+
+        // Job persistence shares the session root; neither it nor other
+        // directories/files should be mistaken for a session.
+        std::fs::create_dir_all(dir.path().join("jobs/job-1")).unwrap();
+        std::fs::write(dir.path().join("jobs/job-1/state.json"), "{}").unwrap();
+        std::fs::create_dir(dir.path().join("cache")).unwrap();
+        std::fs::create_dir(dir.path().join(ulid::Ulid::new().to_string())).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "not a session").unwrap();
+        // A directory named like the log is not a log file either.
+        std::fs::create_dir_all(dir.path().join("not-a-log/session.v1.jsonl")).unwrap();
+
+        assert_eq!(store.list().unwrap(), expected);
+        assert!(dir.path().join("jobs/job-1/state.json").is_file());
+    }
+
+    #[test]
+    fn list_skips_empty_invalid_and_non_header_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let real = store.create(None).unwrap();
+        let sid = real.session().clone();
+        let header = std::fs::read_to_string(super::super::log::log_file(&dir.path().join(&sid))).unwrap();
+        for (name, contents) in [
+            ("empty", ""),
+            ("invalid-json", "not json\n"),
+            ("non-header", "{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n"),
+            ("uncommitted-header", header.trim_end()),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(super::super::log::log_file(&path), contents).unwrap();
+        }
+        // Discovery validates only the header, not an entire conversation.
+        // A later corruption must still surface when that session is read.
+        drop(real);
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true)
+            .open(super::super::log::log_file(&dir.path().join(&sid))).unwrap()
+            .write_all(b"invalid later event\n").unwrap();
+        assert_eq!(store.list().unwrap(), vec![sid.clone()]);
+        assert!(store.history(&sid).is_err());
     }
 
     #[test]

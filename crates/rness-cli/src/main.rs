@@ -1409,8 +1409,8 @@ async fn run_tui(
     activity_task.abort();
     apps_task.abort();
 
-    // Let any in-flight turn settle before dropping the engine.
-    sessions.cancel(&session);
+    // Suppress child-result wakes before letting the in-flight turn settle.
+    sessions.begin_teardown(&session);
     sessions.join(&session).await;
     eprintln!("session: {session}");
     Ok(())
