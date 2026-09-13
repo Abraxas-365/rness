@@ -1,63 +1,80 @@
 # Known limitations
 
-This page records observed boundaries in the current checkout. It is not a roadmap or a promise of a release date.
+This page explains where you may run into problems, what to expect, and what you can do about them. It describes the current source version; your installed version may differ. It is not a roadmap.
 
-## Configuration and Lua
+## Configuration and plugin updates
 
-- Startup configuration requires restart. Explicit watched file/linked-package plugins support registration reload and automatic busy retry; managed packages and inline sources are not watchable. Unwatched source snapshots may execute again during registration rebuilds.
-- Startup declarations close after `init.lua`; post-mount plugins cannot add providers, profiles, capabilities, or agents through those declaration methods.
-- Lua module search retains existing `package.path` entries. Personal module paths are not a sandbox.
-- Lua command cancellation and coroutine cleanup use cooperative instruction hooks, not hard time limits. Trusted plugin code can catch hook errors or block in native calls; a pathological callback or `__close` handler can still stall the VM.
-- Engine APIs are unavailable at startup top level. The CLI synchronizes Lua tools before `ready`, but frontend session selection is not guaranteed.
-- Reload rollback covers registrations, not arbitrary Lua/global/filesystem/network effects. Required global modules remain cached.
-- Component defaults and legacy keymaps remain separate from scoped declarations. App-provided help cannot verify arbitrary handlers. Completion/paste-preview core mappings do not make all internal image controls independently scoped actions.
-- Queued plugin actions and UI batches have conservative input/focus/generation guards; unrelated subsequent terminal input can discard slow actions. Full coverage of every focus/race interleaving has not been established.
-- The 15-case terminal harness covers inline/file/linked-package activation and mappings, not a complete managed-Git end-to-end workflow. Package unit tests use local Git fixtures; they do not validate public transport/authentication.
+- **Most configuration changes need a restart.** This includes providers, profiles, agents, and other declarations in `init.lua`. Plugins loaded later cannot add these startup settings.
+- **Not every plugin can reload automatically.** Watched files and linked packages support reload; managed packages and inline plugin code do not support watching. See [plugin loading and lifecycle](../guides/plugins/loading-and-lifecycle.md).
+- **Reload is not a full reset.** It replaces plugin registrations, but it does not undo files written, network requests, or other side effects. Lua modules loaded with `require` remain cached. If a plugin behaves unexpectedly after reload, restart rness.
+- **Updating the binary does not update your copied plugins.** If you keep local copies of the default plugins, check whether a feature also requires changes to those files. For example, older compaction commands may still block the Lua statusline while they run.
 
-## Messagebox presentation
+## Terminal display and performance
 
-- `cache_bytes` bounds retained visual-row allocations only, not total transcript memory, transient rendering, Markdown/card caches, or history indexes. Height-changing updates can adjust a suffix index; rendering is not universally constant-time.
-- Width changes still reflow the durable transcript, so resize cost grows with history. Configured code-card previews now highlight only the source prefix needed for the preview (plus one truncation row); expanded cards and diffs retain full rendering. The ignored `diagnostic_streaming_resize_performance` test measures render-only costs, not end-to-end tmux latency.
-- Tool/thinking expansion is session-local UI state, not a durable preference. Presentation metadata never changes model-visible output and must not be reconstructed by rereading current files.
-- Lua card callbacks have instruction/allocation limits, not a sandbox or a timeout for blocking native calls. Missing, malformed, oversized, or truncated metadata must have a useful fallback.
-- Messagebox schema/rendering regressions and prior terminal streaming/resize/compaction checks do not certify every possible plugin renderer or retained-history size.
-- Legacy model-registry examples and process-global model exposure have not all been migrated to per-session configuration. Do not assume a statusline reports the active session's selected model or exact live context size.
+- **Resizing a long conversation can still pause the display.** Changing the terminal width makes rness lay out the transcript again. Code previews now do less work, but expanded code and diffs still cost more to render. Collapsing tool output can help; it does not eliminate the cost of resizing a long history.
+- **The display cache setting is not a total memory limit.** `cache_bytes` limits cached display rows, not the conversation itself or all Markdown, tool-card, and temporary rendering data.
+- **Expanded tool output and thinking are not saved preferences.** Expansion state belongs to the current UI session; do not expect it to survive a restart. Expanding or collapsing content does not change what the model receives.
+- **Custom statuslines may show incomplete or outdated information.** Some older model-registry examples are not session-aware. Treat displayed context size as an estimate, and do not assume every custom statusline shows the active session's selected model.
+- **A delayed plugin action may be discarded if you keep typing or change focus.** This prevents an old result from changing the wrong draft or view. Retry the action if it did not apply. Help and keybinding listings also cannot describe every custom handler or internal control.
 
-## Context reduction
+## Compaction and context limits
 
-- Explicit startup `rness.compaction["provider/model"]` budgets enable pre-step pruning and summarization, including closed steps within a running turn. See `examples/init.lua`. No route is enabled implicitly.
-- Measurement is heuristic, configurable per route via `meter = {bytes_per_token=4, message_tokens=8, image_tokens=4096, output_reserve=2048}`. Pressure reserves the larger of the configured reserve and request output cap. Retention and shrink checks use the same route meter. This is not an exact tokenizer or provider image-pricing implementation.
-- Token-budget retention keeps the newest message and preserves assistant/tool-result boundaries. Pruning is remeasured immediately; empty or non-shrinking summaries are not committed. Original events remain in the log.
-- Overflow recovery is bounded and requires a durable reduction. Recognized HTTP and streaming error envelopes are classified for OpenAI-compatible, Anthropic, and Responses adapters, including `response.failed`. Partial stream chunks remain failed-attempt data. Arbitrary gateway-specific variants are not inferred from loose message matching.
-- Boundary summarization supports explicit `summary_selection = {route='...', model='...'}` per policy. The service resolves it before committing the opening prompt; unavailable routes fail rather than silently falling back. Without a selection the active provider is used.
-- Boundary summaries append `compaction/started` and `compaction/finished` audit events, including source IDs, model, estimate, logical request (system, turns, config, tools), outcome, returned usage and chunks. Model-request JSON bodies are recorded as `compaction/request` before sending in the OpenAI-compatible, Anthropic, and Responses adapters; durable acknowledgement gates transmission. Headers, credentials, URLs, and auxiliary upload/auth traffic are excluded. These bodies can contain sensitive conversation data or inline images, just like the logical request. These events never enter model context. Resuming a send closes unmatched starts as interrupted or committed-before-interruption without repeating the request; unrecovered usage/chunks remain unavailable. Lifecycle and checkpoint writes are not atomic.
-- Manual regions are available through `session.compaction_view(id)` and idle-only `session.compact_region(id, {start=..., end=..., sources=view.sources, policy=...})`. Indices are one-based inclusive model-message positions, not raw log events. The engine rejects stale source snapshots and split tool pairs; summaries retain their replaced span's position. The synchronous API still blocks the Lua VM during summarization. Command callbacks can instead call `session.compact_region_async(id, opts)` with the same options and boolean result: it suspends only the command coroutine while summarization runs on Tokio, leaving Lua frame hooks and status refreshes responsive. The command retains its session/extension reservation and cancellation token until completion; cancellation closes the suspended coroutine rather than continuing arbitrary command code. Service errors propagate back to its caller (provider failures retain the existing reducer behavior: a durable failure record and `false`, meaning history unchanged). This is not a detached job API and is not available from status callbacks or ordinary hooks. The default `/compact` and optional region-confirmation command use this asynchronous path; existing copied plugins must update their call to opt in. The optional `commands.lua` example offers `/compact-region`, `/compact-region start end`, `confirm`, and `cancel`, with truncated message previews, a 100-message selection limit, and an explicit paid-request warning. A Ctrl+G overlay supports j/k navigation, space anchoring, Enter range review, and r snapshot refresh. Confirmation still requires closing the overlay and running `/compact-region confirm`. Terminal testing against an isolated local mock verified navigation, range review, and successful confirmation with a persisted request body and committed checkpoint. Command callbacks carry an opaque, session-specific reservation permit so compaction retains the command's lock rather than reacquiring it; ordinary callers still require their own reservation. Command cancellation is passed to summarization. The widget's `key_help` metadata is restored; registration uses indexed reads to avoid mlua 0.10.5's under-reserved sequence-iterator stack, with regression coverage for the full example set and varying metadata lengths.
-- This is not full DSH parity: exact tokenization and the complete lifecycle/recovery matrix remain outstanding. Captured JSON bytes are compared against a mock OpenAI HTTP request; equivalent byte-level adapter tests and exhaustive disk-failure injection remain outstanding. Existing idle `session.compact`/`session.prune` APIs retain their previous behavior.
-- Do not also enable the legacy turn-end `autocompact.lua` policy for a route configured with boundary compaction.
+Compaction summarizes older conversation content to make room for new messages. It does not guarantee that every conversation will fit a model's context window.
 
-## Agents
+### Setup and estimates
 
-- `/agent <name>` is available through TUI and HTTP sends. There is no public `rness.agents.list()` Lua query.
-- `rness.subagents.roster()` exposes delegable roles, not all principal roles or all child sessions.
-- CLI principal snapshots do not share every validation step with service-based selection, including unknown-tool validation.
-- Synchronous Lua delegation blocks the VM actor. Work requiring that same VM to execute callbacks may not be appropriate for this API.
-- Allowed tool names are not a security sandbox. Trusted plugins and powerful tools can have broader effects than their names suggest.
+- **Automatic compaction is opt-in for each provider/model.** Configure budgets through `rness.compaction`; no route is enabled automatically. See [the example configuration](../../examples/init.lua). Do not enable the legacy `autocompact.lua` plugin for the same route.
+- **Token counts are estimates, not exact provider counts.** Text, message overhead, images, and reserved output space all affect the estimate. If requests still exceed the context limit, leave more headroom in your configured budget. Image estimates are not billing estimates.
+- **Context-limit recovery can still fail.** rness recognizes common provider errors, but gateways may report them differently. Retries are limited, and recovery must actually reduce the context before proceeding.
 
-## Providers and compatibility
+### Summaries and manual compaction
 
-- There is no complete maintained built-in model-capabilities catalog. Endpoint IDs and supported reasoning modes must be verified for your deployment.
-- OpenAI-compatible describes a protocol family, not identical behavior across gateways.
-- Local HTTP authentication tests verify adapter request behavior; they do not establish live OAuth entitlement or model availability.
-- These pages target the source checkout. No release-level configuration or session-format compatibility guarantee is established by this documentation.
+- **A summary may not make the conversation smaller.** Empty or non-shrinking summaries are not applied. A provider failure can also leave history unchanged; an unchanged result does not necessarily mean the provider completed successfully.
+- **Compaction keeps the original events in the session log.** It reduces the context sent to the model, not the size of the stored log, and is not a way to erase sensitive content. It preserves the newest message and keeps tool calls paired with their results.
+- **Summarization makes a model request and may incur a charge.** It uses the active provider unless you configure `summary_selection`. An unavailable summary provider/model causes an error rather than silently falling back.
+- **Manual compaction requires an idle session.** The default `/compact` command keeps Lua status updates responsive, but the session remains occupied until the command finishes. Other commands or prompts for that session must wait.
+- **Region selection is an optional example, not a built-in workflow.** The [commands plugin example](../../examples/plugins/commands.lua) previews up to 100 messages. After reviewing a range in the overlay, close it and run `/compact-region confirm`; reviewing alone does not start compaction. If the conversation changed after selection, refresh the selection and try again.
 
-## Documentation coverage
+### Logs and interrupted requests
 
-The first documentation set covers installation, startup, profiles, agent roles, and delegation. Detailed reference for every Lua namespace, HTTP endpoint, event type, and built-in tool is still being written.
+Compaction logs can contain conversation text, tool output, request bodies, and inline images. Headers and credentials are excluded from the recorded request bodies, but sensitive information may still appear in the conversation itself. **Review and redact logs before sharing them.**
 
-The original architecture document contains design intent alongside historical context. Consult current implementation and tests before treating an unreferenced architectural example as an available API.
+If compaction is interrupted, rness records the interruption on resume rather than automatically repeating the request. Usage details or response chunks may be missing. Recovery has not been tested against every provider or disk-failure scenario; writing the completion record and the updated context is not one indivisible operation.
 
-When reporting a problem, include the revision, invocation, relevant redacted configuration, and observed error. Do not publish credentials or an entire session log without reviewing it for sensitive prompts, tool output, and workspace content.
+## Agents, plugins, and security
 
-## Filesystem sandbox
+- **A tool allowlist is not full isolation.** It restricts which tools an agent can call, not every effect an allowed tool can have. Approval settings are a separate control.
+- **Only load plugins you trust.** Lua plugins and native extensions can access resources outside the tool allowlist. Plugin search paths and callback limits do not isolate plugin code.
+- **The filesystem sandbox has a limited scope.** It confines Bash/process filesystem access, not Lua plugins, non-Bash tools, or network access. Enforced modes currently use the macOS backend and fail with an error on unsupported platforms; they do not silently run unrestricted. Without an explicit sandbox declaration, the compatibility default is full access. See [sandbox configuration](../reference/configuration/sandbox.md) before relying on it.
+- **A blocking plugin can freeze Lua-driven features.** Cancellation cannot forcibly stop every native call or misbehaving cleanup handler. Long-running synchronous delegation can also block callbacks needed by the delegated work.
+- **Invalid agent tool names may produce different errors depending on how you select the agent.** CLI startup and in-session selection do not yet share all validation checks. Use exact registered tool names; see [agent configuration](../reference/configuration/agents.md).
 
-Sandboxing is opt-in and currently confines Bash filesystem writes on macOS only. It does not confine non-Bash tools, Lua/native plugins, MCP processes, network access, or requests to other host services. Unsupported hosts fail closed for restricted modes. See [sandbox configuration](../reference/configuration/sandbox.md).
+## Providers and upgrades
+
+- **“OpenAI-compatible” does not mean identical behavior.** Model IDs, reasoning options, error formats, and authentication support vary between gateways. Verify them with your provider; rness does not maintain a complete built-in catalog of model capabilities.
+- **Passing local tests does not guarantee account access.** Live OAuth permissions, model availability, and remote Git authentication depend on your deployment and are not established by mock or local-fixture tests.
+- **Configuration and session formats do not yet have a release-level compatibility guarantee.** Keep backups of important configuration and sessions before upgrading.
+
+## Notes for plugin authors
+
+These details mainly matter if you write your own plugins:
+
+- Session/engine APIs are not available at the top level of startup configuration. Use the appropriate lifecycle callback, and do not assume a frontend session has already been selected when `ready` runs.
+- `session.compact_region` is synchronous and blocks the Lua host. In a command callback, prefer `session.compact_region_async(id, opts)`: it pauses that command while allowing hooks and status updates to run. It is not a detached job API and cannot be used from ordinary hooks or status callbacks. The session remains reserved until completion; cancellation closes the paused command rather than continuing its code.
+- Manual region indices are one-based, inclusive positions in the model-message view, not raw log event numbers. Use `session.compaction_view(id)` and pass its source IDs so stale selections can be rejected. Provider failures retain the existing `false`/unchanged result; service errors raise Lua errors.
+- Lua execution and tool-card rendering limits are not hard timeouts. Native calls can block, and plugin code can catch instruction-hook errors. Keep callbacks bounded and provide a useful display fallback for missing or invalid card data.
+- `/agent <name>` works through TUI and HTTP sends, but there is no public `rness.agents.list()` query. `rness.subagents.roster()` lists delegable roles, not every agent role or running child session.
+
+## Documentation and reporting problems
+
+The documentation does not yet cover every Lua API, HTTP endpoint, event type, or built-in tool. The architecture document also includes historical designs, so not every example there is an available API today.
+
+Tests cover common rendering, plugin, and compaction workflows, not every custom renderer, conversation size, reload timing, or provider. Resize benchmarks measure rendering work only, not the full delay you may see in tmux or your terminal.
+
+When reporting a problem, include:
+
+- Your rness version or Git revision, operating system, and terminal/tmux version if relevant.
+- The command or steps that reproduce it, what you expected, and what happened instead.
+- The error message and only the relevant, redacted configuration or log excerpt.
+
+Do not post credentials or an entire session log without checking it for private prompts, tool output, images, and workspace content.
