@@ -96,7 +96,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(config.agents["worker"].profile.is_none());
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 10);
+    assert_eq!(config.plugin_specs.len(), 11);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
     assert_eq!(policy.prune_threshold, 8192);
@@ -117,10 +117,15 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
         Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)),
         registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into(),
     ).await.unwrap();
-    host.install_questions(Arc::new(rness_engine::questions::Questions::default())).await.unwrap();
+    let questions = Arc::new(rness_engine::questions::Questions::default());
+    host.install_questions(questions.clone()).await.unwrap();
+    assert!(!questions.is_available());
     assert!(!sessions.reference_service().enabled());
     let errors = rness_lua::loader::load_all(&host, &specs).await;
     assert!(errors.is_empty(), "{errors:?}");
+    assert!(questions.is_available());
+    let plan = host.tool_specs().await.into_iter().find(|spec| spec.name == "exit_plan_mode").unwrap().plan.unwrap();
+    assert!(Arc::ptr_eq(&plan.questions, &questions));
     assert!(sessions.reference_service().enabled());
     host.validate_bindings().await.unwrap();
     for (name, key, operation) in [
@@ -139,7 +144,7 @@ async fn explicit_file_lifecycle_remap_disable_reload_and_unload() {
     let path = root.path().join("review.lua");
     let source = "return function(opts, plugin) plugin.action('insert', {scope='promptbox', description='Insert', run=function(ctx) ctx.promptbox.insert(opts.text) end}); plugin.keys({insert={action='insert', key='<F6>'}}) end";
     std::fs::write(&path, source).unwrap();
-    let mut spec = PluginSpec { name: "review".into(), source: PluginLocation::File(path.clone()), enabled: true, watch: false, opts: serde_json::json!({"text":"first"}), keys: serde_json::json!({"insert":["<F8>","<F9>"]}) };
+    let mut spec = PluginSpec { dependencies: vec![], name: "review".into(), source: PluginLocation::File(path.clone()), enabled: true, watch: false, opts: serde_json::json!({"text":"first"}), keys: serde_json::json!({"insert":["<F8>","<F9>"]}) };
     let host = LuaHost::spawn().unwrap();
     let sources = discover_specs(root.path(), &[spec.clone()]).unwrap();
     assert!(rness_lua::loader::load_all(&host, &sources).await.is_empty());
@@ -175,6 +180,7 @@ async fn watcher_retries_busy_reload_without_another_save() {
     let path = root.path().join("live.plugin");
     std::fs::write(&path, "rness.tool.register{name='old', run=function() return 'old' end}").unwrap();
     let specs = vec![rness_lua::loader::PluginSpec {
+        dependencies: vec![],
         name: "live".into(), source: rness_lua::loader::PluginLocation::File(path.clone()),
         enabled: true, watch: true, opts: serde_json::json!({}), keys: serde_json::json!({}),
     }];
@@ -221,7 +227,7 @@ async fn references_enable_disable_failed_reload_and_ownership() {
     assert!(host.load("bad", "rness.file_references.disable(); error('rollback')").await.is_err());
     assert_eq!(sessions.reference_service().generation(), generation);
     assert!(sessions.reference_service().enabled());
-    assert!(host.reload(vec![rness_lua::loader::PluginSource { name: "broken".into(), source: "rness.file_references.disable(); error('broken')".into() }]).await.is_err());
+    assert!(host.reload(vec![rness_lua::loader::PluginSource { dependencies: vec![], name: "broken".into(), source: "rness.file_references.disable(); error('broken')".into() }]).await.is_err());
     assert!(sessions.reference_service().enabled());
     host.load("replacement", "rness.file_references.enable()").await.unwrap();
     host.unload_coordinated("references", vec![], |_| {}).await.unwrap();
@@ -296,9 +302,9 @@ async fn runtime_reload_preserves_init_and_rolls_back_commands_and_hooks() {
     let registry = Arc::new(ToolRegistry::default());
     let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path().join("sessions")), Arc::new(Silent), registry.clone(), TurnConfig::default(), Arc::new(EventBus::default())));
     host.install_session(sessions.clone(), Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)), registry, Default::default(), tokio::runtime::Handle::current(), "test/model".into()).await.unwrap();
-    let source = |version: &str| rness_lua::loader::PluginSource { name: "live".into(), source: format!("rness.commands.register{{name='live', description='{version}', arguments={{'{version}'}}, run=function() return '{version}' end}}; rness.hook.on('tick', function() ticks=(ticks or 0)+1 end)") };
+    let source = |version: &str| rness_lua::loader::PluginSource { dependencies: vec![], name: "live".into(), source: format!("rness.commands.register{{name='live', description='{version}', arguments={{'{version}'}}, run=function() return '{version}' end}}; rness.hook.on('tick', function() ticks=(ticks or 0)+1 end)") };
     host.load("live", &source("v1").source).await.unwrap();
-    let widgets = rness_lua::loader::PluginSource { name: "widgets".into(), source: "rness.tool.register{name='widget', run=function() return 'new' end}; rness.ui.app{name='widget', view=function() return {'new'} end}; rness.ui.tool_card('widget', function() return {'new'} end)".into() };
+    let widgets = rness_lua::loader::PluginSource { dependencies: vec![], name: "widgets".into(), source: "rness.tool.register{name='widget', run=function() return 'new' end}; rness.ui.app{name='widget', view=function() return {'new'} end}; rness.ui.tool_card('widget', function() return {'new'} end)".into() };
     host.load("widgets", &widgets.source).await.unwrap();
     let guard = sessions.try_extension_maintenance().unwrap();
     assert!(host.reload(vec![source("v2")]).await.is_err());
@@ -557,7 +563,7 @@ async fn plan_lifecycle_uses_live_questions_and_preserves_state() {
     host.unload_coordinated("plan", vec![], |_| {}).await.unwrap();
     assert!(host.tool_specs().await.iter().any(|s| s.name == "exit_plan_mode"));
     let old = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap().plan.unwrap();
-    host.reload(vec![rness_lua::loader::PluginSource { name: "fresh".into(), source: "rness.plan.enable()".into() }]).await.unwrap();
+    host.reload(vec![rness_lua::loader::PluginSource { dependencies: vec![], name: "fresh".into(), source: "rness.plan.enable()".into() }]).await.unwrap();
     assert!(old.alive.is_cancelled());
     let fresh = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap().plan.unwrap();
     assert!(Arc::ptr_eq(&fresh.questions, &questions));
@@ -575,6 +581,7 @@ fn examples() -> Vec<rness_lua::loader::PluginSource> {
         .collect();
     names.sort();
     let specs: Vec<_> = names.into_iter().map(|n| rness_lua::loader::PluginSpec {
+        dependencies: if n == "plan.lua" { vec!["questions".into()] } else { vec![] },
         name: n.trim_end_matches(".lua").to_string(),
         source: rness_lua::loader::PluginLocation::File(std::path::Path::new(root).join("plugins").join(n)),
         enabled: true,

@@ -14,9 +14,9 @@ async fn owned_hooks_reload_unload_and_failed_reload() {
     let cancel = CancellationToken::new();
     assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"first");
     assert!(host.load("duplicate",source).await.is_err());
-    assert!(host.reload(vec![rness_lua::loader::PluginSource {name:"web".into(),source:format!("{source}; error('bad reload')")}]).await.is_err());
+    assert!(host.reload(vec![rness_lua::loader::PluginSource {dependencies: vec![], name:"web".into(),source:format!("{source}; error('bad reload')")}]).await.is_err());
     assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"first");
-    host.reload(vec![rness_lua::loader::PluginSource {name:"web".into(),source:source.replace("first","second")}]).await.unwrap();
+    host.reload(vec![rness_lua::loader::PluginSource {dependencies: vec![], name:"web".into(),source:source.replace("first","second")}]).await.unwrap();
     assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap()["content"],"second");
     host.reload(vec![]).await.unwrap();
     assert_eq!(host.transform("fetch","after",input.clone(),json!({}),&cancel).await.unwrap(),input);

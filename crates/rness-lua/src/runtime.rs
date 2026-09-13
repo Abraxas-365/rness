@@ -90,6 +90,7 @@ pub struct LuaRuntime {
     commands: HashMap<String, (String, RegistryKey)>,
     web_hooks: HashMap<String, Table>,
     plugin_hooks: HashMap<String, Table>,
+    plugin_dependencies: HashMap<String, Vec<String>>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
     references: Option<(String, rness_engine::file_references::Config)>,
     plan_store: Option<std::sync::Arc<rness_engine::session::branch::SessionStore>>,
@@ -181,7 +182,7 @@ impl LuaRuntime {
             actions: HashMap::new(),
             commands: HashMap::new(),
             web_hooks: HashMap::new(),
-            plugin_hooks: HashMap::new(),
+            plugin_hooks: HashMap::new(), plugin_dependencies: HashMap::new(),
             references: None,
             plan_store: None,
             questions: None,
@@ -230,6 +231,19 @@ impl LuaRuntime {
     /// Run a plugin chunk. Registrations made during execution are
     /// drained from the VM into runtime state.
     pub fn load(&mut self, name: &str, source: &str) -> Result<(), LuaError> {
+        self.load_with_dependencies(name, source, &[])
+    }
+
+    pub fn load_with_dependencies(&mut self, name: &str, source: &str, dependencies: &[String]) -> Result<(), LuaError> {
+        let mut seen = std::collections::HashSet::new();
+        for dependency in dependencies {
+            if !seen.insert(dependency) {
+                return Err(mlua::Error::runtime(format!("plugin {name} has duplicate dependency: {dependency}")).into());
+            }
+            if dependency == name || !self.plugin_hooks.contains_key(dependency) {
+                return Err(mlua::Error::runtime(format!("plugin {name} requires loaded dependency: {dependency}")).into());
+            }
+        }
         if self.plugin_hooks.contains_key(name) {
             return Err(mlua::Error::runtime(format!("plugin already loaded: {name}; unload it first")).into());
         }
@@ -327,6 +341,7 @@ impl LuaRuntime {
             }
             pending.set("web_hooks", LuaValue::Nil)?;
         }
+        self.plugin_dependencies.insert(name.to_owned(), dependencies.to_vec());
         self.plugin_hooks.insert(name.to_owned(), hook_owner);
         Ok(())
     }
@@ -334,6 +349,7 @@ impl LuaRuntime {
     /// Stage runtime declarations in the existing VM, preserving startup closures.
     /// Lua globals and external side effects are not transactional.
     pub(crate) fn reload_plugins(&mut self, sources: &[crate::loader::PluginSource], validate: impl FnOnce(&Self) -> Result<(), String>) -> Result<(), String> {
+        let sources = crate::loader::ordered_sources(sources)?;
         let run = || -> Result<Self, LuaError> {
             let copy_key = |key: &RegistryKey| self.lua.create_registry_value(self.lua.registry_value::<LuaValue>(key)?);
             let mut staged = Self {
@@ -350,7 +366,7 @@ impl LuaRuntime {
                 commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
                 references: None,
                 web_hooks: HashMap::new(),
-            plugin_hooks: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
+            plugin_hooks: HashMap::new(), plugin_dependencies: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
             };
             let declarations: Table = self.lua.globals().get("__rness_declarations")?;
             let fresh = self.lua.create_table()?;
@@ -380,7 +396,7 @@ impl LuaRuntime {
         };
         let declarations: Table = self.lua.globals().get("__rness_declarations").map_err(|e| e.to_string())?;
         let mut staged = run().map_err(|e| e.to_string())?;
-        let result = sources.iter().try_for_each(|source| staged.load(&source.name, &source.source).map_err(|e| format!("{}: {e}", source.name)))
+        let result = sources.iter().try_for_each(|source| staged.load_with_dependencies(&source.name, &source.source, &source.dependencies).map_err(|e| format!("{}: {e}", source.name)))
             .and_then(|()| {
                 for mapping in self.user_mappings()? {
                     if let Some((previous, _)) = self.actions.get(&mapping.action) {
@@ -393,7 +409,7 @@ impl LuaRuntime {
             })
             .and_then(|()| validate(&staged));
         if let Err(error) = result {
-            for name in staged.plugin_names() { let _ = staged.unload(&name); }
+            for source in sources.iter().rev() { let _ = staged.unload(&source.name); }
             self.lua.globals().set("__rness_declarations", declarations).map_err(|e| e.to_string())?;
             return Err(error);
         }
@@ -569,7 +585,15 @@ impl LuaRuntime {
     pub(crate) fn reference_config(&self) -> Option<rness_engine::file_references::Config> { self.references.as_ref().map(|(_, c)| c.clone()) }
 
     pub fn unload(&mut self, name: &str) -> Result<bool, LuaError> {
+        let mut dependents: Vec<_> = self.plugin_dependencies.iter()
+            .filter(|(_, dependencies)| dependencies.iter().any(|dependency| dependency == name))
+            .map(|(dependent, _)| dependent.as_str()).collect();
+        dependents.sort();
+        if !dependents.is_empty() {
+            return Err(mlua::Error::runtime(format!("cannot unload plugin {name}; required by: {}", dependents.join(", "))).into());
+        }
         let Some(hooks) = self.plugin_hooks.remove(name) else { return Ok(false) };
+        self.plugin_dependencies.remove(name);
         if self.references.as_ref().is_some_and(|(owner, _)| owner == name) { self.references = None; }
         for unsubscribe in hooks.clone().sequence_values::<Function>() {
             unsubscribe?.call::<bool>(())?;
@@ -1948,7 +1972,7 @@ mod tests {
         rt.install_config(&config).unwrap();
         rt.load("review", "local p=__rness_plugin_context(); p.action('insert', {scope='promptbox', description='Insert', run=function() end})").unwrap();
         rt.validate_bindings(false).unwrap();
-        let error = rt.reload_plugins(&[crate::loader::PluginSource { name: "review".into(), source: String::new() }], |_| Ok(())).unwrap_err();
+        let error = rt.reload_plugins(&[crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: String::new() }], |_| Ok(())).unwrap_err();
         assert!(error.contains("removed mapped action"), "{error}");
         assert!(rt.call_action("review.insert", "promptbox", json!({})).is_ok());
         rt.unload("review").unwrap();
@@ -1970,11 +1994,11 @@ mod tests {
         assert!(rt.call_action("review.insert", "messagebox", json!({"text":"wrong"})).is_err());
         rt.call_action("review.insert", "promptbox", json!({"text":"first"})).unwrap();
         assert_eq!(rt.lua.globals().get::<String>("observed").unwrap(), "first");
-        let replacement = crate::loader::PluginSource { name: "review".into(), source: format!("{source}\nerror('broken')") };
+        let replacement = crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: format!("{source}\nerror('broken')") };
         assert!(rt.reload_plugins(&[replacement], |_| Ok(())).is_err());
         rt.call_action("review.insert", "promptbox", json!({"text":"retained"})).unwrap();
         assert_eq!(rt.lua.globals().get::<String>("observed").unwrap(), "retained");
-        rt.reload_plugins(&[crate::loader::PluginSource { name: "review".into(), source: source.into() }], |_| Ok(())).unwrap();
+        rt.reload_plugins(&[crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: source.into() }], |_| Ok(())).unwrap();
         assert_eq!(rt.action_specs().len(), 1);
         rt.unload("review").unwrap();
         assert!(rt.action_specs().is_empty());

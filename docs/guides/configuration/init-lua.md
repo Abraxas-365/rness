@@ -9,7 +9,7 @@ rness evaluates `~/.rness/init.lua` before constructing model providers. This is
 | `~/.rness/init.lua` | Evaluated once in the production Lua VM at startup |
 | `~/.rness/lua/?.lua` | Available through explicit `require` |
 | `~/.rness/lua/?/init.lua` | Available through explicit `require` |
-| Explicit `file`, `package`, or inline `config` source | Selected with `rness.plugins.setup`, executed after engine mount in declaration order |
+| Explicit `file`, `package`, or inline `config` source | Selected with `rness.plugins.setup`, executed after engine mount with dependencies first |
 | Repository `examples/` | Copyable material; not automatically loaded |
 | `~/.rness/config.lua` | Not a second automatic startup entry point |
 
@@ -77,12 +77,18 @@ require a name; package identity comes from its manifest. Names accept ASCII let
 digits, underscores, and hyphens. Relative files resolve against the configuration
 directory, not the shell working directory. Optional `enabled=false` skips a source;
 `opts` supplies JSON-compatible setup options; `keys` overrides plugin binding slots.
+`dependencies = { "questions" }` is a dense list of plugin names. Each dependency
+must be explicitly selected and enabled; missing/disabled dependencies and cycles
+are rejected. Dependencies load first, even if declared later. A failed dependency
+prevents its consumers from executing. Unload consumers before dependencies; an
+unload is blocked while loaded dependents remain. Plan's runtime check for an
+available Questions frontend still applies in headless operation.
 See [plugin lifecycle](../plugins/loading-and-lifecycle.md) for the full contract.
 
 Legacy `rness.plugins.load(name)` remains supported for existing configurations but
 cannot be mixed with `plugins.setup`. Migrate all entries together.
 
-A missing selected file fails startup with its path. A Lua execution error is reported as a warning and later selected plugins are still attempted; plugin execution is not transactional, so earlier side effects are not rolled back.
+A missing selected file fails startup with its path. A Lua execution error is reported as a warning and independent selected plugins are still attempted, but dependents are skipped; plugin execution is not transactional, so earlier side effects are not rolled back.
 
 This is not equivalent to `require`: `require` executes immediately and uses Lua's module cache and search paths. Plugin selection queues a specific file for execution after the engine APIs exist. Plugins cannot call `rness.plugins.load` to add more plugins after declarations close.
 

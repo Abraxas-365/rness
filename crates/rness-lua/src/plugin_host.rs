@@ -111,6 +111,7 @@ enum Cmd {
     Load {
         name: String,
         source: String,
+        dependencies: Vec<String>,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     Unload {
@@ -324,7 +325,7 @@ impl LuaHost {
                             rt.lua().remove_app_data::<rness_engine::service::CommandPermit>();
                             let _ = reply.send(if cancel.is_cancelled() { Err("command cancelled".into()) } else { result });
                         }
-                        Cmd::Load { name, source, reply } => {
+                        Cmd::Load { name, source, dependencies, reply } => {
                             let staged = questions_ref.as_ref().map(|qs| {
                                 let staged = std::sync::Arc::new(rness_engine::questions::Questions::default());
                                 staged.set_overlay_config(qs.overlay_config());
@@ -335,7 +336,7 @@ impl LuaHost {
                             if let Some(staged) = &staged {
                                 if let Err(error) = rt.install_questions(staged.clone()) { let _ = reply.send(Err(error.to_string())); continue; }
                             }
-                            let r = rt.load(&name, &source).map_err(|e| e.to_string()).and_then(|()| {
+                            let r = rt.load_with_dependencies(&name, &source, &dependencies).map_err(|e| e.to_string()).and_then(|()| {
                                 if let Some(binding) = &session_binding {
                                     if let Err(error) = sync_commands(&rt, binding, &command_tx, &mut installed_commands) {
                                         let _ = rt.unload(&name);
@@ -483,7 +484,26 @@ impl LuaHost {
                             let _ = reply.send(r);
                         }
                         Cmd::Reload { mut sources, reconcile, reply } => {
-                            sources.retain(|source| !disabled_plugins.contains(&source.name));
+                            // Validate the declared graph before applying session-local unloads.
+                            // Failed consumers may never have loaded, so unloading their
+                            // prerequisite is valid; keep them skipped on subsequent reloads.
+                            if let Err(error) = crate::loader::ordered_sources(&sources) {
+                                let _ = reply.send(Err(ReloadError::Failed(error)));
+                                continue;
+                            }
+                            let mut excluded = disabled_plugins.clone();
+                            loop {
+                                let mut changed = false;
+                                for source in &sources {
+                                    if !excluded.contains(&source.name) && source.dependencies.iter().any(|dependency| excluded.contains(dependency)) {
+                                        tracing::warn!(target: "lua", "skipping plugin '{}' on reload: dependency unloaded", source.name);
+                                        excluded.insert(source.name.clone());
+                                        changed = true;
+                                    }
+                                }
+                                if !changed { break; }
+                            }
+                            sources.retain(|source| !excluded.contains(&source.name));
                             let _maintenance = match session_binding.as_ref().map(|b| b.sessions.try_extension_maintenance()).transpose() {
                                 Ok(guard) => guard,
                                 Err(_) => { let _ = reply.send(Err(ReloadError::Busy)); continue; }
@@ -527,9 +547,13 @@ impl LuaHost {
     }
 
     pub async fn load(&self, name: &str, source: &str) -> Result<(), String> {
+        self.load_with_dependencies(name, source, &[]).await
+    }
+
+    pub async fn load_with_dependencies(&self, name: &str, source: &str, dependencies: &[String]) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::Load { name: name.into(), source: source.into(), reply })
+            .send(Cmd::Load { name: name.into(), source: source.into(), dependencies: dependencies.to_vec(), reply })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
@@ -769,11 +793,11 @@ mod tests {
         let source = "local p = __rness_plugin_context(); p.action('run', {scope='promptbox', description='Run', run=function(ctx) ctx.promptbox.insert('new') end})";
         host.load("review", source).await.unwrap();
         let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
-        host.reload(vec![crate::loader::PluginSource { name: "review".into(), source: source.into() }]).await.unwrap();
+        host.reload(vec![crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: source.into() }]).await.unwrap();
         assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.unwrap_err().contains("generation expired"));
         assert_eq!(host.call_action("review.run", "promptbox", json!({})).await.unwrap().len(), 1);
         let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
-        assert!(host.reload(vec![crate::loader::PluginSource { name: "review".into(), source: "error('failed')".into() }]).await.is_err());
+        assert!(host.reload(vec![crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: "error('failed')".into() }]).await.is_err());
         assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.is_ok());
     }
 
@@ -781,6 +805,7 @@ mod tests {
     async fn reload_does_not_resurrect_session_unloaded_plugins() {
         let host = LuaHost::spawn().unwrap();
         let source = crate::loader::PluginSource {
+            dependencies: vec![],
             name: "disabled".into(),
             source: "rness.tool.register{name='owned', run=function() return 'ok' end}".into(),
         };

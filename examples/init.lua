@@ -2,7 +2,7 @@
 -- This file is NOT loaded from examples/. Restart after changing startup config.
 -- Register providers, profiles, hooks and UI here. Hooks run after startup.
 -- Optional modules: require('providers') loads ~/.rness/lua/providers.lua.
--- Plugins are opt-in: setup runs after engine mount, in declaration order.
+-- Plugins are opt-in: setup runs after engine mount, with dependencies first.
 -- Paths below are relative to the directory containing init.lua; plugins/ is
 -- only a suggested location. Copy selected files there before enabling them.
 -- Use ONE setup list. Copying or installing a plugin never activates it.

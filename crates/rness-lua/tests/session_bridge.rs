@@ -421,6 +421,7 @@ async fn session_bridge_survives_hot_reload() {
     // even usable at load time.
     let id = sessions.create(None).unwrap();
     host.reload(vec![rness_lua::loader::PluginSource {
+        dependencies: vec![],
         name: "reloaded.lua".into(),
         source: format!(r#"assert(rness.session.phase("{id}") == "idle")"#),
     }])

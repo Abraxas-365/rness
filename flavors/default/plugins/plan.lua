@@ -1,5 +1,8 @@
--- Add { name = "plan", file = "plugins/plan.lua" } to init.lua's setup list.
--- Opt-in plan collaboration. Questions must have an available frontend to review.
+-- Select the questions plugin, then add this entry to init.lua's setup list:
+-- { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } }
+-- Dependencies are selected/enabled plugin names, not paths; they load first.
+-- Missing/disabled dependencies and cycles are rejected; unload Plan before Questions.
+-- Opt-in plan collaboration. The headless check still requires an available Questions frontend.
 rness.plan.enable()
 rness.commands.register {
   name = "plan",

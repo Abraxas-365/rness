@@ -382,9 +382,24 @@ propagation depends on the HTTP server. This exposes a web API, not a web UI.
 ## Plan mode (initial implementation)
 
 `examples/plugins/plan.lua` enables `exit_plan_mode` and registers
-`/plan [on|off|status]`. Copy and explicitly load it as a runtime plugin,
-after session services and the Questions broker have been installed. A
-Questions frontend must be enabled to review plans; missing availability never
+`/plan [on|off|status]`. Copy it and `examples/plugins/questions.lua` into your
+configuration's `plugins/` directory, then add both entries to your existing setup
+list (do not call setup twice):
+
+```lua
+rness.plugins.setup({
+  { name = "questions", file = "plugins/questions.lua" },
+  { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
+})
+```
+
+The Questions plugin explicitly calls `rness.questions.enable()` for AskUser and
+Plan review; the default flavor selects both plugins rather than enabling Questions
+in startup code. `dependencies` lists selected/enabled plugin names, not paths.
+Missing or disabled dependencies and cycles are rejected; dependencies load first,
+and a failed Questions load skips Plan. Unload Plan before Questions: unloading a
+dependency with loaded consumers is blocked. A Questions frontend must still be
+available at review time; the headless check remains and missing availability never
 implies approval. Tasks is not required and permissions are unchanged.
 
 `rness.plan.enable { guidance = "..." }` accepts optional planning guidance;

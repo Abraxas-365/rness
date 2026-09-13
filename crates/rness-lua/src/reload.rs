@@ -159,10 +159,16 @@ fn watch_selected(
             retry_pending = false;
             let discovered = if explicit {
                 let mut sources = snapshots.clone();
-                let refreshed = crate::loader::discover_specs(&root, &specs.iter().filter(|s| s.watch).cloned().collect::<Vec<_>>());
+                // Startup discovery validated the full graph. Refresh only watched
+                // sources without requiring their unwatched dependencies in this subset.
+                let watched: Vec<_> = specs.iter().filter(|s| s.watch).cloned().map(|mut spec| {
+                    spec.dependencies.clear();
+                    spec
+                }).collect();
+                let refreshed = crate::loader::discover_specs(&root, &watched);
                 refreshed.map(|refreshed| {
                     for source in refreshed {
-                        if let Some(slot) = sources.iter_mut().find(|s| s.name == source.name) { *slot = source; }
+                        if let Some(slot) = sources.iter_mut().find(|s| s.name == source.name) { slot.source = source.source; }
                     }
                     sources
                 })
@@ -214,10 +220,13 @@ mod tests {
         let fixed = config.path().join("fixed.lua");
         std::fs::write(&fixed, "rness.tool.register{name='fixed', run=function() return 'fixed' end}").unwrap();
         let spec = |name: &str, path: PathBuf, watch| crate::loader::PluginSpec {
+            dependencies: vec![],
             name: name.into(), source: crate::loader::PluginLocation::File(path), enabled: true,
             watch, opts: serde_json::json!({}), keys: serde_json::json!({}),
         };
-        let specs = vec![spec("live", live.clone(), true), spec("fixed", fixed.clone(), false)];
+        let mut live_spec = spec("live", live.clone(), true);
+        live_spec.dependencies = vec!["fixed".into()];
+        let specs = vec![live_spec, spec("fixed", fixed.clone(), false)];
         let host = LuaHost::spawn().unwrap();
         let sources = crate::loader::discover_specs(config.path(), &specs).unwrap();
         assert!(crate::loader::load_all(&host, &sources).await.is_empty());
@@ -234,6 +243,8 @@ mod tests {
         assert!(registry.get("replacement").is_some());
         assert!(registry.get("live").is_none());
         assert!(registry.get("fixed").is_some());
+        let error = host.unload("fixed").await.unwrap_err();
+        assert!(error.contains("required by: live"), "{error}");
     }
 
     /// End to end: boot with one tool, rewrite the file, watcher swaps

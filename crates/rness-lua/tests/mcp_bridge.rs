@@ -165,6 +165,7 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
     // Hot reload swaps the VM; the HOST owns the connection, so the
     // bridged tool keeps working and the fresh VM still sees the server.
     host.reload(vec![rness_lua::loader::PluginSource {
+        dependencies: vec![],
         name: "check.lua".into(),
         source: r#"assert(rness.mcp.servers()[1] == "fake", "connection survived reload")"#.into(),
     }])

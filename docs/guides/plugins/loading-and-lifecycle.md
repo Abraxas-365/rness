@@ -22,7 +22,7 @@ Restart rness. To disable it, remove or comment out the load declaration and res
 2. Capture explicit plugin specifications in list order and close startup declarations.
 3. Construct providers and mount engine services.
 4. Install the engine-backed Lua APIs.
-5. Discover selected file/package sources and invoke their setup functions (or inline callbacks) in the retained VM.
+5. Discover selected file/package sources and invoke their setup functions (or inline callbacks) in dependency-first order in the retained VM.
 6. Validate central mappings, synchronize Lua tools into the engine registry, then emit `ready`.
 
 Plugin top-level code can access mounted session APIs. It cannot add startup declarations, and it should not assume a frontend has already selected a current session. The CLI synchronizes tools before `ready`; this hook does not imply frontend session selection.
@@ -31,7 +31,7 @@ Plugin top-level code can access mounted session APIs. It cannot add startup dec
 
 Names contain only ASCII letters, digits, underscores, and hyphens. Do not include a path or extension. Duplicate declarations fail startup rather than executing a plugin twice.
 
-Missing selected files fail startup. Syntax or execution errors are reported per plugin and later plugins are still attempted. On a chunk execution error, queued tools, apps, cards, keymaps, and statusline declarations are discarded and duplicate-name bookkeeping is restored. They cannot be committed accidentally by the next successful plugin. Previously installed implementations remain intact.
+Missing selected files fail startup. Syntax or execution errors are reported per plugin; dependents of a failed plugin are skipped without executing their source, while independent plugins are still attempted. On a chunk execution error, queued tools, apps, cards, keymaps, and statusline declarations are discarded and duplicate-name bookkeeping is restored. They cannot be committed accidentally by the next successful plugin. Previously installed implementations remain intact.
 
 Hook subscriptions created during that chunk execution are also unsubscribed on failure, including subscriptions created by required modules or synchronous callbacks during loading. Already cancelled subscriptions are harmless to clean up again. Existing listeners are not removed by cleanup.
 
@@ -39,7 +39,25 @@ This is not a general transaction: explicit cancellation of an existing listener
 
 Tool and app declarations capture their validated fields when submitted, including a detached copy of the tool's JSON schema. Later changes to the caller's table do not change the queued registration. This applies to both registration and explicit replacement. Callback functions themselves are retained, not cloned: mutations to state captured by their closures remain visible when they run.
 
-There is no dependency resolver. Declare prerequisites before consumers and avoid depending on partial initialization of a failed plugin.
+Declare prerequisites with a dense name list, such as `dependencies = { "questions" }`.
+These are plugin identities, not paths, package-install requests, or nested specs.
+Every dependency must be explicitly selected and enabled in the same setup list.
+Missing or disabled dependencies and dependency cycles are rejected before plugin
+execution. Dependencies load before consumers even when declared later; declaration
+order is retained where dependency ordering permits. Nothing is auto-enabled.
+
+For example, copy both bundled files and add these entries to your setup list:
+
+```lua
+rness.plugins.setup({
+  { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
+  { name = "questions", file = "plugins/questions.lua" },
+})
+```
+
+Questions loads first. Plan review still checks for an available Questions frontend
+at runtime: the dependency declaration does not bypass the headless check or imply
+approval when no frontend is available.
 
 ## VM ownership and unload
 
@@ -52,6 +70,8 @@ Ownership means the chunk that registered a callback, not the source file of eve
 Tool/UI/keymap declarations from registered callbacks are rejected immediately, even during synchronous event dispatch at load time. Dynamic hook subscriptions remain supported. Declaration callbacks must not be used as a delayed initialization mechanism.
 
 `LuaHost::unload(name)` is restricted to unmounted hosts. Mounted hosts use `LuaHost::unload_coordinated`, which reserves engine maintenance, unloads the VM registrations, removes tools only when their installed identity still matches, and invokes the frontend cleanup callback before releasing maintenance. Active turns, followups in a running burst, and compactations prevent maintenance; new sends and compactations are rejected while the reservation is held.
+
+Unloading a dependency is blocked while a loaded plugin depends on it. Unload consumers first (for example, `/unload plan` before `/unload questions`); there is no cascading unload.
 
 In the local TUI, submit `/unload <name>`. Completion polls the actual VM roster, so removed plugins disappear from candidates. A Lua app can return `{ action = "plugin:unload", payload = { name = "spinner" } }` from `on_key` to request the same operation. This does not uninstall files or remove the declaration from `init.lua`; restarting loads explicitly selected plugins again. There is no Lua `rness.plugins.unload` function.
 
@@ -71,20 +91,25 @@ include Lua helpers and manifest changes. Managed Git packages reject watching;
 inline callbacks are not watchable. Unwatched source snapshots are retained, though
 setup callbacks can run again when the selected registration set is rebuilt.
 Legacy `plugins.load` selections retain directory-based watching. Reload preserves
-declaration order without
+dependency-first ordering without
 restarting or reexecuting `init.lua`. The existing VM retains startup callbacks,
 globals and module caches. Changing `init.lua`, startup modules, or the selected
 plugin list still requires restart; unselected files are never activated.
 
-Reload stages tools, commands (including help and completion metadata), apps,
+Reload validates the dependency graph and stages dependency ownership along with
+tools, commands (including help and completion metadata), apps,
 cards, keymaps, statusline and hook ownership. If a selected plugin fails, the
-previous runtime registrations remain usable. Successful reload removes old
+previous runtime registrations, dependency edges, and hooks remain usable. Successful reload removes old
 runtime hooks and invalidates native Plan tokens, retaining the shared Questions
 broker and durable session state. The watcher reconciles engine tools while the
 maintenance reservation is still held. The TUI polls presentation declarations.
 Active engine work defers reload; the watcher retries automatically without another
 save. Session-unloaded plugins are filtered from subsequent watcher reloads and
-return only on restart with their activation declaration still present.
+return only on restart with their activation declaration still present. Failed or
+skipped consumers also remain skipped when a prerequisite has been unloaded,
+including transitive dependents, so independent plugins can still reload. The
+original declared graph is validated before this filtering; missing dependencies
+and cycles remain errors even in plugins that would otherwise be skipped.
 
 This is a registration transaction, not a sandbox or rollback of arbitrary Lua:
 filesystem/network effects, mutations of shared globals or captured state,

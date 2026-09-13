@@ -123,6 +123,7 @@ mod ownership_tests {
         assert!(!result.is_error, "{}", result.output);
         assert_eq!(nested[0].1.output, "hello:session:outer/0");
         assert!(host.reload(vec![crate::loader::PluginSource {
+            dependencies: vec![],
             name:"program-tool".into(), source:"rness.tool.register {name='plugin_echo', run=function() return 'reloaded' end}".into(),
         }]).await.unwrap().is_empty());
         let installed = sync_lua_tools(&registry, &host, &installed).await;

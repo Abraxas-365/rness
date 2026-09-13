@@ -534,6 +534,7 @@ pub fn evaluate(
                             | "watch"
                             | "opts"
                             | "keys"
+                            | "dependencies"
                     ) {
                         return Err(mlua::Error::runtime(format!("unknown plugin field: {key}")));
                     }
@@ -564,6 +565,27 @@ pub fn evaluate(
                 if !names.insert(name.clone()) {
                     return Err(mlua::Error::runtime(format!("duplicate plugin: {name}")));
                 }
+                let dependencies = match spec.raw_get::<mlua::Value>("dependencies")? {
+                    mlua::Value::Nil => Vec::new(),
+                    mlua::Value::Table(table) => {
+                        let count = table.raw_len();
+                        for pair in table.clone().pairs::<mlua::Value, mlua::Value>() {
+                            let (key, _) = pair?;
+                            if !matches!(key, mlua::Value::Integer(i) if i > 0 && (i as usize) <= count) {
+                                return Err(mlua::Error::runtime("plugin dependencies must be a dense list of strings"));
+                            }
+                        }
+                        let mut dependencies = Vec::new();
+                        for index in 1..=count {
+                            let mlua::Value::String(name) = table.raw_get::<mlua::Value>(index)? else {
+                                return Err(mlua::Error::runtime("plugin dependencies must be a dense list of strings"));
+                            };
+                            dependencies.push(name.to_str()?.to_owned());
+                        }
+                        dependencies
+                    }
+                    _ => return Err(mlua::Error::runtime("plugin dependencies must be a dense list of strings")),
+                };
                 let enabled = spec.get::<Option<bool>>("enabled")?.unwrap_or(true);
                 let watch = spec.get::<Option<bool>>("watch")?.unwrap_or(false);
                 if callback.is_some() && watch {
@@ -601,11 +623,13 @@ pub fn evaluate(
                     name,
                     source,
                     enabled,
+                    dependencies,
                     watch,
                     opts,
                     keys,
                 });
             }
+            crate::loader::dependency_order(&selected).map_err(mlua::Error::runtime)?;
             let mut state = s.lock().unwrap();
             if !state.plugins.is_empty() {
                 return Err(mlua::Error::runtime(
@@ -1071,6 +1095,96 @@ mod tests {
     }
 
     #[test]
+    fn plugin_dependencies_parse_strict_dense_string_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for dependencies in [
+            "false",
+            "'base'",
+            "42",
+            "{1}",
+            "{true}",
+            "{{}}",
+            "{function() end}",
+            "{[2]='base'}",
+            "{[1]='base',[3]='other'}",
+            "{[0]='base'}",
+            "{[-1]='base'}",
+            "{[1.5]='base'}",
+            "{base=true}",
+            "{['1']='base'}",
+            "{'base', extra='other'}",
+            "{'bad.lua'}",
+            "{'base','base'}",
+            "{'app'}",
+        ] {
+            std::fs::write(&path, format!("rness.plugins.setup({{{{name='app',config=function() end,dependencies={dependencies}}},{{name='base',config=function() end}},{{name='other',config=function() end}}}})")).unwrap();
+            assert!(load(&path).is_err(), "accepted {dependencies}");
+        }
+        std::fs::write(
+            &path,
+            r#"
+            rness.plugins.setup({
+                {name='app',config=function() end,dependencies={'base','other'}},
+                {name='other',file='other.lua',dependencies={}},
+                {package='base'},
+            })
+        "#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.plugin_specs[0].dependencies, ["base", "other"]);
+        assert!(config.plugin_specs[1].dependencies.is_empty());
+        assert!(config.plugin_specs[2].dependencies.is_empty());
+        assert_eq!(
+            crate::loader::dependency_order(&config.plugin_specs).unwrap(),
+            [2, 1, 0]
+        );
+    }
+
+    #[test]
+    fn plugin_dependencies_validate_at_startup_without_running_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for (declarations, expected) in [
+            (
+                "{name='app',file='missing.lua',dependencies={'base'}}",
+                "missing plugin: base",
+            ),
+            (
+                "{name='app',file='missing.lua',dependencies={'base'}},{name='base',file='base.lua',enabled=false}",
+                "disabled plugin: base",
+            ),
+            (
+                "{name='app',file='missing.lua',dependencies={'base'}},{name='base',file='base.lua',dependencies={'app'}}",
+                "app -> base -> app",
+            ),
+        ] {
+            std::fs::write(&path, format!("rness.plugins.setup({{{declarations}}})")).unwrap();
+            let error = load(&path)
+                .err()
+                .expect("invalid dependency graph accepted")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        std::fs::write(
+            &path,
+            r#"
+            assert(not pcall(rness.plugins.setup, {
+                {name='bad',config=function() error('must not run') end,dependencies={'missing'}}
+            }))
+            assert(__rness_plugin_callbacks.bad == nil)
+            rness.plugins.setup({
+                {name='app',config=function() error('deferred') end,dependencies={'base'}},
+                {name='base',config=function() error('deferred') end},
+            })
+        "#,
+        )
+        .unwrap();
+        assert_eq!(load(&path).unwrap().plugin_specs.len(), 2);
+    }
+
+    #[test]
     fn explicit_specs_reject_ambiguous_or_invalid_declarations() {
         for declaration in [
             "{{name='x', file='x.lua', package='x'}}",
@@ -1115,6 +1229,7 @@ mod tests {
             host.reload(vec![crate::loader::PluginSource {
                 name: "check".into(),
                 source: check.into(),
+                dependencies: Vec::new(),
             }])
             .await
             .unwrap()
