@@ -1,11 +1,11 @@
 
 #[tokio::test]
-async fn default_spinner_shows_session_compaction_and_restores_activity() {
+async fn default_statusline_shows_session_compaction_and_restores_activity() {
     use rness_kernel::presentation::TextProvider;
     use serde_json::json;
     let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
     host.load("session-stub.lua", "rness.session = { usage = function() return { input = 0 } end, config = function() return {} end }").await.unwrap();
-    host.load("spinner.lua", include_str!("../../../flavors/default/plugins/spinner.lua")).await.unwrap();
+    host.load("statusline.lua", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
     let context = json!({"session":"s1","model":"test"});
     host.fire_hook("turn_start", json!({"session":"s1"}));
     host.fire_hook("frame", json!({"type":"delta","session":"s1","chunk":{"d":"thinking"}}));
@@ -33,7 +33,7 @@ async fn default_spinner_shows_session_compaction_and_restores_activity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn spinner_pattern_works() {
+async fn statusline_pattern_works() {
     let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
     host.load("probe.lua", r#"
         local running = {}

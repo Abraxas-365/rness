@@ -31,6 +31,16 @@ struct StatusState {
 }
 
 impl StatusText {
+    /// Evaluate and publish the initial provider view before the first TUI frame.
+    pub async fn prime(
+        &self,
+        provider: &dyn rness_kernel::presentation::TextProvider,
+        context: serde_json::Value,
+    ) {
+        self.update_context(context);
+        self.refresh(provider).await;
+    }
+
     /// Evaluate a native or adapted provider outside the synchronous renderer.
     pub async fn refresh(&self, provider: &dyn rness_kernel::presentation::TextProvider) {
         let (generation, revision, context) = {
@@ -63,17 +73,20 @@ impl StatusText {
     }
 
     fn context(&self, ctx: &Ctx<'_>) {
-        let context = serde_json::json!({
+        self.update_context(serde_json::json!({
             "session": ctx.model.session,
             "model": ctx.model.model_name,
             "profile": ctx.model.profile_name,
             "agent": ctx.model.agent_name,
             "busy": ctx.model.busy,
             "activity": if ctx.model.busy { "working" } else { "idle" },
-        });
+        }));
+    }
+
+    fn update_context(&self, context: serde_json::Value) {
         let mut state = self.0.write().expect("status text lock");
         if state.context != context {
-            if !ctx.model.busy { state.busy_since = None; }
+            if !context["busy"].as_bool().unwrap_or(false) { state.busy_since = None; }
             else if state.busy_since.is_none() || state.context["session"] != context["session"] {
                 state.busy_since = Some(std::time::Instant::now());
             }
@@ -220,6 +233,20 @@ mod tests {
         cell.context(&Ctx { model: &model, theme: &theme });
 
         assert_eq!(cell.get().as_deref(), Some("published"));
+    }
+
+    #[tokio::test]
+    async fn prime_publishes_initial_provider_view() {
+        struct Initial;
+        #[async_trait::async_trait]
+        impl rness_kernel::presentation::TextProvider for Initial {
+            async fn text(&self) -> Option<String> { Some("initial".into()) }
+        }
+
+        let cell = StatusText::default();
+        cell.prime(&Initial, serde_json::json!({"session":"s", "busy":false})).await;
+
+        assert_eq!(cell.get().as_deref(), Some("initial"));
     }
 
     #[tokio::test]

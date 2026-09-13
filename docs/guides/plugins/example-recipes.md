@@ -213,7 +213,7 @@ Callbacks receive a detached context snapshot: `session`, `model`, `busy`,
 `activity` (`working` or `idle`), `elapsed_ms`, and `elapsed` (formatted seconds).
 Elapsed time starts when the frontend observes the active session becoming busy.
 Mutations to this snapshot cannot change application state. Token usage and
-cross-session activity can be cached through hooks, as in the default spinner;
+cross-session activity can be cached through hooks, as in the default statusline plugin;
 they are not built-in context fields. Callbacks run in the Lua actor outside
 terminal rendering, on the existing approximately 500ms refresh cycle.
 

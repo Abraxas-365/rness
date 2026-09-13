@@ -73,7 +73,7 @@ async fn exercise(fail: bool, cancel: bool, unchanged: bool) {
         } }
     "#).await.unwrap();
     host.load("commands", include_str!("../../../flavors/default/plugins/commands.lua")).await.unwrap();
-    host.load("spinner", include_str!("../../../flavors/default/plugins/spinner.lua")).await.unwrap();
+    host.load("statusline", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
     let service = sessions.clone();
     let id = session.clone();
     let command = tokio::spawn(async move {

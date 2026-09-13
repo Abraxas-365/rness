@@ -17,6 +17,29 @@ use rness_engine::tools::Tool;
 use serde_json::{json, Value};
 
 const MAX_READ_BYTES: usize = 64 * 1024;
+const MAX_INSPECT_BYTES: usize = 8 * 1024;
+
+/// Non-consuming, session-visible job metadata for user controls.
+#[derive(Debug, serde::Serialize)]
+pub struct JobSnapshot {
+    pub job_id: String,
+    pub kind: String,
+    pub label: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// True until the producer settles, including cancellation pending.
+    pub running: bool,
+    pub cancellation_requested: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct JobInspection {
+    #[serde(flatten)]
+    pub job: JobSnapshot,
+    pub output: String,
+    pub output_bytes: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum JobStatus {
@@ -95,6 +118,38 @@ pub struct JobWriter {
 }
 
 impl Job {
+    fn snapshot(&self, id: &str, state: &JobState) -> JobSnapshot {
+        let cancellation_requested = self.cancel.is_cancelled();
+        let status = if !state.settled && cancellation_requested {
+            "cancelling"
+        } else {
+            match state.status {
+                JobStatus::Running => "running",
+                JobStatus::Exited(_) => "exited",
+                JobStatus::Killed => "killed",
+                JobStatus::Interrupted => "interrupted",
+            }
+        };
+        JobSnapshot {
+            job_id: id.into(), kind: state.kind.clone(), label: state.label.clone(),
+            status: status.into(), running: !state.settled, cancellation_requested,
+            exit_code: match state.status { JobStatus::Exited(code) => code, _ => None },
+        }
+    }
+
+    /// Shared by the model tool and user controls. Settlement stays producer-owned.
+    fn request_stop(&self) -> bool {
+        let mut state = self.state.lock().expect("job lock");
+        if state.settled || state.status != JobStatus::Running || self.cancel.is_cancelled() {
+            return false;
+        }
+        state.status = JobStatus::Killed;
+        self.cancel.cancel();
+        drop(state);
+        self.changed.notify_waiters();
+        true
+    }
+
     fn persist(&self, state: &JobState) -> std::io::Result<()> {
         let Some(path) = &self.path else { return Ok(()); };
         use std::io::Write;
@@ -279,6 +334,44 @@ impl JobRegistry {
         (id, JobWriter { job })
     }
 
+    /// Count visible unsettled jobs without reading or copying their output.
+    pub fn count(&self, session: &str) -> usize {
+        self.inner.jobs.lock().expect("jobs lock").values().filter(|job| {
+            let state = job.state.lock().expect("job lock");
+            state.visible_to(Some(session)) && !state.settled
+        }).count()
+    }
+
+    pub fn list(&self, session: &str) -> Vec<JobSnapshot> {
+        let mut jobs: Vec<_> = self.inner.jobs.lock().expect("jobs lock").iter().filter_map(|(id, job)| {
+            let state = job.state.lock().expect("job lock");
+            state.visible_to(Some(session)).then(|| job.snapshot(id, &state))
+        }).collect();
+        jobs.sort_by(|a, b| a.job_id.len().cmp(&b.job_id.len()).then_with(|| a.job_id.cmp(&b.job_id)));
+        jobs
+    }
+
+    /// Inspect a bounded output tail without advancing the model's read cursor.
+    pub fn inspect(&self, session: &str, id: &str) -> Result<JobInspection, String> {
+        let job = self.get_for_session(id, Some(session))?;
+        let state = job.state.lock().expect("job lock");
+        let output_bytes = state.output.len();
+        let tail = &state.output[output_bytes.saturating_sub(MAX_INSPECT_BYTES)..];
+        let mut output = String::from_utf8_lossy(tail).into_owned();
+        // Lossy decoding can expand invalid bytes; retain a UTF-8-safe bounded tail.
+        if output.len() > MAX_INSPECT_BYTES {
+            let mut start = output.len() - MAX_INSPECT_BYTES;
+            while !output.is_char_boundary(start) { start += 1; }
+            output.drain(..start);
+        }
+        Ok(JobInspection { job: job.snapshot(id, &state), output, output_bytes })
+    }
+
+    /// Return whether this call made a new cancellation request, not settlement.
+    pub fn stop(&self, session: &str, id: &str) -> Result<bool, String> {
+        Ok(self.get_for_session(id, Some(session))?.request_stop())
+    }
+
     fn get_for_session(&self, id: &str, session: Option<&str>) -> Result<Arc<Job>, String> {
         let job = self.get(id)?;
         if !job.state.lock().expect("job lock").visible_to(session) {
@@ -295,6 +388,107 @@ impl JobRegistry {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("no job '{id}' — list jobs with job_list"))
+    }
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn visibility_and_cancellation_until_producer_settlement() {
+        let jobs = JobRegistry::new();
+        let (private, writer) = jobs.start_owned("bash", "private".into(), Some(&"owner".into()));
+        let (shared, shared_writer) = jobs.start("bash", "shared".into());
+        assert_eq!(jobs.count("owner"), 2);
+        assert_eq!(jobs.count("foreign"), 1);
+        assert_eq!(jobs.list("foreign")[0].job_id, shared);
+        assert!(jobs.inspect("foreign", &private).is_err());
+        assert!(jobs.stop("foreign", &private).is_err());
+        assert!(!writer.cancelled().is_cancelled());
+        assert!(jobs.inspect("owner", "missing").is_err());
+        assert!(jobs.stop("owner", "missing").is_err());
+        assert!(jobs.stop("owner", &private).unwrap());
+        assert!(!jobs.stop("owner", &private).unwrap());
+        let snapshot = jobs.inspect("owner", &private).unwrap().job;
+        assert!(snapshot.running && snapshot.cancellation_requested);
+        assert_eq!(snapshot.status, "cancelling");
+        assert_eq!(jobs.count("owner"), 2);
+        writer.settle(JobStatus::Exited(Some(0)));
+        let snapshot = jobs.inspect("owner", &private).unwrap().job;
+        assert!(!snapshot.running);
+        assert!(snapshot.cancellation_requested);
+        assert_eq!(snapshot.status, "killed");
+        assert_eq!(jobs.count("owner"), 1);
+        assert!(!jobs.stop("owner", &private).unwrap());
+        shared_writer.settle(JobStatus::Exited(Some(0)));
+        assert!(!jobs.stop("foreign", &shared).unwrap());
+        assert!(!shared_writer.cancelled().is_cancelled());
+        assert_eq!(jobs.count("owner"), 0);
+        assert_eq!(jobs.list("owner").len(), 2);
+    }
+
+    #[test]
+    fn inspection_is_bounded_and_does_not_consume_output() {
+        let jobs = JobRegistry::new();
+        let (id, writer) = jobs.start("bash", "output".into());
+        writer.append(b"first");
+        let job = jobs.get(&id).unwrap();
+        assert_eq!(drain_output(&job).0, "first");
+        let bytes = vec![b'x'; MAX_INSPECT_BYTES + 100];
+        writer.append(&bytes);
+        for _ in 0..2 {
+            let inspection = jobs.inspect("any", &id).unwrap();
+            assert_eq!(inspection.output, "x".repeat(MAX_INSPECT_BYTES));
+            assert_eq!(inspection.output_bytes, 5 + bytes.len());
+            jobs.count("any");
+            jobs.list("any");
+            assert_eq!(job.state.lock().unwrap().read_from, 5);
+        }
+        assert_eq!(drain_output(&job).0, String::from_utf8(bytes).unwrap());
+        assert!(!jobs.inspect("any", &id).unwrap().output.is_empty());
+        writer.append(&vec![0xff; MAX_INSPECT_BYTES + 1]);
+        let inspection = jobs.inspect("any", &id).unwrap();
+        assert!(inspection.output.len() <= MAX_INSPECT_BYTES);
+        assert!(inspection.output.ends_with('\u{fffd}'));
+        writer.append("😀tail".as_bytes());
+        assert!(jobs.inspect("any", &id).unwrap().output.ends_with("😀tail"));
+    }
+
+    #[tokio::test]
+    async fn model_kill_and_user_stop_share_pending_cancellation() {
+        let jobs = JobRegistry::new();
+        let (id, writer) = jobs.start("bash", "shared cancellation".into());
+        let tool = JobKillTool::new(jobs.clone());
+        let result = tool.execute(json!({"job_id": id})).await.unwrap();
+        assert!(result.contains("cancellation requested"));
+        assert!(writer.cancelled().is_cancelled());
+        assert!(!jobs.stop("any", &id).unwrap());
+        assert_eq!(jobs.count("any"), 1);
+        assert_eq!(jobs.inspect("any", &id).unwrap().job.status, "cancelling");
+        writer.settle(JobStatus::Exited(Some(0)));
+        assert_eq!(jobs.count("any"), 0);
+        assert_eq!(jobs.inspect("any", &id).unwrap().job.status, "killed");
+    }
+
+    #[test]
+    fn recovered_interrupted_jobs_are_not_active() {
+        let directory = tempfile::tempdir().unwrap();
+        let jobs = JobRegistry::new();
+        jobs.enable_persistence(directory.path()).unwrap();
+        let (id, writer) = jobs.start_owned("bash", "recover".into(), Some(&"owner".into()));
+        writer.append(b"retained");
+        drop(writer);
+        drop(jobs);
+        let jobs = JobRegistry::new();
+        jobs.enable_persistence(directory.path()).unwrap();
+        assert_eq!(jobs.count("owner"), 0);
+        assert!(jobs.list("foreign").is_empty());
+        let inspection = jobs.inspect("owner", &id).unwrap();
+        assert_eq!(inspection.job.status, "interrupted");
+        assert!(!inspection.job.running);
+        assert_eq!(inspection.output, "retained");
+        assert!(!jobs.stop("owner", &id).unwrap());
     }
 }
 
@@ -665,22 +859,10 @@ impl JobKillTool {
     fn kill_presented(&self, session: Option<&str>, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get_for_session(id, session)?;
-        let already = {
-            let mut state = job.state.lock().expect("job lock");
-            match state.status {
-                JobStatus::Running => {
-                    state.status = JobStatus::Killed;
-                    false
-                }
-                _ => true,
-            }
-        };
-        if already {
+        if !job.request_stop() {
             let state = job.state.lock().expect("job lock");
             return Ok((format!("job {id} already finished {}", state.status.marker()), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":false,"status":state.status.marker()})));
         }
-        job.cancel.cancel();
-        job.changed.notify_waiters();
         Ok((format!("cancellation requested for job {id}"), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":true})))
     }
 }

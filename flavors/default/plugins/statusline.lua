@@ -111,9 +111,19 @@ rness.ui.statusline = {
     return parts
   end,
   right = function(ctx)
-    return {
-      { text = ctx.profile or "" },
-      { text = ctx.agent or "" },
-    }
+    local parts = {}
+    -- In-memory metadata only: never consume job_output or replay session logs.
+    -- Jobs remain visible while the model is idle or compacting. Missing APIs
+    -- are tolerated when this plugin is copied to an older binary.
+    if ctx.session and rness.jobs then
+      local ok, count = pcall(rness.jobs.count, ctx.session)
+      if ok and count > 0 then
+        parts[#parts + 1] = { text = count .. " bg job" .. (count == 1 and "" or "s"),
+          style = { fg = "#fabd2f" } }
+      end
+    end
+    parts[#parts + 1] = { text = ctx.profile or "" }
+    parts[#parts + 1] = { text = ctx.agent or "" }
+    return parts
   end,
 }

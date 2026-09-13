@@ -887,6 +887,13 @@ impl LuaRuntime {
         errors
     }
 
+    /// Inject shared background jobs independently of the session binding.
+    pub fn install_jobs(&self, jobs: rness_tools::jobs::JobRegistry) -> Result<(), LuaError> {
+        let rness: Table = self.lua.globals().get("rness")?;
+        crate::api::jobs::install(&self.lua, &rness, jobs)?;
+        Ok(())
+    }
+
     /// Surface the engine's SessionService as `rness.session`. Called
     /// after mount and again on every fresh VM (hot reload).
     pub fn install_session(
@@ -1875,6 +1882,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     )?;
     rness.set("json", json)?;
 
+    crate::api::jobs::install_unmounted(lua, &rness)?;
     crate::api::fs::install(lua, &rness)?;
     crate::api::http::install(lua, &rness)?;
     crate::api::process::install(lua, &rness)?;

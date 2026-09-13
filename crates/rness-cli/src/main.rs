@@ -524,6 +524,7 @@ async fn main() -> anyhow::Result<()> {
     subagents.register(Arc::new(rness_engine::subagent::SpawnProvider));
     subagents.register(Arc::new(rness_engine::subagent::ForkProvider));
     jobs.attach_sessions(&sessions);
+    lua.install_jobs(jobs.clone()).await.map_err(|e| anyhow::anyhow!("lua jobs bridge: {e}"))?;
     rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs);
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
 
@@ -1009,6 +1010,21 @@ async fn run_tui(
     // publishes into the shared cell; the ext component shadows the
     // built-in only while text exists. TUI stays Lua-agnostic.
     let status_text = ext_statusline::install(&mut slots);
+    // Lua has loaded all declarations before entering `run_tui`; publish its
+    // first view before terminal rendering can show the built-in fallback.
+    status_text
+        .prime(
+            &lua,
+            serde_json::json!({
+                "session": session,
+                "model": model_name,
+                "profile": serde_json::Value::Null,
+                "agent": serde_json::Value::Null,
+                "busy": false,
+                "activity": "idle",
+            }),
+        )
+        .await;
     // Host keymap: stock bindings + Lua rebinds (rness.keymaps.set).
     // Recomputed on the same poll as the statusline/roster so hot
     // reloads revert bindings from removed plugins.

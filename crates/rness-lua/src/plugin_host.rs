@@ -171,6 +171,10 @@ enum Cmd {
         binding: SessionBinding,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    InstallJobs {
+        jobs: rness_tools::jobs::JobRegistry,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Inject the shared questions broker so plugins can dynamically
     /// enable/disable the AskUser tool via `rness.questions.enable()`.
     InstallQuestions {
@@ -545,6 +549,9 @@ impl LuaHost {
                             session_binding = Some(binding);
                             let _ = reply.send(r);
                         }
+                        Cmd::InstallJobs { jobs, reply } => {
+                            let _ = reply.send(rt.install_jobs(jobs).map_err(|e| e.to_string()));
+                        }
                         Cmd::InstallQuestions { questions, reply } => {
                             questions_ref = Some(questions.clone());
                             let r = rt.install_questions(questions).map_err(|e| e.to_string());
@@ -819,6 +826,13 @@ impl LuaHost {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx.send(Cmd::Reload { sources, reconcile: Some(Box::new(reconcile)), reply }).map_err(|_| ReloadError::Failed("lua vm gone".into()))?;
         rx.await.map_err(|_| ReloadError::Failed("lua vm gone".into()))?
+    }
+
+    /// Inject shared background jobs. Sticky across retained-VM hot reloads.
+    pub async fn install_jobs(&self, jobs: rness_tools::jobs::JobRegistry) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(Cmd::InstallJobs { jobs, reply }).map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// Inject the shared questions broker. Sticky across hot reloads.

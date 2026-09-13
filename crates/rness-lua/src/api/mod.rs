@@ -10,6 +10,7 @@ pub mod fs;
 pub mod process;
 pub mod http;
 pub mod mcp;
+pub mod jobs;
 pub mod session;
 pub mod subagents;
 pub mod tools;
