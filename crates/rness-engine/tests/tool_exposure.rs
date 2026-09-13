@@ -53,6 +53,70 @@ async fn parallel_calls_overlap_and_keep_input_order() {
     for (index,(call,_)) in nested.iter().enumerate() { assert_eq!(call.call,format!("p/{index}")); }
 }
 
+#[tokio::test]
+async fn background_admission_uses_permissions_not_turn_exposure() {
+    use rness_protocol::events::*;
+    struct Named(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str { self.0 }
+        fn starts_background_job(&self, _: &Value) -> bool { self.0 == "Background" }
+        async fn execute(&self, _: Value) -> Result<String, String> { Ok("executed".into()) }
+    }
+    struct BackgroundFlow { step: std::sync::atomic::AtomicUsize, mixed: bool }
+    #[async_trait::async_trait]
+    impl rness_engine::turn::provider::Provider for BackgroundFlow {
+        fn model(&self) -> &str { "test" }
+        async fn step(&self, request: rness_engine::turn::provider::StepRequest<'_>, _: &CancellationToken) -> rness_engine::turn::provider::StepOutcome {
+            let first = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            assert!(request.tools.iter().all(|tool| !tool.name.starts_with("job_")));
+            let mut content = Vec::new();
+            if first {
+                if self.mixed {
+                    content.push(ContentPart::ToolUse { call:"search".into(), name:"ToolSearch".into(), args:json!({"query":"select:Background"}) });
+                }
+                content.push(ContentPart::ToolUse { call:"start".into(), name:"Background".into(), args:json!({}) });
+                // Knowing a deferred tool's name still must not permit a direct call.
+                content.push(ContentPart::ToolUse { call:"hidden".into(), name:"job_output".into(), args:json!({}) });
+            }
+            rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {
+                model:"test".into(), content, stop:if first { StopReason::ToolUse } else { StopReason::EndTurn },
+                usage:Usage::default(), chunks:vec![],
+            })
+        }
+    }
+    for mixed in [false, true] {
+        for permitted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = rness_engine::session::branch::SessionStore::new(dir.path());
+            let mut log = store.create(None).unwrap();
+            let session = log.session().clone();
+            let tools = ToolRegistry::default();
+            for name in ["Background", "job_output", "job_list", "job_kill"] { tools.register(Arc::new(Named(name))); }
+            if !permitted {
+                log.append(&SessionEvent::RequestConfig(CallConfig {
+                    tool_ceiling: Some(vec!["Background".into()]), ..Default::default()
+                })).unwrap();
+            }
+            let config = rness_engine::turn::TurnConfig {
+                tool_exposure: Exposure { mode:Mode::Native, deferred:["job_output", "job_list", "job_kill"].map(str::to_owned).to_vec() },
+                ..Default::default()
+            };
+            let provider = BackgroundFlow { step:0.into(), mixed };
+            rness_engine::turn::run_turn(&store, &mut log, &provider, &tools, &config, &CancellationToken::new(), &mut || vec![], 1, &|_| {}).await.unwrap();
+            drop(log);
+            let history = store.history(&session).unwrap();
+            let results: Vec<_> = history.iter().filter_map(|event| match &event.event {
+                SessionEvent::ToolResult(result) => Some(result), _ => None,
+            }).collect();
+            let start = results.iter().find(|result| result.call == "start").unwrap();
+            assert_eq!(start.is_error, !permitted, "{}", start.output);
+            assert_eq!(start.output.contains("executed"), permitted);
+            assert!(results.iter().find(|result| result.call == "hidden").unwrap().is_error);
+        }
+    }
+}
+
 struct Flow(std::sync::atomic::AtomicUsize);
 #[async_trait::async_trait]
 impl rness_engine::turn::provider::Provider for Flow {

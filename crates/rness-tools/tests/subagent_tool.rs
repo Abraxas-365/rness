@@ -51,6 +51,8 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
     let jobs = rness_tools::jobs::JobRegistry::new();
     jobs.attach_sessions(&sessions);
     tools.register(Arc::new(rness_tools::jobs::JobOutputTool::new(jobs.clone())));
+    tools.register(Arc::new(rness_tools::jobs::JobListTool::new(jobs.clone())));
+    tools.register(Arc::new(rness_tools::jobs::JobKillTool::new(jobs.clone())));
     rness_tools::register_subagent(&tools, Arc::clone(&runtime), jobs);
     rness_tools::subagent_control::register_subagent_control(&tools, runtime);
     (sessions, tools)
@@ -270,11 +272,39 @@ async fn background_subagent_is_a_job() {
     panic!("background subagent never settled");
 }
 
+#[tokio::test]
+async fn background_subagent_without_job_controls_is_rejected_before_creation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sessions, tools) = compose(dir.path());
+    let parent = sessions.create(None).unwrap();
+    let restricted = tools.restricted(&["subagent".into()]);
+    let mut call = ToolCall {
+        call: "delegate".into(), name: "subagent".into(),
+        args: serde_json::json!({"provider":"spawn", "prompt":"work", "run_in_background":true}),
+    };
+    let results = restricted.dispatch(&parent, &[call.clone()], 1, &Default::default()).await;
+    assert!(results[0].is_error);
+    assert!(results[0].output.contains("background jobs unavailable"));
+    assert_eq!(sessions.list().unwrap(), vec![parent.clone()]);
+    let jobs = tools.dispatch(&parent, &[ToolCall {
+        call: "jobs".into(), name: "job_list".into(), args: serde_json::json!({}),
+    }], 1, &Default::default()).await;
+    assert_eq!(jobs[0].output, "No background jobs");
+
+    call.args["run_in_background"] = serde_json::json!(false);
+    let results = restricted.dispatch(&parent, &[call], 1, &Default::default()).await;
+    assert!(!results[0].is_error, "{}", results[0].output);
+    assert!(results[0].output.contains("hecho"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn continuable_lifecycle_through_dispatch() {
     let dir = tempfile::tempdir().unwrap();
     let (sessions, tools) = compose(dir.path());
     let parent = sessions.create(None).unwrap();
+    // Continuable agents do not create jobs, even with run_in_background set.
+    let tools = tools.restricted(&["subagent", "send_message", "interrupt_agent", "list_agents"]
+        .map(str::to_owned));
 
     // Start a continuable child through the model-facing tool.
     let results = tools
@@ -285,7 +315,7 @@ async fn continuable_lifecycle_through_dispatch() {
                 name: "subagent".into(),
                 args: serde_json::json!({
                     "provider": "spawn", "prompt": "quedate",
-                    "background_mode": "continuable"
+                    "background_mode": "continuable", "run_in_background": true
                 }),
             }],
             1,

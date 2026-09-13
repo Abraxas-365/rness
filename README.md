@@ -342,7 +342,7 @@ Use a focused scout to investigate, a worker to implement, and a reviewer to ins
 
 The scout's `small` profile resolves against the **parent's current provider connection**. The default flavor includes Anthropic Haiku and ChatGPT Luna mappings; OpenRouter and Ollama need model IDs you choose. Account availability still applies. A missing mapping fails explicitly—there is no silent cross-provider fallback.
 
-Roles without a profile inherit the principal's model settings. Background one-shot jobs notify their parent on completion; idle parents can wake automatically within a bounded wake budget. Results remain accessible through `job_output`.
+Roles without a profile inherit the principal's model settings. Background one-shot jobs notify their parent on completion; idle parents can wake automatically within a bounded wake budget. Results remain accessible through `job_output`. Background Bash and one-shot subagent calls require `job_output`, `job_list`, and `job_kill` in the calling session's effective tool allowlist; otherwise they are rejected before starting work. Foreground calls remain available. Continuable agents use their separate agent controls rather than job controls.
 
 > [!NOTE]
 > **A child session is not a sandbox.** Specialists share the workspace; delegation does not create isolated git worktrees. Read-only instructions are not enforced tool restrictions. For a strictly limited exploration role, explicitly allow only `Glob`, `Grep`, and `Read`—Bash can modify files.

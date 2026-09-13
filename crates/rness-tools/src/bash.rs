@@ -157,6 +157,10 @@ impl Tool for BashTool {
         "Bash"
     }
 
+    fn starts_background_job(&self, args: &Value) -> bool {
+        args["run_in_background"].as_bool().unwrap_or(false)
+    }
+
     fn sensitive(&self) -> bool {
         true // arbitrary shell execution
     }

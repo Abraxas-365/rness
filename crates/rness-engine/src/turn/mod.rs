@@ -296,7 +296,7 @@ async fn drive(
                 }
                 let exposed: Vec<_> = tool_specs.iter().map(|spec| spec.name.clone()).collect();
                 let results = if calls.iter().all(|call| call.name != "ToolSearch" && call.name != "run_code") {
-                    tools.restricted(&exposed).dispatch(&session, &calls, config.max_tool_concurrency, cancel).await
+                    tools.dispatch_exposed(&session, &calls, config.max_tool_concurrency, cancel, Some(&exposed)).await
                 } else {
                     let mut results = Vec::new();
                     for call in &calls {
@@ -333,7 +333,7 @@ async fn drive(
                             };
                             results.push(result);
                         } else {
-                            results.extend(tools.restricted(&exposed).dispatch(&session, std::slice::from_ref(call), 1, cancel).await);
+                            results.extend(tools.dispatch_exposed(&session, std::slice::from_ref(call), 1, cancel, Some(&exposed)).await);
                         }
                     }
                     results

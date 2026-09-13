@@ -54,6 +54,11 @@ impl Tool for SubagentTool {
         "subagent"
     }
 
+    fn starts_background_job(&self, args: &Value) -> bool {
+        args["run_in_background"].as_bool().unwrap_or(false)
+            && args["background_mode"].as_str() != Some("continuable")
+    }
+
     fn description(&self) -> &str {
         "Delegate a task to a child agent running in its own session. \
          provider 'fork' seeds the child with this conversation's completed \

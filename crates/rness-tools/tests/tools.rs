@@ -562,6 +562,80 @@ async fn bash_timeout_stops_descendants() {
 // -- Background jobs -------------------------------------------------------
 
 #[tokio::test]
+async fn background_bash_requires_effective_job_controls_before_starting() {
+    use rness_engine::tools::{ToolCall, ToolRegistry};
+    let dir = TempDir::new().unwrap();
+    let jobs = JobRegistry::new();
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(BashTool::new(ws(&dir), jobs.clone())));
+    tools.register(Arc::new(JobOutputTool::new(jobs.clone())));
+    tools.register(Arc::new(JobListTool::new(jobs.clone())));
+    tools.register(Arc::new(JobKillTool::new(jobs.clone())));
+    let session = "child".to_string();
+    let call = ToolCall {
+        call: "bash-call".into(), name: "Bash".into(),
+        args: json!({"command":"touch started", "description":"Check background admission", "run_in_background":true}),
+    };
+    for missing in ["job_output", "job_list", "job_kill"] {
+        // Model the inherited ceiling followed by the role's own allowlist.
+        let ceiling = tools.restricted(&["Bash", "job_output", "job_list", "job_kill"]
+            .map(str::to_owned));
+        let allowed = ["Bash", "job_output", "job_list", "job_kill"]
+            .into_iter().filter(|name| *name != missing).map(str::to_owned).collect::<Vec<_>>();
+        let restricted = ceiling.restricted(&allowed);
+        let results = restricted.dispatch(&session, std::slice::from_ref(&call), 1, &Default::default()).await;
+        assert!(results[0].is_error);
+        assert!(results[0].output.contains(missing), "{}", results[0].output);
+        assert_eq!(results[0].presentation.as_ref().unwrap()["outcome"], "background_jobs_unavailable");
+        assert!(jobs.list(&session).is_empty());
+        assert!(!dir.path().join("started").exists());
+    }
+
+    let restricted = Arc::new(tools.restricted(&["Bash".into()]));
+    // PTC must enforce the same admission check as native dispatch.
+    let (_, nested) = rness_engine::tools::exposure::program(
+        restricted.clone(), session.clone(), ToolCall {
+            call: "ptc".into(), name: "run_code".into(),
+            args: json!({"code":"return tools.call('Bash', {command='touch started', description='Check PTC admission', run_in_background=true})"}),
+        }, Default::default(), None,
+    ).await;
+    assert_eq!(nested.len(), 1);
+    assert!(nested[0].1.is_error);
+    assert!(nested[0].1.output.contains("background jobs unavailable"));
+    assert!(jobs.list(&session).is_empty());
+    assert!(!dir.path().join("started").exists());
+
+    for background in [None, Some(false)] {
+        let mut foreground = call.clone();
+        foreground.args["command"] = json!("echo foreground");
+        if let Some(value) = background {
+            foreground.args["run_in_background"] = json!(value);
+        } else {
+            foreground.args.as_object_mut().unwrap().remove("run_in_background");
+        }
+        let results = restricted.dispatch(&session, &[foreground], 1, &Default::default()).await;
+        assert!(!results[0].is_error, "{}", results[0].output);
+        assert!(results[0].output.contains("foreground"));
+    }
+
+    // Hidden-but-discoverable controls are still permitted, and a restricted
+    // child must not change the original registry's ability to start jobs.
+    tools.defer(["job_output", "job_list", "job_kill"].map(str::to_owned));
+    let results = tools.dispatch(&session, &[call], 1, &Default::default()).await;
+    assert!(!results[0].is_error, "{}", results[0].output);
+    let id = results[0].presentation.as_ref().unwrap()["job_id"].as_str().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while jobs.count(&session) != 0 { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    assert!(dir.path().join("started").exists());
+    let output = tools.dispatch(&session, &[ToolCall {
+        call: "output".into(), name: "job_output".into(), args: json!({"job_id":id}),
+    }], 1, &Default::default()).await;
+    assert!(!output[0].is_error);
+    assert!(output[0].output.contains("[status: exited, code 0]"));
+}
+
+#[tokio::test]
 async fn background_job_streams_output_and_settles() {
     let dir = TempDir::new().unwrap();
     let jobs = JobRegistry::new();

@@ -66,6 +66,12 @@ pub trait Tool: Send + Sync {
     fn sensitive(&self) -> bool {
         false
     }
+    /// Whether this call detaches work into the owning session's job registry.
+    /// Dispatch requires all job controls in the effective registry before
+    /// approval or execution. Continuable agents use separate controls.
+    fn starts_background_job(&self, _args: &serde_json::Value) -> bool {
+        false
+    }
     /// Execute with JSON args. `Err` becomes an is_error result — tools
     /// never abort a turn.
     async fn execute(&self, args: serde_json::Value) -> Result<String, String>;
@@ -380,11 +386,37 @@ impl ToolRegistry {
         max_concurrency: usize,
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
+        self.dispatch_exposed(session, calls, max_concurrency, cancel, None).await
+    }
+
+    /// Exposure limits which tools may be called, not the session's permissions
+    /// used for dependency checks (deferred controls can still be discovered).
+    pub(crate) async fn dispatch_exposed(
+        &self,
+        session: &SessionId,
+        calls: &[ToolCall],
+        max_concurrency: usize,
+        cancel: &CancellationToken,
+        exposed: Option<&[String]>,
+    ) -> Vec<ToolResult> {
         let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
         let mut handles = Vec::with_capacity(calls.len());
+        // Check permission, not exposure: deferred controls remain usable via
+        // ToolSearch/PTC. This registry already reflects role and inherited ceilings.
+        let missing_job_controls: Vec<_> = ["job_output", "job_list", "job_kill"]
+            .into_iter()
+            .filter(|name| self.get(name).is_none())
+            .collect();
         for call in calls {
             let sem = Arc::clone(&sem);
-            let tool = self.get(&call.name);
+            let tool = self.get(&call.name)
+                .filter(|_| exposed.is_none_or(|names| names.contains(&call.name)));
+            let background_error = tool.as_ref()
+                .filter(|tool| tool.starts_background_job(&call.args) && !missing_job_controls.is_empty())
+                .map(|_| format!(
+                    "background jobs unavailable: this session lacks required job controls: {}. Run in the foreground instead.",
+                    missing_job_controls.join(", "),
+                ));
             let approvals = Arc::clone(&self.approvals);
             let call = call.clone();
             let session = session.clone();
@@ -396,6 +428,10 @@ impl ToolRegistry {
                 let mut presentation = None;
                 let mut failure_kind = "execution_failed";
                 let outcome = match tool {
+                    Some(_) if background_error.is_some() => {
+                        failure_kind = "background_jobs_unavailable";
+                        Err(background_error.unwrap())
+                    }
                     Some(t) => {
                         {
                             let request = ApprovalRequest {
