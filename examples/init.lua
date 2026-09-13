@@ -27,6 +27,13 @@ rness.plugins.setup({
 -- Plain registration chunks remain valid with empty opts; options require a
 -- returned setup function. See plugins/keymaps.lua for actions and stable slots.
 
+-- Optional Bash filesystem sandbox (disabled unless you opt in).
+-- macOS only for now; restricted modes fail closed on unsupported hosts.
+-- Approval is independent; this does not confine plugins or non-Bash tools.
+-- rness.sandbox.setup({
+--   default = "workspace-write", agent_overrides = "tighten-only", unavailable = "deny",
+-- })
+
 -- Central mappings are startup-only. Add entries to this ONE mapping list.
 rness.keymap.setup({
   -- { scope = "global", key = "ctrl+k", action = "core.scroll_up" },

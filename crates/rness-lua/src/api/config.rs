@@ -54,6 +54,8 @@ pub struct StartupConfig {
     pub question_overlay: QuestionOverlayConfig,
     pub ask_user: bool,
     pub default_agent: Option<String>,
+    pub sandbox: rness_engine::sandbox::SandboxConfig,
+    pub sandbox_configured: bool,
 }
 
 #[cfg(test)]
@@ -691,6 +693,25 @@ pub fn evaluate(
         })?,
     )?;
     rness.set("profiles", profiles)?;
+    let sandbox = lua.create_table()?;
+    let s = state.clone();
+    sandbox.set(
+        "setup",
+        lua.create_function(move |lua, value: Table| {
+            let config: rness_engine::sandbox::SandboxConfig =
+                lua.from_value(mlua::Value::Table(value))?;
+            let mut state = s.lock().unwrap();
+            if state.sandbox_configured {
+                return Err(mlua::Error::runtime(
+                    "sandbox.setup may only be called once",
+                ));
+            }
+            state.sandbox = config;
+            state.sandbox_configured = true;
+            Ok(())
+        })?,
+    )?;
+    rness.set("sandbox", sandbox)?;
     let providers = lua.create_table()?;
     let s = state.clone();
     providers.set(
@@ -985,6 +1006,7 @@ pub fn evaluate(
         ("providers", "set_stream_idle_timeout"),
         ("plugins", "load"),
         ("agents", "declare"),
+        ("sandbox", "setup"),
         ("providers", "register"),
         ("profiles", "declare"),
         ("models", "declare"),
@@ -1014,6 +1036,15 @@ pub fn evaluate(
                 .models
                 .validate_profile(profile)
                 .map_err(std::io::Error::other)?;
+        }
+        if let Some(mode) = agent.sandbox {
+            if !mode.is_at_most(config.sandbox.default) {
+                return Err(std::io::Error::other(format!(
+                    "agent sandbox {mode:?} broadens global sandbox {:?}",
+                    config.sandbox.default
+                ))
+                .into());
+            }
         }
     }
     config.default_profile = rness.get("default_profile")?;
@@ -1405,6 +1436,100 @@ mod tests {
         ] {
             std::fs::write(dir.path().join("init.lua"), script).unwrap();
             assert!(load(&dir.path().join("init.lua")).is_err());
+        }
+    }
+
+    #[test]
+    fn sandbox_setup_is_startup_only_and_roles_cannot_broaden_it() {
+        let root = tempfile::tempdir().unwrap();
+        let init = root.path().join("init.lua");
+        std::fs::write(
+            &init,
+            r#"
+            rness.sandbox.setup({ default = "workspace-write" })
+            rness.agents.declare("reader", {
+              description = "Read files", instructions = "Do not modify files",
+              sandbox = "read-only",
+            })
+            "#,
+        )
+        .unwrap();
+        let config = load(&init).unwrap();
+        assert_eq!(
+            config.sandbox.default,
+            rness_engine::sandbox::SandboxMode::WorkspaceWrite
+        );
+        assert_eq!(
+            config.agents["reader"].sandbox,
+            Some(rness_engine::sandbox::SandboxMode::ReadOnly)
+        );
+
+        std::fs::write(
+            &init,
+            r#"
+            rness.sandbox.setup({ default = "read-only" })
+            rness.agents.declare("writer", {
+              description = "Write files", instructions = "Write files",
+              sandbox = "workspace-write",
+            })
+            "#,
+        )
+        .unwrap();
+        let error = match load(&init) {
+            Ok(_) => panic!("broadening agent sandbox must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("broadens global sandbox"));
+    }
+
+    #[test]
+    fn repeated_sandbox_setup_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("init.lua");
+        std::fs::write(
+            &init,
+            r#"
+            rness.sandbox.setup({ default = "workspace-write" })
+            rness.sandbox.setup({ default = "read-only" })
+            "#,
+        )
+        .unwrap();
+        let error = match load(&init) {
+            Ok(_) => panic!("duplicate sandbox setup must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox.setup may only be called once")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_is_opt_in_and_startup_only() {
+        use rness_engine::sandbox::SandboxMode;
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("init.lua");
+        for script in ["", "rness.agents.declare('worker', {description='Work', instructions='Work'})"] {
+            std::fs::write(&init, script).unwrap();
+            let config = load(&init).unwrap();
+            assert!(!config.sandbox_configured);
+            assert_eq!(config.sandbox.default, SandboxMode::DangerFullAccess);
+            assert!(config.agents.values().all(|agent| agent.sandbox.is_none()));
+        }
+        std::fs::write(&init, "rness.sandbox.setup({default='read-only'})").unwrap();
+        let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(init).unwrap();
+        assert_eq!(config.sandbox.default, SandboxMode::ReadOnly);
+        assert!(host.load("late", "rness.sandbox.setup({default='danger-full-access'})").await.is_err());
+    }
+
+    #[test]
+    fn sandbox_rejects_invalid_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("init.lua");
+        for value in ["{default='invalid'}", "{unknown=true}", "{unavailable='allow'}", "{agent_overrides='allow'}"] {
+            std::fs::write(&init, format!("rness.sandbox.setup({value})")).unwrap();
+            assert!(load(&init).is_err(), "{value}");
         }
     }
 

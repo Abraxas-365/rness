@@ -47,7 +47,7 @@ async fn file_reference_http_is_path_only_and_workspace_scoped() {
     let workspace = tempfile::tempdir().unwrap();
     std::fs::write(workspace.path().join("日本語 notes.txt"), "SECRET CONTENT NOT ATTACHED").unwrap();
     let mut kernel = Kernel::new();
-    kernel.mount(SessionsPlugin { root: logs.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), agents: Default::default(), models: Default::default(), tools: Arc::new(ToolRegistry::default()), config: TurnConfig::default() }).unwrap();
+    kernel.mount(SessionsPlugin { root: logs.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), sandbox: Default::default(), agents: Default::default(), models: Default::default(), tools: Arc::new(ToolRegistry::default()), config: TurnConfig::default() }).unwrap();
     let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
     sessions.reference_service().configure(Some(Default::default()));
     let id = sessions.create(Some(workspace.path().to_string_lossy().into_owned())).unwrap();
@@ -68,7 +68,7 @@ async fn questions_http_sse_validation_resolution_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(ToolRegistry::default());
     let mut kernel = Kernel::new();
-    kernel.mount(SessionsPlugin { root: dir.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), agents: Default::default(), models: Default::default(), tools: tools.clone(), config: TurnConfig::default() }).unwrap();
+    kernel.mount(SessionsPlugin { root: dir.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), sandbox: Default::default(), agents: Default::default(), models: Default::default(), tools: tools.clone(), config: TurnConfig::default() }).unwrap();
     let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
     let state = ServerState::new(sessions.clone());
     state.questions.set_available(true);
@@ -226,9 +226,9 @@ async fn serve_with(
             root: dir.to_path_buf(),
             provider,
             resolver: None,
-            creation_seed: Default::default(),
+            creation_seed: Default::default(), sandbox: Default::default(),
             agents: [("planner".into(), rness_engine::config::AgentDefinition {
-                subagent: false, description: "Planner".into(), instructions: "PLAN_MARKER".into(), profile: None, tools: Some(vec![]),
+                subagent: false, description: "Planner".into(), instructions: "PLAN_MARKER".into(), profile: None, tools: Some(vec![]), sandbox: None,
             })].into(),
             models: Default::default(),
             tools: Arc::clone(&tools),

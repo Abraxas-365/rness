@@ -43,6 +43,16 @@ pub trait Tool: Send + Sync {
     ) -> Option<Arc<dyn Tool>> {
         None
     }
+    /// Bind workspace-dependent tools with the immutable filesystem policy
+    /// selected for this session. Default preserves existing tools.
+    fn for_workspace_with_policy(
+        &self,
+        session: &SessionId,
+        workspace: &std::path::Path,
+        _sandbox: rness_protocol::sandbox::SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        self.for_workspace(session, workspace)
+    }
     /// Shown to the model in the tool list.
     fn description(&self) -> &str {
         ""
@@ -171,6 +181,19 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn for_workspace(&self, session: &SessionId, workspace: &std::path::Path) -> Self {
+        self.for_workspace_with_policy(
+            session,
+            workspace,
+            rness_protocol::sandbox::SandboxMode::DangerFullAccess,
+        )
+    }
+
+    pub fn for_workspace_with_policy(
+        &self,
+        session: &SessionId,
+        workspace: &std::path::Path,
+        sandbox: rness_protocol::sandbox::SandboxMode,
+    ) -> Self {
         let tools = self
             .tools
             .read()
@@ -179,7 +202,7 @@ impl ToolRegistry {
             .map(|(name, tool)| {
                 (
                     name.clone(),
-                    tool.for_workspace(session, workspace)
+                    tool.for_workspace_with_policy(session, workspace, sandbox)
                         .unwrap_or_else(|| Arc::clone(tool)),
                 )
             })

@@ -22,6 +22,7 @@ rness.agents.declare("worker", {
 | `profile` | string | No | Preserve principal generation settings or inherit the parent's settings |
 | `tools` | list of strings | No | No additional role restriction |
 | `subagent` | boolean | No | `false`: not selectable by name through delegation |
+| `sandbox` | `read-only`, `workspace-write`, or `danger-full-access` | No | Inherits the global default for new sessions and preserves any tighter session/parent policy |
 
 Unknown fields fail deserialization. Referenced profiles are resolved during startup validation. Declarations close after startup and require a restart to change.
 
@@ -69,6 +70,8 @@ Each turn restricts both advertised tool schemas and actual dispatch. A model re
 Delegation captures the parent's effective tool names into a durable `tool_ceiling`. The child's role may restrict that set further. Changing the role or using the generic configuration setter cannot expand an existing ceiling. The ceiling is a snapshot: later parent changes do not retroactively rewrite it.
 
 This is not process isolation. Plugins are trusted code, and an allowed shell tool can have broad effects. Approval policy is a separate control.
+
+For Bash filesystem confinement and the global default that also applies without an agent role, see [sandbox configuration](sandbox.md).
 
 ## Current validation boundaries
 

@@ -12,8 +12,8 @@
 //!   prior steps stay — cancellation never un-happens anything.
 //! - Tool calls run through the registry (parallel, model-order commits).
 
-pub mod provider;
 pub mod compaction;
+pub mod provider;
 
 use rness_protocol::events::{
     AssistantAttempt, AttemptOutcome, ContentPart, SessionEvent, StopReason, TurnOutcome,
@@ -23,9 +23,9 @@ use rness_protocol::frames::Frame;
 use tokio_util::sync::CancellationToken;
 
 use crate::inbox::Pending;
-use crate::session::log::SessionLog;
-use crate::session::replay::{replay, ReplayError};
 use crate::session::branch::SessionStore;
+use crate::session::log::SessionLog;
+use crate::session::replay::{ReplayError, replay};
 use crate::tools::{ToolCall, ToolRegistry};
 use provider::{Provider, StepOutcome, StepRequest};
 
@@ -40,6 +40,8 @@ pub enum TurnError {
     Replay(#[from] ReplayError),
     #[error(transparent)]
     Log(#[from] crate::session::log::LogError),
+    #[error("sandboxed turn requires a session workspace")]
+    SandboxWorkspaceRequired,
     #[error("model failed after {attempts} attempts: {last}")]
     ModelExhausted { attempts: u32, last: String },
 }
@@ -111,10 +113,23 @@ async fn drive(
 ) -> Result<TurnOutcome, TurnError> {
     let session = log.session().clone();
     let workspace = store.workspace(&session).map_err(ReplayError::from)?;
-    let scoped = workspace.as_ref().map(|path| tools.for_workspace(&session, std::path::Path::new(path)));
-    let tools = scoped.as_ref().unwrap_or(tools);
     let call_config = replay(store, log.session())?.context.config;
-    let ceiling = call_config.tool_ceiling.as_ref().map(|names| tools.restricted(names));
+    let sandbox = call_config
+        .sandbox
+        .unwrap_or(rness_protocol::sandbox::SandboxMode::DangerFullAccess);
+    if workspace.is_none()
+        && sandbox != rness_protocol::sandbox::SandboxMode::DangerFullAccess
+    {
+        return Err(TurnError::SandboxWorkspaceRequired);
+    }
+    let scoped = workspace
+        .as_ref()
+        .map(|path| tools.for_workspace_with_policy(&session, std::path::Path::new(path), sandbox));
+    let tools = scoped.as_ref().unwrap_or(tools);
+    let ceiling = call_config
+        .tool_ceiling
+        .as_ref()
+        .map(|names| tools.restricted(names));
     let tools = ceiling.as_ref().unwrap_or(tools);
     let active = call_config.agent;
     let restricted = active.as_ref().and_then(|agent| agent.tools.as_ref()).map(|names| tools.restricted(names));

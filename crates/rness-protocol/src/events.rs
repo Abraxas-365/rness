@@ -229,6 +229,9 @@ pub struct CallConfig {
     pub tool_ceiling: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentSnapshot>,
+    /// Immutable filesystem policy selected at session creation or role selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::sandbox::SandboxMode>,
     /// Durable route/model choice used by the service's provider resolver.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,

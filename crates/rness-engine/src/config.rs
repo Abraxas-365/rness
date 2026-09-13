@@ -77,6 +77,9 @@ pub struct AgentDefinition {
     pub profile: Option<String>,
     /// None adds no restriction; an empty list allows no tools.
     pub tools: Option<Vec<String>>,
+    /// Optional filesystem policy for process tools used by this role.
+    /// Startup validation ensures it cannot broaden the global default.
+    pub sandbox: Option<crate::sandbox::SandboxMode>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,6 +182,7 @@ impl ModelRegistry {
         let config = CallConfig {
             tool_ceiling: None,
             agent: None,
+            sandbox: None,
             selection: Some(ModelSelection {
                 route: provider.into(),
                 model: model.clone(),

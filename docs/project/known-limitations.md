@@ -57,3 +57,7 @@ The first documentation set covers installation, startup, profiles, agent roles,
 The original architecture document contains design intent alongside historical context. Consult current implementation and tests before treating an unreferenced architectural example as an available API.
 
 When reporting a problem, include the revision, invocation, relevant redacted configuration, and observed error. Do not publish credentials or an entire session log without reviewing it for sensitive prompts, tool output, and workspace content.
+
+## Filesystem sandbox
+
+Sandboxing is opt-in and currently confines Bash filesystem writes on macOS only. It does not confine non-Bash tools, Lua/native plugins, MCP processes, network access, or requests to other host services. Unsupported hosts fail closed for restricted modes. See [sandbox configuration](../reference/configuration/sandbox.md).

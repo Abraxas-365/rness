@@ -43,7 +43,7 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
         Arc::new(EventBus::default()),
     ).with_agents([("worker".into(), rness_engine::config::AgentDefinition {
         subagent: true, description: "Implementation".into(), instructions: "Implement carefully".into(),
-        profile: None, tools: None,
+        profile: None, tools: None, sandbox: None,
     })].into(), Default::default()));
     let runtime = Arc::new(SubagentRuntime::new(Arc::clone(&sessions), 3));
     runtime.register(Arc::new(SpawnProvider));

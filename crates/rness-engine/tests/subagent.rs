@@ -127,7 +127,7 @@ async fn provider_profiles_follow_parent_without_inheriting_model_options() {
     }})).unwrap();
     models.declare_profile("small".into(), profile).unwrap();
     let agents = [("scout".into(), AgentDefinition { subagent:true, description:"Scout".into(),
-        instructions:"Inspect".into(), profile:Some("small".into()), tools:Some(vec![]) })].into();
+        instructions:"Inspect".into(), profile:Some("small".into()), tools:Some(vec![]), sandbox: None })].into();
     let sessions = Arc::new(SessionService::new(SessionStore::new(dir.path()), Arc::new(EchoCount),
         Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()))
         .with_agents(agents, models)
@@ -169,7 +169,7 @@ async fn named_roles_are_opt_in_and_inherit_generation_without_widening_tools() 
     for (name, subagent) in [("worker", true), ("principal", false)] {
         agents.insert(name.into(), AgentDefinition {
             subagent, description: name.into(), instructions: format!("Role {name}"),
-            profile: None, tools: None,
+            profile: None, tools: None, sandbox: None,
         });
     }
     let sessions = Arc::new(SessionService::new(

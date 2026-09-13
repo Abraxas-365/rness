@@ -12,8 +12,8 @@ use rness_engine::service::{
 };
 use rness_engine::session::branch::SessionStore;
 use rness_engine::tools::{Tool, ToolRegistry};
-use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
 use rness_engine::turn::TurnConfig;
+use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
 use rness_kernel::{EventBus, Kernel};
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
@@ -692,6 +692,7 @@ async fn kernel_plugin_provides_the_sessions_service() {
             resolver: None,
             creation_seed: CallConfig::default(),
             agents: Default::default(),
+            sandbox: Default::default(),
             models: Default::default(),
             tools: Arc::new(ToolRegistry::default()),
             config: TurnConfig::default(),
@@ -980,11 +981,17 @@ async fn compact_folds_pruned_results_cleanly() {
 async fn named_agent_selection_is_durable_and_unknown_names_do_not_mutate() {
     let dir = tempfile::tempdir().unwrap();
     let mut agents = std::collections::BTreeMap::new();
-    agents.insert("reviewer".into(), rness_engine::config::AgentDefinition {
-        subagent: false,
-        description: "Review".into(), instructions: "Inspect without edits".into(),
-        profile: None, tools: Some(vec![]),
-    });
+    agents.insert(
+        "reviewer".into(),
+        rness_engine::config::AgentDefinition {
+            subagent: false,
+            description: "Review".into(),
+            instructions: "Inspect without edits".into(),
+            profile: None,
+            tools: Some(vec![]),
+            sandbox: None,
+        },
+    );
     let svc = service(dir.path(), Scripted::new(scripted_answers(1)))
         .with_agents(agents, Default::default());
     let sid = svc.create(None).unwrap();
@@ -995,6 +1002,74 @@ async fn named_agent_selection_is_durable_and_unknown_names_do_not_mutate() {
     assert_eq!(svc.config(&sid).unwrap(), config);
     let restored = service(dir.path(), Scripted::new(vec![]));
     assert_eq!(restored.config(&sid).unwrap(), config);
+}
+
+#[test]
+fn configured_global_sandbox_is_durable_and_named_role_can_tighten_it() {
+    use rness_engine::config::AgentDefinition;
+    use rness_engine::sandbox::{SandboxConfig, SandboxMode};
+    let dir = tempfile::tempdir().unwrap();
+    let mut agents = std::collections::BTreeMap::new();
+    agents.insert(
+        "reader".into(),
+        AgentDefinition {
+            subagent: false,
+            description: "Reader".into(),
+            instructions: "Read only".into(),
+            profile: None,
+            tools: None,
+            sandbox: Some(SandboxMode::ReadOnly),
+        },
+    );
+    let sandbox = SandboxConfig {
+        default: SandboxMode::WorkspaceWrite,
+        ..Default::default()
+    };
+    let svc = service(dir.path(), Scripted::new(vec![]))
+        .with_agents(agents, Default::default())
+        .with_sandbox(sandbox);
+    svc.set_default_workspace(dir.path().display().to_string())
+        .unwrap();
+    let session = svc.create(None).unwrap();
+    assert_eq!(
+        svc.config(&session).unwrap().sandbox,
+        Some(SandboxMode::WorkspaceWrite)
+    );
+    svc.select_agent(&session, "reader").unwrap();
+    assert_eq!(
+        svc.config(&session).unwrap().sandbox,
+        Some(SandboxMode::ReadOnly)
+    );
+    let restored = service(dir.path(), Scripted::new(vec![]));
+    assert_eq!(
+        restored.config(&session).unwrap().sandbox,
+        Some(SandboxMode::ReadOnly)
+    );
+    let broader = CallConfig {
+        sandbox: Some(SandboxMode::DangerFullAccess),
+        ..svc.config(&session).unwrap()
+    };
+    assert!(svc.set_config(&session, broader).is_err());
+}
+
+#[test]
+fn configured_sandbox_requires_a_workspace_but_absent_setup_does_not() {
+    use rness_engine::sandbox::{SandboxConfig, SandboxMode};
+    let dir = tempfile::tempdir().unwrap();
+    let unrestricted = service(dir.path(), Scripted::new(vec![]));
+    assert!(unrestricted.create(None).is_ok());
+
+    let restricted = service(dir.path(), Scripted::new(vec![])).with_sandbox(SandboxConfig {
+        default: SandboxMode::WorkspaceWrite,
+        ..Default::default()
+    });
+    assert!(
+        restricted
+            .create(None)
+            .unwrap_err()
+            .to_string()
+            .contains("session workspace is required")
+    );
 }
 
 fn enable_instructions(svc: &SessionService, ws: &std::path::Path, max: usize) {

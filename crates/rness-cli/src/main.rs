@@ -327,6 +327,10 @@ async fn main() -> anyhow::Result<()> {
         CallConfig::default()
     };
     let inherited_ceiling = creation_seed.tool_ceiling.clone();
+    let mut sandbox = creation_seed.sandbox;
+    if cli.session.is_none() && startup.sandbox.default != rness_protocol::sandbox::SandboxMode::DangerFullAccess {
+        sandbox = Some(startup.sandbox.default);
+    }
     let chosen_agent = cli.agent.as_ref().or_else(|| if cli.session.is_none() { startup.default_agent.as_ref() } else { None });
     if let Some(name) = chosen_agent {
         let agent = startup.agents.get(name).with_context(|| format!("unknown agent: {name}"))?;
@@ -336,6 +340,9 @@ async fn main() -> anyhow::Result<()> {
         creation_seed.agent = Some(rness_protocol::events::AgentSnapshot {
             name: name.clone(), instructions: agent.instructions.clone(), tools: agent.tools.clone(),
         });
+        if let Some(mode) = agent.sandbox {
+            sandbox = Some(sandbox.unwrap_or_default().min(mode));
+        }
     }
     if let Some(profile) = cli.profile.as_ref().or_else(|| {
         if cli.session.is_none() && cli.model.is_none() && chosen_agent.and_then(|name| startup.agents.get(name)).and_then(|agent| agent.profile.as_ref()).is_none() { startup.default_profile.as_ref() } else { None }
@@ -351,6 +358,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     creation_seed.tool_ceiling = inherited_ceiling;
+    creation_seed.sandbox = sandbox;
     let selected = creation_seed.selection.as_ref()
         .context("no model selected: pass -m <route>/<model>; older sessions need an explicit selection")?;
     let selection = routes::Selection { route: selected.route.clone(), model: selected.model.clone() };
@@ -464,6 +472,7 @@ async fn main() -> anyhow::Result<()> {
             resolver: Some(provider_resolver),
             creation_seed: creation_seed.clone(),
             agents: startup.agents.clone(),
+            sandbox: startup.sandbox.clone(),
             models: startup.models.clone(),
             tools: Arc::clone(&tools),
             config: TurnConfig {

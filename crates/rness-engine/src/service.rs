@@ -193,6 +193,7 @@ pub struct SessionService {
     resolver: Option<Arc<ProviderResolver>>,
     creation_seed: CallConfig,
     agents: std::collections::BTreeMap<String, crate::config::AgentDefinition>,
+    sandbox: crate::sandbox::SandboxConfig,
     models: crate::config::ModelRegistry,
     tools: Arc<ToolRegistry>,
     config: TurnConfig,
@@ -257,6 +258,11 @@ impl SessionService {
         self
     }
 
+    pub fn with_sandbox(mut self, sandbox: crate::sandbox::SandboxConfig) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
     pub fn agents(&self) -> &std::collections::BTreeMap<String, crate::config::AgentDefinition> { &self.agents }
 
     pub fn select_agent(&self, session: &SessionId, name: &str) -> Result<(), ServiceError> {
@@ -271,14 +277,30 @@ impl SessionService {
         let inbox = live.inbox.lock().unwrap();
         if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
         let config = self.agent_config(self.config(session)?, name)?;
+        self.require_workspace_for_sandbox(
+            &self.store.workspace(session)?,
+            self.effective_sandbox(&config),
+        )?;
         if self.config(session)? != config {
             self.store.open(session)?.append(&SessionEvent::RequestConfig(config))?;
         }
         Ok(())
     }
 
-    pub(crate) fn agent_config(&self, mut config: CallConfig, name: &str) -> Result<CallConfig, ServiceError> {
-        let agent = self.agents.get(name).ok_or_else(|| ServiceError::InvalidConfig(format!("unknown agent: {name}")))?;
+    pub(crate) fn agent_config(
+        &self,
+        mut config: CallConfig,
+        name: &str,
+    ) -> Result<CallConfig, ServiceError> {
+        let agent = self
+            .agents
+            .get(name)
+            .ok_or_else(|| ServiceError::InvalidConfig(format!("unknown agent: {name}")))?;
+        // Resolve before a profile replaces request options: neither a role
+        // nor its profile may discard the session's (or parent's) restriction.
+        let inherited_sandbox = config.sandbox;
+        let sandbox = self.effective_sandbox(&config)
+            .min(agent.sandbox.unwrap_or(self.sandbox.default));
         if let Some(profile) = &agent.profile {
             let ceiling = config.tool_ceiling;
             config = self.models.resolve_profile_for(profile, config.selection.as_ref().map(|s| s.route.as_str())).map_err(ServiceError::InvalidConfig)?;
@@ -289,7 +311,14 @@ impl SessionService {
                 if self.tools.get(name).is_none() { return Err(ServiceError::InvalidConfig(format!("unknown tool: {name}"))); }
             }
         }
-        config.agent = Some(rness_protocol::events::AgentSnapshot { name: name.into(), instructions: agent.instructions.clone(), tools: agent.tools.clone() });
+        config.agent = Some(rness_protocol::events::AgentSnapshot {
+            name: name.into(),
+            instructions: agent.instructions.clone(),
+            tools: agent.tools.clone(),
+        });
+        config.sandbox = (inherited_sandbox.is_some()
+            || sandbox != crate::sandbox::SandboxMode::DangerFullAccess)
+            .then_some(sandbox);
         self.provider_for(&config)?;
         Self::validate_config(&config)?;
         self.models.validate(&config).map_err(ServiceError::InvalidConfig)?;
@@ -304,7 +333,8 @@ impl SessionService {
             allowed.retain(|name| tools.contains(name));
         }
         config.tool_ceiling = Some(allowed);
-        // An unnamed child inherits generation options, not a principal-only role.
+        // Both unnamed and named children retain the parent's restriction;
+        // role resolution may only tighten it, including through a profile.
         config.agent = None;
         if let Some(name) = agent {
             if !self.agents.get(name).is_some_and(|agent| agent.subagent) {
@@ -329,6 +359,7 @@ impl SessionService {
             resolver: None,
             creation_seed: CallConfig::default(),
             agents: Default::default(),
+            sandbox: Default::default(),
             models: Default::default(),
             tools,
             config,
@@ -547,11 +578,28 @@ impl SessionService {
         }).transpose()
     }
 
+    fn require_workspace_for_sandbox(
+        &self,
+        workspace: &Option<String>,
+        sandbox: crate::sandbox::SandboxMode,
+    ) -> Result<(), ServiceError> {
+        if workspace.is_none() && sandbox != crate::sandbox::SandboxMode::DangerFullAccess {
+            return Err(ServiceError::InvalidConfig(
+                "a session workspace is required when sandboxing is configured; set a default workspace or create the session with one".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn create(&self, workspace: Option<String>) -> Result<SessionId, ServiceError> {
         let workspace = workspace.or_else(|| self.default_workspace.lock().unwrap().clone());
         let workspace = Self::normalize_workspace(workspace)?;
+        let seed = self.creation_config()?;
+        self.require_workspace_for_sandbox(&workspace, self.effective_sandbox(&seed))?;
         let mut log = self.store.create(workspace)?;
-        self.append_creation_seed(&mut log)?;
+        if seed != CallConfig::default() {
+            log.append(&SessionEvent::RequestConfig(seed))?;
+        }
         Ok(log.session().clone())
     }
 
@@ -567,43 +615,72 @@ impl SessionService {
             None => self.store.workspace(&delegation.parent)?,
         };
         let workspace = Self::normalize_workspace(workspace)?;
+        let mut seed = self.creation_config()?;
+        if let Some(parent_sandbox) = self.config(&delegation.parent)?.sandbox {
+            seed.sandbox = Some(self.effective_sandbox(&seed).min(parent_sandbox));
+        }
+        self.require_workspace_for_sandbox(&workspace, self.effective_sandbox(&seed))?;
         let mut log = self.store.create_delegated(workspace, delegation)?;
-        self.append_creation_seed(&mut log)?;
+        if seed != CallConfig::default() {
+            log.append(&SessionEvent::RequestConfig(seed))?;
+        }
         Ok(log.session().clone())
     }
 
-    fn append_creation_seed(
-        &self,
-        log: &mut crate::session::log::SessionLog,
-    ) -> Result<(), ServiceError> {
+    fn creation_config(&self) -> Result<CallConfig, ServiceError> {
         Self::validate_config(&self.creation_seed)?;
-        if self.creation_seed != CallConfig::default() {
-            log.append(&SessionEvent::RequestConfig(self.creation_seed.clone()))?;
+        let mut seed = self.creation_seed.clone();
+        let sandbox = self.effective_sandbox(&seed).min(self.sandbox.default);
+        // Keep opt-in defaults absent, but always persist restricted policy.
+        if seed.sandbox.is_some()
+            || sandbox != crate::sandbox::SandboxMode::DangerFullAccess
+        {
+            seed.sandbox = Some(sandbox);
         }
-        Ok(())
+        Ok(seed)
     }
 
-    /// Fork `session` at `at` (or its tip). Prefix config replays into the
-    /// child, so no copy or rewrite is required.
+    /// Fork `session` at `at` (or its tip). Prefix request options replay
+    /// into the child, but sandbox authority cannot exceed the current parent.
     pub fn fork(
         &self,
         session: &SessionId,
         at: Option<String>,
     ) -> Result<SessionId, ServiceError> {
-        let log = self.store.fork(session, at)?;
+        let mut log = self.store.fork(session, at)?;
+        self.tighten_fork_sandbox(&mut log, session)?;
         Ok(log.session().clone())
     }
 
-    /// Fork a delegated child. The parent prefix retains its effective
-    /// config; this only stamps the delegation header.
+    /// Fork a delegated child, retaining current source and delegating-parent
+    /// sandbox restrictions even when the inherited prefix predates them.
     pub fn fork_delegated(
         &self,
         session: &SessionId,
         at: Option<String>,
         delegation: rness_protocol::branch::Delegation,
     ) -> Result<SessionId, ServiceError> {
-        let log = self.store.fork_delegated(session, at, delegation)?;
+        let parent = delegation.parent.clone();
+        let mut log = self.store.fork_delegated(session, at, delegation)?;
+        self.tighten_fork_sandbox(&mut log, session)?;
+        if parent != *session {
+            self.tighten_fork_sandbox(&mut log, &parent)?;
+        }
         Ok(log.session().clone())
+    }
+
+    fn tighten_fork_sandbox(
+        &self,
+        log: &mut crate::session::log::SessionLog,
+        parent: &SessionId,
+    ) -> Result<(), ServiceError> {
+        let parent_sandbox = self.effective_sandbox(&self.config(parent)?);
+        let mut config = self.config(log.session())?;
+        if parent_sandbox < self.effective_sandbox(&config) {
+            config.sandbox = Some(parent_sandbox);
+            log.append(&SessionEvent::RequestConfig(config))?;
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Result<Vec<SessionId>, ServiceError> {
@@ -1188,6 +1265,25 @@ impl SessionService {
         self.models.resolve_profile_for(name, provider).map_err(ServiceError::InvalidConfig)
     }
 
+    fn effective_sandbox(&self, config: &CallConfig) -> crate::sandbox::SandboxMode {
+        // Absence in durable config is the compatibility policy, not the
+        // current startup default (which applies only to creation/role choice).
+        config.sandbox.unwrap_or(crate::sandbox::SandboxMode::DangerFullAccess)
+    }
+
+    fn validate_sandbox_update(
+        &self,
+        previous: &CallConfig,
+        next: &CallConfig,
+    ) -> Result<(), ServiceError> {
+        if self.effective_sandbox(next) > self.effective_sandbox(previous) {
+            return Err(ServiceError::InvalidConfig(
+                "session sandbox cannot be broadened after creation".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Commit new request controls (dsh request/header model): a durable
     /// `request/config` event applied to every later model request.
     /// No-op when equal to the effective config — only real changes are
@@ -1226,14 +1322,27 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let mut config = config;
-        if let Some(ceiling) = self.config(session)?.tool_ceiling {
+        let previous = self.config(session)?;
+        // Request options are replaced, but omitting sandbox is not permission
+        // to erase durable policy (including when changing model profiles).
+        if config.sandbox.is_none() {
+            config.sandbox = previous.sandbox;
+        }
+        if let Some(ceiling) = previous.tool_ceiling.clone() {
             config.tool_ceiling = Some(match config.tool_ceiling {
                 Some(requested) => ceiling.into_iter().filter(|name| requested.contains(name)).collect(),
                 None => ceiling,
             });
         }
         Self::validate_config(&config)?;
-        self.models.validate(&config).map_err(ServiceError::InvalidConfig)?;
+        self.validate_sandbox_update(&previous, &config)?;
+        self.require_workspace_for_sandbox(
+            &self.store.workspace(session)?,
+            self.effective_sandbox(&config),
+        )?;
+        self.models
+            .validate(&config)
+            .map_err(ServiceError::InvalidConfig)?;
         self.provider_for(&config)?;
         if self.config(session)? == config {
             return Ok(());
@@ -1486,6 +1595,7 @@ pub struct SessionsPlugin {
     /// Explicit config committed into every new root/spawn session.
     pub creation_seed: CallConfig,
     pub agents: std::collections::BTreeMap<String, crate::config::AgentDefinition>,
+    pub sandbox: crate::sandbox::SandboxConfig,
     pub models: crate::config::ModelRegistry,
     pub tools: Arc<ToolRegistry>,
     pub config: TurnConfig,
@@ -1507,7 +1617,11 @@ impl Plugin for SessionsPlugin {
         if let Some(resolver) = &self.resolver {
             service = service.with_provider_resolver(self.creation_seed.clone(), Arc::clone(resolver));
         }
-        let service = Arc::new(service.with_agents(self.agents.clone(), self.models.clone()));
+        let service = Arc::new(
+            service
+                .with_agents(self.agents.clone(), self.models.clone())
+                .with_sandbox(self.sandbox.clone()),
+        );
         ctx.provide("sessions", service).map_err(|e| e.to_string())
     }
 }

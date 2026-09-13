@@ -11,6 +11,8 @@ use std::time::SystemTime;
 
 use rness_engine::tools::ToolRegistry;
 
+pub mod sandbox;
+
 pub mod bash;
 pub mod edit;
 pub mod glob;
