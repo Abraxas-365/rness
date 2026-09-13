@@ -90,6 +90,19 @@ mod tests {
     }
 
     #[test]
+    fn file_extensions_select_syntax() {
+        for (extension, language, source) in [
+            ("rs", "rust", "fn main() {}"),
+            ("lua", "lua", "local x = 42"),
+        ] {
+            let lines = highlight_code(source, extension).expect("known file extension");
+            assert_eq!(lines, highlight_code(source, language).unwrap());
+            assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg.is_some()));
+        }
+        assert!(highlight_code("plain text", "unknown_extension").is_none());
+    }
+
+    #[test]
     fn unknown_language_falls_back() {
         assert!(highlight_code("whatever", "notalanguage").is_none());
         assert!(highlight_code("whatever", "").is_none());

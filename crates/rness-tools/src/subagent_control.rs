@@ -37,7 +37,7 @@ impl Tool for SendMessageTool {
         json!({
             "type": "object",
             "properties": {
-                "agent_id": { "type": "string", "description": "Session id of the target agent" },
+                "agent_id": { "type": "string", "description": "Session id returned by a continuable subagent or list_agents, never a background job_id" },
                 "message": { "type": "string", "description": "The message to deliver" },
             },
             "required": ["agent_id", "message"],
@@ -57,6 +57,9 @@ impl Tool for SendMessageTool {
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
         let target = crate::required_str(&args, "agent_id")?.to_string();
         let message = crate::required_str(&args, "message")?.to_string();
+        if target.starts_with('j') {
+            return Err("message not delivered: agent_id is a background job ID, not an agent session ID. One-shot jobs cannot receive messages; use job_output to read their results. To message a child, spawn it with background_mode='continuable' and use its returned session ID (or list_agents).".into());
+        }
         self.runtime
             .send_message(session, &target, message)
             .map_err(|e| format!("message not delivered: {e}"))?;

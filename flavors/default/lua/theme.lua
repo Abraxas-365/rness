@@ -3,6 +3,12 @@ local p = {
   border = "#665c54", yellow = "#fabd2f", green = "#b8bb26",
   red = "#fb4934", blue = "#83a598", purple = "#d3869b",
 }
+-- Pass file extensions to the renderer's syntax registry; unknown types stay plain.
+local function file_language(path)
+  if type(path) ~= "string" then return nil end
+  return path:match("%.([^./\\]+)$")
+end
+
 local function web_card(call)
   local search = call.name == "web_search"
   local title = search and "Web search" or "Web fetch"
@@ -155,6 +161,36 @@ rness.ui.messagebox = {
       end
       return lines
     end },
+    Read = { render = function(call)
+      if call.is_error then return nil end
+      local a = call.args
+      if type(a) ~= "table" or type(a.path) ~= "string" or type(call.output) ~= "string" then return nil end
+      -- Read returns cat -n output. Strip only its gutter, not source indentation,
+      -- and keep notices outside the code block (also works for saved history).
+      local source, notices, start = {}, {}, nil
+      for line in call.output:gmatch("([^\n]*)\n?") do
+        local number, text = line:match("^%s*(%d+)\t(.*)$")
+        if number then
+          start = start or tonumber(number)
+          source[#source + 1] = text
+        elseif line ~= "" then
+          notices[#notices + 1] = { text = line, style = "dim" }
+        end
+      end
+      if not start then return nil end
+      local body = {
+        { kind = "code", text = table.concat(source, "\n") .. "\n", language = file_language(a.path),
+          syntax_highlight = true, line_numbers = true, start_line = start },
+      }
+      for _, notice in ipairs(notices) do body[#body + 1] = notice end
+      return {
+        header = {
+          left = { { text = "Read", style = "tool_name" }, { text = "  " .. a.path, style = "code" } },
+          right = { { text = "done", style = { fg = p.green, bold = true } } },
+        },
+        body = body,
+      }
+    end },
     Write = { render = function(call)
       if call.is_error then return nil end
       local a = call.args
@@ -168,7 +204,7 @@ rness.ui.messagebox = {
           right = { { text = "done", style = { fg = p.green, bold = true } } },
         },
         body = {
-          { kind = "code", text = a.content, syntax_highlight = true, line_numbers = true },
+          { kind = "code", text = a.content, language = file_language(a.path), syntax_highlight = true, line_numbers = true },
         },
       }
     end },

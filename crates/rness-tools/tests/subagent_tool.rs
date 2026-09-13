@@ -230,13 +230,25 @@ async fn background_subagent_is_a_job() {
     assert!(!results[0].is_error);
     assert!(results[0].output.contains("job"), "{}", results[0].output);
 
+    assert!(results[0].output.contains("job_id cannot be used with send_message"));
+
     // The job settles with the child's output readable via job_output.
     let id = results[0]
         .output
-        .split_whitespace()
-        .find(|w| w.starts_with('j') && w[1..].chars().all(|c| c.is_ascii_digit()))
+        .split("as job ")
+        .nth(1)
+        .and_then(|text| text.split_whitespace().next())
         .expect("job id in output")
         .to_string();
+    let rejected = tools.dispatch(&parent, &[ToolCall {
+        call: "wrong-target".into(),
+        name: "send_message".into(),
+        args: serde_json::json!({ "agent_id": id, "message": "change direction" }),
+    }], 1, &Default::default()).await;
+    assert!(rejected[0].is_error);
+    assert!(rejected[0].output.contains("background job ID"));
+    assert!(rejected[0].output.contains("background_mode='continuable'"));
+    assert!(!rejected[0].output.contains("not found"));
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let out = tools
@@ -287,6 +299,7 @@ async fn continuable_lifecycle_through_dispatch() {
         .find(|w| w.len() == 26 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("child id in output")
         .to_string();
+    assert!(results[0].output.contains(&format!("send_message (agent_id: {child})")));
     sessions.join(&child).await;
 
     // list_agents sees it.

@@ -2124,6 +2124,39 @@ mod tests {
     }
 
     #[test]
+    fn default_theme_file_cards_supply_syntax_and_preserve_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, include_str!("../../../flavors/default/lua/theme.lua")).unwrap();
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.startup(&path).unwrap();
+
+        for (path, language) in [("src/main.rs", Some("rs")), ("config.lua", Some("lua")), ("dir.rs/README", None)] {
+            let args = serde_json::json!({"path":path,"content":"fn main() {}\n"});
+            let card = rt.tool_card("Write", &args, "written", false).unwrap();
+            let block = card[1].block.as_ref().unwrap();
+            assert_eq!(block["language"].as_str(), language);
+            assert_eq!(block["text"], args["content"]);
+            assert_eq!(block["syntax_highlight"], true);
+            assert!(rt.tool_card("Write", &args, "error", true).is_none());
+        }
+
+        let args = serde_json::json!({"path":"src/main.rs","offset":42});
+        let output = "    42\tfn main() {\n    43\t\tprintln!(\"hi\");\n    44\t}\n    45\t\n… 2 more lines (file has 47 lines; continue with offset=46)\n";
+        let card = rt.tool_card("Read", &args, output, false).unwrap();
+        let block = card[1].block.as_ref().unwrap();
+        assert_eq!(block["language"], "rs");
+        assert_eq!(block["text"], "fn main() {\n\tprintln!(\"hi\");\n}\n\n");
+        assert_eq!(block["start_line"], 42);
+        assert_eq!(block["line_numbers"], true);
+        assert_eq!(block["syntax_highlight"], true);
+        assert_eq!(card[2].text, "… 2 more lines (file has 47 lines; continue with offset=46)");
+        assert!(rt.tool_card("Read", &args, "(empty file)", false).is_none());
+        assert!(rt.tool_card("Read", &args, "read failed", true).is_none());
+        assert!(rt.tool_card("Read", &serde_json::json!({}), output, false).is_none());
+    }
+
+    #[test]
     fn messagebox_user_renderers_override_plugin_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");

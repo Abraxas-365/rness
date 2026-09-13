@@ -104,5 +104,5 @@ rness.ui.statusline(function()
   if count == 1 then
     return string.format("%s %s %ds%s", spin, verb, secs, suffix)
   end
-  return string.format("%s %d agents · %s %ds%s", spin, count, verb, secs, suffix)
+  return string.format("%s %d active sessions · %s %ds%s", spin, count, verb, secs, suffix)
 end)

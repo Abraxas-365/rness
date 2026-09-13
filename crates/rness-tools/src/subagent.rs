@@ -60,7 +60,8 @@ impl Tool for SubagentTool {
          history (it knows what you know); provider 'spawn' starts fresh \
          (describe the task fully). Foreground by default: the result is \
          the child's final answer. With run_in_background the child runs \
-         as a job — read it with job_output, cancel with job_kill. With \
+         as a one-shot job — read it with job_output, cancel with job_kill. \
+         Job IDs cannot be used with send_message. With \
          background_mode 'continuable' the child keeps running as a named \
          agent: message it with send_message, stop its turn with \
          interrupt_agent, list with list_agents; its results arrive as \
@@ -87,12 +88,12 @@ impl Tool for SubagentTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Run as a background job (default false)",
+                    "description": "Run in the background (default false). One-shot mode returns job_id for job_output/job_kill, not send_message. Use background_mode='continuable' for a messageable agent.",
                 },
                 "background_mode": {
                     "type": "string",
                     "enum": ["one-shot", "continuable"],
-                    "description": "Child shape when backgrounded: 'one-shot' (default) settles once as a job; 'continuable' keeps a durable agent you can send_message to",
+                    "description": "'one-shot' (default) returns a result, or job_id when run_in_background=true; it cannot receive messages. 'continuable' immediately returns agent_id for send_message/interrupt_agent and keeps the child available for later turns.",
                 },
             },
             "required": ["provider", "prompt"],
@@ -141,9 +142,9 @@ impl SubagentTool {
                 .map_err(|e| e.to_string())?;
             return Ok((format!(
                 "started continuable agent {child} — message it with \
-                 send_message, stop its turn with interrupt_agent; its \
+                 send_message (agent_id: {child}), stop its turn with interrupt_agent; its \
                  results arrive here as settle notices"
-            ), json!({"version":1,"kind":"subagent","mode":"continuable","session":child,"accepted":true})));
+            ), json!({"version":1,"kind":"subagent","mode":"continuable","session":child,"agent_id":child,"accepted":true})));
         }
 
         if !background {
@@ -180,7 +181,7 @@ impl SubagentTool {
             }
         });
         Ok((format!(
-            "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill"
+             "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill. This is a one-shot job: its job_id cannot be used with send_message. For a messageable child, use background_mode='continuable' instead."
         ), json!({"version":1,"kind":"subagent","mode":"background","job_id":id,"accepted":true})))
     }
 }
