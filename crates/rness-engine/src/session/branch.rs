@@ -11,7 +11,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
-use rness_protocol::events::{Envelope, EventId, SessionEvent, SessionId};
+use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
 
 use super::log::{LogError, SessionLog};
 
@@ -44,6 +44,51 @@ impl SessionStore {
         readers.entry(session.clone()).or_default().read(&self.root, session)
     }
 
+    /// Read through the first committed event only, without touching the
+    /// history cache. Like SessionReader, skip blank lines and ignore torn tails.
+    fn read_header(&self, session: &SessionId) -> Result<Header, LogError> {
+        let path = super::log::log_file(&self.root.join(session));
+        let file = std::fs::File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                LogError::NotFound(session.clone())
+            } else {
+                LogError::Io(error)
+            }
+        })?;
+        let mut reader = std::io::BufReader::new(file);
+        let mut bytes = Vec::new();
+        let mut line = 0;
+        loop {
+            line += 1;
+            bytes.clear();
+            if reader.read_until(b'\n', &mut bytes)? == 0 || !bytes.ends_with(b"\n") {
+                return Err(LogError::Corrupt { line: 0, reason: "empty log".into() });
+            }
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
+                LogError::Corrupt { line, reason: error.to_string() }
+            })?;
+            let SessionEvent::Header(header) = envelope.event else {
+                return Err(LogError::Corrupt {
+                    line: 1, reason: "first event is not session/header".into(),
+                });
+            };
+            if header.version != FORMAT_VERSION {
+                return Err(LogError::Corrupt {
+                    line, reason: format!("unsupported session header version {}", header.version),
+                });
+            }
+            if &header.session != session {
+                return Err(LogError::Corrupt {
+                    line, reason: format!("session header identity '{}' does not match '{session}'", header.session),
+                });
+            }
+            return Ok(header);
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -66,11 +111,7 @@ impl SessionStore {
     }
 
     pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
-        let events = self.read_session(session)?;
-        match &events[0].event {
-            SessionEvent::Header(header) => Ok(header.workspace.clone()),
-            _ => unreachable!("read_session guarantees header first"),
-        }
+        Ok(self.read_header(session)?.workspace)
     }
 
     pub fn open(&self, session: &SessionId) -> Result<SessionLog, BranchError> {
@@ -130,20 +171,12 @@ impl SessionStore {
 
     /// Delegation lineage of a session, if an agent created it.
     pub fn delegation(&self, session: &SessionId) -> Result<Option<Delegation>, BranchError> {
-        let events = self.read_session(session)?;
-        match &events[0].event {
-            SessionEvent::Header(h) => Ok(h.delegation.clone()),
-            _ => unreachable!(),
-        }
+        Ok(self.read_header(session)?.delegation)
     }
 
     /// Parent reference of a session, if it is a fork.
     pub fn parent(&self, session: &SessionId) -> Result<Option<ForkRef>, BranchError> {
-        let events = self.read_session(session)?;
-        match &events[0].event {
-            SessionEvent::Header(h) => Ok(h.parent.clone()),
-            _ => unreachable!(),
-        }
+        Ok(self.read_header(session)?.parent)
     }
 
     /// Ancestry chain, root first, queried session last. Each hop's
@@ -284,6 +317,127 @@ mod tests {
             },
             _ => None,
         }
+    }
+
+    #[test]
+    fn header_metadata_ignores_corrupt_body_without_touching_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut root = store.create(Some("/w".into())).unwrap();
+        let root_id = root.session().clone();
+        let at = root.append(&msg("base")).unwrap().id;
+        assert_eq!(store.delegation(&root_id).unwrap(), None);
+        assert_eq!(store.parent(&root_id).unwrap(), None);
+        assert_eq!(store.workspace(&root_id).unwrap(), Some("/w".into()));
+        assert!(store.readers.lock().unwrap().is_empty());
+
+        // Fill the cache: metadata discovery must neither insert nor evict.
+        store.history(&root_id).unwrap();
+        for _ in 0..7 {
+            let log = store.create(None).unwrap();
+            store.history(log.session()).unwrap();
+        }
+        let cached: std::collections::HashSet<_> = store.readers.lock().unwrap().keys().cloned().collect();
+        assert_eq!(cached.len(), 8);
+        let delegation = Delegation {
+            parent: root_id.clone(), call: Some("call-1".into()), depth: 1, mode: Default::default(),
+        };
+        let parent = ForkRef { session: root_id, at };
+        let sid = "metadata".to_string();
+        let log = SessionLog::create(
+            dir.path(), &sid, Some("/w".into()), Some(parent.clone()), Some(delegation.clone()),
+        ).unwrap();
+        let path = log.path().to_path_buf();
+        let header = std::fs::read(&path).unwrap();
+        drop(log);
+
+        for body in [
+            b"invalid JSON\n".to_vec(),
+            b"{\"id\":\"future\",\"at\":\"now\",\"type\":\"future/event\"}\n".to_vec(),
+            vec![b'x'; 1024 * 1024].into_iter().chain([b'\n']).collect(),
+        ] {
+            let mut contents = header.clone();
+            contents.extend(body);
+            std::fs::write(&path, &contents).unwrap();
+            assert_eq!(store.delegation(&sid).unwrap(), Some(delegation.clone()));
+            assert_eq!(store.parent(&sid).unwrap(), Some(parent.clone()));
+            assert_eq!(store.workspace(&sid).unwrap(), Some("/w".into()));
+            assert_eq!(store.readers.lock().unwrap().keys().cloned().collect::<std::collections::HashSet<_>>(), cached);
+            // A fresh full-history reader still reports the corrupt body.
+            assert!(matches!(
+                SessionStore::new(dir.path()).history(&sid),
+                Err(BranchError::Log(LogError::Corrupt { line: 2, .. }))
+            ));
+        }
+    }
+
+    #[test]
+    fn header_metadata_rejects_malformed_headers_without_caching() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let log = store.create(None).unwrap();
+        let sid = log.session().clone();
+        let path = log.path().to_path_buf();
+        let header = std::fs::read_to_string(&path).unwrap();
+        drop(log);
+        let value: serde_json::Value = serde_json::from_str(&header).unwrap();
+        let mut wrong_version = value.clone();
+        wrong_version["version"] = serde_json::json!(FORMAT_VERSION + 1);
+        let mut wrong_session = value.clone();
+        wrong_session["session"] = serde_json::json!("different-session");
+        let mut missing_version = value.clone();
+        missing_version.as_object_mut().unwrap().remove("version");
+        let mut missing_session = value;
+        missing_session.as_object_mut().unwrap().remove("session");
+        for (contents, expected_line) in [
+            (String::new(), 0),
+            (" \t\n\n".into(), 0),
+            (header.trim_end().to_string(), 0),
+            ("not json\n".into(), 1),
+            ("\nnot json\n".into(), 2),
+            ("{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n".into(), 1),
+            (format!("{wrong_version}\n"), 1),
+            (format!("{wrong_session}\n"), 1),
+            (format!("{missing_version}\n"), 1),
+            (format!("{missing_session}\n"), 1),
+        ] {
+            std::fs::write(&path, &contents).unwrap();
+            for result in [
+                store.delegation(&sid).map(|_| ()),
+                store.parent(&sid).map(|_| ()),
+                store.workspace(&sid).map(|_| ()),
+            ] {
+                assert!(matches!(result, Err(BranchError::Log(LogError::Corrupt { line, .. }))
+                    if line == expected_line), "contents: {contents:?}");
+            }
+            assert!(store.readers.lock().unwrap().is_empty());
+        }
+        let missing = "missing".to_string();
+        for result in [
+            store.delegation(&missing).map(|_| ()),
+            store.parent(&missing).map(|_| ()),
+            store.workspace(&missing).map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(BranchError::Log(LogError::NotFound(id))) if id == missing));
+        }
+        assert!(store.readers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn header_metadata_accepts_blank_prefix_and_torn_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let log = store.create(None).unwrap();
+        let sid = log.session().clone();
+        let path = log.path().to_path_buf();
+        let header = std::fs::read_to_string(&path).unwrap();
+        drop(log);
+        std::fs::write(&path, format!(" \t\n\r\n{header}torn body")).unwrap();
+        assert_eq!(store.delegation(&sid).unwrap(), None);
+        assert_eq!(store.parent(&sid).unwrap(), None);
+        assert_eq!(store.workspace(&sid).unwrap(), None);
+        assert!(store.readers.lock().unwrap().is_empty());
+        assert_eq!(store.history(&sid).unwrap().len(), 1);
     }
 
     #[test]

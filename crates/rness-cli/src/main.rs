@@ -8,6 +8,8 @@
 //!
 //! Currently: TUI (default) or headless one-shot with -p.
 
+mod activity_recovery;
+
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _};
@@ -1146,18 +1148,14 @@ async fn run_tui(
         let subagents = subagents.clone();
         let watched = watched.clone();
         tokio::spawn(async move {
-            let mut recovered = std::collections::HashSet::new();
+            let mut recovery = activity_recovery::ActivityRecovery::default();
             let mut published = std::collections::HashMap::new();
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
                 let session = watched.read().unwrap().clone();
-                if recovered.insert(session.clone()) {
-                    if let Err(error) = subagents.activity.recover(&sessions, &session) {
-                        tracing::warn!(%error, "subagent activity recovery failed");
-                        recovered.remove(&session);
-                    }
-                }
+                recovery.recover(&subagents.activity, &sessions, &session);
                 let generation = cache.generation();
                 for (call, args, mut presentation) in subagents.activity.snapshots(&sessions, &session) {
                     let ms = presentation["elapsed_ms"].as_u64().unwrap_or(0);
