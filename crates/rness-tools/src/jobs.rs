@@ -58,6 +58,12 @@ struct JobState {
     delivered: bool,
 }
 
+impl JobState {
+    fn visible_to(&self, session: Option<&str>) -> bool {
+        self.owner.is_none() || self.owner.as_deref() == session
+    }
+}
+
 struct Job {
     path: Option<std::path::PathBuf>,
     state: Mutex<JobState>,
@@ -273,6 +279,14 @@ impl JobRegistry {
         (id, JobWriter { job })
     }
 
+    fn get_for_session(&self, id: &str, session: Option<&str>) -> Result<Arc<Job>, String> {
+        let job = self.get(id)?;
+        if !job.state.lock().expect("job lock").visible_to(session) {
+            return Err(format!("job '{id}' belongs to another session"));
+        }
+        Ok(job)
+    }
+
     fn get(&self, id: &str) -> Result<Arc<Job>, String> {
         self.inner
             .jobs
@@ -331,6 +345,89 @@ mod durability_tests {
         drop(job); drop(recovered);
         let again = JobRegistry::new(); again.enable_persistence(directory.path()).unwrap();
         assert_eq!(drain_output(&again.get(&id).unwrap()).0,"");
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn foreign_sessions_cannot_read_wait_or_kill_owned_jobs() {
+        let registry = JobRegistry::new();
+        let owner = "owner".to_string();
+        let foreign = "child-or-unrelated".to_string();
+        let (id, writer) = registry.start_owned("subagent", "private".into(), Some(&owner));
+        writer.append(b"secret");
+        let output = JobOutputTool::new(registry.clone());
+        let kill = JobKillTool::new(registry.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let call = "call".to_string();
+        for wait in [false, true] {
+            let args = json!({"job_id":id,"wait":wait});
+            assert!(output.execute(args.clone()).await.is_err());
+            assert!(output.execute_in(&foreign, args.clone()).await.unwrap_err().contains("belongs to another session"));
+            assert!(output.execute_call(&foreign, &call, args.clone(), &cancel).await.is_err());
+            assert!(output.execute_presented(&foreign, &call, args, &cancel).await.is_err());
+        }
+        let args = json!({"job_id":id});
+        assert!(kill.execute(args.clone()).await.is_err());
+        assert!(kill.execute_in(&foreign, args.clone()).await.is_err());
+        assert!(kill.execute_call(&foreign, &call, args.clone(), &cancel).await.is_err());
+        assert!(kill.execute_presented(&foreign, &call, args.clone(), &cancel).await.is_err());
+        assert!(!writer.cancelled().is_cancelled());
+        assert_eq!(writer.job.state.lock().unwrap().read_from, 0);
+        assert!(output.execute_in(&owner, args.clone()).await.unwrap().contains("secret"));
+        kill.execute_presented(&owner, &call, args, &cancel).await.unwrap();
+        assert!(writer.cancelled().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn lists_filter_text_metadata_and_totals_and_share_unowned_jobs() {
+        let registry = JobRegistry::new();
+        let owner = "owner".to_string();
+        let foreign = "foreign".to_string();
+        let (private, _) = registry.start_owned("bash", "private".into(), Some(&owner));
+        let list = JobListTool::new(registry.clone());
+        let (text, metadata) = list.list_presented(Some(&foreign)).unwrap();
+        assert_eq!(text, "No background jobs");
+        assert_eq!(metadata["total"], 0);
+        assert_eq!(metadata["jobs"], json!([]));
+        assert_eq!(metadata["truncated"], false);
+        let (shared, writer) = registry.start("bash", "shared".into());
+        writer.append(b"public");
+        for session in [None, Some(foreign.as_str()), Some(owner.as_str())] {
+            let (text, metadata) = list.list_presented(session).unwrap();
+            let owns = session == Some(owner.as_str());
+            assert_eq!(text.contains("private"), owns);
+            assert!(text.contains("shared"));
+            assert_eq!(metadata["total"], if owns { 2 } else { 1 });
+            assert_eq!(metadata["jobs"].as_array().unwrap().iter().any(|j| j["job_id"] == private), owns);
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let (_, _, _, metadata) = list.execute_presented(&foreign, &"call".into(), json!({}), &cancel).await.unwrap();
+        assert_eq!(metadata.unwrap()["total"], 1);
+        assert!(!list.execute_in(&foreign, json!({})).await.unwrap().contains("private"));
+        let output = JobOutputTool::new(registry.clone());
+        assert!(output.execute_in(&foreign, json!({"job_id":shared})).await.unwrap().contains("public"));
+        JobKillTool::new(registry).execute(json!({"job_id":shared})).await.unwrap();
+        assert!(writer.cancelled().is_cancelled());
+    }
+
+    #[test]
+    fn recovered_jobs_preserve_session_isolation() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (id, writer) = registry.start_owned("bash", "private".into(), Some(&"owner".into()));
+        writer.append(b"secret");
+        drop(writer);
+        drop(registry);
+        let recovered = JobRegistry::new();
+        recovered.enable_persistence(directory.path()).unwrap();
+        assert!(recovered.get_for_session(&id, Some("foreign")).is_err());
+        assert!(recovered.get_for_session(&id, None).is_err());
+        assert!(recovered.get_for_session(&id, Some("owner")).is_ok());
     }
 }
 
@@ -407,19 +504,23 @@ impl Tool for JobOutputTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.read_presented(args).await.map(|(output, _)| output)
+        self.read_presented(None, args).await.map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, metadata) = self.read_presented(args).await?;
+    async fn execute_in(&self, session: &String, args: Value) -> Result<String, String> {
+        self.read_presented(Some(session), args).await.map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.read_presented(Some(session), args).await?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
     }
 }
 
 impl JobOutputTool {
-    async fn read_presented(&self, args: Value) -> Result<(String, Value), String> {
+    async fn read_presented(&self, session: Option<&str>, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
-        let job = self.jobs.get(id)?;
+        let job = self.jobs.get_for_session(id, session)?;
         let wait = args["wait"].as_bool().unwrap_or(false);
         let timeout = std::time::Duration::from_millis(args["timeout_ms"].as_u64().unwrap_or(30_000));
 
@@ -475,37 +576,42 @@ impl Tool for JobListTool {
     }
 
     async fn execute(&self, _args: Value) -> Result<String, String> {
-        self.list_presented().map(|(output, _)| output)
+        self.list_presented(None).map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, _args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, metadata) = self.list_presented()?;
+    async fn execute_in(&self, session: &String, _args: Value) -> Result<String, String> {
+        self.list_presented(Some(session)).map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, _args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.list_presented(Some(session))?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
     }
 }
 
 impl JobListTool {
-    fn list_presented(&self) -> Result<(String, Value), String> {
+    fn list_presented(&self, session: Option<&str>) -> Result<(String, Value), String> {
         let jobs = self.jobs.inner.jobs.lock().expect("jobs lock");
         let mut records = Vec::new();
         let mut metadata_bytes = 0;
-        if jobs.is_empty() {
-            return Ok(("No background jobs".into(), json!({"version":1,"kind":"job_list","jobs":[],"truncated":false})));
-        }
         let mut lines: Vec<(u64, String)> = jobs
             .iter()
-            .map(|(id, job)| {
+            .filter_map(|(id, job)| {
                 let state = job.state.lock().expect("job lock");
+                if !state.visible_to(session) { return None; }
                 let n: u64 = id[1..].parse().unwrap_or(0);
                 let record = json!({"job_id":id,"kind":state.kind,"status":state.status.marker(),"label":state.label});
                 metadata_bytes += serde_json::to_vec(&record).unwrap().len();
                 if metadata_bytes <= 48 * 1024 { records.push(record); }
-                (n, format!("{id} [{}] {} — {}", state.kind, state.status.marker(), state.label))
+                Some((n, format!("{id} [{}] {} — {}", state.kind, state.status.marker(), state.label)))
             })
             .collect();
         lines.sort();
-        let metadata = json!({"version":1,"kind":"job_list","total":jobs.len(),"truncated":records.len()<jobs.len(),"jobs":records});
-        Ok((lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n"), metadata))
+        let metadata = json!({"version":1,"kind":"job_list","total":lines.len(),"truncated":records.len()<lines.len(),"jobs":records});
+        let output = if lines.is_empty() { "No background jobs".into() } else {
+            lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")
+        };
+        Ok((output, metadata))
     }
 }
 
@@ -543,19 +649,23 @@ impl Tool for JobKillTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.kill_presented(args).map(|(output, _)| output)
+        self.kill_presented(None, args).map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        let (output, metadata) = self.kill_presented(args)?;
+    async fn execute_in(&self, session: &String, args: Value) -> Result<String, String> {
+        self.kill_presented(Some(session), args).map(|(output, _)| output)
+    }
+
+    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        let (output, metadata) = self.kill_presented(Some(session), args)?;
         Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
     }
 }
 
 impl JobKillTool {
-    fn kill_presented(&self, args: Value) -> Result<(String, Value), String> {
+    fn kill_presented(&self, session: Option<&str>, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
-        let job = self.jobs.get(id)?;
+        let job = self.jobs.get_for_session(id, session)?;
         let already = {
             let mut state = job.state.lock().expect("job lock");
             match state.status {
