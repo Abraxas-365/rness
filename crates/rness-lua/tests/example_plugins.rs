@@ -240,7 +240,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     let config = rness_lua::api::config::load(&root.join("init.lua")).unwrap();
     assert_eq!(config.colorscheme.as_deref(), Some("gruvbox"));
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
-    assert!(config.agents["worker"].profile.is_none());
+    assert!(!config.agents.contains_key("worker"), "the optional worker role stays disabled by default");
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
     assert_eq!(config.plugin_specs.len(), 12);
     let policy = &config.compaction["default"];

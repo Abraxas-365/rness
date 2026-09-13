@@ -14,11 +14,12 @@ rness.agents.declare("scout", {
   instructions = [[Locate the minimum evidence needed to answer the assigned question. Search first, then read relevant ranges. Do not dump entire files. Return a direct answer, file:line references, key connections, and unresolved questions in about 400 words. Do not edit or delegate.]],
 })
 
-rness.agents.declare("worker", {
-  description = "Implements a bounded approved task and runs targeted validation.",
-  subagent = true, 
-  instructions = [[Understand the task and read relevant code before editing. Make narrow coherent changes and preserve unrelated work. Run appropriate checks. Do not commit, push, perform destructive operations, or delegate. Escalate unapproved decisions. Return changed files, actual validation results, and remaining blockers.]],
-})
+-- rness.agents.declare("worker", {
+--   description = "Implements a bounded approved task and runs targeted validation.",
+--   subagent = true,
+--   instructions = [[Understand the task and read relevant code before editing. Make narrow coherent changes and preserve unrelated work. Run appropriate checks. Do not commit, push, perform destructive operations, or delegate. Escalate unapproved decisions. Return changed files, actual validation results, and remaining blockers.]],
+-- })
+--
 rness.agents.declare("reviewer", {
   description = "Read-only review with prioritized, evidence-backed findings.",
   subagent = true,
