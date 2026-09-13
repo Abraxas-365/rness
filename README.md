@@ -160,6 +160,25 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 
 Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
 
+### External file references
+
+The `references` plugin keeps ordinary `@filename` searches inside the workspace.
+Enable explicit external directory browsing through its Lua options:
+
+```lua
+{ name = "references", file = "plugins/references.lua", opts = {
+  max_results = 20,
+  allow_parent = true,   -- @../
+  allow_home = true,     -- @~/
+  allow_absolute = true, -- @/absolute/path/
+} },
+```
+
+All three options default to false. External paths browse one directory level at
+a time, without recursively indexing your home directory or attaching file contents.
+Directory symlinks are not traversed. Parent traversal inside home or absolute paths
+also requires `allow_parent`.
+
 ### Switching models inside a session
 
 The default flavor's `models` Lua plugin provides slash commands with autocomplete

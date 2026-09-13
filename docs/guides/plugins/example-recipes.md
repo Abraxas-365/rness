@@ -318,7 +318,8 @@ Use `/help bindings` to inspect declared shortcuts and scoped overrides.
 
 ## Path references in terminal and HTTP
 
-Declare in a selected runtime plugin (off by default), loaded through
+The default flavor enables this through its `references` plugin. Other flavors can
+declare it in a runtime plugin loaded through
 a `{name='references', file='./plugins/references.lua', watch=true}` entry in the single `rness.plugins.setup({...})` list in init.lua:
 
 ```lua
@@ -326,6 +327,9 @@ rness.file_references.enable {
   max_results = 20,
   max_entries = 50000,
   respect_gitignore = true,
+  allow_parent = false,   -- Set true for @../ browsing.
+  allow_home = false,     -- Set true for @~/ browsing.
+  allow_absolute = false, -- Set true for @/absolute/path/ browsing.
   -- Optional replacement for the default directory exclusion list:
   -- excluded_directories = { '.git', 'node_modules', 'target' },
 }
@@ -345,8 +349,17 @@ needed, without claiming they have already been inspected.
 Web clients use `POST /api/sessions/:id/file-references` with JSON
 `{"query":"src/","limit":50}`. Responses are arrays of `{path,directory}`; no SSE
 subscription is needed. The same service uses the session's persisted workspace.
-Limits are 1..200. A disabled feature returns an empty array. Queries must be
-relative workspace paths; this discovery boundary does not change tool permissions.
+Limits are 1..200. A disabled feature returns an empty array. Queries default to
+relative workspace paths. Lua can independently enable `allow_parent`, `allow_home`,
+and `allow_absolute` (all default to false). HTTP queries use `../`, `~/`, or `/path/`
+without the terminal's `@` prefix. Home expansion uses the server process's `HOME`;
+relative paths use the session workspace. Parent traversal within home or absolute
+paths also requires `allow_parent`.
+
+External queries browse one directory level at a time and never recursively index
+the home directory. Directory symlinks are not traversed; configured directory
+exclusions and ignore filters still apply. Selecting a path inserts a reference,
+not file contents. These options control discovery, not tool permissions.
 
 An empty query and slash-containing queries list a directory live. Bare queries
 use a shared bounded fuzzy path index with deterministic prefix/gap/path ranking.

@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, path::{Component, Path, PathBuf}, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use tokio_util::sync::CancellationToken;
 
-pub const GUIDANCE: &str = "Tokens prefixed with @ are user-referenced workspace paths, not attached file contents. A trailing slash denotes a directory: list it when needed. Otherwise use the read tool when contents are needed. Never claim to have inspected a reference before reading it. @\"...\" quotes paths containing spaces.";
+pub const GUIDANCE: &str = "Tokens prefixed with @ are user-referenced paths (workspace-relative, ../, ~/, or absolute), not attached file contents. A trailing slash denotes a directory: list it when needed. Otherwise use the read tool when contents are needed. Never claim to have inspected a reference before reading it. @\"...\" quotes paths containing spaces.";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Config { pub max_results: usize, pub max_entries: usize, pub excluded_directories: Vec<String>, pub respect_gitignore: bool }
+pub struct Config { pub max_results: usize, pub max_entries: usize, pub excluded_directories: Vec<String>, pub respect_gitignore: bool, pub allow_parent: bool, pub allow_home: bool, pub allow_absolute: bool }
 impl Default for Config {
-    fn default() -> Self { Self { max_results: 20, max_entries: 50_000, excluded_directories: [".git", "node_modules", "dist", "build", "out", "coverage", "target", ".next", ".nuxt", ".turbo", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle"].map(String::from).to_vec(), respect_gitignore: true } }
+    fn default() -> Self { Self { max_results: 20, max_entries: 50_000, excluded_directories: [".git", "node_modules", "dist", "build", "out", "coverage", "target", ".next", ".nuxt", ".turbo", ".venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".gradle"].map(String::from).to_vec(), respect_gitignore: true, allow_parent: false, allow_home: false, allow_absolute: false } }
 }
 impl Config {
     pub fn validate(&self) -> Result<(), String> {
@@ -43,7 +43,7 @@ impl FileReferences {
         for workspace in self.state.lock().unwrap().workspaces.values() { workspace.index.lock().unwrap().version += 1; }
     }
     pub fn list(&self, root: &Path, query: &Query, cancel: &CancellationToken) -> Result<Vec<Candidate>, String> {
-        if query.limit == 0 || query.limit > 200 || query.query.len() > 4096 || query.query.chars().any(char::is_control) || Path::new(&query.query).components().any(|c| !matches!(c, Component::Normal(_) | Component::CurDir)) { return Err("invalid relative workspace query or limit".into()); }
+        if query.limit == 0 || query.limit > 200 || query.query.len() > 4096 || query.query.chars().any(char::is_control) { return Err("invalid reference query or limit".into()); }
         let root = root.canonicalize().map_err(|e| e.to_string())?;
         let (config, workspace) = {
             let mut state = self.state.lock().unwrap();
@@ -54,7 +54,35 @@ impl FileReferences {
             }
             (config, state.workspaces.entry(root.clone()).or_default().clone())
         };
+        let home = query.query.starts_with("~/");
+        let absolute = Path::new(&query.query).is_absolute();
+        let parent = Path::new(&query.query).components().any(|c| c == Component::ParentDir);
+        if (home && !config.allow_home) || (absolute && !config.allow_absolute) || (parent && !config.allow_parent) {
+            return Err("external reference path is disabled by Lua configuration".into());
+        }
         let limit = query.limit.min(config.max_results);
+        if home || absolute || parent {
+            let (directory, fragment) = query.query.rsplit_once('/').unwrap_or((&query.query, ""));
+            let base = if home {
+                PathBuf::from(std::env::var_os("HOME").ok_or("home directory is unavailable")?).canonicalize().map_err(|e| e.to_string())?
+            } else if absolute { PathBuf::from("/") } else { root.clone() };
+            let relative = if home { directory.strip_prefix('~').unwrap().trim_start_matches('/') } else { directory };
+            let mut dir = base;
+            for component in Path::new(relative).components() {
+                dir.push(component.as_os_str());
+                if std::fs::symlink_metadata(&dir).map_err(|e| e.to_string())?.file_type().is_symlink() {
+                    return Err("directory symlinks are not traversed".into());
+                }
+            }
+            let dir = dir.canonicalize().map_err(|e| e.to_string())?;
+            if dir.components().any(|c| config.excluded_directories.iter().any(|excluded| c.as_os_str() == excluded.as_str())) { return Ok(Vec::new()); }
+            let entries = scan(&dir, &dir, &config, Some(1), cancel, &workspace.cancel)?;
+            let mut result = rank(&entries, fragment, limit, true);
+            let prefix = if query.query.contains('/') { format!("{directory}/") } else { format!("{}/", query.query) };
+            for entry in &mut result { entry.path = format!("{prefix}{}", entry.path); }
+            if cancel.is_cancelled() || workspace.cancel.is_cancelled() { result.clear(); }
+            return Ok(result);
+        }
         if query.query.is_empty() || query.query.contains('/') {
             let (directory, fragment) = query.query.rsplit_once('/').unwrap_or(("", ""));
             let mut dir = root.clone();
@@ -127,6 +155,48 @@ fn rank(entries: &[Candidate], query: &str, limit: usize, basename: bool) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_paths_require_opt_in_and_browse_one_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(tmp.path().join("outside.txt"), "").unwrap();
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+        std::fs::write(tmp.path().join("nested/deep.txt"), "").unwrap();
+        let service = FileReferences::default();
+        service.configure(Some(Config::default()));
+        let cancel = CancellationToken::new();
+        let query = |s: &str| Query { query: s.into(), limit: 20 };
+        for text in ["../", "~/", "/"] { assert!(service.list(&root, &query(text), &cancel).is_err()); }
+        service.configure(Some(Config { allow_parent: true, ..Default::default() }));
+        let entries = service.list(&root, &query("../"), &cancel).unwrap();
+        assert!(entries.iter().any(|c| c.path == "../outside.txt"));
+        assert!(entries.iter().any(|c| c.path == "../nested/"));
+        assert!(!entries.iter().any(|c| c.path.contains("deep.txt")));
+        assert!(service.list(&root, &query("~/"), &cancel).is_err());
+        service.configure(Some(Config { allow_absolute: true, ..Default::default() }));
+        let directory = tmp.path().canonicalize().unwrap();
+        let text = format!("{}/out", directory.display());
+        let entries = service.list(&root, &query(&text), &cancel).unwrap();
+        assert_eq!(entries[0].path, format!("{}/outside.txt", directory.display()));
+        assert!(service.list(&root, &query("../"), &cancel).is_err());
+        let config: Config = serde_json::from_str(r#"{"allow_home":true}"#).unwrap();
+        assert!(config.allow_home);
+        assert!(!config.allow_parent);
+        service.configure(Some(config));
+        if std::env::var_os("HOME").is_some() {
+            let entries = service.list(&root, &query("~/"), &cancel).unwrap();
+            assert!(entries.iter().all(|c| c.path.starts_with("~/") && !c.path[2..].trim_end_matches('/').contains('/')));
+            assert!(service.list(&root, &query("~/../"), &cancel).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(tmp.path().join("nested"), root.join("link")).unwrap();
+            service.configure(Some(Config { allow_parent: true, ..Default::default() }));
+            assert!(service.list(&root, &query("link/../"), &cancel).is_err());
+        }
+    }
+
     #[test]
     fn shared_cache_refresh_and_entry_budget() {
         let root = tempfile::tempdir().unwrap();
