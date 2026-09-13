@@ -41,7 +41,7 @@ impl Exposure {
                 .collect()
         };
         if !self.deferred.is_empty() || tools.has_deferred() || self.mode != Mode::Native {
-            specs.push(ToolSpec { name: "ToolSearch".into(), description: "Discover permitted tools and their full JSON schemas. query accepts keywords or select:Name,Other. Discovered tools become available next step; in ptc mode call them through run_code.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}) });
+            specs.push(ToolSpec { name: "ToolSearch".into(), description: "Discover permitted tools and their full JSON schemas. query accepts keywords (ranked partial matches, top 20) or select:Name,Other (case-insensitive full names, no result cap). Returns tools, total_matches, truncated, missing names, and guidance. Discovered tools become available next step; in ptc mode call them through run_code.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}) });
         }
         if self.mode != Mode::Native {
             specs.push(ToolSpec { name:"run_code".into(), description:"Execute isolated Lua to orchestrate tools. Use tools.call(name, args) to get {output,is_error,content}; return a JSON-serializable value. Discover schemas with ToolSearch first. No filesystem, process, network, imports or config access except through permitted tools. Use tools.parallel({{name=...,args=...},...}) for up to four concurrent calls with results in input order. Shared max 32 calls, 60s execution budget, 16 MiB VM memory. Tools still require normal approvals. Recursive run_code and ToolSearch are forbidden inside programs.".into(), input_schema:json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}) });
@@ -71,27 +71,40 @@ impl Exposure {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or("query must be a nonempty string")?;
+        let query = query.trim();
         let exact = query.strip_prefix("select:");
-        let words: Vec<_> = query
-            .to_lowercase()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        let matches: Vec<_> = tools
-            .specs()
-            .into_iter()
-            .filter(|spec| {
-                if let Some(names) = exact {
-                    names.split(',').any(|name| name.trim() == spec.name)
-                } else {
-                    let text = format!("{} {}", spec.name, spec.description).to_lowercase();
-                    words.iter().all(|word| text.contains(word))
-                }
-            })
-            .take(20)
-            .collect();
-        let names = matches.iter().map(|s| s.name.clone()).collect();
-        let output = serde_json::to_string(&matches.iter().map(|s| json!({"name":s.name,"description":s.description,"input_schema":s.input_schema})).collect::<Vec<_>>()).map_err(|e| e.to_string())?;
+        let requested: Vec<_> = exact.map(|names| names.split(',').map(str::trim).filter(|name| !name.is_empty()).collect()).unwrap_or_default();
+        if exact.is_some() && requested.is_empty() { return Err("select: requires at least one tool name".into()); }
+        let words: BTreeSet<_> = query.to_lowercase().split_whitespace().map(str::to_owned).collect();
+        let mut matches: Vec<_> = tools.specs().into_iter().filter_map(|spec| {
+            let name = spec.name.to_lowercase();
+            let description = spec.description.to_lowercase();
+            let score = if exact.is_some() {
+                usize::from(requested.iter().any(|requested| requested.eq_ignore_ascii_case(&spec.name)))
+            } else {
+                words.iter().map(|word| if name == *word { 8 } else if name.contains(word.as_str()) { 4 } else if description.contains(word.as_str()) { 1 } else { 0 }).sum()
+            };
+            (score > 0).then_some((score, spec))
+        }).collect();
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        let total_matches = matches.len();
+        let missing: Vec<_> = requested.iter().filter(|name| !matches.iter().any(|(_, spec)| name.eq_ignore_ascii_case(&spec.name))).copied().collect();
+        if exact.is_none() { matches.truncate(20); }
+        let names: Vec<_> = matches.iter().map(|(_, spec)| spec.name.clone()).collect();
+        let guidance = if matches.is_empty() {
+            "No permitted registered tools matched. Try a shorter keyword or select: with a known tool name. An empty result does not establish whether an MCP server is connected."
+        } else if total_matches > matches.len() {
+            "Results are truncated to the top 20 matches. Narrow the query or use select:Name,Other for specific tools."
+        } else if !missing.is_empty() {
+            "Some requested names were not found among permitted registered tools. Check their spelling and tool registration."
+        } else { "Returned tools are available next step; in ptc mode use run_code." };
+        let output = serde_json::to_string(&json!({
+            "tools": matches.iter().map(|(_, s)| json!({"name":s.name,"description":s.description,"input_schema":s.input_schema})).collect::<Vec<_>>(),
+            "total_matches": total_matches,
+            "truncated": total_matches > matches.len(),
+            "missing": missing,
+            "guidance": guidance,
+        })).map_err(|e| e.to_string())?;
         Ok((output, names))
     }
 }

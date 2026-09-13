@@ -4,6 +4,39 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 struct Echo;
+
+#[test]
+fn search_ranks_partial_matches_reports_limits_and_respects_scope() {
+    struct Named(String);
+    #[async_trait::async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str { &self.0 }
+        async fn execute(&self, _: Value) -> Result<String, String> { Ok(String::new()) }
+    }
+    let tools = ToolRegistry::default();
+    for i in 0..25 { tools.register(Arc::new(Named(format!("chrome_{i:02}")))); }
+    tools.register(Arc::new(Named("chrome_browser".into())));
+    let exposure = Exposure::default();
+    let (output, names) = exposure.search(&tools, &json!({"query":"chrome MCP browser"})).unwrap();
+    let output: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(names.len(), 20);
+    assert_eq!(names[0], "chrome_browser");
+    assert_eq!(output["total_matches"], 26);
+    assert_eq!(output["truncated"], true);
+    let requested = (0..25).map(|i| format!("CHROME_{i:02}")).collect::<Vec<_>>().join(",");
+    let (output, names) = exposure.search(&tools, &json!({"query":format!(" select:{requested},missing ")})).unwrap();
+    let output: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(names.len(), 25);
+    assert_eq!(output["truncated"], false);
+    assert_eq!(output["missing"], json!(["missing"]));
+    let (output, names) = exposure.search(&tools.restricted(&[]), &json!({"query":"chrome"})).unwrap();
+    let output: Value = serde_json::from_str(&output).unwrap();
+    assert!(names.is_empty());
+    assert_eq!(output["total_matches"], 0);
+    assert!(output["guidance"].as_str().unwrap().contains("No permitted"));
+    assert!(exposure.search(&tools, &json!({"query":"select: , "})).is_err());
+}
+
 #[tokio::test(flavor="multi_thread")]
 async fn parallel_calls_overlap_and_keep_input_order() {
     struct BarrierTool(Arc<tokio::sync::Barrier>);
