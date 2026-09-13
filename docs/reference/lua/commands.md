@@ -63,6 +63,15 @@ Use `/greet world`, `/help`, or `/help greet`. `arguments` supplies static suffi
 
 For runtime candidates, add `complete = function(ctx) return { "world", ctx.session } end` to the declaration. The callback receives the same session/workspace/raw-input context and returns an array of full argument suffixes (without the command name). Press Ctrl+Tab after the command and a space to request completion, then Tab/Enter to select a candidate. Responses for a different draft or session are ignored. Callbacks run off the TUI thread, hold the same reservations as commands, and can be canceled with Ctrl+C. Keep them short and side-effect-free; errors are displayed as session notices. Rust commands override `Command::complete`; integrations call `prepare_command(...).complete(...)`. Static arguments are the fallback when no callback is registered.
 
+Completion arrays may mix strings and `{ value = "a1", description = "scout · Review parser" }`
+records. `value` is the full argument suffix; `description` is an optional,
+display-only hint that is never inserted or submitted. Check
+`rness.commands.completion_descriptions` before returning records from a plugin
+that must also run on older binaries. Rust commands may override
+`Command::complete_items` to return `(value, description)` pairs, and clients use
+`PreparedCommand::complete_items`; existing string-based `complete` methods remain
+supported.
+
 `ctx.session` identifies the invoking session. `ctx.workspace` is its saved workspace, or absent for legacy sessions without one. `ctx.raw_input` preserves the text after the command name, including separator whitespace.
 
 A callback may return a string, nil, or `{ message = string, data = JSON-compatible value }`. Errors become submission failures. Results are local notices in the TUI and `{ "status": "command", "result": ... }` over HTTP. They are not appended as model conversation messages. TUI command results are retained per session for the lifetime of the TUI, including results received while that session is hidden. Switching back or reconciling history restores them without duplicates. They are not persisted across process restarts.

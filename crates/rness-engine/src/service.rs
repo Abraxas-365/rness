@@ -156,6 +156,14 @@ impl PreparedCommand {
         })
     }
 
+    pub fn complete_items(self, service: &SessionService) -> Result<Vec<(String, String)>, ServiceError> {
+        if self.cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("completion cancelled".into())); }
+        self.command.complete_items(service, crate::interaction::CommandInvocation {
+            session: &self.session, raw_input: &self.raw_input, cancel: self.cancel.clone(),
+            permit: CommandPermit(Arc::downgrade(&self.reservation)),
+        })
+    }
+
     pub fn execute(self, service: &SessionService) -> Result<Disposition, ServiceError> {
         if self.cancel.is_cancelled() {
             return Err(ServiceError::InvalidConfig("command cancelled".into()));

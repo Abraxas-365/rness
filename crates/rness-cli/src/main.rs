@@ -856,14 +856,14 @@ impl rness_tui::app::Backend for LocalBackend {
             if current_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
             let prepared = sessions.prepare_command(&session, &text);
             let result = match prepared {
-                Ok(Some(command)) => tokio::task::spawn_blocking(move || command.complete(&sessions)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())),
+                Ok(Some(command)) => tokio::task::spawn_blocking(move || command.complete_items(&sessions)).await.map_err(|e| e.to_string()).and_then(|r| r.map_err(|e| e.to_string())),
                 Ok(None) => Ok(Vec::new()),
                 Err(rness_engine::service::ServiceError::Busy) => return,
                 Err(error) => Err(error.to_string()),
             };
             if current_generation.load(std::sync::atomic::Ordering::SeqCst) != generation { return; }
             match result {
-                Ok(values) => { let _ = tx.send(rness_tui::app::Action::CompletionResult(session, text, values)); }
+                Ok(values) => { let _ = tx.send(rness_tui::app::Action::CommandCompletionResult(session, text, values)); }
                 Err(error) => { let _ = tx.send(rness_tui::app::Action::CommandResult(session, format!("Completion failed: {error}"))); }
             }
         });

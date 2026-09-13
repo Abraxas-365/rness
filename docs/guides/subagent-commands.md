@@ -13,8 +13,11 @@ The default flavor enables `plugins/agent-controls.lua`:
 - `/agents stop` selects the child when exactly one descendant is running. With
   several running children it lists them instead; with none it reports that.
 
-Use the normal slash-command completion menu to select an exact full session
-ID or an alias such as `a1`. Aliases cover all descendants including idle children,
+Use the normal slash-command completion menu to select an alias such as `a1`.
+Each agent suggestion shows its role and a short preview of its assigned task;
+the preview is display-only and is never inserted into the command. Full session
+IDs remain accepted when entered manually, but are not duplicate suggestions.
+Aliases cover all descendants including idle children,
 are append-only per root, and keep tombstones for removed sessions. Running-state
 changes, deletion, and imports do not retarget an alias during this runtime.
 Aliases reset after restart: use a full ID for durable identity. Unrelated IDs and ambiguous
@@ -71,6 +74,8 @@ the theme changes into custom themes rather than overwriting local customization
 
 `rness.subagents.list(session)` returns all delegated descendants, including
 one-shot children, with `alias`, `session`, `parent`, `depth`, and `running` fields.
+Pass `true` as a second argument for cached `name` and assigned `task` preview
+fields used by completion hints. The default call avoids task-history reads.
 `rness.subagents.children` and the model's `list_agents` tool retain their existing
 continuable-only behavior. `rness.subagents.interrupt(caller, target)` still
 validates durable ancestry before cancellation. `rness.subagents.steer_user`

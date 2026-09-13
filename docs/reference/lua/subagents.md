@@ -69,9 +69,19 @@ The target receives a durable plain `UserMessage` (`intent = steer` while runnin
 
 The API relies on trusted Lua supplying the actual invoking conversation, just like the existing interrupt API. It does not broaden model-facing messaging authorization or introduce a new wire-format source variant.
 
-## `list(root)`
+## `list(root, details?)`
 
 Returns all delegated descendants, including idle and one-shot children, with `session`, `parent`, `depth`, `running`, and `alias`. Aliases `a1`, `a2`, … are assigned per root in full-ID order on first observation; later discoveries append regardless of their IDs. Removed sessions leave tombstones, so no existing alias is reassigned during the runtime's lifetime. Clients must use `child.alias`, **not** enumerate a filtered list. Aliases reset on process restart; full IDs remain the durable identity across restarts.
+
+Pass `true` as the optional second argument to include `name` (the current role,
+or `subagent` for an unnamed child) and `task` (a bounded preview of its original
+assigned prompt). The task excludes inherited fork history and injected
+instructions. These details are cached and updated from the child's own log;
+omitting the flag avoids those reads, as used by the statusline.
+
+The default completion menu uses aliases and shows `name · task` as a display-only
+hint. Selecting a suggestion inserts only the command, never the hint. Full IDs
+remain accepted as input and are used in durable stop-confirmation commands.
 
 ## Default `/agents` command
 

@@ -404,6 +404,27 @@ mod tests {
     }
 
     #[test]
+    fn completion_hints_are_display_only_and_ignore_stale_queries() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut input = Input::new();
+        input.editor.insert_str("/agents a");
+        input.on_action(&ctx, "input:completion", &serde_json::json!({
+            "text":"/agents old", "items":[["wrong", "stale"]]
+        }));
+        assert!(input.matches().is_empty());
+        input.on_action(&ctx, "input:completion", &serde_json::json!({
+            "text":"/agents a", "items":[["a1", "scout · Trace compaction"]]
+        }));
+        assert_eq!(input.matches()[0], &("agents a1".into(), "scout · Trace compaction".into()));
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(input.editor.text().trim(), "/agents a1");
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome.actions.as_slice(), [Action::Submit(text)] if text.trim() == "/agents a1"));
+    }
+
+    #[test]
     fn dynamic_completion_ignores_stale_queries() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -587,11 +608,17 @@ impl Component for Input {
                 return;
             }
             if payload["text"].as_str() != Some(self.editor.text().as_str()) { return; }
-            if let (Some(text), Ok(values)) = (payload["text"].as_str(), serde_json::from_value::<Vec<String>>(payload["values"].clone())) {
+            let items = if payload.get("items").is_some() {
+                serde_json::from_value::<Vec<(String, String)>>(payload["items"].clone())
+            } else {
+                serde_json::from_value::<Vec<String>>(payload["values"].clone())
+                    .map(|values| values.into_iter().map(|value| (value, String::new())).collect())
+            };
+            if let (Some(text), Ok(values)) = (payload["text"].as_str(), items) {
                 let command = text.trim_start_matches('/').split_whitespace().next().unwrap_or_default();
                 let prefix = format!("{command} ");
                 self.commands.retain(|(name, _)| !name.starts_with(&prefix));
-                self.commands.extend(values.into_iter().map(|value| (format!("{prefix}{value}"), String::new())));
+                self.commands.extend(values.into_iter().map(|(value, description)| (format!("{prefix}{value}"), description)));
                 self.dismissed = false;
                 self.selected = 0;
             }

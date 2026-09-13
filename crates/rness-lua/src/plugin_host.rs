@@ -99,7 +99,7 @@ enum Cmd {
     ActionSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaActionSpec>> },
     BindingSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>> },
     Action { guard: Box<dyn FnOnce() -> bool + Send>, generation: u64, name: String, scope: String, context: serde_json::Value, reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>> },
-    Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<String>, String>> },
+    Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<(String, String)>, String>> },
     Command { name: String, context: serde_json::Value, permit: rness_engine::service::CommandPermit, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
     ResumeCommand { id: u64, result: Result<bool, String> },
     PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
@@ -215,6 +215,9 @@ impl rness_engine::interaction::Command for LuaCommand {
     fn arguments(&self) -> Vec<(String, String)> { self.arguments.clone() }
     fn description(&self) -> &str { &self.description }
     fn complete(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<String>, rness_engine::service::ServiceError> {
+        self.complete_items(service, input).map(|items| items.into_iter().map(|(value, _)| value).collect())
+    }
+    fn complete_items(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<(String, String)>, rness_engine::service::ServiceError> {
         use rness_engine::service::ServiceError;
         if std::thread::current().name() == Some("lua-vm") { return Err(ServiceError::InvalidConfig("recursive Lua completion".into())); }
         let workspace = service.store().workspace(input.session)?;
@@ -364,7 +367,7 @@ impl LuaHost {
                             rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
                                 if token.is_cancelled() { Err(mlua::Error::runtime("completion cancelled")) } else { Ok(mlua::VmState::Continue) }
                             });
-                            let result = if cancel.is_cancelled() { Err("completion cancelled".into()) } else { rt.complete_command(&name, context) };
+                            let result = if cancel.is_cancelled() { Err("completion cancelled".into()) } else { rt.complete_command_items(&name, context) };
                             rt.lua().remove_hook();
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);

@@ -528,6 +528,7 @@ pub enum Action {
     Custom(String, serde_json::Value),
     Complete(String),
     CompletionResult(SessionId, String, Vec<String>),
+    CommandCompletionResult(SessionId, String, Vec<(String, String)>),
     CommandResult(SessionId, String),
     Notice(String),
     /// Point the TUI at another session: model resets and rehydrates
@@ -1415,6 +1416,12 @@ impl App {
                         "input:completion",
                         &serde_json::json!({"text":text,"values":values}),
                     );
+                }
+            }
+            Action::CommandCompletionResult(session, text, items) => {
+                if session == self.model.session {
+                    let ctx = Ctx { model: &self.model, theme: &self.theme };
+                    self.slots.broadcast(&ctx, "input:completion", &serde_json::json!({"text":text,"items":items}));
                 }
             }
             Action::CommandResult(session, message) => {

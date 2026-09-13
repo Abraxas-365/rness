@@ -33,6 +33,10 @@ pub trait Command: Send + Sync {
     fn complete(&self, _service: &SessionService, _invocation: CommandInvocation<'_>) -> Result<Vec<String>, ServiceError> {
         Ok(self.arguments().into_iter().map(|(value, _)| value).collect())
     }
+    /// Display hints are separate from the argument suffix inserted by clients.
+    fn complete_items(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<Vec<(String, String)>, ServiceError> {
+        self.complete(service, invocation).map(|values| values.into_iter().map(|value| (value, String::new())).collect())
+    }
     fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError>;
 }
 

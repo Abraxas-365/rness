@@ -37,6 +37,73 @@ fn host() -> LuaRuntime {
 }
 
 #[test]
+fn completion_hints_show_role_and_bounded_task_without_changing_values() {
+    let mut host = LuaRuntime::new().unwrap();
+    host.load("hint-fixture", r#"
+        rness.commands.register = function(command) controls = command end
+        rness.commands.completion_descriptions = true
+        rness.subagents = {list = function(root, details)
+          assert(root == 'main' and details == true)
+          return {
+            {alias='a1', session='child-full', name='scout', task='  Trace\n  compaction settings  ', running=true},
+            {alias='a2', session='other-full', task=string.rep('界', 125), running=false},
+          }
+        end}
+    "#).unwrap();
+    host.load(
+        "controls",
+        include_str!("../../../flavors/default/plugins/agent-controls.lua"),
+    )
+    .unwrap();
+    host.load(
+        "hint-assertions",
+        r#"
+        local choices = controls.complete({session='main'})
+        local found = {}
+        for _, item in ipairs(choices) do
+          assert(type(item) == 'table')
+          assert(not item.value:find('full', 1, true))
+          found[item.value] = item.description
+        end
+        assert(found.a1 == 'scout · Trace compaction settings')
+        assert(found['a1 steer'] == found.a1 and found['stop a1'] == found.a1)
+        assert(found.a2 == 'subagent · ' .. string.rep('界', 120) .. '…')
+        local exact = controls.complete({session='main', raw_input=' a1 '})[1]
+        assert(exact.value == 'a1 ' and exact.description == found.a1)
+        -- Older binaries still receive string completions, never hint text.
+        rness.commands.completion_descriptions = nil
+        for _, item in ipairs(controls.complete({session='main'})) do
+          assert(type(item) == 'string' and not item:find('scout', 1, true))
+        end
+    "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn runtime_parses_mixed_completion_items_and_preserves_legacy_values() {
+    let mut host = host();
+    let items = host.complete_command_items("agents", json!({"session":"main"})).unwrap();
+    assert!(items.contains(&("a1".into(), "subagent".into())));
+    host.load("mixed", r#"
+        assert(rness.commands.completion_descriptions)
+        rness.commands.register {
+          name='mixed', run=function() end,
+          complete=function() return {'plain', {value='rich', description='hint'}, {value='bare'}} end,
+        }
+    "#).unwrap();
+    assert_eq!(host.complete_command_items("mixed", json!({})).unwrap(), vec![
+        ("plain".into(), "".into()), ("rich".into(), "hint".into()), ("bare".into(), "".into()),
+    ]);
+    assert_eq!(host.complete_command("mixed", json!({})).unwrap(), ["plain", "rich", "bare"]);
+    host.load("invalid", r#"
+        rness.commands.register {name='invalid', run=function() end,
+          complete=function() return {{description='missing value'}} end}
+    "#).unwrap();
+    assert!(host.complete_command_items("invalid", json!({})).is_err());
+}
+
+#[test]
 fn monitor_returns_allowlisted_data_action_and_full_ids() {
     let host = host();
     for (input, child) in [
@@ -82,11 +149,13 @@ fn steering_requires_text_and_stop_retains_compatibility() {
             .unwrap_err();
         assert!(error.contains("Usage: /agents <id> steer <message>"));
     }
-    host.call_command(
-        "agents",
-        json!({"session":"main", "raw_input":"a2 steer keep  spaces\nand lines"}),
-    )
-    .unwrap();
+    let result = host
+        .call_command(
+            "agents",
+            json!({"session":"main", "raw_input":"a2 steer keep  spaces\nand lines"}),
+        )
+        .unwrap();
+    assert_eq!(result.message, "User steering sent to subagent a2");
     for input in ["a2 stop", "stop grandchild-full", "stop a2", "stop"] {
         let result = host
             .call_command("agents", json!({"session":"main", "raw_input":input}))
@@ -117,6 +186,46 @@ fn steering_requires_text_and_stop_retains_compatibility() {
     assert!(choices.contains(&"a2 steer".into()));
     assert!(choices.contains(&"stop a2".into()));
     assert!(!choices.contains(&"stop a1".into()));
+    assert!(choices.iter().all(|choice| !choice.contains("-full")));
+}
+
+#[test]
+fn stop_listing_uses_aliases_and_completion_falls_back_without_aliases() {
+    let mut host = host();
+    host.load(
+        "active",
+        r#"
+        rness.subagents.list = function()
+          return {
+            {alias='a1', session='child-full', parent='main', depth=1, running=true},
+            {alias='a2', session='grandchild-full', parent='child-full', depth=2, running=true},
+          }
+        end
+    "#,
+    )
+    .unwrap();
+    let result = host
+        .call_command("agents", json!({"session":"main", "raw_input":"stop"}))
+        .unwrap();
+    assert!(result.message.contains("a1  depth=1"));
+    assert!(result.message.contains("a2  depth=2"));
+    assert!(!result.message.contains("-full"));
+
+    host.load(
+        "legacy",
+        r#"
+        rness.subagents.list = function()
+          return {{session='child-full', parent='main', depth=1, running=true}}
+        end
+    "#,
+    )
+    .unwrap();
+    let choices = host
+        .complete_command("agents", json!({"session":"main"}))
+        .unwrap();
+    assert!(choices.contains(&"child-full".into()));
+    assert!(choices.contains(&"child-full steer".into()));
+    assert!(choices.contains(&"stop child-full".into()));
 }
 
 #[test]

@@ -566,14 +566,22 @@ impl LuaRuntime {
     }
 
     pub fn complete_command(&self, name: &str, context: serde_json::Value) -> Result<Vec<String>, String> {
+        self.complete_command_items(name, context).map(|items| items.into_iter().map(|(value, _)| value).collect())
+    }
+
+    pub fn complete_command_items(&self, name: &str, context: serde_json::Value) -> Result<Vec<(String, String)>, String> {
         if !self.commands.contains_key(name) { return Err(format!("command unavailable: {name}")); }
         let Some(key) = self.command_completers.get(name) else {
-            return Ok(self.command_metadata(name).1.into_iter().map(|(value, _)| value).collect());
+            return Ok(self.command_metadata(name).1);
         };
         let run: Function = self.lua.registry_value(key).map_err(|e| e.to_string())?;
         let context = self.lua.to_value(&context).map_err(|e| e.to_string())?;
         let result: Table = run.call(context).map_err(|e| e.to_string())?;
-        result.sequence_values::<String>().collect::<mlua::Result<Vec<_>>>().map_err(|e| e.to_string())
+        result.sequence_values::<LuaValue>().map(|item| match item? {
+            LuaValue::String(value) => Ok((value.to_str()?.to_owned(), String::new())),
+            LuaValue::Table(item) => Ok((item.get::<String>("value")?, item.get::<Option<String>>("description")?.unwrap_or_default())),
+            _ => Err(mlua::Error::runtime("completion must be a string or {value, description}")),
+        }).collect::<mlua::Result<Vec<_>>>().map_err(|e| e.to_string())
     }
 
     pub fn call_command(&self, name: &str, context: serde_json::Value) -> Result<rness_engine::interaction::CommandResult, String> {
@@ -1433,6 +1441,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         Ok(context)
     })?)?;
     let commands = lua.create_table()?;
+    commands.set("completion_descriptions", true)?;
     let names = lua.create_table()?;
     declarations.set("commands", names.clone())?;
     commands.set("register", lua.create_function(move |lua, spec: Table| {
