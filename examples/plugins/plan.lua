@@ -16,7 +16,9 @@ rness.commands.register {
     elseif arg ~= "status" then error("Usage: /plan [on|off|status]") end
     local state = rness.session.plan(ctx.session)
     local message = state.active and "Plan mode active" or "Plan mode inactive"
-    if state.pending ~= nil then message = message .. (state.pending and "; activation pending next step" or "; exit pending next step") end
+    if state.pending ~= nil then
+      message = state.pending and "Plan mode will activate on the next AI step" or "Plan mode will deactivate on the next AI step"
+    end
     return { message = message, data = state }
   end,
 }

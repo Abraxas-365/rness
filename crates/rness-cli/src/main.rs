@@ -74,7 +74,7 @@ struct Cli {
     #[arg(long, default_value = "allow")]
     approval: String,
 
-    /// List sessions and exit.
+    /// List sessions whose saved workspace is the current directory and exit.
     #[arg(long)]
     list: bool,
 
@@ -601,7 +601,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if cli.list {
-        for id in sessions.list()? {
+        for id in sessions_in_directory(sessions.store(), &cwd)? {
             println!("{id}");
         }
         return Ok(());
@@ -1450,6 +1450,65 @@ async fn run_tui(
     sessions.join(&session).await;
     eprintln!("session: {session}");
     Ok(())
+}
+
+/// Match the saved workspace, not the repository root or a path prefix.
+/// Canonicalization also recognizes alternate symlink spellings of the directory.
+fn sessions_in_directory(
+    store: &rness_engine::session::branch::SessionStore,
+    cwd: &std::path::Path,
+) -> anyhow::Result<Vec<SessionId>> {
+    let cwd = cwd.canonicalize()?;
+    let mut matches = Vec::new();
+    for id in store.list()? {
+        let Some(workspace) = store.workspace(&id)? else { continue; };
+        let workspace = std::path::Path::new(&workspace);
+        if workspace == cwd || workspace.canonicalize().is_ok_and(|path| path == cwd) {
+            matches.push(id);
+        }
+    }
+    Ok(matches)
+}
+
+#[cfg(test)]
+mod session_list_tests {
+    use super::*;
+    use rness_engine::session::branch::SessionStore;
+
+    #[test]
+    fn lists_only_sessions_saved_in_the_exact_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("expenses");
+        let nested = project.join("nested");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let local = store.create(Some(project.display().to_string())).unwrap();
+        store.create(Some(nested.display().to_string())).unwrap();
+        store.create(Some(other.display().to_string())).unwrap();
+        store.create(Some(dir.path().join("removed").display().to_string())).unwrap();
+        store.create(None).unwrap();
+
+        assert_eq!(sessions_in_directory(&store, &project).unwrap(), vec![local.session().clone()]);
+        assert!(sessions_in_directory(&store, dir.path()).unwrap().is_empty());
+        assert_eq!(store.list().unwrap().len(), 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_symlinked_workspace_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("expenses");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&project).unwrap();
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        let store = SessionStore::new(dir.path().join("sessions"));
+        let session = store.create(Some(alias.display().to_string())).unwrap();
+
+        assert_eq!(sessions_in_directory(&store, &project).unwrap(), vec![session.session().clone()]);
+        assert_eq!(sessions_in_directory(&store, &alias).unwrap(), vec![session.session().clone()]);
+    }
 }
 
 /// Command results can request only these session-scoped presentation routes.

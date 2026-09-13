@@ -153,7 +153,7 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 | One headless prompt | `rness -m chatgpt/gpt-6-astra --reasoning high -p "Explain this project"` |
 | Resume a session | `rness -s SESSION_ID` |
 | Resume with a prompt | `rness -s SESSION_ID -p "Continue the implementation"` |
-| List saved sessions | `rness --list` |
+| List saved sessions for the current directory | `rness --list` |
 | HTTP/SSE server | `rness --serve 127.0.0.1:7777 -m chatgpt/gpt-6-astra --reasoning high` |
 | Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
 | One-off OpenAI-compatible connection | `rness --route local=http://localhost:8000/v1,none -m local/YOUR_MODEL` |
@@ -250,7 +250,7 @@ Reasoning effort is not a universal model capability. Do not assume every model 
 | `--instructions NAMES` | Comma-separated instruction filenames in precedence order; default: `AGENTS.md,CLAUDE.md`. Use `none` to disable. |
 | `--instructions-bytes BYTES` | Instruction baseline byte budget; default: `65536`. |
 | `--serve ADDR` | Run the HTTP/SSE service instead of the TUI. |
-| `--list` | List sessions and exit. |
+| `--list` | List sessions whose saved workspace matches the current directory and exit (not the entire repository or subdirectories; sessions without a saved workspace are omitted). |
 | `-h`, `--help` | Show the current CLI reference. |
 | `-V`, `--version` | Print the installed version. |
 
