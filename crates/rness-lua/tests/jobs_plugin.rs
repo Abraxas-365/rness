@@ -48,6 +48,25 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
 }
 
 #[tokio::test]
+async fn statusline_shows_background_agents_without_total_running_agent_count() {
+    let host = LuaHost::spawn().unwrap();
+    host.load("stub", r#"
+        rness.session = {usage=function() return {input=0} end}
+        rness.subagents = {list=function()
+          return {{session='child',running=true}}
+        end}
+    "#).await.unwrap();
+    host.load("statusline", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
+    host.fire_hook("turn_start", json!({"session":"parent"}));
+    host.fire_hook("turn_start", json!({"session":"child"}));
+    let text = host.status(json!({"session":"parent","model":"test"}))
+        .await.unwrap().to_string();
+    assert!(text.contains("working"), "{text}");
+    assert!(text.contains("1 bg agent"), "{text}");
+    assert!(!text.contains("2 agents"), "{text}");
+}
+
+#[tokio::test]
 async fn jobs_command_lists_inspects_and_stops_only_explicit_ids() {
     let host = LuaHost::spawn().unwrap();
     host.load("stub", r#"

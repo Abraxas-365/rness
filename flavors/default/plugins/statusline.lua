@@ -115,7 +115,6 @@ rness.ui.statusline = {
       local spin = frames[(secs % #frames) + 1]
       parts[#parts + 1] = { text = spin .. " " .. (act or "working"), style = { fg = "#83a598" } }
       parts[#parts + 1] = { text = tostring(secs) .. "s" }
-      parts[#parts + 1] = { text = count > 1 and (count .. " agents") or "" }
     end
     parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
     append_usage(parts, ctx.session)

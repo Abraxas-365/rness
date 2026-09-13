@@ -53,9 +53,11 @@ fn project(child: &mut ChildRead, events: &[Envelope], running: bool) {
     for event in events {
         match &event.event {
             SessionEvent::RequestConfig(config) => {
-                if let Some(agent) = &config.agent {
-                    child.info.name = agent.name.clone();
-                }
+                child.info.name = config
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.name.clone())
+                    .unwrap_or_else(|| "subagent".into());
             }
             SessionEvent::UserMessage(message)
                 if child.info.task.is_empty() && message.source.is_none() =>
@@ -413,6 +415,39 @@ mod tests {
             at: String::new(),
             event,
         }
+    }
+
+    #[test]
+    fn config_projection_clears_inherited_role_and_preserves_named_roles() {
+        use rness_protocol::events::{AgentSnapshot, CallConfig};
+
+        let named_config = |name: &str| CallConfig {
+            agent: Some(AgentSnapshot {
+                name: name.into(),
+                instructions: String::new(),
+                tools: None,
+            }),
+            ..CallConfig::default()
+        };
+        let inherited = event(1000, SessionEvent::RequestConfig(named_config("coding")));
+        let unnamed = event(2000, SessionEvent::RequestConfig(CallConfig::default()));
+
+        // Cover both initial history replay and incremental drawer refreshes.
+        let mut replayed = child("continuable");
+        project(&mut replayed, &[inherited.clone(), unnamed.clone()], false);
+        assert_eq!(replayed.info.name, "subagent");
+
+        let mut refreshed = child("continuable");
+        project(&mut refreshed, &[inherited], false);
+        assert_eq!(refreshed.info.name, "coding");
+        project(&mut refreshed, &[unnamed], false);
+        assert_eq!(refreshed.info.name, "subagent");
+        project(
+            &mut refreshed,
+            &[event(3000, SessionEvent::RequestConfig(named_config("scout")))],
+            false,
+        );
+        assert_eq!(refreshed.info.name, "scout");
     }
 
     #[test]
