@@ -1,39 +1,78 @@
 <div align="center">
 
+<img src="docs/assets/rness-banner.svg" alt="Rness — Your terminal. Your models. Your agent. A Gruvbox-inspired illustration of a configurable coding workflow." width="1200" />
+
 # Rness
 
-### Your terminal. Your models. Your agent.
+**Bring your editor mindset to your coding agent.**
 
-A terminal-first coding agent with a Rust engine and a Lua-configurable workflow.<br>
-**Bring the same opinionated setup to your AI that you bring to your editor.**
+A terminal-first coding agent with a Rust engine and a Lua-configurable workflow.<br />
+Choose the models. Shape the interface. Build your own way of working.
 
-[Get started](#get-started) · [Make it yours](#make-it-yours) · [Documentation](docs/README.md) · [Examples](examples/) · [Contributing](#contributing)
+<p>
+  <a href="rust-toolchain.toml"><img src="https://img.shields.io/badge/Engine-Rust-d65d0e?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust engine" /></a>
+  <a href="docs/guides/configuration/init-lua.md"><img src="https://img.shields.io/badge/Extensions-Lua-83a598?style=flat-square&amp;logo=lua&amp;logoColor=white" alt="Lua extensions" /></a>
+  <a href="flavors/default/"><img src="https://img.shields.io/badge/Default_flavor-Gruvbox-fabd2f?style=flat-square" alt="Gruvbox default flavor" /></a>
+  <a href="docs/project/known-limitations.md"><img src="https://img.shields.io/badge/Status-Early_stage-bdae93?style=flat-square" alt="Early-stage software" /></a>
+</p>
 
-<sub>Rust engine / Lua extensions / Gruvbox default / Explicit configuration</sub>
+**[Get started](#get-started)** &nbsp; · &nbsp;
+**[Make it yours](#make-it-yours)** &nbsp; · &nbsp;
+**[Read the docs](docs/README.md)** &nbsp; · &nbsp;
+**[Explore examples](examples/)** &nbsp; · &nbsp;
+**[Contribute](#contributing)**
 
 </div>
 
 ---
 
+## Your setup is the product
+
 **The Neovim of coding agents.** Not because it copies your editor—but because you should own the setup. Choose the model, define specialist agents, remap keys, change the tool cards, and load exactly the plugins you want.
 
-Start with the included Gruvbox flavor. Keep what you like. Rewrite the rest.
+Start with the included **Gruvbox flavor**. Keep what you like. Rewrite the rest.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+<h3>01 · Own the workflow</h3>
+<p>Configure agents, actions, keybindings, hooks, and presentation in Lua. Build a setup—not just a system prompt.</p>
+</td>
+<td width="50%" valign="top">
+<h3>02 · Build the missing pieces</h3>
+<p>Add tools, slash commands, and terminal views through plugins. Extend the experience without modifying the Rust engine.</p>
+</td>
+</tr>
+<tr>
+<td width="50%" valign="top">
+<h3>03 · Choose your specialists</h3>
+<p>Define the roster, instructions, model profiles, and tool access. Generic children are off by default: delegation uses your named roles.</p>
+</td>
+<td width="50%" valign="top">
+<h3>04 · Compose, don't conform</h3>
+<p>Session pickers, plan review, task views, and agent controls are Lua plugins. Load only what you want—or replace it with your own.</p>
+</td>
+</tr>
+</table>
+
+**Rust handles the mechanisms. Lua shapes the experience. You own the decisions.**
+
+If you enjoy maintaining your editor's dotfiles, rness brings that same approach to your coding agent—including the responsibility to review your plugins and configuration changes.
 
 > [!IMPORTANT]
 > **Early-stage software.** Configuration and extension APIs are evolving. Read the [known limitations](docs/project/known-limitations.md) and review changes before upgrading.
 
-## Why rness?
+## From your terminal to your workflow
 
-**Your coding agent should adapt to how you work—not the other way around.** rness is for developers who want to build their own setup, not just customize a prompt.
-
-| You want to… | rness gives you… |
+| Start with | Make it yours |
 | :--- | :--- |
-| **Own the workflow** | Lua configuration for agents, plugins, actions, keybindings, hooks, and presentation. |
-| **Build the missing pieces** | Add your own tools, slash commands, and terminal views through Lua plugins. Extend the workflow without modifying the Rust engine. |
-| **Decide who does the work** | Define the roles available for delegation, their instructions, model profiles, and tool access. Generic children are off by default: the agent must choose from your roster, not create an unnamed substitute. |
-| **Compose your agent from plugins** | Session pickers, plan review, task views, and agent controls are Lua plugins—not a fixed workflow. Load only what you want, change how it works, or replace it with your own. |
+| **A model connection** | Anthropic, ChatGPT, OpenRouter, or local Ollama; choose credentials and model profiles explicitly |
+| **A principal agent** | Configure its instructions and the specialist roles available for delegation |
+| **A terminal interface** | Tune colors, message cards, keybindings, slash commands, and plugin views |
+| **A durable session** | Resume work, manage branches, and control the context sent to the model |
+| **The mode you need** | Interactive TUI, headless prompts, or an HTTP/SSE interface |
 
-**Rust handles the mechanisms. Lua lets you shape the experience.** You take responsibility for your setup, including reviewing plugins and configuration changes. If you enjoy maintaining your editor's dotfiles, rness brings that same approach to your coding agent.
+**[Browse the default flavor →](flavors/default/)** &nbsp; **[Understand the engine →](docs/architecture.md)**
 
 ## Get started
 
@@ -141,6 +180,9 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 > [!WARNING]
 > The default approval policy is `allow`: sensitive tools run without confirmation. Add `--approval ask` to request approval, or `--approval never` to reject sensitive tools. Neither is an OS sandbox.
 
+<details>
+<summary><strong>Launch modes · interactive, headless, sessions, and server</strong></summary>
+
 ### Ways to launch Rness
 
 | Mode | Command |
@@ -160,6 +202,11 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 
 Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
 
+</details>
+
+<details>
+<summary><strong>File references · opt into browsing beyond the workspace</strong></summary>
+
 ### External file references
 
 The `references` plugin keeps ordinary `@filename` searches inside the workspace.
@@ -178,6 +225,11 @@ All three options default to false. External paths browse one directory level at
 a time, without recursively indexing your home directory or attaching file contents.
 Directory symlinks are not traversed. Parent traversal inside home or absolute paths
 also requires `allow_parent`.
+
+</details>
+
+<details>
+<summary><strong>Model controls · switch profiles and tune request options</strong></summary>
 
 ### Switching models inside a session
 
@@ -234,6 +286,8 @@ rness -m chatgpt/gpt-6-astra --reasoning high --max-output-tokens 8192
 | `--approval allow\|ask\|never` | Allow tools without questions, ask for sensitive tools, or reject sensitive tools. Default: `allow`. |
 
 Reasoning effort is not a universal model capability. Do not assume every model supports every level, manual thinking, or temperature; use options supported by your selected endpoint.
+
+</details>
 
 <details>
 <summary><strong>More CLI options and shortcuts</strong></summary>

@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="400" viewBox="0 0 1200 400" role="img" aria-labelledby="title description">
+  <title id="title">rness — Your terminal. Your models. Your agent.</title>
+  <desc id="description">A Gruvbox-inspired banner with a gold rness wordmark and an illustrative Lua configuration editor. Rust engine, Lua workflow, your rules. The editor illustration is not an application screenshot.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#504945" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="400" rx="18" fill="#1d2021"/>
+  <rect width="1200" height="400" rx="18" fill="url(#grid)" opacity="0.22"/>
+  <path d="M54 61l10 10-10 10M74 81h15" fill="none" stroke="#b8bb26" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="105" y="77" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700" letter-spacing="3" fill="#bdae93">BUILT FOR YOUR WAY OF WORKING</text>
+  <text x="48" y="200" font-family="monospace" font-size="108" font-weight="700" letter-spacing="-6" fill="#fabd2f">rness<tspan fill="#b8bb26">_</tspan></text>
+  <text x="56" y="250" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="600" fill="#fbf1c7">Your terminal. Your models. Your agent.</text>
+  <text x="56" y="286" font-family="Arial, Helvetica, sans-serif" font-size="16" fill="#bdae93">The coding agent you configure like your editor.</text>
+  <text x="56" y="353" font-family="monospace" font-size="12" letter-spacing="1" fill="#a89984">RUST ENGINE <tspan fill="#665c54">/</tspan> LUA WORKFLOW <tspan fill="#665c54">/</tspan> YOUR RULES</text>
+  <rect x="650" y="54" width="494" height="292" rx="12" fill="#282828" stroke="#504945"/>
+  <path d="M662 54h470a12 12 0 0 1 12 12v30H650V66a12 12 0 0 1 12-12" fill="#32302f"/>
+  <circle cx="672" cy="75" r="5" fill="#fb4934"/>
+  <circle cx="690" cy="75" r="5" fill="#fabd2f"/>
+  <circle cx="708" cy="75" r="5" fill="#b8bb26"/>
+  <text x="1123" y="80" text-anchor="end" font-family="monospace" font-size="12" fill="#bdae93">~/.rness/init.lua</text>
+  <g font-family="monospace" font-size="15">
+    <g fill="#7c6f64" text-anchor="end">
+      <text x="681" y="130">1</text><text x="681" y="160">2</text><text x="681" y="190">3</text><text x="681" y="220">4</text><text x="681" y="250">5</text><text x="681" y="280">6</text>
+    </g>
+    <text x="702" y="130" fill="#928374">-- Keep what you like. Rewrite the rest.</text>
+    <text x="702" y="160" fill="#ebdbb2">rness.plugins.<tspan fill="#b8bb26">setup</tspan>({</text>
+    <text x="702" y="190" fill="#ebdbb2">  { name = <tspan fill="#b8bb26">"sessions"</tspan>, <tspan fill="#928374">-- ...</tspan></text>
+    <text x="702" y="220" fill="#ebdbb2">  { name = <tspan fill="#b8bb26">"branches"</tspan>, <tspan fill="#928374">-- ...</tspan></text>
+    <text x="702" y="250" fill="#ebdbb2">  { name = <tspan fill="#b8bb26">"tasks"</tspan>,    <tspan fill="#928374">-- ...</tspan></text>
+    <text x="702" y="280" fill="#ebdbb2">})</text>
+  </g>
+  <path d="M650 305h494" stroke="#504945"/>
+  <rect x="663" y="316" width="65" height="20" rx="3" fill="#b8bb26"/>
+  <text x="696" y="330" text-anchor="middle" font-family="monospace" font-size="11" font-weight="700" fill="#1d2021">NORMAL</text>
+  <text x="740" y="330" font-family="monospace" font-size="11" fill="#bdae93">explicit config. no hidden preset.</text>
+  <text x="1124" y="330" text-anchor="end" font-family="monospace" font-size="11" fill="#83a598">lua</text>
+</svg>
