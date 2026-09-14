@@ -547,6 +547,8 @@ pub struct PluginActionRequest {
 }
 
 pub struct App {
+    /// Optional host observer, updated atomically with actual UI session switches.
+    pub displayed_session: Option<Arc<std::sync::RwLock<SessionId>>>,
     pub input_epoch: Arc<std::sync::atomic::AtomicU64>,
     pub model: Model,
     pub slots: Slots,
@@ -570,6 +572,7 @@ pub struct App {
 impl App {
     pub fn new(model: Model, slots: Slots, backend: Arc<dyn Backend>) -> Self {
         Self {
+            displayed_session: None,
             model,
             slots,
             theme: Theme::default(),
@@ -1489,6 +1492,8 @@ impl App {
                 self.slots.broadcast(&ctx, &name, &payload);
             }
             Action::SwitchSession(session) => {
+                let observer = self.displayed_session.clone();
+                let mut displayed = observer.as_ref().map(|state| state.write().unwrap());
                 if session == self.model.session {
                     return;
                 }
@@ -1498,6 +1503,7 @@ impl App {
                     .remove(&session)
                     .unwrap_or_else(|| Model::new(session, self.model.model_name.clone()));
                 let previous = std::mem::replace(&mut self.model, next);
+                if let Some(ref mut displayed) = displayed { **displayed = self.model.session.clone(); }
                 if previous.busy || previous.live.is_some() {
                     self.background_models
                         .insert(previous.session.clone(), previous);
@@ -1850,6 +1856,18 @@ mod tests {
             .unwrap()
             .unwrap();
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn displayed_session_observer_tracks_actual_switch() {
+        let mut app = App::new(Model::new("s1".into(), "m".into()), Slots::default(),
+            Arc::new(FakeBackend { history: prior_history("s1") }));
+        let displayed = Arc::new(std::sync::RwLock::new("s1".to_string()));
+        app.displayed_session = Some(displayed.clone());
+        app.apply(Action::SwitchSession("s2".into()));
+        assert_eq!(*displayed.read().unwrap(), app.model.session);
+        app.apply(Action::SwitchSession("s1".into()));
+        assert_eq!(*displayed.read().unwrap(), "s1");
     }
 
     #[test]

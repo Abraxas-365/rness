@@ -26,6 +26,30 @@ rness --help
 
 Make sure Cargo's binary directory is on your `PATH` if you choose installation.
 
+## Experimental local submission support
+
+Standard builds omit the local control endpoint and `rness send`. To opt in when
+installing from this checkout (preserving existing configuration):
+
+```sh
+./install.sh --experimental-control
+# To replace an existing ~/.local/bin/rness:
+./install.sh --experimental-control --replace-binary
+```
+
+For a manual build or Cargo installation, enable the feature explicitly:
+
+```sh
+cargo build --release -p rness-cli --features experimental-control
+cargo install --path crates/rness-cli --features experimental-control
+```
+
+Verify the executable you installed with `rness --help` and `rness send --help`.
+A listener still starts only when you pass `--control-socket`. See the
+[experimental local submission guide](../control-socket.md) for editor/script
+usage, durable acceptance versus execution guarantees, recovery and limits.
+Windows named-pipe support is implemented but not yet validated on Windows.
+
 ## Verify the checkout
 
 ```sh

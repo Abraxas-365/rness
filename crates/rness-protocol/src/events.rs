@@ -321,6 +321,7 @@ pub struct UserMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageSource {
+    ExternalPrompt { id: String },
     JobCompletion { id: String },
     /// Workspace instruction baseline (AGENTS.md chain). `identity`
     /// fingerprints discovery inputs+content: a visible baseline with a

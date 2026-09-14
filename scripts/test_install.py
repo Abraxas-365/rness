@@ -10,6 +10,23 @@ REPO = Path(__file__).resolve().parents[1]
 
 
 class InstallerTests(unittest.TestCase):
+    def test_experimental_prebuilt_requires_matching_opt_in(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "binary"
+            binary.write_text("#!/bin/sh\nprintf '%s\\n' '--control-socket'\n")
+            binary.chmod(0o755)
+            env = dict(os.environ, HOME=str(root))
+            command = ["bash", str(REPO / "install.sh"), "--binary", str(binary)]
+            self.assertNotEqual(subprocess.run(command, env=env, capture_output=True).returncode, 0)
+            self.assertFalse((root / ".local/bin/rness").exists())
+            result = subprocess.run(command + ["--experimental-control"], env=env, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            binary.write_text("#!/bin/sh\nexit 42\n")
+            self.assertNotEqual(subprocess.run(command + ["--replace-binary"], env=env, capture_output=True).returncode, 0)
+            binary.write_text("#!/bin/sh\nexit 0\n")
+            self.assertNotEqual(subprocess.run(command + ["--replace-binary", "--experimental-control"], env=env, capture_output=True).returncode, 0)
+
     def test_install_upgrade_and_preserve_user_configuration(self):
         with tempfile.TemporaryDirectory(prefix="rness install ") as temporary:
             root = Path(temporary)
@@ -36,7 +53,7 @@ class InstallerTests(unittest.TestCase):
             (config / "init.lua").write_text("-- user configuration\n")
             (config / "private.txt").write_text("keep me")
             snapshot = {str(p.relative_to(config)): p.read_bytes() for p in config.rglob("*") if p.is_file()}
-            binary.write_text("#!/bin/sh\nexit 42\n")
+            binary.write_text('#!/bin/sh\nif [ "$1" = "--help" ]; then exit 0; fi\nexit 42\n')
             self.assertNotEqual(run().returncode, 0)
             self.assertNotEqual(installed.read_bytes(), binary.read_bytes())
             result = run("--replace-binary")

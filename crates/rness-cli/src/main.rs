@@ -10,6 +10,12 @@
 
 mod activity_recovery;
 mod agent_monitor;
+#[cfg(feature = "experimental-control")]
+mod control_socket;
+#[cfg(feature = "experimental-control")]
+mod control_journal;
+#[cfg(all(feature = "experimental-control", windows))]
+mod control_windows;
 
 use std::sync::Arc;
 
@@ -83,6 +89,11 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     serve: Option<String>,
 
+    /// Experimental native-TUI submission endpoint: private Unix socket or local Windows pipe.
+    #[cfg(feature = "experimental-control")]
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["serve", "prompt", "list"])]
+    control_socket: Option<std::path::PathBuf>,
+
     /// Workspace instruction files, comma-separated in precedence order,
     /// discovered from the project root (.git) down to the cwd and
     /// injected as durable context (re-injected after compaction folds
@@ -129,6 +140,9 @@ struct Cli {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Experimental: submit chat text to a running native TUI, without keyboard injection.
+    #[cfg(feature = "experimental-control")]
+    Send(control_socket::SendArgs),
     /// Install Lua packages without activating or executing them.
     Plugin {
         #[command(subcommand)]
@@ -209,6 +223,14 @@ enum AuthAction {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "experimental-control")]
+    if cli.control_socket.is_some() && cli.command.is_some() { bail!("--control-socket is only supported in native TUI mode"); }
+    #[cfg(feature = "experimental-control")]
+    if let Some(Command::Send(args)) = cli.command { return control_socket::send(args).await; }
+    #[cfg(feature = "experimental-control")]
+    let control_path = cli.control_socket.clone();
+    #[cfg(not(feature = "experimental-control"))]
+    let control_path = None;
 
     // Interactive mode owns the terminal: a stray stderr line would be
     // painted over the TUI. Log to ~/.rness/log instead; headless and
@@ -248,6 +270,8 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(command) = cli.command {
         return match command {
+            #[cfg(feature = "experimental-control")]
+            Command::Send(_) => unreachable!("handled before provider/config initialization"),
             Command::Auth { action } => run_auth(action).await,
             Command::Plugin { action } => run_plugin(action),
         };
@@ -671,7 +695,7 @@ async fn main() -> anyhow::Result<()> {
             None
         };
         // Run the TUI over protocol frames.
-        return run_tui(kernel, sessions, subagents, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone(), startup.messagebox.clone())
+        return run_tui(kernel, sessions, subagents, session, selection.model.clone(), questions, startup.question_overlay.priority, approval_rx, lua, installed_lua_tools, startup.colorschemes.clone(), startup.colorscheme.clone(), startup.promptbox.clone(), startup.messagebox.clone(), control_path)
             .await;
     };
 
@@ -957,6 +981,7 @@ async fn run_tui(
     selected_scheme: Option<String>,
     promptbox_config: serde_json::Value,
     messagebox_config: serde_json::Value,
+    control_path: Option<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -1391,6 +1416,7 @@ async fn run_tui(
                                             Some(name) => unload = Some(name.to_owned()),
                                             None => error = Some("plugin:unload requires payload.name".into()),
                                         }
+
                                     } else if name == "session:switch" {
                                         if let Some(id) = payload.get("session").and_then(|v| v.as_str()) {
                                             *watched.write().unwrap() = id.to_string();
@@ -1425,6 +1451,8 @@ async fn run_tui(
     };
 
     let mut app = App::new(Model::new(session.clone(), model_name), slots, backend);
+    let displayed = Arc::new(std::sync::RwLock::new(session.clone()));
+    app.displayed_session = Some(displayed.clone());
     app.apply(rness_tui::app::Action::Custom("input:promptbox-config".into(), promptbox_config));
     app.theme.validate_messagebox(&messagebox_config).map_err(anyhow::Error::msg)?;
     app.apply(rness_tui::app::Action::Custom("chat:messagebox-config".into(), messagebox_config));
@@ -1436,7 +1464,14 @@ async fn run_tui(
     app.plugin_keymap = plugin_keymap;
     app.plugin_actions = Some(plugin_action_tx);
     app.keymap = keymap;
-    rness_tui::app::run(app, rx, approval_rx, host_rx).await?;
+    #[cfg(feature = "experimental-control")]
+    let control = control_path.as_deref().map(|path| control_socket::start(path, sessions.clone(), displayed, host_tx.clone())).transpose()?;
+    #[cfg(not(feature = "experimental-control"))]
+    let _ = control_path;
+    let result = rness_tui::app::run(app, rx, approval_rx, host_rx).await;
+    #[cfg(feature = "experimental-control")]
+    if let Some(control) = control { control.shutdown().await; }
+    result?;
     plugin_action_task.abort();
     plugin_catalog_task.abort();
     status_task.abort();

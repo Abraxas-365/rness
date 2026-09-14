@@ -19,6 +19,32 @@ use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
+async fn external_delivery_is_idle_only_deduplicated_across_restart_and_teardown_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Scripted::gated(vec![
+        StepOutcome::Committed(assistant("one", StopReason::EndTurn, vec![])),
+        StepOutcome::Committed(assistant("two", StopReason::EndTurn, vec![])),
+    ], gate.clone());
+    let svc = service(dir.path(), provider);
+    let sid = svc.create(None).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("busy")).unwrap();
+    assert!(!svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
+    gate.add_permits(1); svc.join(&sid).await;
+    assert!(svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
+    assert!(svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
+    gate.add_permits(1); svc.join(&sid).await;
+    svc.begin_teardown(&sid);
+    assert!(!svc.deliver_external_once(&sid, "new", "do not wake".into()).unwrap());
+    drop(svc);
+    let resumed = service(dir.path(), Scripted::new(vec![]));
+    assert!(resumed.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
+    assert_eq!(resumed.store().history(&sid).unwrap().iter().filter(|event| matches!(&event.event,
+        SessionEvent::UserMessage(m) if matches!(&m.source, Some(MessageSource::ExternalPrompt { id }) if id == "external"))).count(), 1);
+    assert_eq!(resumed.phase(&sid), Phase::Idle);
+}
+
+#[tokio::test]
 async fn job_completion_id_survives_lost_ack_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done",StopReason::EndTurn,vec![]))]);

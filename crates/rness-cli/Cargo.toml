@@ -9,6 +9,10 @@ license.workspace = true
 name = "rness"
 path = "src/main.rs"
 
+[features]
+default = []
+experimental-control = []
+
 [dependencies]
 rness-kernel.workspace = true
 rness-protocol.workspace = true
@@ -25,6 +29,7 @@ keyring.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 anyhow.workspace = true
@@ -35,6 +40,9 @@ tracing-appender.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 textwrap.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [dev-dependencies]
 tokio-util.workspace = true

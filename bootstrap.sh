@@ -18,6 +18,7 @@ Environment:
 
 All remaining arguments are passed to install.sh, for example:
   --replace-binary
+  --experimental-control     Build opt-in experimental local submission support
   --bin-dir DIR
   --config-dir DIR
   --binary FILE

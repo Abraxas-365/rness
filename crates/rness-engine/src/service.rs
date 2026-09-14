@@ -801,6 +801,28 @@ impl SessionService {
         self.send_or_retry(session, UserIntent::Followup, vec![], true, Notice::None, None)
     }
 
+    /// Idle-only admission for a durable external queue. The ID is committed in
+    /// the same fsynced envelope as the prompt; replay never submits it twice.
+    /// false means busy: the caller must retain its durable pending record.
+    pub fn deliver_external_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
+        if text.trim().is_empty() || text.trim_start().starts_with('/') {
+            return Err(ServiceError::InvalidConfig("external prompts must be nonempty chat text, not commands".into()));
+        }
+        let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let live = self.live(session);
+        let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        if self.store.history(session)?.iter().any(|e| matches!(&e.event,
+            SessionEvent::UserMessage(m) if matches!(&m.source, Some(MessageSource::ExternalPrompt { id: key }) if key == id))) {
+            return Ok(true);
+        }
+        if self.closing.lock().unwrap().contains(session) || live.inbox.lock().unwrap().phase() != Phase::Idle {
+            return Ok(false);
+        }
+        self.send_or_retry_sourced(session, UserIntent::Followup, vec![ContentPart::Text { text }], false,
+            Notice::None, Some((activity, operation)), Some(MessageSource::ExternalPrompt { id: id.into() }))?;
+        Ok(true)
+    }
+
     pub async fn notify_job_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let live = self.live(session);
@@ -818,7 +840,7 @@ impl SessionService {
         self.send_or_retry_sourced(session,intent,content,retry,notice,reservation,None)
     }
     fn send_or_retry_sourced(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, notice: Notice, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>, source: Option<rness_protocol::events::MessageSource>) -> Result<Disposition, ServiceError> {
-        if notice == Notice::None {
+        if notice == Notice::None && !matches!(source, Some(MessageSource::ExternalPrompt { .. })) {
             if let [ContentPart::Text { text }] = content.as_slice() {
                 if let Some(command) = self.prepare_command(session, text)? {
                     return command.execute(self);

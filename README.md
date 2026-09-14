@@ -281,6 +281,11 @@ Install an executable you have already built:
 
 Add `--replace-binary` if an executable already exists at the destination.
 
+- `--experimental-control` opts into the experimental local submission API
+  (`--control-socket` and `rness send`); normal builds/installations omit it.
+  Runtime listeners still require an explicit flag. See the
+  [experimental control guide](docs/guides/control-socket.md) for durable queue
+  semantics, limits, and unvalidated Windows named-pipe support.
 - `--bin-dir DIR` changes the binary destination.
 - `--config-dir DIR` changes where the installer copies the flavor, **not** the runtime configuration lookup: rness still reads `$HOME/.rness`.
 - Existing configuration is preserved, including during binary upgrades.

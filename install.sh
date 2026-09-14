@@ -7,12 +7,14 @@ bin_dir="${HOME:?HOME must be set}/.local/bin"
 config_dir="$HOME/.rness"
 binary=""
 replace_binary=false
+experimental_control=false
 usage() {
-  printf '%s\n' 'Usage: ./install.sh [--bin-dir DIR] [--config-dir DIR] [--binary FILE] [--replace-binary]' \
+  printf '%s\n' 'Usage: ./install.sh [--bin-dir DIR] [--config-dir DIR] [--binary FILE] [--replace-binary] [--experimental-control]' \
     'Builds the release binary with Cargo unless --binary is supplied.' \
     'Copies the default flavor only when the configuration directory does not exist.' \
     'Existing configuration is never merged, replaced, or deleted.' \
-    '--replace-binary explicitly permits replacing an existing rness executable.'
+    '--replace-binary explicitly permits replacing an existing rness executable.' \
+    '--experimental-control builds the experimental local submission API (off by default).'
 }
 while (($#)); do
   case "$1" in
@@ -24,6 +26,7 @@ while (($#)); do
         --binary) binary="$2" ;;
       esac
       shift 2 ;;
+    --experimental-control) experimental_control=true; shift ;;
     --replace-binary) replace_binary=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) printf 'Unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -48,10 +51,21 @@ fi
 if [[ -z "$binary" ]]; then
   command -v cargo >/dev/null || { printf 'Install Rust/Cargo first, or supply --binary FILE.\n' >&2; exit 1; }
   # An explicit target directory avoids guessing Cargo workspace overrides.
-  cargo build --manifest-path "$repo/Cargo.toml" --locked --release --package rness-cli --target-dir "$repo/target"
+  features=(--no-default-features)
+  if [[ "$experimental_control" == true ]]; then features+=(--features experimental-control); fi
+  cargo build --manifest-path "$repo/Cargo.toml" --locked --release --package rness-cli --target-dir "$repo/target" "${features[@]}"
   binary="$repo/target/release/rness"
 fi
 [[ -f "$binary" && -x "$binary" ]] || { printf 'Not an executable file: %s\n' "$binary" >&2; exit 1; }
+# A prebuilt binary must match the installation opt-in; do not silently enable it.
+help_output=$("$binary" --help) || { printf 'Could not inspect binary capabilities (--help failed).\n' >&2; exit 2; }
+if [[ "$help_output" == *--control-socket* ]]; then
+  if [[ "$experimental_control" != true ]]; then
+    printf 'This binary includes experimental control. Pass --experimental-control explicitly.\n' >&2; exit 2
+  fi
+elif [[ "$experimental_control" == true ]]; then
+  printf 'Supplied binary lacks experimental control support.\n' >&2; exit 2
+fi
 mkdir -p "$bin_dir"
 staged=$(mktemp "$bin_dir/.rness-install.XXXXXX")
 trap 'rm -f "$staged"' EXIT
