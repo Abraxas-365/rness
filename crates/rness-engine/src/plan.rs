@@ -5,9 +5,19 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PlanConfig { pub guidance: String }
+pub struct PlanConfig { pub guidance: String, pub review: PlanReviewConfig }
+#[path = "plan_ui.rs"]
+mod ui;
+pub use ui::PlanReviewConfig;
+
+pub fn validate_plan(plan: &str) -> Result<(), String> {
+    if !plan.trim().strip_prefix("# ").is_some_and(|s| !s.lines().next().unwrap_or("").trim().is_empty()) {
+        return Err("provide a complete Markdown plan starting with a # heading".into());
+    }
+    Ok(())
+}
 impl Default for PlanConfig {
-    fn default() -> Self { Self { guidance: "Plan mode is active. Investigate and discuss the work with the user. Present the complete implementation plan using exit_plan_mode before starting implementation. Approval allows execution from your next step. This guidance does not change tool permissions.".into() } }
+    fn default() -> Self { Self { guidance: "Plan mode is active. Investigate and discuss the work with the user. Present the complete implementation plan using exit_plan_mode before starting implementation. Approval allows execution from your next step. This guidance does not change tool permissions.".into(), review: PlanReviewConfig::default() } }
 }
 
 #[derive(Default)]
@@ -45,11 +55,12 @@ impl ExitPlan {
         #[serde(deny_unknown_fields)]
         struct Input { plan: String }
         let input: Input = serde_json::from_value(args).map_err(|e| e.to_string())?;
-        if !input.plan.trim().strip_prefix("# ").is_some_and(|s| !s.trim().is_empty()) { return Err("provide a complete Markdown plan starting with a # heading".into()); }
+        validate_plan(&input.plan)?;
         if !PlanState::from_history(&self.store.history(&session.into()).map_err(|e| e.to_string())?).active { return Err("exit_plan_mode requires active plan mode".into()); }
         if !self.questions.is_available() { return Err("no Questions frontend is available; plan mode remains active".into()); }
         use crate::questions::{Question, OptionItem, Request, Answers};
         let request = Request { session: session.into(), call: call.into(), questions: vec![Question {
+            plan_review: Some(self.config.review.clone()),
             id: "plan-review".into(), header: "Plan review".into(), question: "Approve this plan and leave plan mode?".into(), markdown: Some(input.plan), multi_select: false,
             options: vec![OptionItem { label: "Approve".into(), description: "Execute the plan from the next step".into() }, OptionItem { label: "Keep planning".into(), description: "Revise the plan using your feedback".into() }],
         }] };
@@ -67,7 +78,14 @@ impl ExitPlan {
         let answers: Answers = serde_json::from_str(&response).map_err(|e| e.to_string())?;
         let answer = answers.answers.iter().find(|answer| answer.id == "plan-review").ok_or("missing plan review answer")?;
         if answer.selected == ["Approve"] && answer.custom.is_none() {
-            Ok(("Plan approved. Leave plan mode at the next step and carry out the plan.".into(), PlanReview::Approved))
+            let output = match &answer.edited_markdown {
+                Some(plan) => {
+                    validate_plan(plan)?;
+                    format!("The user edited and approved the following plan. It replaces the original plan. Leave plan mode at the next step and carry out this version:\n\n{plan}")
+                }
+                None => "Plan approved. Leave plan mode at the next step and carry out the plan.".into(),
+            };
+            Ok((output, PlanReview::Approved))
         } else {
             Ok((format!("Keep planning. Revise and present the plan again. Feedback: {}", answer.custom.as_deref().unwrap_or("")), PlanReview::KeepPlanning))
         }

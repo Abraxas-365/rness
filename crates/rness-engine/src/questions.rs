@@ -13,13 +13,20 @@ pub struct Question {
     pub id: String,
     pub question: String,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub markdown: Option<String>,
+    // Engine-owned metadata: ordinary AskUser input cannot select plan behavior.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub plan_review: Option<crate::plan::PlanReviewConfig>,
     #[serde(default)] pub header: String,
     #[serde(default)] pub options: Vec<OptionItem>,
     #[serde(default)] pub multi_select: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Answer { pub id: String, pub selected: Vec<String>, pub custom: Option<String> }
+pub struct Answer {
+    pub id: String, pub selected: Vec<String>, pub custom: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_markdown: Option<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Answers { pub answers: Vec<Answer> }
@@ -112,6 +119,13 @@ impl Questions {
             for selected in &answer.selected {
                 if !selections.insert(selected) || !question.options.iter().any(|o| &o.label == selected) { return Err("invalid selection".into()); }
             }
+            if let Some(plan) = &answer.edited_markdown {
+                if !question.plan_review.as_ref().is_some_and(|config| config.edit_enabled)
+                    || answer.selected != ["Approve"] || answer.custom.is_some() {
+                    return Err("edited Markdown requires plan approval with editing enabled".into());
+                }
+                crate::plan::validate_plan(plan)?;
+            }
             if answer.selected.is_empty() && answer.custom.as_ref().map_or(true, |s| s.trim().is_empty()) { return Err("empty answer".into()); }
         }
         let result = pending.remove(&key).unwrap().tx.send(answers).map_err(|_| "question cancelled".into());
@@ -173,9 +187,12 @@ mod tests {
             let worker = tokio::spawn(async move { registry.dispatch(&"s".into(), &[call], 1, &token).await });
             tokio::time::timeout(std::time::Duration::from_secs(2), async { while questions.pending().is_empty() { tokio::task::yield_now().await; } }).await.unwrap();
             assert!(questions.resolve("s", "c", Answers { answers: vec![] }).is_err());
+            assert!(questions.resolve("s", "c", Answers { answers: vec![Answer {
+                id: "q".into(), selected: vec!["A".into()], custom: None, edited_markdown: Some("# Not a plan review".into()),
+            }] }).is_err());
             assert_eq!(questions.pending().len(), 1);
             if cancel_it { cancel.cancel(); } else {
-                questions.resolve("s", "c", Answers { answers: vec![Answer { id: "q".into(), selected: vec!["A".into()], custom: None }] }).unwrap();
+                questions.resolve("s", "c", Answers { answers: vec![Answer { edited_markdown: None, id: "q".into(), selected: vec!["A".into()], custom: None }] }).unwrap();
             }
             let result = worker.await.unwrap();
             assert_eq!(result[0].is_error, cancel_it);

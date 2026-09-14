@@ -364,6 +364,7 @@ async fn bundled_plan_questions_dependencies_survive_reload_rollback_and_unload(
                     id: "plan-review".into(),
                     selected: vec!["Approve".into()],
                     custom: None,
+                    edited_markdown: None,
                 }],
             },
         )

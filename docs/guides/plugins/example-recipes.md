@@ -430,9 +430,62 @@ dependency with loaded consumers is blocked. A Questions frontend must still be
 available at review time; the headless check remains and missing availability never
 implies approval. Tasks is not required and permissions are unchanged.
 
-`rness.plan.enable { guidance = "..." }` accepts optional planning guidance;
-omitting it uses the native default. `rness.session.plan(id)` reads `{active,
-pending}` and `rness.session.plan(id, true_or_false)` selects the next mode.
+`rness.plan.enable` accepts optional planning guidance and a dedicated review UI:
+
+```lua
+rness.plan.enable {
+  -- guidance = "...", -- omit to keep the native planning guidance
+  review = {
+    title = "Plan review", width = 100, height = 30,
+    border = "rounded", padding = { left = 1, right = 1, top = 0, bottom = 0 },
+    show_help = true,
+    edit_enabled = true, approve_after_edit = true,
+    editor = { "nvim" }, -- or { "code", "--wait" }; omit for VISUAL, then EDITOR
+    labels = {
+      approve = "Approve", feedback = "Request changes",
+      edit = "Open in editor", edit_and_approve = "Edit & approve",
+      feedback_prompt = "Feedback",
+    },
+    keys = {
+      approve = "a", feedback = "r", edit = "e",
+      up = "up", down = "down", page_up = "pageup", page_down = "pagedown",
+      first = "home", last = "end", dismiss = "esc", cancel = "ctrl+c",
+      feedback_submit = "enter", feedback_back = "esc",
+    },
+    styles = { border = { fg = "#83a598" } },
+  },
+}
+```
+
+All fields are optional; the values above (except `editor` and `styles`) are the
+defaults. Edit this declaration in `plugins/plan.lua`, rather than enabling Plan
+again in a second plugin. Partial labels/keymaps keep omitted defaults. Dimensions
+are terminal cells; width/height clamp to the available terminal. Border, padding,
+and style names use the Questions UI vocabulary. Plan review styles are independent
+of ordinary AskUser. Invalid options, conflicting keys, and unusable dimensions
+are rejected at plugin load. Ctrl+C remains a cancellation safety binding.
+
+The review shows Markdown and the approve, feedback, and editor actions together,
+without the generic AskUser heading or a separate choices screen. Press `e` to
+open a temporary `.md` file. **A successful editor exit immediately approves the
+file's contents**, even if unchanged; no second approval is required. The edited
+plan replaces the original in the durable tool result seen by the agent. Save
+before exiting. Use a waiting editor command (`code --wait`, not just `code`);
+argv is executed directly, not through a shell. VISUAL/EDITOR are treated as an
+executable path; use the Lua argv for flags. The temporary file is removed afterward.
+To abort editing without approval, exit the editor with a failure status (e.g.
+Vim `:cq`). Missing editors, nonzero exits, unreadable files, or invalid Markdown
+leave the review open. Dismissed/cancelled/stale reviews never accept an editor
+completion. Set `approve_after_edit = false` to return to the edited preview for
+explicit approval instead, or `edit_enabled = false` to hide/disable editing.
+
+Remote frontends receive `plan_review` metadata with the question and may submit
+`edited_markdown` alongside `selected = { "Approve" }` (no custom feedback).
+Edited Markdown is accepted only for an editable plan review and must start with
+a nonempty `# ` heading; ordinary AskUser answers cannot attach edited plans.
+
+`rness.session.plan(id)` reads `{active, pending}` and
+`rness.session.plan(id, true_or_false)` selects the next mode.
 Selections remain in memory until the next uncancelled step boundary, where
 `plan/mode` is appended through the turn writer. A selection alone does not
 start a turn, survive restart, or enter a fork. Committed mode does survive.

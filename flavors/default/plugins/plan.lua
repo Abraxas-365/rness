@@ -3,7 +3,15 @@
 -- Dependencies are selected/enabled plugin names, not paths; they load first.
 -- Missing/disabled dependencies and cycles are rejected; unload Plan before Questions.
 -- Opt-in plan collaboration. The headless check still requires an available Questions frontend.
-rness.plan.enable()
+rness.plan.enable {
+  review = {
+    title = "Plan review", width = 100, height = 30, border = "rounded",
+    edit_enabled = true, approve_after_edit = true,
+    -- editor = { "nvim" }, -- otherwise use VISUAL, then EDITOR
+    -- GUI editors must wait: editor = { "code", "--wait" }
+    keys = { approve = "a", feedback = "r", edit = "e" },
+  },
+}
 rness.commands.register {
   name = "plan",
   description = "Select planning mode for the next step",

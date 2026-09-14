@@ -1,4 +1,5 @@
 use std::sync::Arc;
+mod plan;
 use rness_engine::questions::{Questions, Answers, Answer, Request, QuestionUiConfig};
 use rness_tui::keys::Chord;
 use ratatui::style::Style;
@@ -257,7 +258,7 @@ impl QuestionOverlay {
             self.drafts.retain(|key, _| pending.iter().any(|r| r.session == key.0 && r.call == key.1));
             let saved = self.drafts.remove(&key);
             self.key = Some(key); self.page = 0; self.cursor = 0; self.editing = false; self.error.clear(); self.scroll = if request.questions[0].markdown.is_some() { 1 } else { 0 };
-            self.answers = request.questions.iter().map(|q| Answer { id: q.id.clone(), selected: vec![], custom: None }).collect();
+            self.answers = request.questions.iter().map(|q| Answer { edited_markdown: None, id: q.id.clone(), selected: vec![], custom: None }).collect();
             if let Some((page, cursor, answers, editing)) = saved {
                 self.page = page; self.cursor = cursor; self.answers = answers; self.editing = editing;
             }
@@ -268,15 +269,34 @@ impl Drop for QuestionOverlay {
     fn drop(&mut self) { self.questions.set_available(false); }
 }
 impl Component for QuestionOverlay {
+    fn on_action(&mut self, ctx: &Ctx<'_>, name: &str, payload: &serde_json::Value) {
+        if name == "questions:plan-edited" { self.plan_edited(ctx, payload); }
+    }
+    fn on_paste(&mut self, ctx: &Ctx<'_>, text: &str) -> KeyOutcome {
+        let Some(request) = self.questions.pending().into_iter().find(|p| p.session == ctx.model.session) else { return KeyOutcome::pass(); };
+        self.sync(&request);
+        if self.editing {
+            if let Some(answer) = self.answers.get_mut(self.page) { answer.custom.get_or_insert_default().push_str(text); }
+        }
+        KeyOutcome::consumed()
+    }
     fn name(&self) -> &str { "user-questions" }
     fn priority(&self) -> Option<i32> { Some(self.questions.overlay_config().priority) }
     fn wants(&self, ctx: &Ctx<'_>) -> bool {
         !self.apps.as_ref().is_some_and(|apps| apps.active_overlay()) && self.questions.pending().iter().any(|p| p.session == ctx.model.session)
     }
-    fn height(&self, _: &Ctx<'_>, _: u16) -> Option<u16> { Some(self.questions.overlay_config().height) }
+    fn height(&self, ctx: &Ctx<'_>, _: u16) -> Option<u16> {
+        Some(self.questions.pending().iter().find(|p| p.session == ctx.model.session)
+            .and_then(|p| p.questions.first()).and_then(|q| q.plan_review.as_ref())
+            .map_or(self.questions.overlay_config().height, |config| config.height))
+    }
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
         let Some(request) = self.questions.pending().into_iter().find(|p| p.session == ctx.model.session) else { return; };
         self.sync(&request);
+        if let Some(config) = &request.questions[self.page].plan_review {
+            self.render_plan(ctx, area, buf, &request, config);
+            return;
+        }
         let q = &request.questions[self.page];
         let answer = &self.answers[self.page];
         let config = self.questions.overlay_config();
@@ -363,6 +383,9 @@ impl Component for QuestionOverlay {
         let Some(request) = self.questions.pending().into_iter().find(|p| p.session == ctx.model.session) else { return KeyOutcome::pass(); };
         self.sync(&request);
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { return KeyOutcome::act(vec![rness_tui::app::Action::Cancel]); }
+        if let Some(config) = &request.questions[self.page].plan_review {
+            return self.plan_key(key, &request, config);
+        }
         let config = self.questions.overlay_config();
         let matches = |action| binding_matches(&config.ui, action, key);
         self.error.clear();

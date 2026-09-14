@@ -1532,7 +1532,9 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let plan = lua.create_table()?;
     plan.set("enable", lua.create_function(|lua, options: Option<Table>| {
         require_declaration_phase(lua)?;
-        let config: rness_engine::plan::PlanConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_default();
+        let mut config: rness_engine::plan::PlanConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_default();
+        config.review.normalize();
+        config.review.validate().map_err(mlua::Error::runtime)?;
         let pending: Table = lua.globals().get("__rness_pending")?;
         if pending.get::<Option<bool>>("plan_disabled")?.unwrap_or(false) { return Err(mlua::Error::runtime("enable or disable plan once per plugin load")); }
         let rness: Table = lua.globals().get("rness")?;

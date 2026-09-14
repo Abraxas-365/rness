@@ -715,6 +715,30 @@ async fn usage_reports_latest_request_and_durable_turn_count() {
 }
 
 #[tokio::test]
+async fn plan_review_lua_configuration_is_validated_and_normalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = booted_host(dir.path()).await;
+    host.install_questions(Arc::new(rness_engine::questions::Questions::default())).await.unwrap();
+    for options in ["{width=20}", "{height=2}", "{unknown=true}", "{editor={}}", "{keys={edit='a'}}", "{keys={edit='ctrl+c'}}", "{keys={typo='x'}}"] {
+        assert!(host.load("bad-plan", &format!("rness.plan.enable {{ review = {options} }}")).await.is_err(), "{options}");
+        assert!(!host.tool_specs().await.iter().any(|s| s.name == "exit_plan_mode"));
+    }
+    host.load("plan", r##"rness.plan.enable { review = {
+        title = "Review changes", width = 88, height = 24,
+        editor = { "code", "--wait" }, approve_after_edit = false,
+        keys = { edit = "ctrl+e" }, labels = { approve = "Go" },
+        styles = { border = { fg = "#aabbcc" } },
+    } }"##).await.unwrap();
+    let plan = host.tool_specs().await.into_iter().find(|s| s.name == "exit_plan_mode").unwrap().plan.unwrap();
+    assert_eq!(plan.config.review.title, "Review changes");
+    assert_eq!(plan.config.review.width, 88);
+    assert_eq!(plan.config.review.keys["edit"], "ctrl+e");
+    assert_eq!(plan.config.review.keys["approve"], "a");
+    assert_eq!(plan.config.review.labels.approve, "Go");
+    assert!(!plan.config.review.approve_after_edit);
+}
+
+#[tokio::test]
 async fn plan_lifecycle_uses_live_questions_and_preserves_state() {
     let dir = tempfile::tempdir().unwrap();
     let host = booted_host(dir.path()).await;

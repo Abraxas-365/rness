@@ -1392,6 +1392,7 @@ impl App {
                 self.model.scroll_from_bottom = 0;
             }
             Action::Cancel => {
+                self.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.backend.request(ClientRequest::Cancel {
                     session: self.model.session.clone(),
                 });
@@ -1470,6 +1471,13 @@ impl App {
                     self.edit_prompt = Some(payload);
                     return;
                 }
+                if name == "terminal:edit-plan" {
+                    let mut payload = payload;
+                    payload["plan_edit"] = serde_json::json!(true);
+                    payload["input_epoch"] = serde_json::json!(self.input_epoch.load(std::sync::atomic::Ordering::SeqCst));
+                    self.edit_prompt = Some(payload);
+                    return;
+                }
                 if name == "terminal:edit-prompt" {
                     self.edit_prompt = Some(payload);
                     return;
@@ -1525,12 +1533,12 @@ fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
         .ok_or("Editor command is empty")?;
     let snapshot = payload["snapshot"] == true;
     let mut file = tempfile::Builder::new()
-        .prefix(if snapshot {
+        .prefix(if payload["plan_edit"] == true { "rness-plan-" } else if snapshot {
             "rness-message-"
         } else {
             "rness-prompt-"
         })
-        .suffix(if snapshot { ".md" } else { ".txt" })
+        .suffix(if snapshot || payload["plan_edit"] == true { ".md" } else { ".txt" })
         .tempfile()
         .map_err(|e| e.to_string())?;
     file.write_all(
@@ -1647,20 +1655,48 @@ pub async fn run(
         if let Some(payload) = app.edit_prompt.take() {
             // The reader must relinquish stdin before handing it to an editor.
             let _guard = terminal_input.lock().await;
+            if payload["plan_edit"] == true {
+                while let Ok(event) = term_events.try_recv() { app.on_term_event(event); }
+                while let Ok(action) = host_actions.try_recv() { app.apply(action); }
+                if app.model.should_quit || payload["session"] != app.model.session
+                    || payload["input_epoch"].as_u64() != Some(app.input_epoch.load(std::sync::atomic::Ordering::SeqCst)) {
+                    let mut response = payload.clone();
+                    response["error"] = serde_json::json!("review interrupted before editor launch");
+                    app.apply(Action::Custom("questions:plan-edited".into(), response));
+                    continue;
+                }
+            }
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::DisableMouseCapture,
                 crossterm::event::DisableBracketedPaste
             );
             ratatui::restore();
-            let edited = edit_prompt(&payload);
+            let editor_epoch = app.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
+            let mut edited = edit_prompt(&payload);
             terminal = ratatui::init();
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::EnableMouseCapture,
                 crossterm::event::EnableBracketedPaste
             );
+            if payload["plan_edit"] == true {
+                // Apply queued host cancellation/session changes before auto-approval.
+                while let Ok(action) = host_actions.try_recv() { app.apply(action); }
+                if app.model.should_quit || payload["session"] != app.model.session
+                    || editor_epoch != app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                    edited = Err("review interrupted while editor was open".into());
+                }
+            }
             match edited {
+                result if payload["plan_edit"] == true => {
+                    let mut response = payload.clone();
+                    match result {
+                        Ok(text) => response["text"] = serde_json::json!(text),
+                        Err(error) => response["error"] = serde_json::json!(error),
+                    }
+                    app.apply(Action::Custom("questions:plan-edited".into(), response));
+                }
                 Ok(_) if payload["snapshot"] == true => {}
                 Ok(text) => app.apply(Action::Custom(
                     "input:prompt-edited".into(),
@@ -2111,6 +2147,12 @@ mod tests {
         assert_eq!(model.model_name, "provider/model");
         assert_eq!(model.profile_name.as_deref(), Some("fast"));
         assert_eq!(model.agent_name.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn plan_editor_uses_markdown_and_reads_atomic_save() {
+        let payload = serde_json::json!({"plan_edit":true, "text":"# Original", "editor":["/bin/sh", "-c", "case \"$1\" in *.md) ;; *) exit 8;; esac; printf '# Edited\\nNew content' > \"$1.new\"; mv \"$1.new\" \"$1\"", "rness-editor"]});
+        assert_eq!(edit_prompt(&payload).unwrap(), "# Edited\nNew content");
     }
 
     #[test]
