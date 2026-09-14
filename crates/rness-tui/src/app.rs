@@ -360,6 +360,12 @@ impl Model {
                     }
                 }
                 SessionEvent::ToolResult(r) => {
+                    // A durable result replaces its live card even while the turn
+                    // stays busy (for example, during context compaction).
+                    if let Some(live) = &mut self.live {
+                        live.running_tools.retain(|(call, _)| call != &r.call);
+                        live.tool_args.retain(|(call, _)| call != &r.call);
+                    }
                     if r.presentation
                         .as_ref()
                         .and_then(|p| p.get("outcome"))
@@ -1896,6 +1902,98 @@ mod tests {
         assert_eq!(apps.active(), None);
         app.apply(open("s1", "jobs"));
         assert_eq!(apps.active(), None);
+    }
+
+    #[test]
+    fn completed_card_is_not_live_and_selection_works_during_compaction() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        struct CompletingBackend { history: History, incremental: bool }
+        impl Backend for CompletingBackend {
+            fn request(&self, _: ClientRequest) {}
+            fn history(&self, _: &SessionId) -> History { self.history.clone() }
+            fn history_after(&self, _: &SessionId, after: &str) -> Option<Vec<Envelope>> {
+                if !self.incremental { return None; }
+                let index = self.history.envelopes.iter().position(|env| env.id == after)?;
+                Some(self.history.envelopes[index + 1..].to_vec())
+            }
+        }
+
+        for incremental in [false, true] {
+            let mut history = prior_history("s");
+            history.envelopes.truncate(4);
+            for (index, env) in history.envelopes.iter_mut().enumerate() {
+                env.id = format!("event-{index}");
+            }
+            if let SessionEvent::AssistantMessage(message) = &mut history.envelopes[2].event {
+                if let ContentPart::ToolUse { name, .. } = &mut message.content[0] {
+                    *name = "subagent".into();
+                }
+            }
+            let mut model = Model::new("s".into(), "m".into());
+            model.load_history(&History {
+                session: "s".into(), envelopes: history.envelopes[..3].to_vec(),
+            });
+            model.busy = true;
+            model.live = Some(LiveStep {
+                running_tools: vec![("c1".into(), "subagent".into())],
+                tool_args: vec![("c1".into(), "{}".into())],
+                ..Default::default()
+            });
+            let mut slots = Slots::default();
+            crate::modules::chat::install(&mut slots);
+            let mut app = App::new(model, slots, Arc::new(CompletingBackend { history, incremental }));
+            app.apply(Action::Custom("chat:messagebox-config".into(),
+                serde_json::json!({"keys":{"select_message":"ctrl+n"}})));
+            app.apply_frame(&Frame::HistoryChanged { session: "s".into() });
+            app.apply_frame(&Frame::CompactionStarted {
+                session: "s".into(), events: 42, estimated_tokens: 183_000,
+            });
+            assert!(app.model.busy);
+            assert!(app.model.compaction.is_some());
+            let live = app.model.live.as_ref().unwrap();
+            assert!(live.running_tools.is_empty());
+            assert!(live.tool_args.is_empty());
+
+            let area = Rect::new(0, 0, 110, 30);
+            let mut buffer = Buffer::empty(area);
+            app.render(area, &mut buffer);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(text.matches("subagent").count(), 1, "{text}");
+            app.route_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+            app.render(area, &mut Buffer::empty(area));
+            let copy = app.route_key(KeyEvent::from(KeyCode::Char('y')));
+            assert!(matches!(copy.as_slice(), [Action::Custom(name, payload)]
+                if name == "terminal:copy-text" && payload["text"] == "wrote foo.txt"));
+            app.route_key(KeyEvent::from(KeyCode::Up));
+            let copy = app.route_key(KeyEvent::from(KeyCode::Char('y')));
+            assert!(matches!(copy.as_slice(), [Action::Custom(name, payload)]
+                if name == "terminal:copy-text" && payload["text"] == "crea foo.txt"));
+            app.route_key(KeyEvent::from(KeyCode::Esc));
+            assert!(app.slots.focused_mut(&Ctx { model: &app.model, theme: &app.theme }).is_none());
+        }
+    }
+
+    #[test]
+    fn durable_result_retires_only_its_own_live_tool() {
+        let mut history = prior_history("s");
+        history.envelopes.truncate(4);
+        let mut model = Model::new("s".into(), "m".into());
+        model.live = Some(LiveStep {
+            text: "streaming text".into(),
+            running_tools: vec![("c1".into(), "Write".into()), ("c2".into(), "Bash".into())],
+            tool_args: vec![("c1".into(), "{}".into()), ("c2".into(), "{}".into())],
+            ..Default::default()
+        });
+        model.apply_frame(&Frame::ToolOutput {
+            session: "s".into(), call: "c1".into(), output: "partial output".into(),
+        });
+        assert_eq!(model.live.as_ref().unwrap().running_tools.len(), 2);
+        model.load_history(&history);
+        let live = model.live.as_ref().unwrap();
+        assert_eq!(live.running_tools, vec![("c2".into(), "Bash".into())]);
+        assert_eq!(live.tool_args, vec![("c2".into(), "{}".into())]);
+        assert_eq!(live.text, "streaming text");
     }
 
     #[test]
