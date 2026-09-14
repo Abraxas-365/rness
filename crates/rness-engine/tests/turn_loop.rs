@@ -165,7 +165,7 @@ fn route_meter_changes_estimate_without_changing_context() {
 fn compact_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
     rness_engine::turn::compaction::Policy {
         meter: Default::default(),
-        summary_selection: None,
+        summary_profile: None,
         threshold_tokens: threshold, retain_tokens: 40, summary_tokens: 100,
         system_prompt: "Summarize without tools.".into(),
         prompt: "Create a continuation briefing.".into(),

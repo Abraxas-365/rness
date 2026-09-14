@@ -64,6 +64,39 @@ local config = rness.profiles.resolve("coding")
 
 Resolving alone does not apply it to a session. A profile resolution contains generation settings, not an agent snapshot. Preserve the current agent explicitly if using the generic session configuration setter to switch profiles.
 
+## Compaction profiles
+
+Compaction can use a separate profile without changing the principal session's configuration:
+
+```lua
+rness.profiles.declare("compactor", {
+  provider = "YOUR_CONFIGURED_PROVIDER",
+  model = "YOUR_SUMMARY_MODEL",
+  options = {
+    reasoning = { kind = "effort", effort = "low" }, -- if supported by this model
+  },
+})
+
+-- Add after your existing complete compaction policy declaration:
+rness.compaction.default.summary_profile = "compactor"
+```
+
+`summary_profile` is optional and must name a declared profile. A `by_provider` profile resolves against the provider of the session being compacted (including child sessions). A fixed profile can explicitly choose another provider; that provider receives the context being summarized.
+
+- Without a profile, compaction inherits the current session's model and generation settings.
+- With a profile, it uses that profile's model and generation settings. Omitted profile options use adapter defaults, not the principal's settings. Agent instructions and permissions are not inherited into the profile.
+- `summary_tokens` overrides the profile/session output limit when the adapter supports it. Otherwise no output limit is sent; notably the ChatGPT Responses adapter does not enforce this cap.
+- The resulting settings are validated before sending. In particular, a manual thinking budget must be smaller than `summary_tokens`. Unknown profiles, missing provider variants, and unavailable routes fail explicitly; there is no fallback model.
+- Summary requests advertise no tools and use the compaction policy's `system_prompt` and `prompt`.
+- Automatic compaction, the default `/compact`, region APIs, and the legacy session/server compaction API share profile resolution. The legacy API retains its existing region/checkpoint behavior and, without a configured policy, its built-in prompts.
+- Provider/model policy keys refer to the **principal session model**, not the summarizer. Set thresholds for that session's context; separately ensure the summary model can accept the selected context.
+
+Profile and automatic policy changes require restarting rness. Resolving a profile does not verify remote account/model availability.
+
+### Migration from `summary_selection`
+
+The inline `summary_selection = { route = ..., model = ... }` field was removed. Declare a profile using `provider` and `model`, then set `summary_profile` to its name. The old field is rejected with a migration error, including in manual region policies; it is never silently ignored.
+
 ## Declared capabilities
 
 Capabilities are optional facts about a provider/model pair, not profile preferences. The current registry supports optional context and output limits, supported effort names, and a manual-budget range. Unknown capability data remains unknown; the repository does not promise a complete maintained model catalog.

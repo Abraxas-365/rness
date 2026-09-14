@@ -38,6 +38,7 @@ rness.ui.promptbox = { paste = { keys = { preview = "alt+g" } } }
 rness.compaction = {
   default = {
     threshold_tokens = 165000, retain_tokens = 24000, summary_tokens = 4096,
+    -- summary_profile = "compactor", -- optional declared profile; otherwise current session model
     system_prompt = [[CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
 
 - Do NOT use Read, Bash, Grep, Glob, Edit, Write, or ANY other tool.

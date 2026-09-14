@@ -48,6 +48,9 @@ rness.keymap.setup({
 -- rness.compaction = {
 --   ["ollama/qwen3:14b"] = {
 --     threshold_tokens = 24000, retain_tokens = 4800, summary_tokens = 2048,
+--     system_prompt = "Summarize the conversation. Do not call tools.",
+--     prompt = "Preserve current work, constraints, decisions and next steps.",
+--     -- summary_profile = "compactor", -- optional declared profile; otherwise current session model
 --     max_overflow_retries = 1, max_compactions = 2,
 --     prune_threshold = 8192, prune_head = 4096, prune_tail = 1024,
 --   },

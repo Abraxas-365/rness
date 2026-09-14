@@ -80,6 +80,8 @@ pub(crate) struct ImageCapabilityProvider {
 #[async_trait]
 impl Provider for ImageCapabilityProvider {
     fn model(&self) -> &str { self.inner.model() }
+    fn supports_max_output_tokens(&self) -> bool { self.inner.supports_max_output_tokens() }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { self.inner.summary_config() }
     fn summary_model(&self) -> &str { self.inner.summary_model() }
     fn summary_supports_max_output_tokens(&self) -> bool { self.inner.summary_supports_max_output_tokens() }
 
@@ -128,7 +130,7 @@ mod tests {
                     message: self.0.into(), retryable: false }, partial: vec![] }
             }
         }
-        let provider = SummaryProvider { main: std::sync::Arc::new(Tagged("main")), summary: std::sync::Arc::new(Tagged("summary")) };
+        let provider = SummaryProvider { main: std::sync::Arc::new(Tagged("main")), summary: std::sync::Arc::new(Tagged("summary")), config: Default::default() };
         let context = ModelContext::default();
         let request = || StepRequest { context: &context, system: "", tools: &[], on_delta: None };
         let cancel = CancellationToken::new();
@@ -162,11 +164,13 @@ mod tests {
 pub(crate) struct SummaryProvider {
     pub main: std::sync::Arc<dyn Provider>,
     pub summary: std::sync::Arc<dyn Provider>,
+    pub config: rness_protocol::events::CallConfig,
 }
 #[async_trait]
 impl Provider for SummaryProvider {
     fn model(&self) -> &str { self.main.model() }
     fn summary_model(&self) -> &str { self.summary.model() }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { Some(&self.config) }
     fn summary_supports_max_output_tokens(&self) -> bool { self.summary.supports_max_output_tokens() }
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         self.main.step(request, cancel).await
@@ -189,6 +193,7 @@ pub trait Provider: Send + Sync {
 
     /// Separate summarization route, when explicitly configured by the host.
     fn summary_model(&self) -> &str { self.model() }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { None }
     fn summary_supports_max_output_tokens(&self) -> bool { self.supports_max_output_tokens() }
     async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         self.step(request, cancel).await

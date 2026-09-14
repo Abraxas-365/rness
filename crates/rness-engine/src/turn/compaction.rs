@@ -6,12 +6,12 @@ use rness_protocol::events::{Compaction, ContentPart, SessionEvent, Prune};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 pub struct Policy {
     #[serde(default)]
     pub meter: Meter,
     #[serde(default)]
-    pub summary_selection: Option<rness_protocol::events::ModelSelection>,
+    pub summary_profile: Option<String>,
     pub threshold_tokens: u64,
     pub retain_tokens: u64,
     pub summary_tokens: u32,
@@ -23,6 +23,22 @@ pub struct Policy {
     pub prune_head: usize,
     pub prune_tail: usize,
 }
+impl serde::Serialize for Policy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for Policy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("summary_selection").is_some() {
+            return Err(serde::de::Error::custom(
+                "summary_selection was removed; declare a profile and set summary_profile",
+            ));
+        }
+        Self::deserialize(value).map_err(serde::de::Error::custom)
+    }
+}
 impl Policy {
     pub fn validate(&self) -> Result<(), String> {
         if self.meter.bytes_per_token == 0 || self.meter.bytes_per_token > 16
@@ -30,8 +46,8 @@ impl Policy {
             || self.meter.output_reserve >= self.threshold_tokens {
             return Err("invalid route measurement budgets".into());
         }
-        if self.summary_selection.as_ref().is_some_and(|s| s.route.trim().is_empty() || s.model.trim().is_empty()) {
-            return Err("summary selection requires route and model".into());
+        if self.summary_profile.as_ref().is_some_and(|name| name.trim().is_empty()) {
+            return Err("summary_profile must be a nonempty profile name".into());
         }
         if self.threshold_tokens == 0 || self.retain_tokens >= self.threshold_tokens
             || self.summary_tokens == 0 || self.system_prompt.trim().is_empty() || self.prompt.trim().is_empty()
@@ -240,9 +256,7 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
         let mut context = ModelContext { turns: replayed.context.turns[start..cut].to_vec(), ..Default::default() };
         let before = policy.meter.measure(&context, "", &[]);
         progress(CompactionProgress::Summarizing { events: replaces.len(), estimated_tokens: before });
-        context.config = if let Some(selection) = &policy.summary_selection {
-            rness_protocol::events::CallConfig { selection: Some(selection.clone()), ..Default::default() }
-        } else { replayed.context.config.clone() };
+        context.config = provider.summary_config().cloned().unwrap_or_else(|| replayed.context.config.clone());
         if provider.summary_supports_max_output_tokens() {
             context.config.max_output_tokens = Some(policy.summary_tokens);
         } else {

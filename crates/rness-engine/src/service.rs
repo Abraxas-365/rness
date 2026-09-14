@@ -477,6 +477,31 @@ impl SessionService {
         } else { Ok(provider) }
     }
 
+    /// Resolve once for both automatic and manual policy-based compaction.
+    fn compaction_provider(&self, current: &CallConfig, policy: &crate::turn::compaction::Policy)
+        -> Result<Arc<dyn Provider>, ServiceError>
+    {
+        policy.validate().map_err(ServiceError::InvalidConfig)?;
+        let main = self.provider_for(current)?;
+        let mut config = match &policy.summary_profile {
+            Some(name) => self.models.resolve_profile_for(name, current.selection.as_ref().map(|s| s.route.as_str()))
+                .map_err(ServiceError::InvalidConfig)?,
+            None => current.clone(),
+        };
+        let summary = if policy.summary_profile.is_some() { self.provider_for(&config)? } else { main.clone() };
+        config.max_output_tokens = summary.supports_max_output_tokens().then_some(policy.summary_tokens);
+        Self::validate_config(&config)?;
+        self.models.validate(&config).map_err(ServiceError::InvalidConfig)?;
+        if let (Some(rness_protocol::events::Reasoning::BudgetTokens { tokens }), Some(limit)) =
+            (&config.reasoning, config.max_output_tokens)
+        {
+            if *tokens >= limit {
+                return Err(ServiceError::InvalidConfig("compaction reasoning budget must be less than summary_tokens".into()));
+            }
+        }
+        Ok(Arc::new(crate::turn::provider::SummaryProvider { main, summary, config }))
+    }
+
     fn validate_config(config: &CallConfig) -> Result<(), ServiceError> {
         if let Some(selection) = &config.selection {
             if selection.route.trim().is_empty() || selection.model.trim().is_empty() {
@@ -922,15 +947,13 @@ impl SessionService {
                 // an unavailable selected provider must not leave a session
                 // running with an input it cannot process.
                 let request_config = self.config(session)?;
-                let mut provider = self.provider_for(&request_config)?;
-                if let Some(selection) = request_config.selection.as_ref()
+                let policy = request_config.selection.as_ref()
                     .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
-                    .or_else(|| self.config.compaction.get("default"))
-                    .and_then(|p| p.summary_selection.clone()) {
-                    let summary_config = CallConfig { selection: Some(selection), ..Default::default() };
-                    let summary = self.provider_for(&summary_config)?;
-                    provider = Arc::new(crate::turn::provider::SummaryProvider { main: provider, summary });
-                }
+                    .or_else(|| self.config.compaction.get("default"));
+                let provider = match policy {
+                    Some(policy) => self.compaction_provider(&request_config, policy)?,
+                    None => self.provider_for(&request_config)?,
+                };
                 let mut log = self.store.open(session)?;
                 crate::turn::compaction::recover(&mut log)?;
                 // Workspace instructions precede the prompt that opens
@@ -1047,7 +1070,13 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
-        let provider = self.provider_for(&replayed.context.config)?;
+        let policy = replayed.context.config.selection.as_ref()
+            .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
+            .or_else(|| self.config.compaction.get("default"));
+        let provider = match policy {
+            Some(policy) => self.compaction_provider(&replayed.context.config, policy)?,
+            None => self.provider_for(&replayed.context.config)?,
+        };
         let history = &replayed.history;
 
         // The cut: index of the TurnStarted opening the keep_turns-th
@@ -1101,12 +1130,12 @@ impl SessionService {
         // Summarize ONLY the folding region, projected exactly as the
         // model saw it (shadowing of prior checkpoints honored).
         let mut fold_ctx = crate::session::projection::model_context(&history[..cut]);
-        fold_ctx.config = replayed.context.config.clone();
+        fold_ctx.config = provider.summary_config().cloned().unwrap_or_else(|| replayed.context.config.clone());
         let estimated_tokens = crate::turn::compaction::measure(&fold_ctx, "", &[]);
         self.bus.emit::<FrameEv>(&Frame::CompactionStarted {
             session: session.clone(), events: replaces.len(), estimated_tokens,
         });
-        let summary = summarize(provider.as_ref(), fold_ctx).await;
+        let summary = summarize(provider.as_ref(), fold_ctx, policy).await;
         self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
             session: session.clone(), changed: summary.is_ok(),
         });
@@ -1117,7 +1146,7 @@ impl SessionService {
         log.append(&SessionEvent::Compaction(Compaction {
             replaces,
             summary: summary.clone(),
-            model: provider.model().to_string(),
+            model: provider.summary_model().to_string(),
         }))?;
         drop(log);
 
@@ -1159,11 +1188,7 @@ impl SessionService {
         if replayed.context.sources != expected_sources {
             return Err(ServiceError::InvalidConfig("stale compaction region".into()));
         }
-        let mut provider = self.provider_for(&replayed.context.config)?;
-        if let Some(selection) = &policy.summary_selection {
-            let summary = self.provider_for(&CallConfig { selection: Some(selection.clone()), ..Default::default() })?;
-            provider = Arc::new(crate::turn::provider::SummaryProvider { main: provider, summary });
-        }
+        let provider = self.compaction_provider(&replayed.context.config, &policy)?;
         let mut log = self.store.open(session)?;
         crate::turn::compaction::recover(&mut log)?;
         let progress_session = session.clone();
@@ -1429,21 +1454,21 @@ exact identifiers (paths, names, ids) verbatim. Output only the summary.";
 async fn summarize(
     provider: &dyn Provider,
     mut ctx: crate::session::projection::ModelContext,
+    policy: Option<&crate::turn::compaction::Policy>,
 ) -> Result<String, ServiceError> {
     ctx.turns.push(crate::session::projection::ModelTurn::User {
         content: vec![ContentPart::Text {
-            text: "Summarize the conversation above now, per the system instructions."
-                .to_string(),
+            text: policy.map_or("Summarize the conversation above now, per the system instructions.", |p| p.prompt.as_str()).to_string(),
         }],
     });
     let request = crate::turn::provider::StepRequest {
         context: &ctx,
-        system: SUMMARIZE_SYSTEM,
+        system: policy.map_or(SUMMARIZE_SYSTEM, |p| p.system_prompt.as_str()),
         tools: &[],
         on_delta: None,
     };
     let cancel = CancellationToken::new();
-    match provider.step(request, &cancel).await {
+    match provider.summarize_step(request, &cancel).await {
         crate::turn::provider::StepOutcome::Committed(msg) => {
             let text: String = msg
                 .content

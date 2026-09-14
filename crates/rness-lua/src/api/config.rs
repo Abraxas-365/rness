@@ -136,6 +136,27 @@ mod permission_tests {
     }
 
     #[test]
+    fn compaction_profile_validates_names_and_removed_selector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        let policy = "system_prompt='Summary',prompt='Summarize',threshold_tokens=1000,retain_tokens=100,summary_tokens=100,max_overflow_retries=1,max_compactions=1,prune_threshold=8192,prune_head=4096,prune_tail=1024";
+        for declaration in ["{provider='test',model='summary'}", "{by_provider={test={model='summary'}}}"] {
+            std::fs::write(&path, format!("rness.profiles.declare('compact', {declaration}); rness.compaction={{default={{{policy},summary_profile='compact'}}}}")).unwrap();
+            assert_eq!(super::load(&path).unwrap().compaction["default"].summary_profile.as_deref(), Some("compact"));
+        }
+        for (field, expected) in [
+            ("summary_profile='missing'", "unknown profile"),
+            ("summary_profile=' '", "nonempty"),
+            ("summary_selection={route='test',model='summary'}", "summary_selection was removed"),
+            ("summary_selection=false", "summary_selection was removed"),
+        ] {
+            std::fs::write(&path, format!("rness.compaction={{default={{{policy},{field}}}}}")).unwrap();
+            let error = super::load(&path).err().expect("invalid config").to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn stream_timeouts_are_opt_in_and_validated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
@@ -1149,6 +1170,11 @@ pub fn evaluate(
                 ))
                 .into());
             }
+        }
+    }
+    for policy in config.compaction.values() {
+        if let Some(name) = &policy.summary_profile {
+            config.models.validate_profile(name).map_err(std::io::Error::other)?;
         }
     }
     config.default_profile = rness.get("default_profile")?;

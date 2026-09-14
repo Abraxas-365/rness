@@ -31,7 +31,7 @@ Compaction summarizes older conversation content to make room for new messages. 
 
 - **A summary may not make the conversation smaller.** Empty or non-shrinking summaries are not applied. A provider failure can also leave history unchanged; an unchanged result does not necessarily mean the provider completed successfully.
 - **Compaction keeps the original events in the session log.** It reduces the context sent to the model, not the size of the stored log, and is not a way to erase sensitive content. It preserves the newest message and keeps tool calls paired with their results.
-- **Summarization makes a model request and may incur a charge.** It uses the active provider unless you configure `summary_selection`. An unavailable summary provider/model causes an error rather than silently falling back.
+- **Summarization makes a model request and may incur a charge.** It uses the active session model unless you configure a [`summary_profile`](../reference/configuration/profiles.md#compaction-profiles). An unavailable summary profile/provider/model causes an error rather than silently falling back.
 - **Manual compaction requires an idle session.** The default `/compact` command keeps Lua status updates responsive, but the session remains occupied until the command finishes. Other commands or prompts for that session must wait.
 - **Region selection is an optional example, not a built-in workflow.** The [commands plugin example](../../examples/plugins/commands.lua) previews up to 100 messages. After reviewing a range in the overlay, close it and run `/compact-region confirm`; reviewing alone does not start compaction. If the conversation changed after selection, refresh the selection and try again.
 
