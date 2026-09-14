@@ -172,7 +172,16 @@ impl SkillTool {
             description.push_str("\nAvailable skills:\n");
             for s in &skills {
                 let d = s.description.replace('\n', " ");
-                let d = if d.len() > 200 { format!("{}...", &d[..197]) } else { d };
+                let d = if d.len() > 200 {
+                    let mut end = 197;
+                    // Keep the byte budget without splitting a UTF-8 character.
+                    while !d.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &d[..end])
+                } else {
+                    d
+                };
                 description.push_str(&format!("- {}: {}\n", s.name, d));
             }
         }

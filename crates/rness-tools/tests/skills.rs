@@ -86,6 +86,30 @@ async fn tool_catalog_and_execute() {
     assert!(err.contains("unknown"));
 }
 
+#[test]
+fn tool_catalog_truncates_descriptions_at_utf8_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        ("a".repeat(200), "a".repeat(200)),
+        ("Ó".repeat(100), "Ó".repeat(100)),
+        ("a".repeat(201), format!("{}...", "a".repeat(197))),
+        (format!("{}Ó extra", "a".repeat(196)), format!("{}...", "a".repeat(196))),
+        (format!("{}界 extra", "a".repeat(195)), format!("{}...", "a".repeat(195))),
+        (format!("{}😀 extra", "a".repeat(194)), format!("{}...", "a".repeat(194))),
+    ];
+    for (description, expected) in cases {
+        write_skill(dir.path(), "proposal.md", "proposal", &description, "Full body.");
+        let roots = vec![SkillRoot { path: dir.path().into(), rank: 0 }];
+        let tool = SkillTool::new(roots.clone());
+        let summary = tool.description().lines().find_map(|line| line.strip_prefix("- proposal: ")).unwrap();
+        assert_eq!(summary, expected);
+        assert!(summary.len() <= 200);
+        let (skill, body) = load(&roots, "proposal").unwrap();
+        assert_eq!(skill.description, description);
+        assert_eq!(body, "Full body.");
+    }
+}
+
 #[tokio::test]
 async fn skill_added_after_registration_is_loadable() {
     let dir = tempfile::tempdir().unwrap();
