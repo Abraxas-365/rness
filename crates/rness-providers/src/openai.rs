@@ -32,6 +32,7 @@ pub struct OpenAiProvider {
     images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
+    headers: crate::headers::ProviderHeaders,
     base_url: String,
     api_key: Option<String>,
     model: String,
@@ -45,6 +46,7 @@ impl OpenAiProvider {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
+            headers: Default::default(),
             base_url: OPENAI_BASE_URL.to_string(),
             api_key: Some(api_key.into()),
             model: model.into(),
@@ -55,6 +57,13 @@ impl OpenAiProvider {
     pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
         self.images = Some((store, policy));
         self
+    }
+
+    /// Apply validated headers to inference and file requests, never OAuth.
+    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+        self.client = headers.client()?;
+        self.headers = headers;
+        Ok(self)
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
@@ -100,7 +109,8 @@ impl OpenAiProvider {
             let data_url = body.pointer(&path).and_then(|p| p["image_url"]["url"].as_str()).ok_or_else(|| crate::image_error("missing image URL".into()))?;
             let (prefix, encoded) = data_url.split_once(";base64,").ok_or_else(|| crate::image_error("invalid inline image URL".into()))?;
             let mime = prefix.strip_prefix("data:").ok_or_else(|| crate::image_error("invalid inline image MIME".into()))?;
-            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, key, data_url)).map_err(|e| crate::image_error(e.to_string()))?));
+            let upload_credential = self.headers.upload_credential(key);
+            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, &upload_credential, data_url)).map_err(|e| crate::image_error(e.to_string()))?));
             let mut cache = tokio::select! {
                 _ = cancel.cancelled() => return Err(crate::image_error("image upload cancelled".into())),
                 cache = UPLOADS.get_or_init(Default::default).lock() => cache,
@@ -124,7 +134,7 @@ impl OpenAiProvider {
             let id = if let Some((id, _)) = cached { id } else {
                 let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|e| crate::image_error(e.to_string()))?;
                 let endpoint = format!("{}/files", self.base_url.trim_end_matches('/'));
-                let scope = crate::upload_scope(&endpoint, key);
+                let scope = crate::upload_scope(&endpoint, &upload_credential);
                 let value = crate::upload_with_quota_recovery(store, &scope, &protected, || {
                     let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("image").mime_str(mime).map_err(|e| crate::image_error(e.to_string()))?;
                     let form = reqwest::multipart::Form::new().part("file", part).text("purpose", "user_data").text("expires_after[anchor]", "created_at").text("expires_after[seconds]", "3600");

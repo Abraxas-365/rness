@@ -198,9 +198,17 @@ async fn http_401_refreshes_once_and_retries() {
     };
     let source = CredentialSource::new(store).with_oauth_client(OAuthClient::new(config));
     let provider =
-        AnthropicProvider::with_credentials(source, "m").with_base_url(server.uri());
+        AnthropicProvider::with_credentials(source, "m").with_base_url(server.uri())
+            .with_headers(rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "secret".into())].into()).unwrap()).unwrap();
 
     assert!(matches!(run_step(&provider).await, StepOutcome::Committed(_)));
+    for request in server.received_requests().await.unwrap() {
+        if request.url.path() == "/token" {
+            assert!(!request.headers.contains_key("x-tenant"));
+        } else {
+            assert_eq!(request.headers["x-tenant"], "secret");
+        }
+    }
 }
 
 #[tokio::test]

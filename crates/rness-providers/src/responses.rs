@@ -34,6 +34,7 @@ pub struct ResponsesProvider {
     images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
+    headers: crate::headers::ProviderHeaders,
     base_url: String,
     source: CodexCredentialSource,
     model: String,
@@ -45,6 +46,7 @@ impl ResponsesProvider {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
+            headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
             source,
             model: model.into(),
@@ -54,6 +56,13 @@ impl ResponsesProvider {
     pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
         self.images = Some((store, policy));
         self
+    }
+
+    /// Apply validated headers to inference and file requests, never OAuth.
+    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+        self.client = headers.client()?;
+        self.headers = headers;
+        Ok(self)
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {

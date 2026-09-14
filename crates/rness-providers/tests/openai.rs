@@ -113,11 +113,15 @@ async fn deepseek_files_upload_once_and_recover_missing_id() {
     image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
     let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
     let context = ModelContext { turns:vec![ModelTurn::User { content:vec![ContentPart::Image { attachment }] }], ..Default::default() };
-    let provider = OpenAiProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy);
+    let provider = OpenAiProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy)
+        .with_headers(rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "tenant-secret".into())].into()).unwrap()).unwrap();
     for _ in 0..2 { assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_))); }
     for request in server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/chat/completions") {
         let body:serde_json::Value = request.body_json().unwrap();
         assert_eq!(body["messages"][0]["content"][0], json!({"type":"file","file_id":"file-image"}));
+    }
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
     }
     server.verify().await;
     server.reset().await;
@@ -125,6 +129,9 @@ async fn deepseek_files_upload_once_and_recover_missing_id() {
     Mock::given(method("POST")).and(path("/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file-new", "expires_at":expires}))).expect(1).mount(&server).await;
     Mock::given(method("POST")).and(path("/chat/completions")).respond_with(sse_response(&stream_happy("seen"))).expect(1).mount(&server).await;
     assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_)));
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
     server.verify().await;
     server.reset().await;
     // Metadata still says the old file exists; only the model rejects it.
@@ -137,6 +144,9 @@ async fn deepseek_files_upload_once_and_recover_missing_id() {
         } else { sse_response(&stream_happy("recovered")) }
     }).expect(2).mount(&server).await;
     assert!(matches!(step(&provider, &context, "", &[]).await, StepOutcome::Committed(_)));
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
     server.verify().await;
     server.reset().await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;

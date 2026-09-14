@@ -5,6 +5,10 @@ use tokio_util::sync::CancellationToken;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wiremock::matchers::method;
 
+fn custom_headers() -> rness_providers::headers::ProviderHeaders {
+    rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "tenant-secret".into()), ("X-Title".into(), "My App".into())].into()).unwrap()
+}
+
 #[tokio::test]
 async fn body_inactivity_timeout_is_explicit_and_retryable() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,7 +23,7 @@ async fn body_inactivity_timeout_is_explicit_and_retryable() {
         socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n: connected\n\n").await.unwrap();
         std::future::pending::<()>().await;
     });
-    let route = Route { kind, base_url: Some(url), credential: None, stream_idle_timeout: Some(std::time::Duration::from_millis(50)) };
+    let route = Route { kind, base_url: Some(url), credential: None, headers: custom_headers(), stream_idle_timeout: Some(std::time::Duration::from_millis(50)) };
     let dir = tempfile::tempdir().unwrap();
     let provider = if matches!(kind, Kind::ChatGptResponses) {
         let store = CredentialStore::new(dir.path().join("credentials.json"));
@@ -46,11 +50,13 @@ async fn api_keys_use_protocol_specific_headers() {
     for (kind, expected) in [(Kind::Anthropic, "x-api-key"), (Kind::OpenAiCompatible, "authorization")] {
         let server = MockServer::start().await;
         Mock::given(method("POST")).respond_with(ResponseTemplate::new(400)).expect(1).mount(&server).await;
-        let route = Route { kind, base_url: Some(server.uri()), credential: None, stream_idle_timeout: None };
+        let route = Route { kind, base_url: Some(server.uri()), credential: None, headers: custom_headers(), stream_idle_timeout: None };
         let provider = routes::build_with_api_key(&route, "test", "fake-key".into()).unwrap();
         send(provider.as_ref()).await;
         let requests = server.received_requests().await.unwrap();
         let headers = &requests[0].headers;
+        assert_eq!(headers["x-tenant"], "tenant-secret");
+        assert_eq!(headers["x-title"], "My App");
         assert_eq!(headers.get(expected).unwrap().to_str().unwrap(), if expected == "x-api-key" { "fake-key" } else { "Bearer fake-key" });
         assert!(!headers.contains_key(if expected == "x-api-key" { "authorization" } else { "x-api-key" }));
     }
@@ -62,9 +68,10 @@ async fn no_auth_means_no_authorization_header() {
     Mock::given(method("POST")).respond_with(ResponseTemplate::new(400)).expect(1).mount(&server).await;
     let dir = tempfile::tempdir().unwrap();
     let store = CredentialStore::new(dir.path().join("credentials.json"));
-    let routes = [("local".into(), Route { kind: Kind::OpenAiCompatible, base_url: Some(server.uri()), credential: None, stream_idle_timeout: None })].into();
+    let routes = [("local".into(), Route { kind: Kind::OpenAiCompatible, base_url: Some(server.uri()), credential: None, headers: custom_headers(), stream_idle_timeout: None })].into();
     let provider = routes::build(&routes, &Selection { route: "local".into(), model: "test".into() }, store).unwrap();
     send(provider.as_ref()).await;
+    assert_eq!(server.received_requests().await.unwrap()[0].headers["x-tenant"], "tenant-secret");
     assert!(!server.received_requests().await.unwrap()[0].headers.contains_key("authorization"));
 }
 
@@ -78,14 +85,40 @@ async fn oauth_uses_named_tokens_not_stored_api_keys() {
         let mut tokens = Tokens { access_token: "named-token".into(), ..Default::default() };
         tokens.extra.insert("accountId".into(), serde_json::json!("named-account"));
         store.save_tokens("custom-login", &tokens).unwrap();
-        let route = Route { kind, base_url: Some(server.uri()), credential: None, stream_idle_timeout: None };
+        let route = Route { kind, base_url: Some(server.uri()), credential: None, headers: custom_headers(), stream_idle_timeout: None };
         let provider = routes::build_with_oauth(&route, "test", store, "custom-login".into()).unwrap();
         send(provider.as_ref()).await;
         let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests[0].headers["x-tenant"], "tenant-secret");
         assert_eq!(requests[0].headers.get("authorization").unwrap(), "Bearer named-token");
         assert!(!requests[0].headers.contains_key("x-api-key"));
         if matches!(route.kind, Kind::ChatGptResponses) {
             assert_eq!(requests[0].headers.get("chatgpt-account-id").unwrap(), "named-account");
         }
+    }
+}
+
+#[tokio::test]
+async fn custom_headers_follow_same_origin_redirects_only() {
+    for same_origin in [false, true] {
+        let server = MockServer::start().await;
+        let other = MockServer::start().await;
+        let target = if same_origin { &server } else { &other };
+        Mock::given(method("POST")).and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", format!("{}/redirected", target.uri())))
+            .expect(1).mount(&server).await;
+        Mock::given(method("POST")).and(wiremock::matchers::path("/redirected"))
+            .and(wiremock::matchers::header("x-tenant", "tenant-secret"))
+            .respond_with(ResponseTemplate::new(400)).expect(if same_origin { 1 } else { 0 }).mount(target).await;
+        let provider = rness_providers::openai::OpenAiProvider::new("key", "model")
+            .with_base_url(server.uri()).with_headers(rness_providers::headers::ProviderHeaders::new(&[
+                ("X-Tenant".into(), "tenant-secret".into()),
+                ("Referer".into(), "https://my-app.example".into()),
+            ].into()).unwrap()).unwrap();
+        send(&provider).await;
+        for request in server.received_requests().await.unwrap() {
+            assert_eq!(request.headers["referer"], "https://my-app.example");
+        }
+        if !same_origin { assert!(other.received_requests().await.unwrap().is_empty()); }
     }
 }

@@ -319,6 +319,8 @@ async fn main() -> anyhow::Result<()> {
         };
         route_table.insert(name.clone(), routes::Route {
             kind, base_url: Some(declaration.base_url.clone()), credential, stream_idle_timeout: Some(std::time::Duration::from_secs(300)),
+            headers: rness_providers::headers::ProviderHeaders::new(&declaration.headers)
+                .map_err(|e| anyhow::anyhow!("provider {name}: {e}"))?,
         });
     }
     for spec in &cli.route {

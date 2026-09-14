@@ -74,6 +74,23 @@ pub struct StartupConfig {
 #[cfg(test)]
 mod permission_tests {
     #[test]
+    fn provider_headers_are_optional_and_require_string_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        let source = |extra: &str| format!("rness.providers.register('test', {{protocol='openai-chat', base_url='http://localhost', auth=false, {extra}}})");
+        std::fs::write(&path, source("")).unwrap();
+        assert!(super::load(&path).unwrap().providers["test"].headers.is_empty());
+        std::fs::write(&path, source("headers={['X-Title']='My App', ['HTTP-Referer']='https://example.com'}")).unwrap();
+        let config = super::load(&path).unwrap();
+        assert_eq!(config.providers["test"].headers["X-Title"], "My App");
+        for extra in ["headers='secret-value'", "headers={['x-test']=false}", "headers={['x-test']={}}", "headers={['x-test']=123}", "headers={[123]='secret-value'}"] {
+            std::fs::write(&path, source(extra)).unwrap();
+            let error = super::load(&path).err().expect("malformed headers must fail").to_string();
+            assert!(!error.contains("secret-value"), "{error}");
+        }
+    }
+
+    #[test]
     fn web_configuration_registers_selected_backends() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
@@ -315,6 +332,14 @@ pub struct ProviderDeclaration {
     pub protocol: String,
     pub base_url: String,
     pub auth: ProviderAuth,
+    #[serde(default, deserialize_with = "deserialize_provider_headers")]
+    pub headers: BTreeMap<String, String>,
+}
+
+fn deserialize_provider_headers<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
+    // serde's normal type errors can echo secret values from malformed input.
+    serde::Deserialize::deserialize(deserializer)
+        .map_err(|_| serde::de::Error::custom("provider headers must be a table of string names and string values"))
 }
 
 #[derive(Clone, serde::Deserialize)]

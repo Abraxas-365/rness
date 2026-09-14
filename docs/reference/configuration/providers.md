@@ -7,6 +7,10 @@ rness.providers.register("router", {
   protocol = "openai-chat",
   base_url = "https://openrouter.ai/api/v1",
   auth = { env = "OPENROUTER_API_KEY" },
+  headers = {
+    ["HTTP-Referer"] = "https://my-app.example",
+    ["X-Title"] = "My App",
+  },
 })
 ```
 
@@ -18,8 +22,37 @@ rness.providers.register("router", {
 | `protocol` | string | Yes | `openai-chat`, `anthropic`, or `chatgpt-responses` |
 | `base_url` | string | Yes | HTTP(S) endpoint base appropriate to the adapter |
 | `auth` | boolean or table | Yes | Explicit authentication strategy below |
+| `headers` | table of string names to string values | No | Additional provider request headers; defaults to `{}` |
 
 Duplicate startup provider names fail. Unknown top-level declaration fields fail. User declarations can replace built-in connection names when the CLI assembles its route table.
+
+## Custom headers
+
+`headers` applies to every model on the connection, across all three protocols.
+It is sent on inference requests (including retries) and supported file upload,
+metadata lookup, and deletion requests. It is **not** sent to OAuth login or
+refresh endpoints. File caches and quota cleanup are isolated by header values,
+so different tenant headers do not share upstream file IDs.
+
+Names must be valid HTTP header names; they are case-insensitive, and declarations
+such as `X-Tenant` plus `x-tenant` are rejected. Values must be strings of at most
+8192 bytes without control characters (including tabs and newlines). Invalid or
+reserved headers fail CLI startup, even for connections not currently selected.
+
+Authentication, transport, and adapter-managed headers are reserved:
+
+- `authorization`, `proxy-authorization`, `x-api-key`, `cookie`, `host`
+- `content-length`, `content-type`, `content-encoding`, `transfer-encoding`,
+  `connection`, `keep-alive`, `te`, `trailer`, `upgrade`, `expect`
+- `accept`, `accept-encoding`, `user-agent`
+- `anthropic-version`, `anthropic-beta`, `anthropic-dangerous-direct-browser-access`, `x-app`
+- `openai-beta`, `originator`, `chatgpt-account-id`
+
+Continue using `auth` for built-in authentication. Treat custom values as secrets:
+header diagnostics redact values, but literals remain in your configuration file.
+Use HTTPS for sensitive values. With custom headers configured, only same-origin
+redirects are followed (same scheme, host, and effective port), preventing their
+forwarding to a different server or an HTTP downgrade.
 
 ## Authentication
 
@@ -73,7 +106,7 @@ These selections identify the same connection/model pair. The `router/` prefix i
 
 ## Legacy CLI routes
 
-`--route 'name=url[,credential|,none]'` declares an OpenAI-compatible connection for that invocation. A CLI route overrides the same-name startup connection and removes its explicit startup auth strategy. Prefer `init.lua` declarations for reusable configuration with unambiguous authentication.
+`--route 'name=url[,credential|,none]'` declares an OpenAI-compatible connection for that invocation. A CLI route overrides the same-name startup connection and removes its explicit startup auth strategy and custom headers. Prefer `init.lua` declarations for reusable configuration with unambiguous authentication.
 
 ## Stream inactivity watchdog
 

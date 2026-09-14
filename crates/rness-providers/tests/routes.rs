@@ -22,7 +22,7 @@ fn configured_routes() -> HashMap<String, Route> {
             kind,
             base_url: Some(url.into()),
             credential: credential.map(str::to_string),
-            stream_idle_timeout: None,
+            headers: Default::default(), stream_idle_timeout: None,
         })
     }).collect()
 }

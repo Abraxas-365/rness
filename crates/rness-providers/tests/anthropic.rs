@@ -38,7 +38,8 @@ async fn files_are_reused_and_missing_files_reuploaded() {
     image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
     let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
     let context = ModelContext { turns:vec![ModelTurn::User { content:vec![ContentPart::Image { attachment }] }], ..Default::default() };
-    let provider = AnthropicProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy);
+    let provider = AnthropicProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy)
+        .with_headers(rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "tenant-secret".into())].into()).unwrap()).unwrap();
     for _ in 0..2 {
         let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
     }
@@ -46,12 +47,18 @@ async fn files_are_reused_and_missing_files_reuploaded() {
         let body:serde_json::Value = request.body_json().unwrap();
         assert_eq!(body["messages"][0]["content"][0]["source"], json!({"type":"file","file_id":"file_image"}));
     }
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
     server.verify().await;
     server.reset().await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
     Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_reuploaded"}))).expect(1).mount(&server).await;
     Mock::given(method("POST")).and(path("/v1/messages")).and(body_partial_json(json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_reuploaded"}}]}]}))).respond_with(sse_response(&[])).expect(1).mount(&server).await;
     let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
     server.verify().await;
     server.reset().await;
     Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;

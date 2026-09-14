@@ -4,6 +4,7 @@
 
 pub mod anthropic;
 pub mod auth;
+pub mod headers;
 pub mod ollama;
 pub mod openai;
 pub mod responses;

@@ -49,6 +49,7 @@ pub struct AnthropicProvider {
     images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
+    headers: crate::headers::ProviderHeaders,
     base_url: String,
     auth: Auth,
     model: String,
@@ -61,6 +62,13 @@ impl AnthropicProvider {
         self
     }
 
+    /// Apply validated headers to inference and file requests, never OAuth.
+    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+        self.client = headers.client()?;
+        self.headers = headers;
+        Ok(self)
+    }
+
     pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.idle_timeout = timeout;
         self
@@ -71,6 +79,7 @@ impl AnthropicProvider {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
+            headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::ApiKey(api_key.into()),
             model: model.into(),
@@ -85,6 +94,7 @@ impl AnthropicProvider {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             client: reqwest::Client::new(),
+            headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::Source(source),
             model: model.into(),
@@ -233,7 +243,8 @@ impl AnthropicProvider {
             let source = body.pointer(&path).ok_or_else(|| crate::image_error("missing image source".into()))?;
             let data = source["data"].as_str().ok_or_else(|| crate::image_error("missing inline image bytes".into()))?;
             let mime = source["media_type"].as_str().ok_or_else(|| crate::image_error("missing image media type".into()))?;
-            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, key, mime, data)).map_err(|e| crate::image_error(e.to_string()))?));
+            let upload_credential = self.headers.upload_credential(key);
+            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, &upload_credential, mime, data)).map_err(|e| crate::image_error(e.to_string()))?));
             let mut cache = tokio::select! {
                 _ = cancel.cancelled() => return Err(crate::image_error("image upload cancelled".into())),
                 guard = UPLOADS.get_or_init(Default::default).lock() => guard,
@@ -261,7 +272,7 @@ impl AnthropicProvider {
                 let expires = now.saturating_add(3500);
                 let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| crate::image_error(e.to_string()))?;
                 let endpoint = format!("{}/v1/files", self.base_url);
-                let scope = crate::upload_scope(&endpoint, key);
+                let scope = crate::upload_scope(&endpoint, &upload_credential);
                 let value = crate::upload_with_quota_recovery(store, &scope, &protected, || {
                     let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("image").mime_str(mime).map_err(|e| crate::image_error(e.to_string()))?;
                     let form = reqwest::multipart::Form::new().part("file", part).text("expires_in_seconds", "3600");
