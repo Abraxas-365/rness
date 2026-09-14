@@ -129,6 +129,61 @@ rness.ui.messagebox = {
   tools = {
     web_fetch = { display = "preview", preview_lines = 12, render = web_card },
     web_search = { display = "preview", preview_lines = 12, render = web_card },
+    ToolSearch = { display = "preview", preview_lines = 12, render = function(call)
+      local args = type(call.args) == "table" and call.args or {}
+      local output = type(call.output) == "string" and call.output or ""
+      local payload = output:match("^%s*({.*})%s*$") or output:match("\n%s*({.*})%s*$")
+      local ok, data = pcall(rness.json.decode, payload or "")
+      local status, status_style = tool_status(call)
+      local duration = call.presentation and tonumber(call.presentation.duration_ms)
+      local body = { { spans = {
+        { text = "query ", style = "dim" },
+        { text = preview(args.query, 200, "Not available"), style = "code" },
+      } } }
+      if call.is_error or not ok or type(data) ~= "table" or type(data.tools) ~= "table" then
+        if output ~= "" then
+          body[#body + 1] = { text = output, style = call.is_error and "error" or "tool_output" }
+        end
+      else
+        local count = #data.tools
+        local total = tonumber(data.total_matches) or count
+        local summary = count == 0 and "No tools found" or string.format("%d tool%s available", count, count == 1 and "" or "s")
+        if data.truncated or total > count then
+          summary = summary .. string.format(" · showing %d of %d matches · narrow your query", count, total)
+        end
+        body[#body + 1] = { text = summary, style = "dim" }
+        if type(data.missing) == "table" then
+          local missing = {}
+          for _, name in ipairs(data.missing) do
+            if type(name) == "string" then missing[#missing + 1] = name end
+          end
+          if #missing > 0 then
+            body[#body + 1] = { text = "Not found: " .. table.concat(missing, ", "), style = { fg = p.yellow } }
+          end
+        end
+        -- Schemas are for the model; keep the card focused on discovered tools.
+        for _, tool in ipairs(data.tools) do
+          if type(tool) == "table" then
+            body[#body + 1] = { text = preview(tool.name, 120, "Unnamed tool"), style = "tool_name" }
+            local description = preview(tool.description, 180)
+            if description ~= "" then
+              body[#body + 1] = { text = "  " .. description, style = "dim" }
+            end
+          end
+        end
+      end
+      return {
+        header = {
+          left = {
+            { text = "Tool search", style = "tool_name" },
+            { text = " · ", style = "dim" },
+            { text = status, style = status_style },
+          },
+          right = duration and { { text = string.format("%.0f ms", duration), style = "dim" } } or {},
+        },
+        body = body,
+      }
+    end },
     subagent = { display = "preview", preview_lines = 6, render = function(call)
       local meta = call.presentation
       if type(meta) ~= "table" or meta.kind ~= "subagent_activity" then return nil end
