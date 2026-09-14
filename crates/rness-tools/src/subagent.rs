@@ -67,7 +67,8 @@ impl Tool for SubagentTool {
          provider 'fork' seeds the child with this conversation's completed \
          history (it knows what you know); provider 'spawn' starts fresh \
          (describe the task fully). Foreground by default: the result is \
-         the child's final answer. With run_in_background the child runs \
+         the child's final answer. Prefer foreground when your next action needs \
+         the child's answer and there is no independent work to do. With run_in_background the child runs \
          as a one-shot job — read it with job_output, cancel with job_kill. \
          Job IDs cannot be used with send_message. Continue independent work, \
          avoid busy-polling or duplicating the child task, and collect relevant \
@@ -78,7 +79,15 @@ impl Tool for SubagentTool {
          background_mode 'continuable' the child keeps running as a named \
          agent: message it with send_message, stop its turn with \
          interrupt_agent, list with list_agents; its results arrive as \
-         settle notices in this conversation."
+         settle notices in this conversation. For BOTH background modes, before \
+         each next action check whether the child's answer could change it. If \
+         so, that action is dependent: do not implement, decide, validate, or \
+         report conclusions based on an assumed result. Do not repeat the child's \
+         investigation to avoid waiting. Once independent work is exhausted, \
+         end your turn with a brief waiting update; a commentary update followed \
+         by more dependent tool calls is not waiting. Resume dependent work only \
+         after receiving and reading the child's result. A launch acknowledgement \
+         is not a result. Do not ask the user to prompt you again."
     }
 
     fn input_schema(&self) -> Value {
@@ -101,7 +110,7 @@ impl Tool for SubagentTool {
                 },
                 "run_in_background": {
                     "type": "boolean",
-                    "description": "Run in the background (default false). One-shot mode returns job_id for job_output/job_kill, not send_message. Use background_mode='continuable' for a messageable agent.",
+                    "description": "Run in the background (default false). Prefer false when the next action depends on the result. If true, do only independent work, then end your turn and wait for completion. One-shot mode returns job_id for job_output/job_kill, not send_message. Use background_mode='continuable' for a messageable agent.",
                 },
                 "background_mode": {
                     "type": "string",
@@ -168,7 +177,10 @@ impl SubagentTool {
             return Ok((format!(
                 "started continuable agent {child} — message it with \
                  send_message (agent_id: {child}), stop its turn with interrupt_agent; its \
-                 results arrive here as settle notices"
+                 results arrive here as settle notices. This is a launch acknowledgement, not the child's answer. \
+                 Do only work that does not depend on that answer. If your next action needs it and no independent \
+                 work remains, end your turn now with a brief waiting update; the result will resume this session. \
+                 Do not guess the result, duplicate the delegated task, or poll for completion."
             ), json!({"version":1,"kind":"subagent","mode":"continuable","session":child,"agent_id":child,"accepted":true})));
         }
 
@@ -206,7 +218,7 @@ impl SubagentTool {
             }
         });
         Ok((format!(
-             "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill. This is a one-shot job: its job_id cannot be used with send_message. For a messageable child, use background_mode='continuable' instead."
+             "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill. This is a one-shot job: its job_id cannot be used with send_message. For a messageable child, use background_mode='continuable' instead. This is a launch acknowledgement, not the child's answer. Do only work that does not depend on that answer. If your next action needs it and no independent work remains, end your turn now with a brief waiting update; completion will resume this session. Then read job_output before dependent work. Do not guess the result, duplicate the delegated task, or poll for completion."
         ), json!({"version":1,"kind":"subagent","mode":"background","job_id":id,"accepted":true})))
     }
 }

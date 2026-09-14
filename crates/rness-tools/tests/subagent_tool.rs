@@ -290,6 +290,9 @@ async fn background_subagent_is_a_job() {
     assert!(results[0].output.contains("job"), "{}", results[0].output);
 
     assert!(results[0].output.contains("job_id cannot be used with send_message"));
+    assert!(results[0].output.contains("end your turn now"));
+    assert!(results[0].output.contains("Then read job_output before dependent work"));
+    assert!(results[0].output.contains("not the child's answer"));
 
     // The job settles with the child's output readable via job_output.
     let id = results[0]
@@ -387,6 +390,9 @@ async fn continuable_lifecycle_through_dispatch() {
         .expect("child id in output")
         .to_string();
     assert!(results[0].output.contains(&format!("send_message (agent_id: {child})")));
+    assert!(results[0].output.contains("end your turn now"));
+    assert!(results[0].output.contains("not the child's answer"));
+    assert!(results[0].output.contains("result will resume this session"));
     sessions.join(&child).await;
 
     // list_agents sees it.
