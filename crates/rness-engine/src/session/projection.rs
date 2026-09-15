@@ -103,6 +103,17 @@ fn compaction_plan(history: &[Envelope]) -> CompactionPlan {
 
 /// Derive the model context from a history (as returned by
 /// `SessionStore::history` — header first, events in order).
+pub fn search_surfaces(history: &[Envelope]) -> std::collections::HashMap<EventId, &'static str> {
+    let plan = compaction_plan(history);
+    let current: HashSet<_> = model_context(history).sources.into_iter().collect();
+    history.iter().map(|event| {
+        let surface = if plan.shadowed.contains(&event.id) || plan.pruned.contains_key(&event.id) {
+            "shadowed"
+        } else if current.contains(&event.id) { "current" } else { "log-only" };
+        (event.id.clone(), surface)
+    }).collect()
+}
+
 pub fn model_context(history: &[Envelope]) -> ModelContext {
     let mut ctx = ModelContext::default();
     let mut pending_tools: Vec<(EventId, ToolResult)> = Vec::new();

@@ -32,6 +32,9 @@ pub(crate) type CompactionFuture = std::pin::Pin<Box<dyn std::future::Future<Out
 pub(crate) struct CompactionRequest(pub(crate) CompactionFuture);
 impl mlua::UserData for CompactionRequest {}
 
+pub(crate) struct SearchRequest(pub(crate) std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>);
+impl mlua::UserData for SearchRequest {}
+
 /// Yield from Lua rather than through a non-yieldable Rust callback frame.
 pub(crate) fn compaction_wrapper(lua: &Lua, prepare: mlua::Function) -> mlua::Result<mlua::Function> {
     lua.load(r#"
@@ -98,6 +101,60 @@ pub fn install(
     })?)?;
     rness.set("images", images)?;
     let session = lua.create_table()?;
+
+    // Trusted plugin API, not a model tool. Each plugin instance owns its
+    // provider; dropping the returned function releases the SQLite connection.
+    // Creating the function performs no filesystem operations.
+    let search_service = Arc::clone(&sessions);
+    let search_rt = rt.clone();
+    session.set("sqlite_search_provider", lua.create_function(move |lua, ()| {
+        let sessions = Arc::clone(&search_service);
+        // Separate versioned filename: leave the earlier prototype index alone.
+        let path = sessions.store().root().join("session-search-v2.sqlite3");
+        let provider = Arc::new(std::sync::Mutex::new(
+            rness_engine::session_search::SqliteSessionSearch::new(path),
+        ));
+        let runtime = search_rt.clone();
+        let prepare = lua.create_function(move |lua, (caller, operation, args): (String, String, Table)| {
+            let request: rness_engine::session_search::QueryRequest = lua.from_value(mlua::Value::Table(args))?;
+            let sessions = sessions.clone();
+            let provider = provider.clone();
+            let runtime = runtime.clone();
+            Ok(SearchRequest(Box::pin(async move {
+                runtime.spawn_blocking(move || {
+                    // Do not queue unbounded blocking workers behind one index.
+                    let mut provider = provider.try_lock().map_err(|_| "session search busy; retry shortly".to_string())?;
+                    provider.execute(sessions.store(), &caller, &operation, request).map_err(|e| e.to_string())
+                }).await.map_err(|e| e.to_string())?
+            })))
+        })?;
+        compaction_wrapper(lua, prepare)
+    })?)?;
+
+    // Owned registration with cleanup on unload or failed plugin load.
+    session.set("register_search_provider", lua.create_function(|lua, provider: mlua::Function| {
+        let globals = lua.globals();
+        let owner: Table = globals.get("__rness_load_owner")?;
+        if globals.get::<Option<mlua::Function>>("__rness_search_provider")?.is_some() {
+            return Err(err("session search provider already registered"));
+        }
+        globals.set("__rness_search_provider", provider.clone())?;
+        let cleanup = lua.create_function(move |lua, ()| {
+            let current = lua.globals().get::<Option<mlua::Function>>("__rness_search_provider")?;
+            if current.is_some_and(|current| current.to_pointer() == provider.to_pointer()) {
+                lua.globals().set("__rness_search_provider", mlua::Value::Nil)?;
+            }
+            Ok(true)
+        })?;
+        owner.push(cleanup.clone())?;
+        globals.get::<Table>("__rness_loading_hooks")?.push(cleanup)?;
+        Ok(())
+    })?)?;
+    session.set("search_provider", lua.create_function(|lua, ()| {
+        lua.globals().get::<Option<mlua::Function>>("__rness_search_provider")?
+            .ok_or_else(|| err("enable a session search provider plugin first"))
+    })?)?;
+
     let s = Arc::clone(&sessions);
     session.set("model_capabilities", lua.create_function(move |lua, selection: Table| {
         let selection = lua.from_value(mlua::Value::Table(selection))?;

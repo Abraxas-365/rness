@@ -158,7 +158,7 @@ pub fn read_session(root: &Path, session: &SessionId) -> Result<Vec<Envelope>, L
     read_envelopes(&path)
 }
 
-fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
+pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();

@@ -122,6 +122,7 @@ enum Cmd {
     ToolSpecs {
         reply: tokio::sync::oneshot::Sender<Vec<LuaToolSpec>>,
     },
+    ResumeTool { id: u64, result: Result<serde_json::Value, String> },
     CallTool {
         context: serde_json::Value,
         name: String,
@@ -260,6 +261,48 @@ fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak
     Ok(())
 }
 
+struct PendingTool {
+    thread: crate::runtime::CommandThread,
+    reply: tokio::sync::oneshot::Sender<Result<(String, Option<serde_json::Value>), String>>,
+}
+
+struct ToolCompletion {
+    tx: std::sync::Arc<mpsc::Sender<Cmd>>,
+    id: u64,
+    result: Option<Result<serde_json::Value, String>>,
+}
+impl Drop for ToolCompletion {
+    fn drop(&mut self) {
+        let result = self.result.take().unwrap_or_else(|| Err("session query task stopped".into()));
+        let _ = self.tx.send(Cmd::ResumeTool { id: self.id, result });
+    }
+}
+fn tool_step(
+    id: u64, tool: PendingTool, step: Result<crate::runtime::ToolStep, String>,
+    pending: &mut std::collections::HashMap<u64, PendingTool>,
+    runtime: Option<&tokio::runtime::Handle>, tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
+) {
+    match step {
+        Ok(crate::runtime::ToolStep::Pending(request)) => {
+            let Some((runtime, tx)) = runtime.zip(tx.upgrade()) else {
+                let _ = tool.reply.send(Err("session query runtime unavailable".into()));
+                return;
+            };
+            pending.insert(id, tool);
+            let mut completion = ToolCompletion { tx, id, result: None };
+            runtime.spawn(async move {
+                completion.result = Some(match tokio::time::timeout(std::time::Duration::from_secs(60), request.0).await {
+                    Ok(result) => result,
+                    Err(_) => Err("session query timed out; index worker may still finish".into()),
+                });
+                drop(completion);
+            });
+        }
+        Ok(crate::runtime::ToolStep::Complete(result)) => { let _ = tool.reply.send(Ok(result)); }
+        Err(error) => { let _ = tool.reply.send(Err(error)); }
+    }
+}
+
 struct PendingCommand {
     thread: crate::runtime::CommandThread,
     permit: rness_engine::service::CommandPermit,
@@ -358,6 +401,8 @@ impl LuaHost {
                 let mut installed_commands = Vec::new();
                 let mut session_binding: Option<SessionBinding> = None;
                 let mut questions_ref: Option<std::sync::Arc<rness_engine::questions::Questions>> = None;
+                let mut pending_tools = std::collections::HashMap::new();
+                let mut next_tool_id = 0u64;
                 let mut pending_commands = std::collections::HashMap::new();
                 let mut next_command_id = 0u64;
                 while let Ok(cmd) = rx.recv() {
@@ -398,7 +443,7 @@ impl LuaHost {
                                 session_binding.as_ref().map(|b| &b.rt), &command_tx);
                         }
                         Cmd::Load { name, source, dependencies, reply } => {
-                            if !pending_commands.is_empty() {
+                            if !pending_commands.is_empty() || !pending_tools.is_empty() {
                                 let _ = reply.send(Err("extension runtime is busy".into()));
                                 continue;
                             }
@@ -434,6 +479,10 @@ impl LuaHost {
                             let _ = reply.send(r);
                         }
                         Cmd::CoordinatedUnload { name, installed, apply_ui, reply } => {
+                            if !pending_tools.is_empty() {
+                                let _ = reply.send(Err("extension runtime is busy".into()));
+                                continue;
+                            }
                             let result = (|| {
                                 let binding = session_binding.as_ref().ok_or("coordinated unload requires a mounted host")?;
                                 let _maintenance = binding.sessions.try_extension_maintenance().map_err(|e| e.to_string())?;
@@ -493,11 +542,30 @@ impl LuaHost {
                             let _ = reply.send(result);
                         }
                         Cmd::CallTool { name, args, context, reply } => {
-                            let r = match rt.call_tool_presented(&name, &args, &context) {
-                                Ok(r) => r,
-                                Err(e) => Err(e.to_string()),
+                            use mlua::LuaSerdeExt;
+                            let mut thread = match rt.tool_thread(&name) {
+                                Ok(thread) => thread,
+                                Err(error) => { let _ = reply.send(Err(error)); continue; }
                             };
-                            let _ = reply.send(r);
+                            let id = next_tool_id;
+                            next_tool_id = next_tool_id.checked_add(1).expect("tool ID exhausted");
+                            let step = rt.lua().to_value(&args).and_then(|args|
+                                Ok((args, rt.lua().to_value(&context)?))).map_err(|e| e.to_string())
+                                .and_then(|args| rt.resume_tool(&mut thread, args));
+                            tool_step(id, PendingTool { thread, reply }, step, &mut pending_tools,
+                                session_binding.as_ref().map(|b| &b.rt), &command_tx);
+                        }
+                        Cmd::ResumeTool { id, result } => {
+                            use mlua::LuaSerdeExt;
+                            let Some(mut tool) = pending_tools.remove(&id) else { continue; };
+                            if tool.reply.is_closed() { continue; }
+                            let step = match result {
+                                Ok(value) => rt.lua().to_value(&value).map_err(|e| e.to_string())
+                                    .and_then(|value| rt.resume_tool(&mut tool.thread, (true, value))),
+                                Err(error) => rt.resume_tool(&mut tool.thread, (false, error)),
+                            };
+                            tool_step(id, tool, step, &mut pending_tools,
+                                session_binding.as_ref().map(|b| &b.rt), &command_tx);
                         }
                         Cmd::FireHook { event, payload } => {
                             for err in rt.fire_hook(&event, &payload) {
@@ -568,6 +636,10 @@ impl LuaHost {
                             let _ = reply.send(r);
                         }
                         Cmd::Reload { mut sources, reconcile, reply } => {
+                            if !pending_tools.is_empty() {
+                                let _ = reply.send(Err(ReloadError::Busy));
+                                continue;
+                            }
                             // Validate the declared graph before applying session-local unloads.
                             // Failed consumers may never have loaded, so unloading their
                             // prerequisite is valid; keep them skipped on subsequent reloads.

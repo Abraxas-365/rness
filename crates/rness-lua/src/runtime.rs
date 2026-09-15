@@ -78,6 +78,11 @@ pub(crate) struct CommandThread {
     depth: LuaValue,
 }
 
+pub(crate) enum ToolStep {
+    Pending(crate::api::session::SearchRequest),
+    Complete((String, Option<serde_json::Value>)),
+}
+
 pub(crate) enum CommandStep {
     Pending(crate::api::session::CompactionFuture),
     Complete(rness_engine::interaction::CommandResult),
@@ -406,6 +411,8 @@ impl LuaRuntime {
         };
         let declarations: Table = self.lua.globals().get("__rness_declarations").map_err(|e| e.to_string())?;
         let mut staged = run().map_err(|e| e.to_string())?;
+        let search_provider: LuaValue = self.lua.globals().get("__rness_search_provider").map_err(|e| e.to_string())?;
+        self.lua.globals().set("__rness_search_provider", LuaValue::Nil).map_err(|e| e.to_string())?;
         let result = sources.iter().try_for_each(|source| staged.load_with_dependencies(&source.name, &source.source, &source.dependencies).map_err(|e| format!("{}: {e}", source.name)))
             .and_then(|()| {
                 for mapping in self.user_mappings()? {
@@ -421,6 +428,7 @@ impl LuaRuntime {
         if let Err(error) = result {
             for source in sources.iter().rev() { let _ = staged.unload(&source.name); }
             self.lua.globals().set("__rness_declarations", declarations).map_err(|e| e.to_string())?;
+            self.lua.globals().set("__rness_search_provider", search_provider).map_err(|e| e.to_string())?;
             return Err(error);
         }
         // Unsubscribe old owners only after all replacements have validated.
@@ -826,6 +834,42 @@ impl LuaRuntime {
             }
             _ => AppKeyOutcome::Consumed,
         })
+    }
+
+    pub(crate) fn tool_thread(&self, name: &str) -> Result<CommandThread, String> {
+        let (_, key) = self.tools.get(name).ok_or_else(|| format!("unknown tool: {name}"))?;
+        let thread = self.lua.registry_value::<Function>(key).and_then(|f| self.lua.create_thread(f)).map_err(|e| e.to_string())?;
+        Ok(CommandThread { thread, owner: LuaValue::Nil, depth: LuaValue::Nil })
+    }
+
+    pub(crate) fn resume_tool(&self, command: &mut CommandThread, args: impl mlua::IntoLuaMulti) -> Result<ToolStep, String> {
+        let globals = self.lua.globals();
+        let run = || -> mlua::Result<mlua::MultiValue> {
+            let owner: LuaValue = globals.get("__rness_callback_owner")?;
+            let depth: LuaValue = globals.get("__rness_callback_depth")?;
+            globals.set("__rness_callback_owner", command.owner.clone())?;
+            globals.set("__rness_callback_depth", command.depth.clone())?;
+            let result = command.thread.resume(args);
+            command.owner = globals.get("__rness_callback_owner")?;
+            command.depth = globals.get("__rness_callback_depth")?;
+            globals.set("__rness_callback_owner", owner)?;
+            globals.set("__rness_callback_depth", depth)?;
+            result
+        };
+        let values = run().map_err(|e| user_message(&e))?;
+        if command.thread.status() == mlua::ThreadStatus::Resumable {
+            if values.len() != 1 { return Err("unsupported tool yield".into()); }
+            let Some(LuaValue::UserData(data)) = values.front() else { return Err("unsupported tool yield".into()); };
+            let request = data.take::<crate::api::session::SearchRequest>().map_err(|e| e.to_string())?;
+            return Ok(ToolStep::Pending(request));
+        }
+        let value = values.front().cloned().unwrap_or(LuaValue::Nil);
+        let metadata = values.get(1).cloned().unwrap_or(LuaValue::Nil);
+        let output = if matches!(value, LuaValue::Nil) { String::new() } else {
+            lua_display(&self.lua, value).map_err(|e| e.to_string())?
+        };
+        let presentation = if matches!(metadata, LuaValue::Nil) { None } else { self.lua.from_value(metadata).ok() };
+        Ok(ToolStep::Complete((output, presentation)))
     }
 
     /// Invoke a Lua tool. Lua raising an error becomes Err (an is_error
@@ -1502,7 +1546,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
             let tools: Table = pending.get("tools")?;
             let entry = lua.create_table()?;
             entry.set("name", name.clone())?;
-            entry.set("run", owned_callback(lua, run)?)?;
+            entry.set("run", owned_command(lua, run)?)?;
             entry.set("description", description)?;
             entry.set("sensitive", sensitive)?;
             entry.set("schema", lua.to_value(&schema)?)?;

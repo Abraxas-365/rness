@@ -44,7 +44,7 @@ pub enum ServiceError {
     Log(#[from] LogError),
     #[error(transparent)]
     Replay(#[from] ReplayError),
-    #[error("session is busy — compact only when idle")]
+    #[error("session is busy — wait for the active operation to finish and retry")]
     Busy,
     #[error("nothing to compact")]
     NothingToCompact,

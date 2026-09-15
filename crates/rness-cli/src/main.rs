@@ -550,9 +550,10 @@ async fn main() -> anyhow::Result<()> {
     ).with_allow_generic(startup.allow_generic_subagents));
     subagents.register(Arc::new(rness_engine::subagent::SpawnProvider));
     subagents.register(Arc::new(rness_engine::subagent::ForkProvider));
-    jobs.attach_sessions(&sessions);
+    // Attach job delivery only after startup configuration is committed below.
+    // Recovered completion notices can start turns immediately on attachment.
     lua.install_jobs(jobs.clone()).await.map_err(|e| anyhow::anyhow!("lua jobs bridge: {e}"))?;
-    rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs);
+    rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs.clone());
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
 
     // Skills: filesystem catalogs, project shadowing user on name
@@ -656,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
+        jobs.attach_sessions(&sessions);
         eprintln!("rness serving on http://{addr} (model: {})", selection.model);
         axum::serve(listener, rness_server::router(state)).await?;
         return Ok(());
@@ -666,7 +668,9 @@ async fn main() -> anyhow::Result<()> {
         None => sessions.create(Some(cwd.display().to_string()))?,
     };
 
-    sessions.set_config(&session, creation_seed)?;
+    sessions.set_config(&session, creation_seed)
+        .with_context(|| format!("apply startup model/reasoning configuration to session {session}"))?;
+    jobs.attach_sessions(&sessions);
 
     let Some(prompt) = cli.prompt else {
         // Interactive: hot-reload Lua plugins while the TUI runs. The

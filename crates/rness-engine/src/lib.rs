@@ -27,6 +27,7 @@ pub mod presentation;
 pub mod invariants;
 pub mod service;
 pub mod session;
+pub mod session_search;
 pub mod subagent;
 pub mod tools;
 pub mod turn;

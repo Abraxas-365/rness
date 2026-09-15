@@ -253,6 +253,173 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Resolve search scope from a trusted execution session and authorize an
+    /// optional model-selected target. Reject paths before touching the store.
+    pub fn search_workspace(
+        &self,
+        caller: &SessionId,
+        target: Option<&SessionId>,
+    ) -> Result<String, BranchError> {
+        for id in std::iter::once(caller).chain(target) {
+            if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
+                return Err(LogError::Corrupt {
+                    line: 0, reason: "invalid search session ID".into(),
+                }.into());
+            }
+        }
+        let workspace = self.workspace(caller)?.filter(|value| !value.is_empty())
+            .ok_or_else(|| LogError::Corrupt {
+                line: 0, reason: "session search requires a caller workspace".into(),
+            })?;
+        if let Some(target) = target {
+            if self.workspace(target)?.as_deref() != Some(workspace.as_str()) {
+                return Err(LogError::Corrupt {
+                    line: 0, reason: "target session is outside the caller workspace".into(),
+                }.into());
+            }
+        }
+        Ok(workspace)
+    }
+
+    /// Local committed events, authorized against the header in the same read.
+    pub fn search_events(&self, caller: &SessionId, target: &SessionId) -> Result<Vec<Envelope>, BranchError> {
+        let workspace = self.search_workspace(caller, Some(target))?;
+        // Changed files may be replacements, not appends. Bypass the engine's
+        // immutable-prefix cache for authoritative search refresh/read.
+        let events = super::log::read_envelopes(&super::log::log_file(&self.root.join(target)))?;
+        if !matches!(events.first().map(|event| &event.event),
+            Some(SessionEvent::Header(header)) if header.session == *target
+                && header.workspace.as_deref() == Some(workspace.as_str())) {
+            return Err(LogError::Corrupt { line: 1, reason: "search session identity changed".into() }.into());
+        }
+        Ok(events)
+    }
+
+    /// Cheap per-session revision. Includes replacement identity on Unix; never
+    /// opens a body. Call before reading so concurrent appends refresh next time.
+    pub fn search_revision(&self, session: &SessionId) -> Result<String, BranchError> {
+        let directory = self.root.join(session);
+        let path = super::log::log_file(&directory);
+        if std::fs::symlink_metadata(&directory).map_err(LogError::from)?.file_type().is_symlink()
+            || std::fs::symlink_metadata(&path).map_err(LogError::from)?.file_type().is_symlink() {
+            return Err(LogError::Corrupt { line: 0, reason: "search refuses symlinked logs".into() }.into());
+        }
+        let meta = std::fs::metadata(path).map_err(LogError::from)?;
+        let revision = format!("{}:{:?}", meta.len(), meta.modified().map_err(LogError::from)?);
+        #[cfg(unix)]
+        let revision = {
+            use std::os::unix::fs::MetadataExt;
+            format!("{revision}:{}:{}:{}:{}", meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        };
+        Ok(revision)
+    }
+
+    /// Read searchable text from its original local JSONL event, without SQLite.
+    /// Ancestor events must be addressed using their source session ID.
+    pub fn search_event_read(
+        &self,
+        caller: &SessionId,
+        target: &SessionId,
+        event_ref: &str,
+    ) -> Result<Option<crate::session_search::SearchDocument>, BranchError> {
+        use rness_protocol::events::ContentPart;
+        let workspace = self.search_workspace(caller, Some(target))?;
+        // Changed files may be replacements, not appends. Bypass the engine's
+        // immutable-prefix cache for authoritative search refresh/read.
+        let events = super::log::read_envelopes(&super::log::log_file(&self.root.join(target)))?;
+        if !matches!(events.first().map(|event| &event.event),
+            Some(SessionEvent::Header(header)) if header.session == *target
+                && header.workspace.as_deref() == Some(workspace.as_str()))
+        {
+            return Err(LogError::Corrupt {
+                line: 1, reason: "session identity or workspace changed during read".into(),
+            }.into());
+        }
+        for envelope in events {
+            if envelope.id != event_ref { continue; }
+            let content = match envelope.event {
+                SessionEvent::UserMessage(message) => message.content,
+                SessionEvent::AssistantMessage(message) => message.content,
+                _ => return Ok(None),
+            };
+            let text = content.into_iter().filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text),
+                _ => None,
+            }).collect::<Vec<_>>().join("\n");
+            return Ok(Some(crate::session_search::SearchDocument {
+                session_id: target.clone(), event_ref: envelope.id, text,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Build a derived search snapshot on demand. This never opens a writable
+    /// log or changes JSONL. Index local messages once, under their source
+    /// session, rather than duplicating ancestor messages for every fork.
+    /// The caller must supply a trusted workspace, not model-provided scope.
+    pub fn search_snapshot(
+        &self,
+        workspace: &str,
+        previous_revision: Option<&str>,
+    ) -> Result<Option<crate::session_search::SearchSnapshot>, BranchError> {
+        use crate::session_search::{SearchDocument, SearchSnapshot};
+        use rness_protocol::events::ContentPart;
+        use sha2::{Digest, Sha256};
+
+        let mut documents = Vec::new();
+        let mut digest = Sha256::new();
+        digest.update(b"session-message-search-v1");
+        digest.update((workspace.len() as u64).to_le_bytes());
+        digest.update(workspace.as_bytes());
+        for session_id in self.list()? {
+            if self.workspace(&session_id)?.as_deref() != Some(workspace) {
+                continue;
+            }
+            let events = self.read_session(&session_id)?;
+            // Authorize again using the same observation as the indexed body.
+            if !matches!(events.first().map(|event| &event.event),
+                Some(SessionEvent::Header(header))
+                    if header.session == session_id
+                        && header.workspace.as_deref() == Some(workspace))
+            {
+                return Err(LogError::Corrupt {
+                    line: 1,
+                    reason: "session identity or workspace changed during search".into(),
+                }.into());
+            }
+            digest.update((session_id.len() as u64).to_le_bytes());
+            digest.update(session_id.as_bytes());
+            for envelope in events {
+                let content = match &envelope.event {
+                    SessionEvent::UserMessage(message) => &message.content,
+                    SessionEvent::AssistantMessage(message) => &message.content,
+                    _ => continue,
+                };
+                let text = content.iter().filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                }).collect::<Vec<_>>().join("\n");
+                if text.trim().is_empty() {
+                    continue;
+                }
+                for value in [envelope.id.as_str(), text.as_str()] {
+                    digest.update((value.len() as u64).to_le_bytes());
+                    digest.update(value.as_bytes());
+                }
+                documents.push(SearchDocument {
+                    session_id: session_id.clone(),
+                    event_ref: envelope.id,
+                    text,
+                });
+            }
+        }
+        let revision = format!("{:x}", digest.finalize());
+        if previous_revision == Some(revision.as_str()) {
+            return Ok(None);
+        }
+        Ok(Some(SearchSnapshot { revision, documents }))
+    }
+
     /// Return only new local envelopes. An ancestor cursor requires a full
     /// history reload; ancestor prefixes are immutable after a fork.
     pub fn history_after(&self, session: &SessionId, after: &str) -> Result<Option<Vec<Envelope>>, BranchError> {

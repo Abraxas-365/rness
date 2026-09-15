@@ -28,6 +28,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 libc = "0.2"
 
 [dev-dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
 rness-tui.workspace = true
 tempfile.workspace = true
 tokio-util.workspace = true
