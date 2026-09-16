@@ -17,6 +17,17 @@ rness.web = {
   -- search = { provider = "deepseek", api_key_env = "DEEPSEEK_API_KEY", model = "deepseek-v4-flash" },
 }
 
+-- Output quotas and age-based cleanup are off in the core defaults.
+-- This flavor opts in; set any byte/age limit to 0 to disable it.
+rness.jobs.setup {
+  retention = {
+    max_job_bytes = 256 * 1024 * 1024,
+    max_total_bytes = 2 * 1024 * 1024 * 1024,
+    max_age_secs = 7 * 24 * 60 * 60,
+    cleanup_interval_secs = 60,
+  },
+}
+
 rness.plugins.setup({
   { name = "delivery", file = "plugins/delivery.lua", keys = { queue = "<F8>", steer = "<F9>" } },
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20, allow_parent = false, allow_home = false, allow_absolute = false } },

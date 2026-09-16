@@ -11,7 +11,8 @@ pub fn install_unmounted(lua: &Lua, rness: &Table) -> mlua::Result<()> {
         })?)?;
     }
     jobs.set("setup", lua.create_function(|lua, config: Table| {
-        if lua.globals().get::<Option<String>>("__rness_loading_plugin")?.is_some()
+        if lua.named_registry_value::<Option<bool>>("rness.jobs.startup_closed")?.unwrap_or(false)
+            || lua.globals().get::<Option<String>>("__rness_loading_plugin")?.is_some()
             || lua.globals().get::<Option<Table>>("__rness_messagebox_renderers")?.is_some() {
             return Err(mlua::Error::runtime("jobs.setup is startup-only; configure it in init.lua"));
         }

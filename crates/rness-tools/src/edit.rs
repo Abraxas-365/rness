@@ -11,16 +11,21 @@ use crate::{required_str, Workspace};
 
 pub struct EditTool {
     ws: Arc<Workspace>,
+    policy: crate::sandbox::Policy,
 }
 
 impl EditTool {
     pub fn new(ws: Arc<Workspace>) -> Self {
-        Self { ws }
+        let policy = crate::sandbox::Policy::new(rness_protocol::sandbox::SandboxMode::DangerFullAccess, ws.root());
+        Self { ws, policy }
     }
 }
 
 #[async_trait]
 impl Tool for EditTool {
+    fn for_workspace_with_policy(&self, session: &String, workspace: &std::path::Path, mode: rness_protocol::sandbox::SandboxMode) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self { ws: self.ws.for_session(session, workspace), policy: crate::sandbox::Policy { mode, workspace: workspace.to_owned() } }))
+    }
     fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }
@@ -72,6 +77,8 @@ impl EditTool {
             return Err("old_string and new_string are identical".to_string());
         }
 
+        self.policy.check_write(&path)?;
+        self.policy.check_write(&path)?;
         self.ws.ensure_fresh(&path)?;
         let content = tokio::fs::read_to_string(&path)
             .await

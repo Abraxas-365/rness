@@ -68,11 +68,49 @@ pub struct StartupConfig {
     pub ask_user: bool,
     pub default_agent: Option<String>,
     pub sandbox: rness_engine::sandbox::SandboxConfig,
+    pub job_retention: rness_tools::jobs::Retention,
     pub sandbox_configured: bool,
 }
 
 #[cfg(test)]
 mod permission_tests {
+    #[test]
+    fn job_retention_is_opt_in_and_default_flavor_enables_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for script in ["", "rness.jobs.setup {}", "rness.jobs.setup {retention={}}"] {
+            std::fs::write(&path, script).unwrap();
+            let policy = super::load(&path).unwrap().job_retention;
+            assert_eq!(policy.max_job_bytes, 0);
+            assert_eq!(policy.max_total_bytes, 0);
+            assert_eq!(policy.max_age_secs, 0);
+            assert_eq!(policy.cleanup_interval_secs, 60);
+        }
+        let flavor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../flavors/default/init.lua");
+        let policy = super::load(&flavor).unwrap().job_retention;
+        assert_eq!(policy.max_job_bytes, 256 * 1024 * 1024);
+        assert_eq!(policy.max_total_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(policy.max_age_secs, 7 * 24 * 60 * 60);
+        assert_eq!(policy.cleanup_interval_secs, 60);
+    }
+
+    #[test]
+    fn job_retention_is_configurable_from_lua() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.jobs.setup{retention={max_job_bytes=123, max_total_bytes=456, max_age_secs=0, cleanup_interval_secs=5}}").unwrap();
+        let config = super::load(&path).unwrap();
+        assert_eq!(config.job_retention.max_job_bytes, 123);
+        assert_eq!(config.job_retention.max_total_bytes, 456);
+        assert_eq!(config.job_retention.max_age_secs, 0);
+        assert_eq!(config.job_retention.cleanup_interval_secs, 5);
+        for retention in ["{cleanup_interval_secs=0}", "{max_job_bytes=-1}", "{typo=true}"] {
+            std::fs::write(&path, format!("rness.jobs.setup{{retention={retention}}}")).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+    }
+
     #[test]
     fn provider_headers_are_optional_and_require_string_pairs() {
         let dir = tempfile::tempdir().unwrap();
@@ -533,6 +571,7 @@ pub fn load(
     }
     let lua = Lua::new();
     lua.globals().set("rness", lua.create_table()?)?;
+    super::jobs::install_unmounted(&lua, &lua.globals().get::<Table>("rness")?)?;
     evaluate(&lua, path)
 }
 
@@ -820,6 +859,7 @@ pub fn evaluate(
         lua.create_function(move |lua, value: Table| {
             let config: rness_engine::sandbox::SandboxConfig =
                 lua.from_value(mlua::Value::Table(value))?;
+            config.process.validate().map_err(mlua::Error::runtime)?;
             let mut state = s.lock().unwrap();
             if state.sandbox_configured {
                 return Err(mlua::Error::runtime(
@@ -1141,7 +1181,14 @@ pub fn evaluate(
             })?,
         )?;
     }
+    lua.set_named_registry_value("rness.jobs.startup_closed", true)?;
     let mut config = state.lock().unwrap().clone();
+    if let Some(jobs) = rness.get::<Table>("jobs")?.get::<Option<Table>>("config")? {
+        if let Some(retention) = jobs.get::<Option<Table>>("retention")? {
+            config.job_retention = lua.from_value(mlua::Value::Table(retention))?;
+            config.job_retention.validate()?;
+        }
+    }
     config.allow_generic_subagents = match rness.get::<Table>("agents")?.get::<mlua::Value>("allow_generic")? {
         mlua::Value::Nil => false,
         mlua::Value::Boolean(allow) => allow,
@@ -1699,7 +1746,7 @@ mod tests {
     fn sandbox_rejects_invalid_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("init.lua");
-        for value in ["{default='invalid'}", "{unknown=true}", "{unavailable='allow'}", "{agent_overrides='allow'}"] {
+        for value in ["{default='invalid'}", "{unknown=true}", "{unavailable='allow'}", "{agent_overrides='allow'}", "{process={unix_shell=''}}", "{process={windows_container_pids=0}}", "{process={windows_container_image='--privileged'}}"] {
             std::fs::write(&init, format!("rness.sandbox.setup({value})")).unwrap();
             assert!(load(&init).is_err(), "{value}");
         }

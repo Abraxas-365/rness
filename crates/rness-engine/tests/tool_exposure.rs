@@ -43,6 +43,7 @@ async fn parallel_calls_overlap_and_keep_input_order() {
     #[async_trait::async_trait]
     impl Tool for BarrierTool {
         fn name(&self)->&str { "Barrier" }
+        fn concurrency_safe(&self, _: &Value) -> bool { true }
         async fn execute(&self,args:Value)->Result<String,String> { self.0.wait().await; Ok(args["index"].to_string()) }
     }
     let registry = Arc::new(ToolRegistry::default());

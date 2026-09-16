@@ -14,7 +14,8 @@ These pages describe the current source checkout, not a versioned stable release
 | Organize personal Lua configuration | [The init.lua entry point](guides/configuration/init-lua.md) |
 | Understand providers, profiles, and roles | [Configuration concepts](explanation/providers-models-profiles-agents.md) |
 | Look up agent fields | [Agent configuration reference](reference/configuration/agents.md) |
-| Opt into Bash filesystem confinement | [Sandbox configuration](reference/configuration/sandbox.md) |
+| Understand scheduling, MCP, server auth and output retention | [Execution hardening](guides/execution-hardening.md) |
+| Opt into filesystem write restrictions | [Sandbox configuration](reference/configuration/sandbox.md) |
 | Call delegation APIs from Lua | [Lua subagents reference](reference/lua/subagents.md) |
 | Check which model settings win | [Configuration precedence](reference/configuration-precedence.md) |
 | Monitor or stop background jobs | [Background job controls](guides/background-jobs.md) |

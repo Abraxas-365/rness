@@ -10,9 +10,12 @@
 //! bridged. Nothing connects unless the host composes it — no config
 //! magic, no auto-discovery.
 
+pub mod http;
+pub mod reconnect;
+
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +40,8 @@ pub enum McpError {
     Protocol { server: String, message: String },
     #[error("mcp '{server}': request timed out after {timeout_ms}ms")]
     Timeout { server: String, timeout_ms: u64 },
+    #[error("mcp '{server}': remote RPC error: {message}")]
+    Rpc { server: String, message: String },
     #[error("mcp '{server}': connection closed")]
     Closed { server: String },
 }
@@ -84,18 +89,78 @@ fn valid_server_name(name: &str) -> bool {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+
+struct PendingRequest { pending: Pending, id: u64 }
+impl Drop for PendingRequest {
+    fn drop(&mut self) { self.pending.lock().expect("pending lock").remove(&self.id); }
+}
+
+struct IncompleteWrite<'a> { connection: &'a McpConnection, complete: bool }
+impl Drop for IncompleteWrite<'_> {
+    fn drop(&mut self) {
+        if self.complete { return; }
+        let conn = self.connection;
+        conn.closed.store(true, Ordering::Release);
+        if let Some(reader) = &conn.reader { reader.abort(); }
+        conn.pending.lock().expect("pending lock").clear();
+        if let Some(child) = conn.child.lock().expect("child lock").as_mut() { let _ = child.start_kill(); }
+        conn.changed.notify_one();
+    }
+}
+
+/// A small launch-environment allowlist; credentials must be passed explicitly.
+fn child_env() -> Vec<(String, std::ffi::OsString)> {
+    ["PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL"]
+        .into_iter().filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value))).collect()
+}
+
+async fn read_frame(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> std::io::Result<Option<Vec<u8>>> {
+    let mut frame = Vec::new();
+    loop {
+        let bytes = reader.fill_buf().await?;
+        if bytes.is_empty() {
+            return if frame.is_empty() { Ok(None) } else { Err(std::io::ErrorKind::UnexpectedEof.into()) };
+        }
+        let end = bytes.iter().position(|b| *b == b'\n').map(|i| i + 1);
+        let count = end.unwrap_or(bytes.len());
+        if frame.len().saturating_add(count) > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "MCP frame exceeds 16 MiB"));
+        }
+        frame.extend_from_slice(&bytes[..count]);
+        reader.consume(count);
+        if end.is_some() { return Ok(Some(frame)); }
+    }
+}
 
 /// A live connection to one MCP server. Dropping it kills the child;
 /// `disconnect` additionally unregisters the bridged tools.
 pub struct McpConnection {
     server: String,
-    stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
+    spec: Option<StdioServer>,
+    http: Option<Arc<http::HttpTransport>>,
+    stdin: Option<Arc<tokio::sync::Mutex<ChildStdin>>>,
     pending: Pending,
     next_id: AtomicU64,
     timeout: Duration,
     child: Mutex<Option<Child>>,
     /// Public names registered on behalf of this connection.
-    registered: Mutex<Vec<String>>,
+    registered: Mutex<Vec<std::sync::Weak<dyn Tool>>>,
+    closed: Arc<AtomicBool>,
+    reader: Option<tokio::task::AbortHandle>,
+    http_reader: Mutex<Option<tokio::task::AbortHandle>>,
+    cancel: tokio_util::sync::CancellationToken,
+    sync: tokio::sync::Mutex<()>,
+    changed: Arc<tokio::sync::Notify>,
+    deferred: AtomicBool,
+}
+
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(reader) = &self.reader { reader.abort(); }
+        if let Some(reader) = self.http_reader.get_mut().unwrap().take() { reader.abort(); }
+    }
 }
 
 impl McpConnection {
@@ -108,6 +173,8 @@ impl McpConnection {
         }
         let mut cmd = tokio::process::Command::new(&spec.command);
         cmd.args(&spec.args)
+            .env_clear()
+            .envs(child_env())
             .envs(spec.env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -120,19 +187,23 @@ impl McpConnection {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let pending: Pending = Arc::default();
-
-        // Reader task: route responses to waiting callers by id.
-        // Server-initiated requests/notifications are ignored (tools
-        // bridge only).
+        let closed = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let reader_closed = closed.clone();
+        let reader_changed = changed.clone();
         let route = Arc::clone(&pending);
         let server_name = spec.name.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                    tracing::warn!(server = %server_name, "mcp: unparseable line");
-                    continue;
+        let reader = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout);
+            while let Ok(Some(line)) = read_frame(&mut lines).await {
+                let Ok(msg) = serde_json::from_slice::<Value>(&line) else {
+                    tracing::warn!(server = %server_name, "mcp: invalid JSON; closing connection");
+                    break;
                 };
+                if msg["method"] == "notifications/tools/list_changed" {
+                    reader_changed.notify_one();
+                    continue;
+                }
                 let Some(id) = msg["id"].as_u64() else { continue };
                 let Some(tx) = route.lock().expect("pending lock").remove(&id) else {
                     continue;
@@ -144,20 +215,30 @@ impl McpConnection {
                 };
                 let _ = tx.send(result);
             }
-            // EOF: fail everything still waiting.
+            reader_closed.store(true, Ordering::Release);
+            reader_changed.notify_one();
+            // EOF/protocol failure: fail calls, never replay side effects.
             for (_, tx) in route.lock().expect("pending lock").drain() {
                 let _ = tx.send(Err("connection closed".into()));
             }
         });
 
         let conn = Arc::new(Self {
+            spec: Some(spec.clone()),
+            http: None,
             server: spec.name,
-            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+            stdin: Some(Arc::new(tokio::sync::Mutex::new(stdin))),
             pending,
             next_id: AtomicU64::new(1),
             timeout: spec.timeout,
             child: Mutex::new(Some(child)),
             registered: Mutex::new(Vec::new()),
+            closed,
+            changed,
+            deferred: AtomicBool::new(false),
+            reader: Some(reader.abort_handle()),
+            http_reader: Default::default(), cancel: Default::default(),
+            sync: tokio::sync::Mutex::new(()),
         });
 
         // MCP handshake: initialize → initialized notification.
@@ -174,6 +255,59 @@ impl McpConnection {
         Ok(conn)
     }
 
+    pub async fn connect_http(spec: http::HttpServer) -> Result<Arc<Self>, McpError> {
+        if !valid_server_name(&spec.name) { return Err(McpError::BadServerName { server: spec.name }); }
+        let transport = http::HttpTransport::new(spec.clone())?;
+        let conn = Arc::new(Self {
+            server: spec.name, spec: None, http: Some(transport.clone()), stdin: None,
+            pending: Default::default(), next_id: AtomicU64::new(1), timeout: spec.timeout,
+            child: Mutex::new(None), registered: Default::default(), closed: Arc::new(AtomicBool::new(false)),
+            reader: None, http_reader: Default::default(), cancel: Default::default(), sync: Default::default(), changed: Default::default(), deferred: AtomicBool::new(false),
+        });
+        let result = match conn.request("initialize", json!({"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"rness", "version":env!("CARGO_PKG_VERSION")}})).await {
+            Ok(result) => result,
+            Err(error) => { transport.close().await; return Err(error); },
+        };
+        if let Err(error) = transport.set_version(result["protocolVersion"].as_str().unwrap_or("")) {
+            transport.close().await;
+            return Err(error);
+        }
+        if let Err(error) = conn.notify("notifications/initialized", json!({})).await {
+            transport.close().await;
+            return Err(error);
+        }
+        if transport.spec.sse.notifications {
+            let changed = conn.changed.clone();
+            let closed = conn.closed.clone();
+            let reader = tokio::spawn(async move {
+                if let Err(error) = transport.notifications(&changed).await {
+                    tracing::warn!(%error, "MCP notification stream stopped");
+                    closed.store(true, Ordering::Release);
+                    changed.notify_one();
+                }
+            });
+            *conn.http_reader.lock().unwrap() = Some(reader.abort_handle());
+        }
+        Ok(conn)
+    }
+
+    /// Explicit reconnection, never a replay of failed tool calls.
+    pub async fn reconnect(&self, registry: &ToolRegistry) -> Result<Arc<Self>, McpError> {
+        self.disconnect(registry).await;
+        let conn = match &self.spec {
+            Some(spec) => Self::connect(spec.clone()).await?,
+            None => Self::connect_http(self.http.as_ref().expect("HTTP transport").spec.clone()).await?,
+        };
+        conn.deferred.store(self.deferred.load(Ordering::Acquire), Ordering::Release);
+        if let Err(error) = conn.bridge_tools(registry).await {
+            conn.disconnect(registry).await;
+            return Err(error);
+        }
+        Ok(conn)
+    }
+
+    pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+
     pub fn server(&self) -> &str {
         &self.server
     }
@@ -181,35 +315,73 @@ impl McpConnection {
     async fn send_raw(&self, payload: &Value) -> Result<(), McpError> {
         let mut line = serde_json::to_string(payload).expect("serializable");
         line.push('\n');
-        let mut stdin = self.stdin.lock().await;
+        if line.len() > MAX_FRAME_BYTES {
+            return Err(McpError::Protocol { server: self.server.clone(), message: "outgoing MCP frame exceeds 16 MiB".into() });
+        }
+        let mut stdin = self.stdin.as_ref().expect("stdio transport").lock().await;
+        if self.closed.load(Ordering::Acquire) { return Err(McpError::Closed { server: self.server.clone() }); }
+        let mut guard = IncompleteWrite { connection: self, complete: false };
         stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|_| McpError::Closed { server: self.server.clone() })?;
-        stdin.flush().await.map_err(|_| McpError::Closed { server: self.server.clone() })
+        stdin.flush().await.map_err(|_| McpError::Closed { server: self.server.clone() })?;
+        guard.complete = true;
+        Ok(())
     }
 
     async fn notify(&self, method: &str, params: Value) -> Result<(), McpError> {
+        if let Some(http) = &self.http {
+            let payload = json!({"jsonrpc":"2.0", "method":method, "params":params});
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(McpError::Closed { server: self.server.clone() }),
+                result = http.post(&payload, &self.changed) => { result?; },
+            }
+            return Ok(());
+        }
         self.send_raw(&json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
     }
 
     /// One JSON-RPC request with the connection's timeout.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Closed { server: self.server.clone() });
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.request_with_id(id, method, params).await
+    }
+
+    async fn request_with_id(&self, id: u64, method: &str, params: Value) -> Result<Value, McpError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Closed { server: self.server.clone() });
+        }
+        if let Some(http) = &self.http {
+            let payload = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
+            let work = http.post(&payload, &self.changed);
+            let result = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(McpError::Closed { server: self.server.clone() }),
+                result = tokio::time::timeout(self.timeout, work) => result
+                    .unwrap_or_else(|_| Err(McpError::Timeout { server:self.server.clone(), timeout_ms:self.timeout.as_millis() as u64 })),
+            };
+            if result.as_ref().is_err_and(|error| !matches!(error, McpError::Rpc { .. })) { self.closed.store(true, Ordering::Release); self.changed.notify_one(); }
+            return result?.ok_or_else(|| McpError::Protocol { server:self.server.clone(), message:"missing HTTP response".into() });
+        }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
-        self.send_raw(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
-            .await?;
+        let _cleanup = PendingRequest { pending: self.pending.clone(), id };
         let timeout_ms = self.timeout.as_millis() as u64;
-        match tokio::time::timeout(self.timeout, rx).await {
-            Err(_) => {
-                self.pending.lock().expect("pending lock").remove(&id);
-                Err(McpError::Timeout { server: self.server.clone(), timeout_ms })
+        let work = async {
+            self.send_raw(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
+            match rx.await {
+                Err(_) => Err(McpError::Closed { server: self.server.clone() }),
+                Ok(Err(message)) => Err(McpError::Protocol { server: self.server.clone(), message }),
+                Ok(Ok(result)) => Ok(result),
             }
-            Ok(Err(_)) => Err(McpError::Closed { server: self.server.clone() }),
-            Ok(Ok(Err(message))) => Err(McpError::Protocol { server: self.server.clone(), message }),
-            Ok(Ok(Ok(result))) => Ok(result),
-        }
+        };
+        tokio::time::timeout(self.timeout, work).await
+            .unwrap_or_else(|_| Err(McpError::Timeout { server: self.server.clone(), timeout_ms }))
     }
 
     /// Discover the server's tools and register each on `registry`
@@ -218,7 +390,9 @@ impl McpConnection {
         self: &Arc<Self>,
         registry: &ToolRegistry,
     ) -> Result<Vec<String>, McpError> {
-        let mut names = Vec::new();
+        let _sync = self.sync.lock().await;
+        let mut discovered: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut cursors = std::collections::HashSet::new();
         let mut cursor: Option<String> = None;
         loop {
             let params = match &cursor {
@@ -230,7 +404,10 @@ impl McpConnection {
             for t in tools {
                 let Some(raw) = t["name"].as_str() else { continue };
                 let public = public_tool_name(&self.server, raw);
-                registry.register(Arc::new(McpTool {
+                if discovered.len() >= 4096 || discovered.iter().any(|tool| tool.name() == public) {
+                    return Err(McpError::Protocol { server: self.server.clone(), message: "duplicate tool or catalog exceeds 4096 tools".into() });
+                }
+                discovered.push(Arc::new(McpTool {
                     images: registry.images.clone(),
                     conn: Arc::clone(self),
                     raw: raw.to_string(),
@@ -242,24 +419,95 @@ impl McpConnection {
                         json!({ "type": "object" })
                     },
                 }));
-                names.push(public);
             }
             match result["nextCursor"].as_str() {
-                Some(c) => cursor = Some(c.to_string()),
+                Some(c) if cursors.len() < 128 && cursors.insert(c.to_owned()) => cursor = Some(c.to_string()),
+                Some(_) => return Err(McpError::Protocol { server: self.server.clone(), message: "repeated cursor or too many catalog pages".into() }),
                 None => break,
             }
         }
-        *self.registered.lock().expect("registered lock") = names.clone();
+        let mut owned = self.registered.lock().expect("registered lock");
+        let previous: Vec<_> = owned.iter().filter_map(|tool| tool.upgrade()).collect();
+        // Check conflicts before changing any registration.
+        for tool in &discovered {
+            if let Some(current) = registry.get(tool.name()) {
+                if !previous.iter().any(|old| Arc::ptr_eq(old, &current)) {
+                    return Err(McpError::Protocol { server: self.server.clone(), message: format!("tool registration conflict: {}", tool.name()) });
+                }
+            }
+        }
+        let mut names = Vec::new();
+        for tool in discovered {
+            let result = if let Some(old) = previous.iter().find(|old| old.name() == tool.name()) {
+                registry.replace_if_current(old, tool.clone())
+            } else { registry.try_register(tool.clone()) };
+            result.map_err(|message| McpError::Protocol { server: self.server.clone(), message })?;
+            names.push(tool.name().to_owned());
+            owned.push(Arc::downgrade(&tool));
+        }
+        for old in previous {
+            if !names.iter().any(|name| name == old.name()) { registry.unregister_if_current(&old); }
+        }
+        owned.retain(|tool| tool.upgrade().is_some_and(|tool| registry.get(tool.name()).is_some_and(|current| Arc::ptr_eq(&tool, &current))));
+        if self.deferred.load(Ordering::Acquire) { registry.defer(names.iter().cloned()); }
         Ok(names)
+    }
+
+    /// Watch catalog changes. EOF removes stale tools; reconnect is explicit so
+    /// a crashed server cannot silently restart side-effecting startup code.
+    pub fn tools_deferred(&self) -> bool { self.deferred.load(Ordering::Acquire) }
+
+    /// Exact currently owned registrations, never inferred from a namespace prefix.
+    pub fn tool_names(&self, registry: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<_> = self.registered.lock().expect("registered lock").iter()
+            .filter_map(|tool| tool.upgrade())
+            .filter(|tool| registry.get(tool.name()).is_some_and(|current| Arc::ptr_eq(tool, &current)))
+            .map(|tool| tool.name().to_owned()).collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    pub async fn watch(self: &Arc<Self>, registry: &Arc<ToolRegistry>, deferred: bool) {
+        let _sync = self.sync.lock().await;
+        self.deferred.store(deferred, Ordering::Release);
+        if deferred { registry.defer(self.tool_names(registry)); }
+        let connection = Arc::downgrade(self);
+        let registry = Arc::downgrade(registry);
+        let changed = self.changed.clone();
+        tokio::spawn(async move {
+            loop {
+                changed.notified().await;
+                let (Some(conn), Some(registry)) = (connection.upgrade(), registry.upgrade()) else { break };
+                if conn.closed.load(Ordering::Acquire) {
+                    conn.disconnect(&registry).await;
+                    break;
+                }
+                match conn.bridge_tools(&registry).await {
+                    Ok(_) => {},
+                    Err(error) => tracing::warn!(%error, "MCP catalog refresh failed"),
+                }
+            }
+        });
     }
 
     /// Unregister this connection's tools and kill the child. Idempotent.
     pub async fn disconnect(&self, registry: &ToolRegistry) {
-        for name in self.registered.lock().expect("registered lock").drain(..) {
-            registry.unregister(&name);
+        self.closed.store(true, Ordering::Release);
+        self.cancel.cancel();
+        if let Some(reader) = self.http_reader.lock().unwrap().take() { reader.abort(); }
+        let _sync = self.sync.lock().await;
+        if let Some(reader) = &self.reader { reader.abort(); }
+        if let Some(reader) = self.http_reader.lock().unwrap().take() { reader.abort(); }
+        self.changed.notify_one();
+        for tool in self.registered.lock().expect("registered lock").drain(..).filter_map(|tool| tool.upgrade()) {
+            registry.unregister_if_current(&tool);
         }
-        if let Some(mut child) = self.child.lock().expect("child lock").take() {
-            let _ = child.start_kill();
+        self.pending.lock().expect("pending lock").clear();
+        if let Some(http) = &self.http { http.close().await; }
+        let child = self.child.lock().expect("child lock").take();
+        if let Some(mut child) = child {
+            let _ = child.kill().await;
         }
     }
 }
@@ -303,9 +551,17 @@ impl Tool for McpTool {
         &self, session: &rness_protocol::events::SessionId, _call: &String, args: Value,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+        if cancel.is_cancelled() { return Err("MCP call cancelled before dispatch".into()); }
+        let id = self.conn.next_id.fetch_add(1, Ordering::Relaxed);
         let result = tokio::select! {
-            _ = cancel.cancelled() => return Err("MCP call cancelled".into()),
-            result = self.conn.request("tools/call", json!({ "name": self.raw, "arguments": args })) => result.map_err(|e| e.to_string())?,
+            _ = cancel.cancelled() => {
+                // Best effort only: acknowledgement is not confirmation that
+                // remote side effects stopped. Never resend the tools/call.
+                let _ = tokio::time::timeout(self.conn.timeout.min(Duration::from_secs(1)),
+                    self.conn.notify("notifications/cancelled", json!({"requestId":id, "reason":"caller cancelled"}))).await;
+                return Err("MCP call cancelled locally; remote termination is not confirmed".into());
+            },
+            result = self.conn.request_with_id(id, "tools/call", json!({ "name": self.raw, "arguments": args })) => result.map_err(|e| e.to_string())?,
         };
         let mut metadata = json!({"version":1,"kind":"mcp","tool":self.raw});
         if let Some(structured) = result.get("structuredContent") {

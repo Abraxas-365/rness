@@ -109,13 +109,17 @@ impl Workspace {
 /// registry so later registrations (subagent — it needs the session
 /// service, which mounts after tools) share the same job controls.
 pub fn register_all(registry: &ToolRegistry, workspace: Arc<Workspace>) -> jobs::JobRegistry {
+    register_all_configured(registry, workspace, Default::default())
+}
+
+pub fn register_all_configured(registry: &ToolRegistry, workspace: Arc<Workspace>, process: rness_engine::sandbox::ProcessConfig) -> jobs::JobRegistry {
     let jobs = jobs::JobRegistry::new();
     registry.register(Arc::new(read::ReadTool::new(workspace.clone())));
     registry.register(Arc::new(write::WriteTool::new(workspace.clone())));
     registry.register(Arc::new(edit::EditTool::new(workspace.clone())));
     registry.register(Arc::new(glob::GlobTool::new(workspace.clone())));
     registry.register(Arc::new(grep::GrepTool::new(workspace.clone())));
-    registry.register(Arc::new(bash::BashTool::new(workspace, jobs.clone())));
+    registry.register(Arc::new(bash::BashTool::new(workspace, jobs.clone()).with_process_config(process)));
     registry.register(Arc::new(jobs::JobOutputTool::new(jobs.clone())));
     registry.register(Arc::new(jobs::JobListTool::new(jobs.clone())));
     registry.register(Arc::new(jobs::JobKillTool::new(jobs.clone())));

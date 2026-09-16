@@ -49,6 +49,7 @@ for line in sys.stdin:
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [{"name": "ping", "description": "pong", "inputSchema": {"type": "object"}}]}})
     elif method == "tools/call":
+        if msg.get('params', {}).get('arguments', {}).get('crash'): sys.exit(0)
         if len(sys.argv) > 1:
             with open(sys.argv[1], 'a') as calls: calls.write('called\n')
         send({"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": "pong!"}]}})
@@ -90,12 +91,17 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
         "mcp-user.lua",
         &format!(
             r#"
+            for _, sse in ipairs({{ {{max_attempts=101}}, {{retry_delay_ms=0}}, {{idle_timeout_ms=0}}, {{unknown=true}} }}) do
+                local ok, failure = pcall(rness.mcp.connect, {{name='invalid', url='http://127.0.0.1:1/mcp', sse=sse}})
+                assert(not ok and (tostring(failure):find('sse') or tostring(failure):find('unknown')), tostring(failure))
+            end
             local tools = rness.mcp.connect{{
                 name = "fake",
                 command = "python3",
                 args = {{ "{}", "{}" }},
                 defer_tools = true,
                 timeout_ms = 5000,
+                reconnect = {{enabled=true, initial_delay_ms=10, max_delay_ms=50, max_attempts=2}},
             }}
             assert(tools[1] == "mcp__fake__ping", "bridged: " .. tostring(tools[1]))
             assert(rness.mcp.servers()[1] == "fake", "listed")
@@ -173,6 +179,29 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
     .unwrap();
     let tool = registry.get("mcp__fake__ping").unwrap();
     assert_eq!(tool.execute(serde_json::json!({})).await.unwrap(), "pong!");
+
+    host.load("nested.lua", &format!(r#"
+        rness.mcp.connect{{name="fake__nested", command="python3", args={{"{}"}}, defer_tools=false}}
+    "#, script.display())).await.unwrap();
+    host.load("reconnect.lua", r#"
+        local names = rness.mcp.reconnect("fake")
+        assert(#names == 1 and names[1] == "mcp__fake__ping")
+    "#).await.unwrap();
+    assert!(!registry.is_deferred("mcp__fake__nested__ping"));
+    host.load("nested-bye.lua", r#"rness.mcp.disconnect("fake__nested")"#).await.unwrap();
+    assert!(registry.is_deferred("mcp__fake__ping"));
+    assert_eq!(registry.get("mcp__fake__ping").unwrap().execute(serde_json::json!({})).await.unwrap(), "pong!");
+
+    let previous = registry.get("mcp__fake__ping").unwrap();
+    assert!(previous.execute(serde_json::json!({"crash":true})).await.is_err());
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if registry.get("mcp__fake__ping").is_some_and(|fresh| !Arc::ptr_eq(&fresh, &previous)) { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert!(registry.is_deferred("mcp__fake__ping"));
+    assert_eq!(registry.get("mcp__fake__ping").unwrap().execute(serde_json::json!({})).await.unwrap(), "pong!");
 
     // Disconnect from Lua unregisters the bridged tools.
     host.load("bye.lua", r#"assert(rness.mcp.disconnect("fake") == true)"#)

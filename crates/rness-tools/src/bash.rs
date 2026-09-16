@@ -27,6 +27,7 @@ pub struct BashTool {
     jobs: JobRegistry,
     sandbox: rness_protocol::sandbox::SandboxMode,
     sandbox_policy: SandboxPolicy,
+    process: rness_engine::sandbox::ProcessConfig,
 }
 
 impl BashTool {
@@ -40,7 +41,12 @@ impl BashTool {
         sandbox: rness_protocol::sandbox::SandboxMode,
     ) -> Self {
         let sandbox_policy = SandboxPolicy::new(sandbox, ws.root());
-        Self { ws, jobs, sandbox, sandbox_policy }
+        Self { ws, jobs, sandbox, sandbox_policy, process: Default::default() }
+    }
+
+    pub fn with_process_config(mut self, process: rness_engine::sandbox::ProcessConfig) -> Self {
+        self.process = process;
+        self
     }
 }
 
@@ -76,15 +82,20 @@ fn publish_stream(pending: &mut Vec<u8>, bytes: &[u8], eof: bool, stream: &Optio
 async fn drain_stream(
     mut pipe: impl tokio::io::AsyncRead + Unpin,
     stream: &Option<(JobRegistry, String, String)>,
-) -> std::io::Result<Vec<u8>> {
+    artifact: &crate::jobs::JobWriter,
+) -> std::io::Result<(Vec<u8>, usize)> {
+    let mut total = 0;
     let mut output = Vec::new();
     let mut pending = Vec::new();
     let mut buffer = [0u8; 8192];
     loop {
         let n = pipe.read(&mut buffer).await?;
-        output.extend_from_slice(&buffer[..n]);
+        total += n;
+        crate::jobs::retain_tail(&mut output, &buffer[..n], MAX_OUTPUT_BYTES);
+        artifact.append(&buffer[..n]);
+        if artifact.cancelled().is_cancelled() { return Err(std::io::Error::other("output persistence failed")); }
         publish_stream(&mut pending, &buffer[..n], n == 0, stream);
-        if n == 0 { return Ok(output); }
+        if n == 0 { return Ok((output, total)); }
     }
 }
 
@@ -116,8 +127,9 @@ fn spawn_shell(
     command: &str,
     workdir: &std::path::Path,
     sandbox_policy: &SandboxPolicy,
+    config: &rness_engine::sandbox::ProcessConfig,
 ) -> Result<(tokio::process::Child, ShellGroup, sandbox::Lease), String> {
-    let (mut process, lease) = sandbox::prepare(command, workdir, sandbox_policy)?;
+    let (mut process, lease) = sandbox::prepare_configured(command, workdir, sandbox_policy, config)?;
     sandbox::standard_io(&mut process, workdir);
     #[cfg(unix)]
     // Closing stdin alone does not prevent sudo/getpass from opening /dev/tty.
@@ -150,6 +162,7 @@ impl Tool for BashTool {
             ws: self.ws.for_session(session, workspace),
             jobs: self.jobs.clone(),
             sandbox,
+            process: self.process.clone(),
             sandbox_policy: SandboxPolicy { mode: sandbox, workspace: workspace.to_path_buf() },
         }))
     }
@@ -243,7 +256,7 @@ impl BashTool {
 
         let stream = owner.zip(call).map(|(owner, call)| (self.jobs.clone(), owner.clone(), call.clone()));
         if args["run_in_background"].as_bool().unwrap_or(false) {
-            let (mut child, mut group, lease) = spawn_shell(command, &workdir, sandbox_policy)?;
+            let (mut child, mut group, lease) = spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
             let (id, writer) = self.jobs.start_owned("bash", command.to_string(), owner);
             let mut stdout_pipe = child.stdout.take().expect("piped stdout");
             let mut stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -301,33 +314,46 @@ impl BashTool {
                 .min(MAX_TIMEOUT_MS),
         );
 
-        let (mut child, mut group, _lease) = spawn_shell(command, &workdir, sandbox_policy)?;
+        let (mut child, mut group, _lease) = spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
+        let (artifact_id, artifact) = self.jobs.capture(command.into(), owner);
+        struct CaptureGuard(crate::jobs::JobWriter);
+        impl Drop for CaptureGuard {
+            fn drop(&mut self) { self.0.settle(JobStatus::Interrupted); }
+        }
+        let _capture_guard = CaptureGuard(artifact.clone());
 
         // Interleave-tolerant capture: drain both pipes concurrently, then
         // append stderr after stdout.
         let mut stdout_pipe = child.stdout.take().expect("piped stdout");
         let mut stderr_pipe = child.stderr.take().expect("piped stderr");
         let run = async {
-            let (out, err, status) = tokio::join!(
-                drain_stream(&mut stdout_pipe, &stream),
-                drain_stream(&mut stderr_pipe, &stream),
+            let (out, err, status) = tokio::try_join!(
+                drain_stream(&mut stdout_pipe, &stream, &artifact),
+                drain_stream(&mut stderr_pipe, &stream, &artifact),
                 child.wait(),
-            );
-            let out = out.map_err(|e| format!("read stdout: {e}"))?;
-            let err = err.map_err(|e| format!("read stderr: {e}"))?;
-            let status = status.map_err(|e| format!("wait: {e}"))?;
+            ).map_err(|e| format!("capture command output: {e}"))?;
             Ok::<_, String>((out, err, status))
         };
 
-        let (out, err, status) = match tokio::time::timeout(timeout, run).await {
-            Ok(r) => r?,
-            Err(_) => {
+        let artifact_cancel = artifact.cancelled();
+        let outcome = tokio::select! {
+            biased;
+            _ = artifact_cancel.cancelled() => Err(artifact.output_error().unwrap_or_else(|| "output capture cancelled or persistence failed".to_owned())),
+            result = tokio::time::timeout(timeout, run) => match result {
+                Ok(result) => result,
+                Err(_) => Err(format!("command timed out after {}ms", timeout.as_millis())),
+            },
+        };
+        let ((out, stdout_bytes), (err, stderr_bytes), status) = match outcome {
+            Ok(result) => result,
+            Err(error) => {
                 group.kill();
                 let _ = child.kill().await;
-                return Err(format!("command timed out after {}ms", timeout.as_millis()));
+                return Err(format!("{error}; retained output: job_output(job_id=\"{artifact_id}\", offset=0)"));
             }
         };
 
+        artifact.settle(JobStatus::Exited(status.code()));
         group.disarm();
         let mut text = String::from_utf8_lossy(&out).into_owned();
         if !err.is_empty() {
@@ -340,11 +366,15 @@ impl BashTool {
             "version":1,"kind":"bash","command":command,"cwd":workdir,
             "status":"finished","exit_code":status.code(),
             "killed_by_signal":status.code().is_none(),
-            "stdout_bytes":out.len(),"stderr_bytes":err.len(),
-            "truncated":text.len() > MAX_OUTPUT_BYTES,
+            "stdout_bytes":stdout_bytes,"stderr_bytes":stderr_bytes,
+            "output_artifact":artifact_id,
+            "truncated":stdout_bytes + stderr_bytes > MAX_OUTPUT_BYTES,
             "output_order":"stdout_then_stderr",
         });
         let mut text = tail_truncate(text);
+        if stdout_bytes + stderr_bytes > MAX_OUTPUT_BYTES {
+            text = format!("… output truncated; full output: job_output(job_id=\"{artifact_id}\", offset=0), page using returned byte offsets …\n{text}");
+        }
 
         // Exit status is a RESULT the model reads, not a tool error: a
         // failing test run is a successful observation of that failure.
@@ -443,13 +473,13 @@ mod tests {
         assert!(!outside.join("should-not-run").exists());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[tokio::test]
     async fn unsupported_modes_never_execute_command() {
         let dir = tempfile::tempdir().unwrap();
         for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
             let error = run(mode, dir.path(), "touch should-not-run").await.unwrap_err();
-            assert!(error.contains("no backend has been implemented"), "{error}");
+            assert!(error.contains("no backend has been implemented") || error.contains("windows_container_image"), "{error}");
             assert!(error.contains("refusing to run"), "{error}");
         }
         assert!(!dir.path().join("should-not-run").exists());

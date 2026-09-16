@@ -18,9 +18,10 @@
 //!   GET  /api/events              SSE: every Frame, all sessions
 //!   GET  /api/events/:id          SSE: frames filtered to one session
 //!
-//! No auth, binds where you tell it. Localhost by default at the CLI —
-//! exposing it wider is the operator's decision (Neovim trust model).
+//! The CLI requires bearer authentication for non-loopback binds; custom hosts
+//! install `auth::authorize` explicitly. TLS termination remains operator-owned.
 
+pub mod auth;
 pub mod approvals;
 pub mod routes;
 pub mod sse;

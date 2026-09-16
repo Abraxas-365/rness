@@ -453,7 +453,8 @@ async fn main() -> anyhow::Result<()> {
     // the hot-reload watcher re-syncs Lua tools into the same registry.
     let cwd = std::env::current_dir().context("no working directory")?;
     let tools = Arc::new(ToolRegistry::default());
-    let jobs = rness_tools::register_all(&tools, rness_tools::Workspace::new(&cwd));
+    let jobs = rness_tools::register_all_configured(&tools, rness_tools::Workspace::new(&cwd), startup.sandbox.process.clone());
+    jobs.configure_retention(startup.job_retention.clone()).map_err(anyhow::Error::msg)?;
     jobs.enable_persistence(&root.join("jobs")).map_err(|e| anyhow::anyhow!("job recovery: {e}"))?;
     if let Some(lsp) = startup.lsp.clone() {
         rness_tools::lsp::register(&tools, lsp).map_err(|e| anyhow::anyhow!("invalid rness.lsp: {e}"))?;
@@ -659,7 +660,10 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("bind {addr}"))?;
         jobs.attach_sessions(&sessions);
         eprintln!("rness serving on http://{addr} (model: {})", selection.model);
-        axum::serve(listener, rness_server::router(state)).await?;
+        let auth = rness_server::auth::Auth::for_bind(listener.local_addr()?, std::env::var("RNESS_SERVER_TOKEN").ok())
+            .map_err(anyhow::Error::msg)?;
+        let router = rness_server::router(state).layer(axum::middleware::from_fn_with_state(auth, rness_server::auth::authorize));
+        axum::serve(listener, router).await?;
         return Ok(());
     }
 

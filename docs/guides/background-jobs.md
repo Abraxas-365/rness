@@ -36,6 +36,15 @@ A job stays in the monitor after it finishes, and selection stays on the same jo
 
 Output is the latest **8 KiB non-consuming tail**, not an unlimited log viewer. ANSI escapes and terminal controls are sanitized; long tokens and Unicode text wrap to the available width. A paused snapshot can be older than the live tail; End replaces it with the latest snapshot. Narrow terminal windows clip the viewport without discarding the snapshot.
 
+## Full-output retrieval
+
+Output is spooled to disk with a 64 KiB in-memory tail per job. Use
+`job_output({job_id = "...", offset = 0})` to page through complete output in
+64 KiB byte windows without advancing the normal incremental cursor. Large
+foreground Bash results also return an artifact ID (kind `bash-output`), without
+sending a background completion notification. Lua-configurable quotas and age-based
+cleanup bound retained output; see [execution hardening](execution-hardening.md) for settings and limits.
+
 ## Customization
 
 The jobs plugin owns all monitor behavior in Lua. Configure it in `init.lua` before the plugins are loaded:

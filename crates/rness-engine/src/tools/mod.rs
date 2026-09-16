@@ -1,9 +1,8 @@
 //! Tool registry + dispatcher: parallel execution, model-order commits.
 //!
-//! The dispatcher runs all requested calls concurrently (bounded by
-//! `max_concurrency`) but returns results in MODEL ORDER — the order the
-//! model emitted the tool_use parts. History stays deterministic no
-//! matter how execution interleaves (invariant #8).
+//! Consecutive explicitly concurrency-safe calls overlap (bounded by
+//! `max_concurrency`); all other calls form exclusive batch-local barriers.
+//! Results remain in MODEL ORDER regardless of completion order (invariant #8).
 
 pub mod exposure;
 
@@ -64,6 +63,12 @@ pub trait Tool: Send + Sync {
     /// Sensitive tools pause for approval under the `ask` policy
     /// (mutations, shell). Non-sensitive tools never ask.
     fn sensitive(&self) -> bool {
+        false
+    }
+    /// Explicit opt-in to overlap with other safe calls in the same batch.
+    /// Unknown/custom/mutating tools are exclusive by default. This governs
+    /// dispatch, not work detached into background jobs or other sessions.
+    fn concurrency_safe(&self, _args: &serde_json::Value) -> bool {
         false
     }
     /// Whether this call detaches work into the owning session's job registry.
@@ -297,6 +302,7 @@ impl ToolRegistry {
             .is_some_and(|entry| Arc::ptr_eq(entry, expected))
         {
             tools.remove(expected.name());
+            self.deferred.write().expect("registry lock").remove(expected.name());
             true
         } else {
             false
@@ -399,6 +405,32 @@ impl ToolRegistry {
         cancel: &CancellationToken,
         exposed: Option<&[String]>,
     ) -> Vec<ToolResult> {
+        let mut results = Vec::with_capacity(calls.len());
+        let mut start = 0;
+        while start < calls.len() {
+            let safe = |call: &ToolCall| {
+                self.get(&call.name)
+                    .filter(|_| exposed.is_none_or(|names| names.contains(&call.name)))
+                    .is_some_and(|tool| tool.concurrency_safe(&call.args))
+            };
+            let mut end = start + 1;
+            if safe(&calls[start]) {
+                while end < calls.len() && safe(&calls[end]) { end += 1; }
+            }
+            results.extend(self.dispatch_batch(session, &calls[start..end], max_concurrency, cancel, exposed).await);
+            start = end;
+        }
+        results
+    }
+
+    async fn dispatch_batch(
+        &self,
+        session: &SessionId,
+        calls: &[ToolCall],
+        max_concurrency: usize,
+        cancel: &CancellationToken,
+        exposed: Option<&[String]>,
+    ) -> Vec<ToolResult> {
         let sem = Arc::new(Semaphore::new(max_concurrency.max(1)));
         let mut handles = Vec::with_capacity(calls.len());
         // Check permission, not exposure: deferred controls remain usable via
@@ -428,6 +460,10 @@ impl ToolRegistry {
                 let mut presentation = None;
                 let mut failure_kind = "execution_failed";
                 let outcome = match tool {
+                    _ if cancel.is_cancelled() => {
+                        failure_kind = "approval_cancelled";
+                        Err("tool call cancelled before execution".into())
+                    }
                     Some(_) if background_error.is_some() => {
                         failure_kind = "background_jobs_unavailable";
                         Err(background_error.unwrap())
@@ -548,6 +584,7 @@ mod tests {
     struct SleepEcho;
     #[async_trait]
     impl Tool for SleepEcho {
+        fn concurrency_safe(&self, _: &serde_json::Value) -> bool { true }
         fn name(&self) -> &str {
             "sleep_echo"
         }

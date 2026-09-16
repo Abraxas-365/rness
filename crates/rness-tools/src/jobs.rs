@@ -16,8 +16,22 @@ use async_trait::async_trait;
 use rness_engine::tools::Tool;
 use serde_json::{json, Value};
 
+mod retention;
+pub use retention::Retention;
+
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_INSPECT_BYTES: usize = 8 * 1024;
+
+pub(crate) fn retain_tail(output: &mut Vec<u8>, bytes: &[u8], limit: usize) {
+    if bytes.len() >= limit {
+        output.clear();
+        output.extend_from_slice(&bytes[bytes.len() - limit..]);
+    } else {
+        let remove = (output.len() + bytes.len()).saturating_sub(limit);
+        output.drain(..remove);
+        output.extend_from_slice(bytes);
+    }
+}
 
 /// Non-consuming, session-visible job metadata for user controls.
 #[derive(Debug, serde::Serialize)]
@@ -31,6 +45,7 @@ pub struct JobSnapshot {
     /// True until the producer settles, including cancellation pending.
     pub running: bool,
     pub cancellation_requested: bool,
+    pub output_error: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -72,6 +87,10 @@ struct JobState {
     status: JobStatus,
     #[serde(skip)]
     output: Vec<u8>,
+    #[serde(skip)]
+    output_bytes: usize,
+    #[serde(skip)]
+    charged_bytes: u64,
     /// Byte offset of the next unread output.
     read_from: usize,
     settled: bool,
@@ -79,17 +98,30 @@ struct JobState {
     owner: Option<String>,
     #[serde(default)]
     delivered: bool,
+    #[serde(default)]
+    settled_at_ms: Option<u64>,
+    #[serde(default)]
+    output_error: Option<String>,
 }
 
 impl JobState {
+    fn marker(&self) -> String {
+        match &self.output_error {
+            Some(error) => format!("{} [output error: {error}]", self.status.marker()),
+            None => self.status.marker(),
+        }
+    }
     fn visible_to(&self, session: Option<&str>) -> bool {
         self.owner.is_none() || self.owner.as_deref() == session
     }
 }
 
 struct Job {
+    budget: Arc<Mutex<retention::Budget>>,
     path: Option<std::path::PathBuf>,
     state: Mutex<JobState>,
+    /// Ephemeral compositions still spool full output to disk without JSON metadata.
+    spool: Mutex<Option<std::fs::File>>,
     /// Requests cancellation; the drain task settles status when the
     /// process actually dies.
     cancel: tokio_util::sync::CancellationToken,
@@ -105,6 +137,7 @@ pub struct JobRegistry {
 }
 
 struct Registry {
+    budget: Arc<Mutex<retention::Budget>>,
     directory: Mutex<Option<std::path::PathBuf>>,
     locks: Mutex<Vec<std::fs::File>>,
     next_id: AtomicU64,
@@ -113,6 +146,7 @@ struct Registry {
 }
 
 /// Producer-side handle for appending output and settling a started job.
+#[derive(Clone)]
 pub struct JobWriter {
     job: Arc<Job>,
 }
@@ -133,6 +167,7 @@ impl Job {
         JobSnapshot {
             job_id: id.into(), kind: state.kind.clone(), label: state.label.clone(),
             status: status.into(), running: !state.settled, cancellation_requested,
+            output_error: state.output_error.clone(),
             exit_code: match state.status { JobStatus::Exited(code) => code, _ => None },
         }
     }
@@ -158,16 +193,65 @@ impl Job {
         file.write_all(&serde_json::to_vec(state)?)?;
         file.sync_all()?;
         std::fs::rename(temporary,path)?;
-        std::fs::File::open(path.parent().unwrap())?.sync_all()
+        sync_directory(path.parent().unwrap())
     }
+    fn reconcile_output(&self, state: &mut JobState) {
+        use std::io::{Read, Seek, SeekFrom};
+        let recover = |file: &mut std::fs::File| -> std::io::Result<(usize, Vec<u8>)> {
+            let len = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
+            file.seek(SeekFrom::Start(len.saturating_sub(MAX_READ_BYTES) as u64))?;
+            let mut tail = Vec::new();
+            file.take(MAX_READ_BYTES as u64).read_to_end(&mut tail)?;
+            Ok((len, tail))
+        };
+        let result = if let Some(path) = &self.path {
+            std::fs::File::open(path.with_extension("output")).and_then(|mut file| recover(&mut file))
+        } else {
+            self.spool.lock().unwrap().as_mut().ok_or_else(|| std::io::Error::other("output spool unavailable")).and_then(recover)
+        };
+        if let Ok((len, tail)) = result {
+            state.output_bytes = len;
+            state.output = tail;
+            state.read_from = state.read_from.min(len);
+        }
+    }
+
     fn checkpoint(&self, state: &JobState) {
         if let Err(error) = self.persist(state) { self.cancel.cancel(); tracing::error!(%error,"job persistence failed; cancelling producer"); }
     }
 }
 
+fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
+    // Windows does not expose portable directory fsync through std::fs.
+    #[cfg(unix)]
+    { std::fs::File::open(path)?.sync_all() }
+    #[cfg(not(unix))]
+    { let _ = path; Ok(()) }
+}
+
 impl JobWriter {
     pub fn append(&self, bytes: &[u8]) {
         let mut state = self.job.state.lock().expect("job lock");
+        if state.settled || state.output_error.is_some() { return; }
+        let mut budget = self.job.budget.lock().unwrap();
+        let count = bytes.len() as u64;
+        let reason = if budget.policy.max_job_bytes != 0 && (state.output_bytes as u64).saturating_add(count) > budget.policy.max_job_bytes {
+            Some("per-job output quota exceeded")
+        } else if budget.policy.max_total_bytes != 0 && budget.used.saturating_add(count) > budget.policy.max_total_bytes {
+            Some("total output quota exceeded")
+        } else { None };
+        if let Some(reason) = reason {
+            state.output_error = Some(format!("{reason}; producer cancelled; output is incomplete"));
+            self.job.checkpoint(&state);
+            self.job.cancel.cancel();
+            self.job.changed.notify_waiters();
+            return;
+        }
+        // Reserve before writing, including partial-write failures. This is
+        // conservative until recovery measures the actual spool length.
+        budget.used = budget.used.saturating_add(count);
+        state.charged_bytes = state.charged_bytes.saturating_add(count);
+        drop(budget);
         if let Some(path) = &self.job.path {
             use std::io::Write;
             let append = (|| -> std::io::Result<()> {
@@ -175,9 +259,32 @@ impl JobWriter {
                 file.write_all(bytes)?;
                 file.sync_data()
             })();
-            if let Err(error) = append { self.job.cancel.cancel(); tracing::error!(%error,"job output append failed"); return; }
+            if let Err(error) = append {
+                state.output_error = Some(format!("output persistence failed: {error}; output is incomplete"));
+                self.job.reconcile_output(&mut state);
+                self.job.checkpoint(&state);
+                self.job.cancel.cancel();
+                self.job.changed.notify_waiters();
+                return;
+            }
+        } else {
+            use std::io::{Seek, SeekFrom, Write};
+            let append = (|| -> std::io::Result<()> {
+                let mut spool = self.job.spool.lock().unwrap();
+                let file = spool.as_mut().ok_or_else(|| std::io::Error::other("output spool unavailable"))?;
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(bytes)
+            })();
+            if let Err(error) = append {
+                state.output_error = Some(format!("output spool failed: {error}; output is incomplete"));
+                self.job.reconcile_output(&mut state);
+                self.job.cancel.cancel();
+                self.job.changed.notify_waiters();
+                return;
+            }
         }
-        state.output.extend_from_slice(bytes);
+        state.output_bytes += bytes.len();
+        retain_tail(&mut state.output, bytes, MAX_READ_BYTES);
         drop(state);
         self.job.changed.notify_waiters();
     }
@@ -186,13 +293,15 @@ impl JobWriter {
         let mut state = self.job.state.lock().expect("job lock");
         if state.settled { return; }
         state.settled = true;
+        state.settled_at_ms = Some(retention::now_ms());
         // A kill request wins over the natural exit that follows it.
         state.status = if state.status == JobStatus::Killed { JobStatus::Killed } else { status };
         self.job.checkpoint(&state);
-        let notice = format!("Background {} job finished {}. Read its output with job_output.", state.kind, state.status.marker());
+        let notice = format!("Background {} job finished {}. Read its output with job_output.", state.kind, state.marker());
+        let notify = !state.delivered;
         drop(state);
         self.job.changed.notify_waiters();
-        if self.job.path.is_some() { return; }
+        if self.job.path.is_some() || !notify { return; }
         if let Some((id, owner, sessions)) = &self.job.completion {
             if let Some(sessions) = sessions.upgrade() {
                 let text = format!("Job {id}: {notice}");
@@ -200,17 +309,23 @@ impl JobWriter {
                     Err(rness_engine::service::ServiceError::Busy) => {
                         let owner = owner.clone();
                         let id = id.clone();
+                        let job = self.job.clone();
                         tokio::spawn(async move {
-                            if let Err(error) = sessions.notify_job_wait(&owner, text).await {
-                                tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed");
+                            match sessions.notify_job_wait(&owner, text).await {
+                                Ok(_) => job.state.lock().unwrap().delivered = true,
+                                Err(error) => tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed"),
                             }
                         });
                     }
                     Err(error) => tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed"),
-                    Ok(_) => {}
+                    Ok(_) => self.job.state.lock().unwrap().delivered = true,
                 }
             }
         }
+    }
+
+    pub fn output_error(&self) -> Option<String> {
+        self.job.state.lock().unwrap().output_error.clone()
     }
 
     pub fn cancelled(&self) -> tokio_util::sync::CancellationToken {
@@ -219,6 +334,75 @@ impl JobWriter {
 }
 
 impl JobRegistry {
+    /// Configure before recovery or starting producers. Zero limits opt out.
+    pub fn configure_retention(&self, policy: Retention) -> Result<(), String> {
+        policy.validate()?;
+        let jobs = self.inner.jobs.lock().unwrap();
+        if !jobs.is_empty() { return Err("configure retention before starting or recovering jobs".into()); }
+        self.inner.budget.lock().unwrap().policy = policy;
+        Ok(())
+    }
+
+    /// Expire only settled, delivered artifacts, never active or pending output.
+    pub fn cleanup(&self) -> Result<usize, String> {
+        let policy = self.inner.budget.lock().unwrap().policy.clone();
+        if policy.max_age_secs == 0 { return Ok(0); }
+        let now = retention::now_ms();
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut removed = Vec::new();
+        let mut errors = Vec::new();
+        for (id, job) in jobs.iter() {
+            // The registry lock prevents acquisition of new readers. Existing
+            // readers/producers must finish before either spool can disappear.
+            if Arc::strong_count(job) > 1 { continue; }
+            let state = job.state.lock().unwrap();
+            if !state.settled || (!state.delivered && state.owner.is_some()) ||
+                !state.settled_at_ms.is_some_and(|at| now.saturating_sub(at) >= policy.max_age_secs.saturating_mul(1000)) { continue; }
+            if let Some(path) = &job.path {
+                // Rename to a tombstone first. Recovery resumes interrupted GC.
+                if let Err(error) = job.persist(&state) { tracing::warn!(%error, "artifact cleanup metadata restore failed"); }
+                let tombstone = path.with_extension("deleted");
+                match std::fs::rename(path, &tombstone) {
+                    Ok(()) => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => { errors.push(e.to_string()); continue; },
+                }
+                if let Err(e) = sync_directory(path.parent().unwrap()) {
+                    errors.push(e.to_string());
+                    continue;
+                }
+                match std::fs::remove_file(path.with_extension("output")) {
+                    Ok(()) => {},
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(e) => {
+                        errors.push(e.to_string());
+                        // Output still exists; restore metadata for readers.
+                        if let Err(e) = std::fs::rename(&tombstone, path) { errors.push(e.to_string()); }
+                        continue;
+                    },
+                }
+                // Keep the tombstone if the output unlink cannot be synced.
+                // The job must leave the registry once its output is removed.
+                if let Err(e) = sync_directory(path.parent().unwrap()) {
+                    errors.push(e.to_string());
+                    removed.push((id.clone(), state.charged_bytes));
+                    continue;
+                }
+                // A leftover tombstone is harmless and retried on recovery.
+                if let Err(e) = std::fs::remove_file(tombstone) {
+                    if e.kind() != std::io::ErrorKind::NotFound { errors.push(e.to_string()); }
+                }
+            }
+            removed.push((id.clone(), state.charged_bytes));
+        }
+        for (id, bytes) in &removed {
+            jobs.remove(id);
+            let mut budget = self.inner.budget.lock().unwrap();
+            budget.used = budget.used.saturating_sub(*bytes);
+        }
+        if errors.is_empty() { Ok(removed.len()) } else { Err(errors.join("; ")) }
+    }
+
     pub fn enable_persistence(&self, root: &std::path::Path) -> Result<(), String> {
         use fs2::FileExt;
         std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
@@ -233,15 +417,45 @@ impl JobRegistry {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Err(error.to_string()),
             }
+            // Reconcile interrupted deletion only while holding this owner's
+            // exclusive lock. Never touch another live instance's artifacts.
             for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
                 let path = file.map_err(|e| e.to_string())?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("deleted") {
+                    match std::fs::remove_file(path.with_extension("output")) {
+                        Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(e) => return Err(e.to_string()),
+                    }
+                    // A checkpoint after failed rollback may have recreated
+                    // metadata. The committed deletion wins over both copies.
+                    match std::fs::remove_file(path.with_extension("json")) {
+                        Ok(()) => {}, Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                        Err(e) => return Err(e.to_string()),
+                    }
+                    sync_directory(path.parent().unwrap()).map_err(|e| e.to_string())?;
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                }
+            }
+            for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
+                let path = file.map_err(|e| e.to_string())?.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("output") && !path.with_extension("json").exists() {
+                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                    continue;
+                }
                 if path.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
                 let mut state: JobState = serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}",path.display()))?;
-                state.output = std::fs::read(path.with_extension("output")).map_err(|e| format!("job output: {e}"))?;
-                if state.read_from > state.output.len() { return Err("invalid durable job output cursor".into()); }
+                use std::io::{Read, Seek, SeekFrom};
+                let mut file = std::fs::File::open(path.with_extension("output")).map_err(|e| format!("job output: {e}"))?;
+                state.output_bytes = usize::try_from(file.metadata().map_err(|e| e.to_string())?.len()).map_err(|e| e.to_string())?;
+                file.seek(SeekFrom::Start(state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64)).map_err(|e| e.to_string())?;
+                file.take(MAX_READ_BYTES as u64).read_to_end(&mut state.output).map_err(|e| e.to_string())?;
+                if state.read_from > state.output_bytes { return Err("invalid durable job output cursor".into()); }
                 if !state.settled { state.status = JobStatus::Interrupted; state.settled = true; }
                 let id = path.file_stem().unwrap().to_str().ok_or("invalid job ID")?.to_owned();
-                let job = Arc::new(Job {path:Some(path),state:Mutex::new(state),cancel:Default::default(),changed:Arc::new(tokio::sync::Notify::new()),completion:None});
+                state.settled_at_ms.get_or_insert_with(retention::now_ms);
+                state.charged_bytes = state.output_bytes as u64;
+                self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                let job = Arc::new(Job {budget:self.inner.budget.clone(),spool:Mutex::new(None),path:Some(path),state:Mutex::new(state),cancel:Default::default(),changed:Arc::new(tokio::sync::Notify::new()),completion:None});
                 job.persist(&job.state.lock().unwrap()).map_err(|e| e.to_string())?;
                 self.inner.jobs.lock().unwrap().insert(id,job);
             }
@@ -265,6 +479,7 @@ impl JobRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Registry {
+                budget: Default::default(),
                 directory: Mutex::new(None),
                 locks: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(1),
@@ -276,6 +491,18 @@ impl JobRegistry {
 
     pub fn attach_sessions(&self, sessions: &Arc<rness_engine::service::SessionService>) {
         *self.inner.sessions.lock().expect("sessions lock") = Arc::downgrade(sessions);
+        let registry = Arc::downgrade(&self.inner);
+        let period = self.inner.budget.lock().unwrap().policy.cleanup_interval_secs;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(period));
+            loop {
+                interval.tick().await;
+                let Some(inner) = registry.upgrade() else { break; };
+                if let Err(error) = (JobRegistry { inner }).cleanup() {
+                    tracing::warn!(%error, "artifact cleanup failed");
+                }
+            }
+        });
         if self.inner.directory.lock().unwrap().is_some() {
             let registry = Arc::downgrade(&self.inner);
             tokio::spawn(async move {
@@ -287,7 +514,7 @@ impl JobRegistry {
                     let Some(sessions) = sessions else { break; };
                     let pending: Vec<_> = registry.jobs.lock().unwrap().iter().filter_map(|(id,job)| {
                         let state = job.state.lock().unwrap();
-                        if state.settled && !state.delivered { state.owner.clone().map(|owner| (id.clone(),owner,job.clone(),format!("Job {id}: Background {} job finished {}. Read its output with job_output.",state.kind,state.status.marker()))) } else { None }
+                        if state.settled && !state.delivered { state.owner.clone().map(|owner| (id.clone(),owner,job.clone(),format!("Job {id}: Background {} job finished {}. Read its output with job_output.",state.kind,state.marker()))) } else { None }
                     }).collect();
                     drop(registry);
                     for (id,owner,job,text) in pending {
@@ -302,6 +529,18 @@ impl JobRegistry {
         }
     }
 
+    /// Foreground captures reuse the job artifact and ownership model, without
+    /// issuing a second completion notice or advertising a running background job.
+    pub(crate) fn capture(&self, label: String, owner: Option<&String>) -> (String, JobWriter) {
+        let (id, writer) = self.start_owned("bash-output", label, owner);
+        {
+            let mut state = writer.job.state.lock().unwrap();
+            state.delivered = true;
+            writer.job.checkpoint(&state);
+        }
+        (id, writer)
+    }
+
     /// Register a new running job; returns its id and the producer handle.
     pub fn start(&self, kind: &'static str, label: String) -> (String, JobWriter) {
         self.start_owned(kind, label, None)
@@ -309,7 +548,12 @@ impl JobRegistry {
 
     pub fn start_owned(&self, kind: &'static str, label: String, owner: Option<&String>) -> (String, JobWriter) {
         let id = if self.inner.directory.lock().unwrap().is_some() { format!("j{}",ulid::Ulid::new()) } else { format!("j{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed)) };
+        let ephemeral = self.inner.directory.lock().unwrap().is_none();
+        let spool = if ephemeral { tempfile::tempfile().ok() } else { None };
+        let spool_failed = ephemeral && spool.is_none();
         let job = Arc::new(Job {
+            budget: self.inner.budget.clone(),
+            spool: Mutex::new(spool),
             path: self.inner.directory.lock().unwrap().as_ref().map(|dir| dir.join(format!("{id}.json"))),
             state: Mutex::new(JobState {
                 kind: kind.into(),
@@ -318,8 +562,12 @@ impl JobRegistry {
                 label,
                 status: JobStatus::Running,
                 output: Vec::new(),
+                output_bytes: 0,
+                charged_bytes: 0,
                 read_from: 0,
                 settled: false,
+                settled_at_ms: None,
+                output_error: None,
             }),
             completion: owner.map(|owner| (id.clone(), owner.clone(), self.inner.sessions.lock().expect("sessions lock").clone())),
             cancel: tokio_util::sync::CancellationToken::new(),
@@ -329,6 +577,7 @@ impl JobRegistry {
             let created = std::fs::OpenOptions::new().create_new(true).write(true).open(path.with_extension("output")).and_then(|file| file.sync_all());
             if let Err(error) = created { job.cancel.cancel(); tracing::error!(%error,"job output creation failed"); }
         }
+        if spool_failed { job.cancel.cancel(); }
         job.checkpoint(&job.state.lock().unwrap());
         self.inner.jobs.lock().expect("jobs lock").insert(id.clone(), job.clone());
         (id, JobWriter { job })
@@ -355,8 +604,8 @@ impl JobRegistry {
     pub fn inspect(&self, session: &str, id: &str) -> Result<JobInspection, String> {
         let job = self.get_for_session(id, Some(session))?;
         let state = job.state.lock().expect("job lock");
-        let output_bytes = state.output.len();
-        let tail = &state.output[output_bytes.saturating_sub(MAX_INSPECT_BYTES)..];
+        let output_bytes = state.output_bytes;
+        let tail = &state.output[state.output.len().saturating_sub(MAX_INSPECT_BYTES)..];
         let mut output = String::from_utf8_lossy(tail).into_owned();
         // Lossy decoding can expand invalid bytes; retain a UTF-8-safe bounded tail.
         if output.len() > MAX_INSPECT_BYTES {
@@ -426,6 +675,73 @@ mod inspection_tests {
         assert!(!shared_writer.cancelled().is_cancelled());
         assert_eq!(jobs.count("owner"), 0);
         assert_eq!(jobs.list("owner").len(), 2);
+    }
+
+    #[test]
+    fn quotas_cancel_without_silently_discarding_output() {
+        let jobs = JobRegistry::new();
+        jobs.configure_retention(Retention { max_job_bytes: 4, max_total_bytes: 6, ..Default::default() }).unwrap();
+        let (_, first) = jobs.start("test", "one".into());
+        first.append(b"1234");
+        first.append(b"5");
+        assert!(first.cancelled().is_cancelled());
+        assert!(first.output_error().unwrap().contains("per-job"));
+        assert_eq!(first.job.state.lock().unwrap().output_bytes, 4);
+        let (_, second) = jobs.start("test", "two".into());
+        second.append(b"12");
+        second.append(b"3");
+        assert!(second.cancelled().is_cancelled());
+        assert!(second.output_error().unwrap().contains("total"));
+    }
+
+    #[test]
+    fn cleanup_preserves_running_and_undelivered_artifacts_and_recovers_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = JobRegistry::new();
+        jobs.configure_retention(Retention { max_age_secs: 1, ..Default::default() }).unwrap();
+        jobs.enable_persistence(dir.path()).unwrap();
+        let (active, running) = jobs.start("test", "running".into());
+        let (pending, undelivered) = jobs.start_owned("test", "pending".into(), Some(&"owner".into()));
+        let (expired, complete) = jobs.capture("complete".into(), Some(&"owner".into()));
+        for writer in [&running, &undelivered, &complete] { writer.append(b"123"); }
+        undelivered.settle(JobStatus::Exited(Some(0)));
+        complete.settle(JobStatus::Exited(Some(0)));
+        for writer in [&running, &undelivered, &complete] { writer.job.state.lock().unwrap().settled_at_ms = Some(0); }
+        let path = complete.job.path.clone().unwrap();
+        assert_eq!(jobs.cleanup().unwrap(), 0, "reader/producer lease protects persistent artifacts");
+        drop(complete);
+        assert_eq!(jobs.cleanup().unwrap(), 1);
+        assert!(jobs.get(&expired).is_err());
+        assert!(jobs.get(&active).is_ok());
+        assert!(jobs.get(&pending).is_ok());
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 6);
+        assert!(!path.exists());
+        assert!(!path.with_extension("output").exists());
+    }
+
+    #[test]
+    fn recovery_finishes_interrupted_cleanup_and_removes_orphan_spools() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = JobRegistry::new();
+        jobs.enable_persistence(dir.path()).unwrap();
+        let (id, writer) = jobs.start("test", "expired".into());
+        writer.append(b"bytes");
+        writer.settle(JobStatus::Exited(Some(0)));
+        let path = writer.job.path.clone().unwrap();
+        std::fs::rename(&path, path.with_extension("deleted")).unwrap();
+        // A reader checkpoint after a failed cleanup rollback can recreate JSON.
+        writer.job.checkpoint(&writer.job.state.lock().unwrap());
+        let orphan = path.parent().unwrap().join("orphan.output");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        drop(writer);
+        drop(jobs);
+        let jobs = JobRegistry::new();
+        jobs.enable_persistence(dir.path()).unwrap();
+        assert!(jobs.get(&id).is_err());
+        assert!(!orphan.exists());
+        assert!(!path.with_extension("deleted").exists());
+        assert!(!path.with_extension("output").exists());
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 0);
     }
 
     #[test]
@@ -512,6 +828,27 @@ mod durability_tests {
         let (output,status,_) = drain_output(&recovered.get(&id).unwrap());
         assert_eq!(output,"firstsecond"); assert_eq!(status,JobStatus::Interrupted);
     }
+    #[tokio::test]
+    async fn partial_output_failure_reconciles_pagination() {
+        use std::io::Write;
+        let registry = JobRegistry::new();
+        let (id, writer) = registry.start("bash", "partial".into());
+        writer.append(b"first");
+        // Model a partial write followed by an I/O failure.
+        writer.job.spool.lock().unwrap().as_mut().unwrap().write_all(b"partial").unwrap();
+        {
+            let mut state = writer.job.state.lock().unwrap();
+            state.output_error = Some("I/O failure; output is incomplete".into());
+            writer.job.reconcile_output(&mut state);
+        }
+        let tool = JobOutputTool::new(registry);
+        let (text, metadata) = tool.read_presented(None, json!({"job_id":id,"offset":5})).await.unwrap();
+        assert!(text.starts_with("partial\n"));
+        assert_eq!(metadata["end_byte"], 12);
+        let (text, _) = tool.read_presented(None, json!({"job_id":id,"offset":12})).await.unwrap();
+        assert!(text.starts_with("\n[output bytes 12..12"));
+    }
+
     #[test]
     fn failed_append_cancels_producer_without_publishing_bytes() {
         let directory = tempfile::tempdir().unwrap();
@@ -634,24 +971,19 @@ impl Default for JobRegistry {
 /// Consume the unread output window (bounded), advancing the read cursor.
 fn drain_output(job: &Job) -> (String, JobStatus, Value) {
     let mut state = job.state.lock().expect("job lock");
-    let unread = &state.output[state.read_from..];
-    // Keep the TAIL of an oversized window: the newest output is what the
-    // model needs to see; the cut is reported below.
-    let (skipped, window) = if unread.len() > MAX_READ_BYTES {
-        (unread.len() - MAX_READ_BYTES, &unread[unread.len() - MAX_READ_BYTES..])
-    } else {
-        (0, unread)
-    };
+    let start = state.read_from.max(state.output_bytes.saturating_sub(state.output.len()));
+    let skipped = start - state.read_from;
+    let window = &state.output[start - (state.output_bytes - state.output.len())..];
     let mut text = String::from_utf8_lossy(window).into_owned();
     if skipped > 0 {
         text = format!("… {skipped} bytes skipped …\n{text}");
     }
     let presentation = json!({
-        "version":1,"kind":"job_output","status":state.status.marker(),
-        "start_byte":state.read_from + skipped,"end_byte":state.output.len(),
+        "version":1,"kind":"job_output","status":state.marker(),
+        "start_byte":state.read_from + skipped,"end_byte":state.output_bytes,
         "skipped_bytes":skipped,"truncated":skipped > 0,
     });
-    state.read_from = state.output.len();
+    state.read_from = state.output_bytes;
     job.checkpoint(&state);
     (text, state.status, presentation)
 }
@@ -687,6 +1019,7 @@ impl Tool for JobOutputTool {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "The job to read" },
+                "offset": { "type": "integer", "minimum": 0, "description": "Read full retained output at this byte offset without advancing the incremental cursor; pages are at most 64 KiB" },
                 "wait": { "type": "boolean", "description": "Reserved for explicit synchronous use; do not use it to wait for job completion" },
                 "timeout_ms": { "type": "integer", "description": "Max explicit wait in milliseconds (default 30000)" },
             },
@@ -712,6 +1045,26 @@ impl JobOutputTool {
     async fn read_presented(&self, session: Option<&str>, args: Value) -> Result<(String, Value), String> {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get_for_session(id, session)?;
+        if let Some(offset) = args.get("offset") {
+            use std::io::{Read, Seek, SeekFrom};
+            let offset = offset.as_u64().ok_or("offset must be a nonnegative byte offset")?;
+            let state = job.state.lock().unwrap();
+            if offset > state.output_bytes as u64 { return Err("offset exceeds retained output".into()); }
+            let read = |file: &mut std::fs::File| -> Result<String, String> {
+                file.seek(SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+                let mut bytes = Vec::new();
+                file.take((state.output_bytes as u64 - offset).min(MAX_READ_BYTES as u64)).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                Ok(String::from_utf8_lossy(&bytes).into_owned())
+            };
+            let text = if let Some(path) = &job.path {
+                read(&mut std::fs::File::open(path.with_extension("output")).map_err(|e| e.to_string())?)?
+            } else {
+                read(job.spool.lock().unwrap().as_mut().ok_or("output spool unavailable")?)?
+            };
+            let end = (offset + MAX_READ_BYTES as u64).min(state.output_bytes as u64);
+            let metadata = json!({"version":1,"kind":"job_output","job_id":id,"start_byte":offset,"end_byte":end,"total_bytes":state.output_bytes,"truncated":end < state.output_bytes as u64});
+            return Ok((format!("{text}\n[output bytes {offset}..{end} of {}; next offset: {end}]\n{}", state.output_bytes, state.marker()), metadata));
+        }
         let wait = args["wait"].as_bool().unwrap_or(false);
         let timeout = std::time::Duration::from_millis(args["timeout_ms"].as_u64().unwrap_or(30_000));
 
@@ -731,7 +1084,14 @@ impl JobOutputTool {
                 }
             }
         }
+        if metadata["truncated"] == true {
+            text.push_str(&format!("\nFull output: job_output(job_id=\"{id}\", offset=0); page using returned byte offsets."));
+        }
         metadata["job_id"] = json!(id);
+        if let Some(error) = &job.state.lock().unwrap().output_error {
+            text.push_str(&format!("\n[output error: {error}]"));
+            metadata["output_error"] = json!(error);
+        }
         Ok((if text.is_empty() {
             format!("(no new output)\n{}", status.marker())
         } else {
@@ -793,10 +1153,10 @@ impl JobListTool {
                 let state = job.state.lock().expect("job lock");
                 if !state.visible_to(session) { return None; }
                 let n: u64 = id[1..].parse().unwrap_or(0);
-                let record = json!({"job_id":id,"kind":state.kind,"status":state.status.marker(),"label":state.label});
+                let record = json!({"job_id":id,"kind":state.kind,"status":state.marker(),"label":state.label});
                 metadata_bytes += serde_json::to_vec(&record).unwrap().len();
                 if metadata_bytes <= 48 * 1024 { records.push(record); }
-                Some((n, format!("{id} [{}] {} — {}", state.kind, state.status.marker(), state.label)))
+                Some((n, format!("{id} [{}] {} — {}", state.kind, state.marker(), state.label)))
             })
             .collect();
         lines.sort();
@@ -861,7 +1221,7 @@ impl JobKillTool {
         let job = self.jobs.get_for_session(id, session)?;
         if !job.request_stop() {
             let state = job.state.lock().expect("job lock");
-            return Ok((format!("job {id} already finished {}", state.status.marker()), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":false,"status":state.status.marker()})));
+            return Ok((format!("job {id} already finished {}", state.marker()), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":false,"status":state.marker()})));
         }
         Ok((format!("cancellation requested for job {id}"), json!({"version":1,"kind":"job_kill","job_id":id,"cancellation_requested":true})))
     }

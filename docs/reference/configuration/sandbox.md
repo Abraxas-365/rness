@@ -1,6 +1,6 @@
 # Filesystem sandbox configuration
 
-`rness.sandbox.setup` chooses the filesystem authority for Bash/process tools. It is independent from approval: an `allow` approval policy can run Bash immediately while the operating-system sandbox still restricts its writes.
+`rness.sandbox.setup` chooses the filesystem authority for Bash/process tools and built-in Write/Edit. It is independent from approval: an `allow` approval policy can run tools immediately while their filesystem policy still restricts writes.
 
 ```lua
 rness.sandbox.setup({
@@ -50,10 +50,17 @@ The effective mode is durable. Resume and fork retain it even if `init.lua` chan
 
 ## Enforcement and current limits
 
-Bash execution is enforced on macOS using `/usr/bin/sandbox-exec` (Seatbelt), including descendant processes. rness canonicalizes both the workspace and requested work directory before launching. On platforms without an implemented backend, `read-only` and `workspace-write` fail closed with an explanatory tool error; `danger-full-access` continues to use the ordinary shell.
+Bash execution uses macOS Seatbelt, Linux Bubblewrap, or an explicitly configured Docker Desktop Linux-container image on Windows. See [process backend configuration](../../guides/execution-hardening.md#process-backend-configuration) for Lua options and platform requirements. Windows restricted commands use a Linux shell inside that image, not native PowerShell confinement. Missing backends fail closed; unrestricted Windows commands use the configured PowerShell executable. rness canonicalizes the workspace and work directory before launching.
 
-This is filesystem confinement for Bash/process tools only. It does **not** currently isolate network access, CPU or process counts, Lua/plugins/native extensions, MCP-managed processes, or non-Bash tools. Other host services reachable through IPC/network are not confined by the child's write policy, so do not treat this as a security boundary against hostile code. Reads (including secrets readable by your user) remain allowed. Pre-existing hard links inside a writable workspace can alias files outside it; writing through such a link changes the same inode and is not prevented by path-based Seatbelt rules. Use a trusted workspace without those aliases. A workspace is therefore a path-based write boundary, not a general-purpose container or VM.
+Bash has OS-level filesystem confinement; built-in Write/Edit additionally enforce the mode through canonical path checks. These checks reject restricted writes outside the workspace, parent traversal, dangling/escaping symlinks and existing multiply linked files on Unix, but are not protection against hostile concurrent path swaps. See [execution hardening](../../guides/execution-hardening.md). This does **not** currently isolate network access, CPU or process counts, Lua/plugins/native extensions, or MCP-managed processes. Other host services reachable through IPC/network are not confined by the child's write policy, so do not treat this as a security boundary against hostile code. Reads (including secrets readable by your user) remain allowed. Pre-existing hard links inside a writable workspace can alias files outside it; writing through such a link changes the same inode and is not prevented by path-based Seatbelt rules. Use a trusted workspace without those aliases. A workspace is therefore a path-based write boundary, not a general-purpose container or VM.
 
-`/dev/null` accepts data writes in both restricted modes. `TMPDIR`, `TMP`, and `TEMP` point at a private per-command directory; only `workspace-write` allows writing there. Cleanup is best-effort: process crashes or files deliberately made undeletable can leave temporary data behind.
+The macOS backend allows `/dev/null` data writes in both restricted modes and
+points `TMPDIR`, `TMP`, and `TEMP` at a private per-command directory. Linux uses
+an isolated `/tmp` in workspace-write mode. Windows containers provide writable
+`/tmp` only in workspace-write mode; Docker-managed `/dev` and `/dev/shm` remain
+writable container-local special mounts even with a read-only root. Cleanup is
+best-effort: crashes or an unavailable container daemon can leave temporary data
+or containers behind. Windows artifact metadata does not have Unix directory-fsync
+power-loss durability guarantees.
 
 Implementation: [Lua declaration](../../../crates/rness-lua/src/api/config.rs), [durable session resolution](../../../crates/rness-engine/src/service.rs), and [Bash executor](../../../crates/rness-tools/src/sandbox.rs).

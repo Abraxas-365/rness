@@ -16,6 +16,7 @@ pub struct SandboxConfig {
     pub agent_overrides: AgentOverrides,
     /// Enforced modes never silently execute unrestricted.
     pub unavailable: UnavailableBehavior,
+    pub process: ProcessConfig,
 }
 
 impl Default for SandboxConfig {
@@ -24,7 +25,54 @@ impl Default for SandboxConfig {
             default: SandboxMode::DangerFullAccess,
             agent_overrides: AgentOverrides::TightenOnly,
             unavailable: UnavailableBehavior::Deny,
+            process: Default::default(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProcessConfig {
+    pub unix_shell: std::path::PathBuf,
+    pub macos_runner: std::path::PathBuf,
+    pub linux_runner: std::path::PathBuf,
+    pub windows_shell: std::path::PathBuf,
+    pub windows_container_runner: std::path::PathBuf,
+    /// Explicit, locally available Linux image; None denies restricted commands.
+    pub windows_container_image: Option<String>,
+    pub windows_container_shell: String,
+    pub windows_container_pids: u32,
+    pub temp_parent: Option<std::path::PathBuf>,
+}
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            unix_shell: "/bin/sh".into(), macos_runner: "/usr/bin/sandbox-exec".into(),
+            linux_runner: "/usr/bin/bwrap".into(), windows_shell: "powershell.exe".into(),
+            windows_container_runner: "docker.exe".into(), windows_container_image: None,
+            windows_container_shell: "/bin/sh".into(), windows_container_pids: 256,
+            temp_parent: None,
+        }
+    }
+}
+
+impl ProcessConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for path in [&self.unix_shell, &self.macos_runner, &self.linux_runner,
+            &self.windows_shell, &self.windows_container_runner] {
+            if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
+                return Err("sandbox process executable must be nonempty and contain no NUL".into());
+            }
+        }
+        if self.windows_container_pids == 0 || self.windows_container_shell.is_empty()
+            || self.windows_container_shell.contains('\0') {
+            return Err("sandbox container requires a shell and positive process limit".into());
+        }
+        if self.windows_container_image.as_ref().is_some_and(|image|
+            image.is_empty() || image.starts_with('-') || image.chars().any(char::is_whitespace) || image.contains('\0')) {
+            return Err("sandbox container image must be a nonempty image reference".into());
+        }
+        Ok(())
     }
 }
 

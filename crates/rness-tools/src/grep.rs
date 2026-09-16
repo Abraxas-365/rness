@@ -41,6 +41,7 @@ impl GrepTool {
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn concurrency_safe(&self, _: &Value) -> bool { true }
     fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }

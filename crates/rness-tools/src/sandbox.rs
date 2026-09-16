@@ -15,6 +15,50 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Authorize a built-in file mutation. Reads remain unrestricted, matching
+    /// the process policy. This is a path policy, not isolation from hostile
+    /// concurrent filesystem changes or trusted plugin code.
+    pub fn check_write(&self, path: &Path) -> Result<(), String> {
+        match self.mode {
+            SandboxMode::DangerFullAccess => return Ok(()),
+            SandboxMode::ReadOnly => return Err("read-only sandbox denies file mutation".into()),
+            SandboxMode::WorkspaceWrite => {}
+        }
+        let root = std::fs::canonicalize(&self.workspace).map_err(|e| format!("sandbox workspace: {e}"))?;
+        if root != self.workspace || !root.is_dir() {
+            return Err("sandbox workspace identity changed".into());
+        }
+        // Reject traversal rather than normalizing away symlink-sensitive '..'.
+        if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Err("workspace-write denies parent traversal in mutation paths".into());
+        }
+        let mut existing = path;
+        loop {
+            match std::fs::symlink_metadata(existing) {
+                Ok(_) => {
+                    let resolved = std::fs::canonicalize(existing)
+                        .map_err(|e| format!("sandbox target: {e}"))?;
+                    if !resolved.starts_with(&root) {
+                        return Err("workspace-write denies mutation outside the session workspace".into());
+                    }
+                    // Resolve the final file too, so symlink aliases cannot hide hard links.
+                    #[cfg(unix)]
+                    if existing == path {
+                        use std::os::unix::fs::MetadataExt;
+                        if std::fs::metadata(existing).map_err(|e| e.to_string())?.nlink() > 1 && resolved.is_file() {
+                            return Err("workspace-write denies mutation of multiply linked files".into());
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    existing = existing.parent().ok_or("sandbox target has no existing ancestor")?;
+                }
+                Err(e) => return Err(format!("sandbox target: {e}")),
+            }
+        }
+    }
+
     pub fn new(mode: SandboxMode, workspace: &Path) -> Self {
         let workspace =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
@@ -26,10 +70,17 @@ impl Policy {
 /// confined child; removal happens after the process and descendants settle.
 pub struct Lease {
     temp: Option<PathBuf>,
+    container: Option<(PathBuf, String)>,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
+        if let Some((runner, name)) = self.container.take() {
+            // Also runs when the attached docker client is cancelled. Killing
+            // the client alone would otherwise leave the producer alive.
+            let _ = std::process::Command::new(runner).args(["rm", "--force", &name])
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
         if let Some(path) = self.temp.take() {
             let _ = std::fs::remove_dir_all(path);
         }
@@ -58,7 +109,7 @@ fn private_temp_in(parent: &Path) -> Result<Lease, String> {
     builder.create(&root)
         .map_err(|e| format!("create sandbox temporary directory {}: {e}", root.display()))?;
     // Own the path immediately, including on subsequent preparation/spawn errors.
-    Ok(Lease { temp: Some(root) })
+    Ok(Lease { temp: Some(root), container: None })
 }
 
 #[cfg(target_os = "macos")]
@@ -88,10 +139,29 @@ pub fn prepare(
     workdir: &Path,
     policy: &Policy,
 ) -> Result<(tokio::process::Command, Lease), String> {
+    prepare_configured(command, workdir, policy, &Default::default())
+}
+
+pub fn prepare_configured(
+    command: &str,
+    workdir: &Path,
+    policy: &Policy,
+    config: &rness_engine::sandbox::ProcessConfig,
+) -> Result<(tokio::process::Command, Lease), String> {
     if policy.mode == SandboxMode::DangerFullAccess {
-        let mut process = tokio::process::Command::new("/bin/sh");
-        process.arg("-c").arg(command);
-        return Ok((process, Lease { temp: None }));
+        #[cfg(not(windows))]
+        let process = {
+            let mut process = tokio::process::Command::new(&config.unix_shell);
+            process.arg("-c").arg(command);
+            process
+        };
+        #[cfg(windows)]
+        let process = {
+            let mut process = tokio::process::Command::new(&config.windows_shell);
+            process.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]);
+            process
+        };
+        return Ok((process, Lease { temp: None, container: None }));
     }
     // Do not trust lexical containment (".." and symlinks can escape it).
     let workdir = std::fs::canonicalize(workdir)
@@ -115,9 +185,17 @@ pub fn prepare(
     }
     #[cfg(target_os = "macos")]
     {
-        prepare_macos(command, policy, Path::new("/usr/bin/sandbox-exec"), &std::env::temp_dir())
+        prepare_macos_configured(command, policy, &config.macos_runner, config.temp_parent.as_deref().unwrap_or(&std::env::temp_dir()), &config.unix_shell)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        prepare_linux(command, &workdir, policy, config)
+    }
+    #[cfg(windows)]
+    {
+        prepare_windows_container(command, &workdir, policy, config)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         Err(unavailable(
             policy.mode,
@@ -126,13 +204,18 @@ pub fn prepare(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn prepare_macos(
     command: &str,
     policy: &Policy,
     runner: &Path,
     temp_parent: &Path,
 ) -> Result<(tokio::process::Command, Lease), String> {
+    prepare_macos_configured(command, policy, runner, temp_parent, Path::new("/bin/sh"))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_macos_configured(command: &str, policy: &Policy, runner: &Path, temp_parent: &Path, shell: &Path) -> Result<(tokio::process::Command, Lease), String> {
     if !runner.is_file() {
         return Err(unavailable(policy.mode, "sandbox-exec is unavailable"));
     }
@@ -148,13 +231,56 @@ fn prepare_macos(
         .arg("-D").arg(temp_param)
         .arg("-p")
         .arg(macos_profile(policy.mode))
-        .arg("/bin/sh")
+        .arg(shell)
         .arg("-c")
         .arg(command)
         .env("TMPDIR", temp)
         .env("TMP", temp)
         .env("TEMP", temp);
     Ok((process, lease))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prepare_linux(command: &str, workdir: &Path, policy: &Policy, config: &rness_engine::sandbox::ProcessConfig) -> Result<(tokio::process::Command, Lease), String> {
+    if !config.linux_runner.is_file() { return Err(unavailable(policy.mode, "bubblewrap is unavailable")); }
+    let mut process = tokio::process::Command::new(&config.linux_runner);
+    process.args(["--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]);
+    process.args(["--remount-ro", "/dev"]);
+    if policy.mode == SandboxMode::WorkspaceWrite {
+        // Mount temporary storage first: workspaces under /tmp must not be
+        // hidden by a later tmpfs mount.
+        process.args(["--tmpfs", "/tmp"]);
+        process.arg("--bind").arg(&policy.workspace).arg(&policy.workspace);
+    }
+    process.arg("--chdir").arg(workdir)
+        .args(["--setenv", "TMPDIR", "/tmp", "--setenv", "TMP", "/tmp", "--setenv", "TEMP", "/tmp", "--"])
+        .arg(&config.unix_shell).arg("-c").arg(command);
+    Ok((process, Lease { temp: None, container: None }))
+}
+
+#[cfg(any(windows, test))]
+fn prepare_windows_container(command: &str, workdir: &Path, policy: &Policy, config: &rness_engine::sandbox::ProcessConfig) -> Result<(tokio::process::Command, Lease), String> {
+    let image = config.windows_container_image.as_deref().filter(|s| !s.is_empty() && !s.starts_with('-'))
+        .ok_or_else(|| unavailable(policy.mode, "configure sandbox.process.windows_container_image and Docker Desktop Linux containers"))?;
+    if config.windows_container_pids == 0 { return Err("windows_container_pids must be positive".into()); }
+    let workspace = policy.workspace.to_str().ok_or("container workspace must be Unicode")?;
+    let workspace = workspace.strip_prefix(r"\\?\").unwrap_or(workspace);
+    if workspace.starts_with("UNC\\") { return Err("container workspace must be a local drive path".into()); }
+    // Docker's --mount grammar has comma separators; reject rather than
+    // reinterpret an arbitrary path as additional mount options.
+    if workspace.contains(',') { return Err("container workspace cannot contain commas".into()); }
+    let relative = workdir.strip_prefix(&policy.workspace).map_err(|_| "container workdir must be inside workspace")?;
+    let name = format!("rness-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let mut process = tokio::process::Command::new(&config.windows_container_runner);
+    process.args(["run", "--rm", "--pull=never", "--name", &name, "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit"])
+        .arg(config.windows_container_pids.to_string());
+    let mut mount = format!("type=bind,source={workspace},target=/workspace");
+    if policy.mode == SandboxMode::ReadOnly { mount.push_str(",readonly"); }
+    process.arg("--mount").arg(mount);
+    if policy.mode == SandboxMode::WorkspaceWrite { process.args(["--tmpfs", "/tmp:rw,nosuid,nodev,noexec,size=64m"]); }
+    process.arg("--workdir").arg(format!("/workspace/{}", relative.to_string_lossy().replace('\\', "/")))
+        .arg("--entrypoint").arg(&config.windows_container_shell).arg(image).args(["-c", command]);
+    Ok((process, Lease { temp: None, container: Some((config.windows_container_runner.clone(), name)) }))
 }
 
 pub fn standard_io(process: &mut tokio::process::Command, workdir: &Path) {
@@ -169,6 +295,44 @@ pub fn standard_io(process: &mut tokio::process::Command, workdir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_launcher_uses_readonly_root_and_explicit_writable_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = dir.path().join("bwrap");
+        std::fs::write(&runner, b"").unwrap();
+        let config = rness_engine::sandbox::ProcessConfig { linux_runner: runner, ..Default::default() };
+        let error = prepare_windows_container("true", dir.path(), &Policy::new(SandboxMode::ReadOnly, dir.path()), &config).err().unwrap();
+        assert!(error.contains("windows_container_image"));
+        for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
+            let policy = Policy::new(mode, dir.path());
+            let (process, _) = prepare_linux("true", dir.path(), &policy, &config).unwrap();
+            let args: Vec<_> = process.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+            assert!(args.windows(3).any(|a| a == ["--ro-bind", "/", "/"]));
+            assert_eq!(args.contains(&"--bind".into()), mode == SandboxMode::WorkspaceWrite);
+            assert!(args.contains(&"--unshare-pid".into()));
+        }
+    }
+
+    #[test]
+    fn windows_container_launcher_limits_host_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = Policy::new(SandboxMode::ReadOnly, dir.path());
+        let config = rness_engine::sandbox::ProcessConfig {
+            windows_container_image: Some("local-dev:latest".into()),
+            ..Default::default()
+        };
+        let (process, mut lease) = prepare_windows_container("true", &policy.workspace, &policy, &config).unwrap();
+        // Argument test only: do not invoke Docker during lease teardown.
+        lease.container.take();
+        let args: Vec<_> = process.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert!(args.contains(&"--read-only".into()));
+        assert!(args.contains(&"--pull=never".into()));
+        assert!(args.contains(&"--cap-drop=ALL".into()));
+        assert_eq!(args.iter().filter(|a| *a == "--mount").count(), 1);
+        assert!(args.iter().any(|a| a.ends_with("target=/workspace,readonly")));
+        assert!(args.windows(2).any(|a| a == ["--workdir", "/workspace/"]));
+    }
 
     #[test]
     fn unconfined_mode_needs_no_private_temp() {
