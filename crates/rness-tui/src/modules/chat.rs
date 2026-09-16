@@ -867,12 +867,11 @@ impl Component for Chat {
             self.card_rows.clear();
         }
         if action == "select_message" {
-            self.selected_message = ctx.model.live.as_ref().and_then(|live| {
-                live.running_tools.iter().rev().find(|(_, name)| name == "subagent")
-                    .map(|(call, _)| call.clone())
-            }).or_else(|| ctx.model.entry_ids.iter().enumerate().rev().find(|(i, _)| {
+            // Selection navigates transcript entries, not temporary live tool IDs.
+            // A live call has no entry row and would lose focus on the next redraw.
+            self.selected_message = ctx.model.entry_ids.iter().enumerate().rev().find(|(i, _)| {
                 ctx.model.entries.get(*i).is_some_and(|entry| !message_text(entry).is_empty())
-            }).map(|(_, id)| id.clone()));
+            }).map(|(_, id)| id.clone());
             self.message_expanded = true;
             self.message_scroll = 0;
             return KeyOutcome::consumed();
@@ -2683,6 +2682,54 @@ mod tests {
             assert_eq!(chat.selected_message.as_deref(), Some("compaction:checkpoint"));
         }
         }
+    }
+
+    #[test]
+    fn message_selection_survives_redraw_while_subagents_run() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut model = Model::new("selection".into(), "fake".into());
+        model.entries = vec![
+            Entry::Notice("Earlier conversation".into()),
+            Entry::Notice("Starting subagents".into()),
+        ];
+        model.entry_ids = vec!["earlier".into(), "latest".into()];
+        model.busy = true;
+        model.live = Some(crate::app::LiveStep {
+            running_tools: vec![
+                ("child-1".into(), "subagent".into()),
+                ("child-2".into(), "subagent".into()),
+            ],
+            ..Default::default()
+        });
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let mut chat = Chat {
+            config: serde_json::json!({}),
+            ..Default::default()
+        };
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buffer = Buffer::empty(area);
+        chat.render(&ctx, area, &mut buffer);
+        assert!(chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)).handled);
+        chat.render(&ctx, area, &mut buffer);
+        assert!(chat.captures_input());
+        assert_eq!(chat.selected_message.as_deref(), Some("latest"));
+
+        for (key, expected) in [
+            (KeyCode::Up, "earlier"),
+            (KeyCode::Down, "latest"),
+        ] {
+            assert!(chat.on_key(&ctx, KeyEvent::from(key)).handled);
+            chat.render(&ctx, area, &mut buffer);
+            assert!(chat.captures_input());
+            assert_eq!(chat.selected_message.as_deref(), Some(expected));
+        }
+        assert!(chat.on_key(&ctx, KeyEvent::from(KeyCode::Esc)).handled);
+        chat.render(&ctx, area, &mut buffer);
+        assert!(!chat.captures_input());
     }
 
     #[test]
