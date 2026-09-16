@@ -50,6 +50,7 @@ pub struct StartupConfig {
     pub compaction: BTreeMap<String, rness_engine::turn::compaction::Policy>,
     pub mappings: Vec<UserMapping>,
     pub images: rness_engine::images::ImagePolicy,
+    pub image_reader: crate::runtime::ImageReaderConfig,
     pub promptbox: serde_json::Value,
     pub messagebox: serde_json::Value,
     pub permissions: BTreeMap<String, rness_engine::approval::ToolPolicy>,
@@ -169,6 +170,21 @@ mod permission_tests {
                 format!("rness.compaction = {{['test/model']={{{bad}}}}}"),
             )
             .unwrap();
+            assert!(super::load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn image_reader_config_validates_limits_and_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for script in [
+            "rness.image_reader = { processing_concurrency = 0 }",
+            "rness.image_reader = { processing_concurrency = 65 }",
+            "rness.image_reader = { typo = 1 }",
+            "rness.images = { processing_concurrency = 2 }",
+        ] {
+            std::fs::write(&path, script).unwrap();
             assert!(super::load(&path).is_err());
         }
     }
@@ -1051,6 +1067,23 @@ pub fn evaluate(
             lua.from_value(mlua::Value::Table(images))?;
         policy.validate().map_err(std::io::Error::other)?;
         state.lock().unwrap().images = policy;
+    }
+    if let Some(image_reader) = rness.get::<Option<Table>>("image_reader")? {
+        let cleaned = lua.create_table()?;
+        for entry in image_reader.pairs::<String, mlua::Value>() {
+            let (key, value) = entry?;
+            if key == "enable" && matches!(value, mlua::Value::Function(_)) {
+                continue; // Runtime API installed before startup evaluation.
+            }
+            if key != "processing_concurrency" {
+                return Err(format!("unknown image_reader option: {key}").into());
+            }
+            cleaned.set(key, value)?;
+        }
+        let config: crate::runtime::ImageReaderConfig =
+            lua.from_value(mlua::Value::Table(cleaned))?;
+        config.validate().map_err(std::io::Error::other)?;
+        state.lock().unwrap().image_reader = config;
     }
     if let Some(messagebox) = rness
         .get::<Table>("ui")?

@@ -245,7 +245,10 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
         .contains("rness.agents.allow_generic = false"));
     assert!(!config.agents.contains_key("worker"), "the optional worker role stays disabled by default");
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 12);
+    assert_eq!(config.plugin_specs.len(), 13);
+    assert_eq!(config.images.max_input_dimension, 8192);
+    assert_eq!(config.image_reader.processing_concurrency, 2);
+    assert_eq!(config.images.max_pixels, 2048 * 2048);
     let policy = &config.compaction["default"];
     assert_eq!(policy.threshold_tokens, 165000);
     assert_eq!(policy.prune_threshold, 8192);
@@ -277,6 +280,8 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     for name in ["branches", "sessions", "tasks"] {
         assert_eq!(apps.iter().find(|a| a.name == name).unwrap().refresh_ms, Some(500));
     }
+    let reader = host.tool_specs().await.into_iter().find(|spec| spec.name == "read_image").unwrap();
+    assert_eq!(reader.read_image.unwrap().processing_concurrency, 2);
     let plan = host.tool_specs().await.into_iter().find(|spec| spec.name == "exit_plan_mode").unwrap().plan.unwrap();
     assert!(Arc::ptr_eq(&plan.questions, &questions));
     assert!(sessions.reference_service().enabled());

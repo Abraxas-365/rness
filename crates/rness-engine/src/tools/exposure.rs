@@ -217,5 +217,16 @@ pub async fn program(
         serde_json::to_string(&value).map_err(|e| e.to_string())
     }).await.unwrap_or_else(|e| Err(format!("program worker failed: {e}")));
     let nested = std::mem::take(&mut *records.lock().unwrap());
-    (result(&original, executed), nested)
+    let mut outer = result(&original, executed);
+    // Nested audit events are not model transcript. Carry admitted image blocks
+    // on the outer result too; JSON metadata alone does not deliver image input.
+    let mut seen = std::collections::HashSet::new();
+    for (_, output) in &nested {
+        for part in &output.content {
+            if let ToolResultContentPart::Image { attachment } = part {
+                if seen.insert(attachment.id.clone()) { outer.content.push(part.clone()); }
+            }
+        }
+    }
+    (outer, nested)
 }

@@ -28,7 +28,24 @@ rness.jobs.setup {
   },
 }
 
+-- Shared image admission and normalization policy (also used by read_image).
+rness.images = {
+  max_input_bytes = 20 * 1024 * 1024,
+  max_input_pixels = 64000000,
+  max_input_dimension = 8192,
+  max_request_images = 20,
+  max_request_bytes = 200 * 1024 * 1024, -- encoded request budget, not source bytes
+  max_pixels = 2048 * 2048,
+  max_dimension = 8192,
+  max_bytes = 4 * 1024 * 1024, -- hard normalized-byte limit
+  animation = "first_frame",
+  normalize_srgb = true,
+  lossless = false,
+  quality = 85,
+}
+
 rness.plugins.setup({
+  { name = "read-image", file = "plugins/read-image.lua" },
   { name = "delivery", file = "plugins/delivery.lua", keys = { queue = "<F8>", steer = "<F9>" } },
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20, allow_parent = false, allow_home = false, allow_absolute = false } },
   { name = "statusline", file = "plugins/statusline.lua" },

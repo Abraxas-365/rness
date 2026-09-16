@@ -33,9 +33,28 @@ fn app_key_help(spec: &Table) -> mlua::Result<Vec<String>> {
     Ok(help)
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ImageReaderConfig {
+    pub processing_concurrency: usize,
+}
+
+impl Default for ImageReaderConfig {
+    fn default() -> Self { Self { processing_concurrency: 2 } }
+}
+
+impl ImageReaderConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=64).contains(&self.processing_concurrency) {
+            return Err("image_reader.processing_concurrency must be in 1..=64".into());
+        }
+        Ok(())
+    }
+}
+
 /// What a Lua plugin registered via `rness.tool.register{...}` — the
 /// engine-facing spec (the callable stays in the VM registry).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LuaToolSpec {
     pub name: String,
     pub description: String,
@@ -43,6 +62,8 @@ pub struct LuaToolSpec {
     pub sensitive: bool,
     pub plan: Option<std::sync::Arc<rness_engine::plan::ExitPlan>>,
     pub tasks: Option<rness_engine::tasks::TasksConfig>,
+    pub read_image: Option<ImageReaderConfig>,
+    pub sessions: Option<std::sync::Weak<rness_engine::service::SessionService>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -110,6 +131,7 @@ pub struct LuaRuntime {
     plugin_dependencies: HashMap<String, Vec<String>>,
     /// Shared questions broker, injected post-mount for dynamic enable/disable.
     references: Option<(String, rness_engine::file_references::Config)>,
+    image_sessions: Option<std::sync::Weak<rness_engine::service::SessionService>>,
     plan_store: Option<std::sync::Arc<rness_engine::session::branch::SessionStore>>,
     questions: Option<std::sync::Arc<rness_engine::questions::Questions>>,
 }
@@ -144,6 +166,7 @@ impl LuaRuntime {
     pub fn install_config(&self, config: &crate::api::config::StartupConfig) -> Result<(), LuaError> {
         self.lua.globals().set("__rness_user_mappings", self.lua.to_value(&config.mappings)?)?;
         let rness: Table = self.lua.globals().get("rness")?;
+        install_image_reader(&self.lua, &rness, config.image_reader.clone())?;
         let models: Table = rness.get("models")?;
         let registry = config.models.clone();
         models.set("get", self.lua.create_function(move |lua, name: String| {
@@ -201,6 +224,7 @@ impl LuaRuntime {
             web_hooks: HashMap::new(),
             plugin_hooks: HashMap::new(), plugin_dependencies: HashMap::new(),
             references: None,
+            image_sessions: None,
             plan_store: None,
             questions: None,
         })
@@ -381,7 +405,7 @@ impl LuaRuntime {
                 commands: self.commands.iter().map(|(n, (d, k))| Ok((n.clone(), (d.clone(), copy_key(k)?)))).collect::<mlua::Result<_>>()?,
                 references: None,
                 web_hooks: HashMap::new(),
-            plugin_hooks: HashMap::new(), plugin_dependencies: HashMap::new(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
+            plugin_hooks: HashMap::new(), plugin_dependencies: HashMap::new(), image_sessions: self.image_sessions.clone(), plan_store: self.plan_store.clone(), questions: self.questions.clone(),
             };
             let declarations: Table = self.lua.globals().get("__rness_declarations")?;
             let fresh = self.lua.create_table()?;
@@ -956,6 +980,7 @@ impl LuaRuntime {
         model: String,
     ) -> Result<(), LuaError> {
         let rness: Table = self.lua.globals().get("rness")?;
+        self.image_sessions = Some(std::sync::Arc::downgrade(&sessions));
         self.plan_store = Some(sessions.plan_store());
         // rness.model — the active "<provider>/<model>" selection, the
         // key plugins pass to rness.models.get. Composition-root fact.
@@ -1216,6 +1241,12 @@ impl LuaRuntime {
                         alive: tokio_util::sync::CancellationToken::new(),
                     }))
                 }).transpose()?,
+                read_image: entry.get::<Option<Table>>("read_image_config")?.map(|table| {
+                    let config: ImageReaderConfig = self.lua.from_value(LuaValue::Table(table))?;
+                    config.validate().map_err(mlua::Error::runtime)?;
+                    Ok::<ImageReaderConfig, mlua::Error>(config)
+                }).transpose()?,
+                sessions: self.image_sessions.clone(),
                 tasks: entry.get::<Option<Table>>("tasks_config")?.map(|table| self.lua.from_value(LuaValue::Table(table))).transpose()?,
                 sensitive: entry.get::<Option<bool>>("sensitive")?.unwrap_or(false),
             };
@@ -1349,6 +1380,33 @@ fn require_declaration_phase(lua: &Lua) -> mlua::Result<()> {
 
 /// Build the `rness` global. Registration calls park their payloads in
 /// `__rness_pending`; the runtime drains them after each chunk load.
+fn install_image_reader(lua: &Lua, rness: &Table, defaults: ImageReaderConfig) -> mlua::Result<()> {
+    let image_reader = lua.create_table()?;
+    image_reader.set("enable", lua.create_function(move |lua, options: Option<Table>| {
+        require_declaration_phase(lua)?;
+        let config: ImageReaderConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_else(|| defaults.clone());
+        config.validate().map_err(mlua::Error::runtime)?;
+        let declarations: Table = lua.globals().get("__rness_declarations")?;
+        let declared: Table = declarations.get("tools")?;
+        if declared.contains_key("read_image")? { return Err(mlua::Error::runtime("read_image already registered")); }
+        use rness_engine::tools::Tool;
+        let native = rness_tools::read_image::ReadImage {
+            images: Default::default(), capability: std::sync::Arc::new(|_| Err("requires session services".into())),
+            processing: std::sync::Arc::new(tokio::sync::Semaphore::new(config.processing_concurrency)), workspace: None,
+        };
+        let entry = lua.create_table()?;
+        entry.set("name", native.name())?;
+        entry.set("description", native.description())?;
+        entry.set("schema", lua.to_value(&native.input_schema())?)?;
+        entry.set("read_image_config", lua.to_value(&config)?)?;
+        entry.set("run", lua.create_function(|_, ()| Err::<(), _>(mlua::Error::runtime("read_image requires rich agent dispatch")))?)?;
+        lua.globals().get::<Table>("__rness_pending")?.get::<Table>("tools")?.push(entry)?;
+        declared.set("read_image", true)?;
+        Ok(())
+    })?)?;
+    rness.set("image_reader", image_reader)
+}
+
 fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let pending = lua.create_table()?;
     pending.set("bindings", lua.create_table()?)?;
@@ -1611,6 +1669,8 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         Ok(())
     })?)?;
     rness.set("plan", plan)?;
+
+    install_image_reader(lua, &rness, ImageReaderConfig::default())?;
 
     let tasks = lua.create_table()?;
     tasks.set("enable", lua.create_function(|lua, options: Option<Table>| {

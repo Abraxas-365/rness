@@ -36,5 +36,6 @@ markup5ever_rcdom = "0.38"
 libc = "0.2"
 
 [dev-dependencies]
+image.workspace = true
 tempfile.workspace = true
 insta.workspace = true

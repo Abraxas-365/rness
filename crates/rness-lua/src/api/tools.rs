@@ -71,6 +71,24 @@ impl Tool for LuaTool {
     }
 }
 
+fn registered_tool(spec: LuaToolSpec, host: &LuaHost, registry: &rness_engine::tools::ToolRegistry) -> std::sync::Arc<dyn Tool> {
+    if let Some(config) = spec.read_image {
+        let sessions = spec.sessions;
+        return std::sync::Arc::new(rness_tools::read_image::ReadImage {
+            images: registry.images.clone(), processing: std::sync::Arc::new(tokio::sync::Semaphore::new(config.processing_concurrency)), workspace: None,
+            capability: std::sync::Arc::new(move |session| {
+                let sessions = sessions.as_ref().and_then(|s| s.upgrade()).ok_or("read_image requires session services")?;
+                let config = sessions.config(session).map_err(|e| e.to_string())?;
+                let capable = config.selection.as_ref().and_then(|selection| sessions.model_capabilities(selection))
+                    .and_then(|caps| caps.image_input) == Some(true);
+                if !capable { return Err("read_image requires declared image_input=true for the selected model".into()); }
+                Ok(())
+            }),
+        });
+    }
+    std::sync::Arc::new(LuaTool::new(spec, host.clone()))
+}
+
 /// Register every Lua tool currently in the VM into the registry.
 pub async fn register_lua_tools(
     registry: &rness_engine::tools::ToolRegistry,
@@ -79,7 +97,7 @@ pub async fn register_lua_tools(
     let specs = host.tool_specs().await;
     let mut n = 0;
     for spec in specs {
-        match registry.try_register(std::sync::Arc::new(LuaTool::new(spec, host.clone()))) {
+        match registry.try_register(registered_tool(spec, host, registry)) {
             Ok(()) => n += 1,
             Err(error) => tracing::warn!("{error}"),
         }
@@ -156,6 +174,45 @@ mod ownership_tests {
     }
 
     #[tokio::test]
+    async fn image_reader_startup_defaults_and_plugin_options_have_explicit_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "rness.image_reader = { processing_concurrency = 7 }").unwrap();
+        let (host, config) = LuaHost::spawn_from_init(path).unwrap();
+        assert_eq!(config.image_reader.processing_concurrency, 7);
+        assert!(host.tool_specs().await.is_empty(), "configuration alone must not enable the tool");
+        host.load("custom-reader", "rness.image_reader.enable()").await.unwrap();
+        assert_eq!(host.tool_specs().await[0].read_image.as_ref().unwrap().processing_concurrency, 7);
+        host.unload("custom-reader").await.unwrap();
+        let plugin = include_str!("../../../../flavors/default/plugins/read-image.lua");
+        for concurrency in [2, 5] {
+            let source = plugin.replace("processing_concurrency = 2", &format!("processing_concurrency = {concurrency}"));
+            host.load("read-image", &source).await.unwrap();
+            assert_eq!(host.tool_specs().await[0].read_image.as_ref().unwrap().processing_concurrency, concurrency);
+            host.unload("read-image").await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_image_reader_is_plugin_owned_and_reloadable() {
+        let host = LuaHost::spawn().unwrap();
+        let registry = rness_engine::tools::ToolRegistry::default();
+        assert!(host.tool_specs().await.is_empty());
+        assert!(host.load("broken-image", "rness.image_reader.enable(); error('broken')").await.is_err());
+        assert!(host.tool_specs().await.is_empty());
+        host.load("read-image", "rness.image_reader.enable { processing_concurrency = 3 }").await.unwrap();
+        assert_eq!(host.tool_specs().await[0].read_image.as_ref().unwrap().processing_concurrency, 3);
+        let installed = sync_lua_tools(&registry, &host, &[]).await;
+        assert!(registry.get("read_image").is_some());
+        let tool = registry.get("read_image").unwrap();
+        let error = tool.execute_rich(&"s".into(), "c", serde_json::json!({"file_path":"missing"}), &Default::default()).await.unwrap_err();
+        assert!(error.contains("session services"));
+        host.unload("read-image").await.unwrap();
+        assert!(sync_lua_tools(&registry, &host, &installed).await.is_empty());
+        assert!(registry.get("read_image").is_none());
+    }
+
+    #[tokio::test]
     async fn native_tasks_lifecycle_and_validation() {
         let host = LuaHost::spawn().unwrap();
         let registry = rness_engine::tools::ToolRegistry::default();
@@ -228,7 +285,7 @@ pub(crate) fn sync_lua_tool_specs(
     let mut installed = Vec::new();
     for spec in specs {
         let name = spec.name.clone();
-        let tool: std::sync::Arc<dyn Tool> = std::sync::Arc::new(LuaTool::new(spec, host.clone()));
+        let tool = registered_tool(spec, host, registry);
         let result = if let Some(expected) = previous.iter().find(|tool| tool.name() == name) {
             registry.replace_if_current(expected, tool.clone())
         } else {

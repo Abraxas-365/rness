@@ -28,6 +28,7 @@ pub struct ImagePolicy {
     pub max_request_bytes: usize,
     pub max_input_bytes: usize,
     pub max_input_pixels: u64,
+    pub max_input_dimension: u32,
     pub max_pixels: u64,
     pub max_dimension: u32,
     pub max_bytes: usize,
@@ -38,6 +39,7 @@ pub struct ImagePolicy {
 impl Default for ImagePolicy {
     fn default() -> Self {
         Self { animation: AnimationPolicy::FirstFrame, normalize_srgb: true, deepseek_files: false, anthropic_files: false, max_request_images: 20, max_request_bytes: 20 * 1024 * 1024, max_input_bytes: 20 * 1024 * 1024, max_input_pixels: 40_000_000,
+            max_input_dimension: 8192,
             max_pixels: 4_000_000, max_dimension: 4096, max_bytes: 5 * 1024 * 1024,
             lossless: true, quality: 85 }
     }
@@ -46,6 +48,7 @@ impl Default for ImagePolicy {
 impl ImagePolicy {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_request_images == 0 || self.max_request_bytes == 0 || self.max_input_bytes == 0 || self.max_input_pixels == 0 || self.max_pixels == 0
+            || self.max_input_dimension == 0
             || self.max_dimension == 0 || self.max_bytes == 0 || !(1..=100).contains(&self.quality)
         { return Err("image limits must be positive; quality must be 1..100".into()); }
         Ok(())
@@ -61,6 +64,24 @@ mod tests {
         let mut data = Vec::new();
         image.write_to(&mut Cursor::new(&mut data), ImageFormat::Png).unwrap();
         data
+    }
+
+    #[test]
+    fn tool_image_normalization_is_not_repeated_by_provider_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().into(), ImagePolicy { lossless: false, max_dimension: 8, ..Default::default() }).unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        store.set_processor(Some(("once".into(), std::sync::Arc::new(move |_, bytes| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(bytes.to_vec())
+        })))).unwrap();
+        let (reference, original) = store.admit_tool_image("s", &png()).unwrap();
+        assert_eq!(original, (32, 16));
+        assert_eq!((reference.width, reference.height), (8, 4));
+        let (_, projected) = store.request_image(&reference, store.policy()).unwrap();
+        assert_eq!(projected, store.read(&reference).unwrap());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -287,7 +308,8 @@ impl ImageStore {
     pub fn set_request_policy(&self, policy: Option<ImagePolicy>) -> Result<(), String> {
         if let Some(policy) = &policy {
             policy.validate()?;
-            if policy.max_input_bytes != self.policy.max_input_bytes || policy.max_input_pixels != self.policy.max_input_pixels {
+            if policy.max_input_bytes != self.policy.max_input_bytes || policy.max_input_pixels != self.policy.max_input_pixels
+                || policy.max_input_dimension != self.policy.max_input_dimension {
                 return Err("image admission limits are startup-only".into());
             }
         }
@@ -308,6 +330,9 @@ impl ImageStore {
         media_type(format)?;
         let (width, height) = ImageReader::with_format(Cursor::new(data), format)
             .into_dimensions().map_err(|e| e.to_string())?;
+        if width.max(height) > self.policy.max_input_dimension {
+            return Err("image exceeds input dimension limit".into());
+        }
         if width == 0 || height == 0 || u64::from(width) * u64::from(height) > self.policy.max_input_pixels {
             return Err("image exceeds input pixel limit".into());
         }
@@ -405,6 +430,24 @@ impl ImageStore {
         file.as_file().sync_all().map_err(|e| e.to_string())?;
         file.persist(path).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Validate and normalize before granting a tool-result attachment. Unlike
+    /// uploads, this path stores the normalized result, preventing oversized or
+    /// unsupported animation results from poisoning the next provider request.
+    pub fn admit_tool_image(&self, session: &str, data: &[u8]) -> Result<(ImageRef, (u32, u32)), String> {
+        let format = image::guess_format(data).map_err(|e| e.to_string())?;
+        let source = self.admit(data, media_type(format)?)?;
+        let dimensions = (source.width, source.height);
+        let policy = self.effective_request_policy(self.policy());
+        let (mime, bytes) = self.request_image(&source, &policy)?;
+        let attachment = self.admit_for_session(session, &bytes, &mime)?;
+        // Seed the identical-policy variant for the normalized attachment so
+        // providers do not invoke the processor or lossy encoder a second time.
+        let processor = self.processor.read().expect("image processor lock").clone();
+        let key = digest(&serde_json::to_vec(&("image-v3", &attachment, &policy, processor.as_ref().map(|(version, _)| version))).map_err(|e| e.to_string())?);
+        self.write(&self.root.join("variants").join(key), &bytes)?;
+        Ok((attachment, dimensions))
     }
 
     /// Preserve admitted source bytes; processing variants never overwrite the source.

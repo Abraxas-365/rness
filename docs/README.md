@@ -15,6 +15,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Understand providers, profiles, and roles | [Configuration concepts](explanation/providers-models-profiles-agents.md) |
 | Look up agent fields | [Agent configuration reference](reference/configuration/agents.md) |
 | Understand scheduling, MCP, server auth and output retention | [Execution hardening](guides/execution-hardening.md) |
+| Read images and configure processing limits | [Image reading](guides/image-reading.md) |
 | Opt into filesystem write restrictions | [Sandbox configuration](reference/configuration/sandbox.md) |
 | Call delegation APIs from Lua | [Lua subagents reference](reference/lua/subagents.md) |
 | Check which model settings win | [Configuration precedence](reference/configuration-precedence.md) |
