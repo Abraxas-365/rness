@@ -169,14 +169,14 @@ async fn completion_reaches_busy_parent_before_it_can_go_idle() {
 }
 
 #[tokio::test]
-async fn job_completion_wakes_owner_once_and_bounds_automatic_turns() {
+async fn consecutive_job_completions_wake_owner_once_without_user_input() {
     let dir = tempfile::tempdir().unwrap();
     let (sessions, _) = compose(dir.path());
     let parent = sessions.create(None).unwrap();
     let stranger = sessions.create(None).unwrap();
     let jobs = rness_tools::jobs::JobRegistry::new();
     jobs.attach_sessions(&sessions);
-    for index in 0..4 {
+    for index in 0..6 {
         let (_, writer) = jobs.start_owned("test", "completion".into(), Some(&parent));
         writer.append(b"result");
         writer.settle(rness_tools::jobs::JobStatus::Exited(Some(index)));
@@ -184,15 +184,16 @@ async fn job_completion_wakes_owner_once_and_bounds_automatic_turns() {
         sessions.join(&parent).await;
     }
     let history = sessions.store().history(&parent).unwrap();
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 4);
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 3);
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 6);
+    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 6);
+    assert!(!history.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)));
     assert!(!sessions.store().history(&stranger).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
     sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "continue".into() }]).unwrap();
     sessions.join(&parent).await;
     let (_, writer) = jobs.start_owned("test", "again".into(), Some(&parent));
     writer.settle(rness_tools::jobs::JobStatus::Killed);
     sessions.join(&parent).await;
-    assert_eq!(sessions.store().history(&parent).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 5);
+    assert_eq!(sessions.store().history(&parent).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 8);
 }
 
 #[tokio::test(flavor = "multi_thread")]

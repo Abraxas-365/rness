@@ -661,7 +661,7 @@ async fn settlements_wake_repeatedly_and_interrupt_is_not_teardown() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = service(dir.path());
     let parent = sessions.create(None).unwrap();
-    // Exhaust the separate job budget first.
+    // Earlier background completions must not prevent later child wakes.
     for _ in 0..3 {
         sessions.notify_job(&parent, "job done".into()).unwrap();
         sessions.join(&parent).await;

@@ -106,7 +106,6 @@ struct Live {
     command: Mutex<Option<CancellationToken>>,
     inbox: Mutex<Inbox>,
     job_pending: Mutex<std::collections::HashSet<String>>,
-    job_wakes: Mutex<u32>,
     /// Token of the current (or last) burst. Replaced on each new burst.
     cancel: Mutex<CancellationToken>,
     /// Handle of the current burst task, for [`SessionService::join`].
@@ -120,7 +119,6 @@ impl Default for Live {
             command: Mutex::new(None),
             inbox: Mutex::new(Inbox::default()),
             job_pending: Default::default(),
-            job_wakes: Mutex::new(0),
             cancel: Mutex::new(CancellationToken::new()),
             handle: Mutex::new(None),
         }
@@ -780,8 +778,8 @@ impl SessionService {
             Notice::Subagent, Some((activity, operation)))
     }
 
-    /// Deliver a continuable child's closing answer, without the job wake
-    /// budget. Wait out command reservations instead of dropping busy notices.
+    /// Deliver a continuable child's closing answer. Wait out command
+    /// reservations instead of dropping busy notices.
     pub async fn notify_subagent_settled(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
@@ -927,12 +925,9 @@ impl SessionService {
                 return Err(ServiceError::InvalidConfig("retry requires a failed turn at the session tip".into()));
             }
         }
-        let mut wakes = live.job_wakes.lock().unwrap();
-        let intent = if notice == Notice::Job && inbox.phase() == Phase::Idle && *wakes >= 3 {
-            UserIntent::Inject
-        } else {
-            intent
-        };
+        // Job completions resume idle owners just like other followups. A
+        // lifetime wake count silently strands valid chains of background work;
+        // duplicate completions are handled by job settlement / durable IDs.
         let (intent, disposition) = inbox.submit_sourced(intent, content.clone(), source.clone());
         match &disposition {
             Disposition::Command(_) => unreachable!("inbox does not execute commands"),
@@ -993,11 +988,6 @@ impl SessionService {
                 });
                 *live.handle.lock().unwrap() = Some(handle);
             }
-        }
-        if notice == Notice::Job && disposition == Disposition::StartTurn {
-            *wakes += 1;
-        } else if notice == Notice::None && intent != UserIntent::Inject {
-            *wakes = 0;
         }
         Ok(disposition)
     }

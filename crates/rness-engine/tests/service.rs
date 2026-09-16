@@ -45,6 +45,24 @@ async fn external_delivery_is_idle_only_deduplicated_across_restart_and_teardown
 }
 
 #[tokio::test]
+async fn consecutive_durable_jobs_wake_without_user_input_and_remain_deduplicated() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new((0..6).map(|_| StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))).collect());
+    let svc = service(dir.path(), provider);
+    let sid = svc.create(None).unwrap();
+    for index in 0..6 {
+        let id = format!("job-{index}");
+        svc.notify_job_once(&sid, &id, "finished".into()).await.unwrap();
+        svc.join(&sid).await;
+        assert!(svc.notify_job_once(&sid, &id, "duplicate".into()).await.unwrap());
+        let history = svc.store().history(&sid).unwrap();
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), index + 1);
+        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), index + 1);
+        assert!(!history.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)));
+    }
+}
+
+#[tokio::test]
 async fn job_completion_id_survives_lost_ack_and_restart() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done",StopReason::EndTurn,vec![]))]);

@@ -15,6 +15,16 @@ The monitor keeps running and finished jobs visible together, including exit cod
 
 Inspection is a **non-consuming snapshot**. It does not advance the model's `job_output` cursor, start a model turn, or wait for job completion. The overlay refreshes every 250 ms by default while visible; no polling is needed from the user. There is deliberately no implicit stop-all or ambiguous short-ID matching. Jobs owned by other sessions cannot be listed, inspected, or stopped; legacy unowned jobs retain their existing shared visibility.
 
+## Completion delivery
+
+Background Bash and one-shot subagent completions automatically resume an idle
+owner; a busy owner receives the notice at a subsequent step boundary. There is
+no three-completion limit and no need to send a user message to reset a wake
+budget. Repeated settlement of a job does not notify twice, and durable job IDs
+prevent duplicate delivery across restarts. Each new job can trigger another
+turn, so this is not a cap on total automatic model usage. Foreground output
+artifacts do not trigger completion turns.
+
 ## Monitor controls
 
 - **j/k or Down/Up**: select a running or finished job; **Enter** opens its output.
