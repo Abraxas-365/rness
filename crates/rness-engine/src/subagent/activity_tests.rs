@@ -36,6 +36,7 @@ fn text_event(text: String) -> SessionEvent {
         content: vec![ContentPart::Text { text }],
         stop: StopReason::EndTurn,
         usage: Usage::default(),
+        estimated_input: 0,
         chunks: vec![],
     })
 }

@@ -82,7 +82,7 @@ async fn background_admission_uses_permissions_not_turn_exposure() {
             }
             rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {
                 model:"test".into(), content, stop:if first { StopReason::ToolUse } else { StopReason::EndTurn },
-                usage:Usage::default(), chunks:vec![],
+                usage:Usage::default(), estimated_input:0, chunks:vec![],
             })
         }
     }
@@ -131,7 +131,7 @@ impl rness_engine::turn::provider::Provider for Flow {
             1 => vec![ContentPart::ToolUse {call:"program".into(),name:"run_code".into(),args:json!({"code":"return tools.call('Echo', {value=42})"})}],
             _ => vec![ContentPart::Text {text:"done".into()}],
         };
-        rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {model:"test".into(),content,stop:if step < 2 {StopReason::ToolUse} else {StopReason::EndTurn},usage:Usage::default(),chunks:vec![]})
+        rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {model:"test".into(),content,stop:if step < 2 {StopReason::ToolUse} else {StopReason::EndTurn},usage:Usage::default(),estimated_input:0,chunks:vec![]})
     }
 }
 #[tokio::test]

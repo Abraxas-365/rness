@@ -28,6 +28,7 @@ impl Provider for Silent {
             content: vec![],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }

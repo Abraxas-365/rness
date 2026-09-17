@@ -28,6 +28,7 @@ impl Provider for OneAnswer {
             content: vec![ContentPart::Text { text: "hecho".into() }],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }

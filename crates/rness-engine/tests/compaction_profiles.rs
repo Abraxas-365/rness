@@ -16,7 +16,7 @@ impl Provider for Capture {
         self.seen.lock().unwrap().push((self.name.clone(), request.context.config.clone()));
         if request.system == "Summarize" { assert!(request.tools.is_empty()); }
         StepOutcome::Committed(AssistantMessage { model: self.name.clone(), content: vec![ContentPart::Text { text: "brief".into() }],
-            stop: StopReason::EndTurn, usage: Usage::default(), chunks: vec![] })
+            stop: StopReason::EndTurn, usage: Usage::default(), estimated_input: 0, chunks: vec![] })
     }
 }
 fn policy(profile: Option<&str>) -> Policy {

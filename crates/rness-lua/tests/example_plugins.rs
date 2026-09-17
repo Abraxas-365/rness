@@ -621,6 +621,7 @@ impl Provider for Silent {
             content: vec![],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }
@@ -708,6 +709,7 @@ async fn usage_reports_latest_request_and_durable_turn_count() {
         log.append(&SessionEvent::AssistantMessage(AssistantMessage {
             model: "fake-1".into(), content: vec![], stop: StopReason::EndTurn,
             usage: Usage { input_tokens: u64::from(turn) * 100, output_tokens: 10, ..Default::default() },
+            estimated_input: 0,
             chunks: vec![],
         })).unwrap();
         log.append(&SessionEvent::TurnEnded { turn, outcome: TurnOutcome::Completed }).unwrap();

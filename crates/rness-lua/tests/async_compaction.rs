@@ -41,7 +41,7 @@ impl Provider for GatedSummary {
         StepOutcome::Committed(AssistantMessage {
             model: "test".into(),
             content: if self.unchanged { vec![] } else { vec![ContentPart::Text { text: "Short summary.".into() }] },
-            stop: StopReason::EndTurn, usage: Usage::default(), chunks: vec![],
+            stop: StopReason::EndTurn, usage: Usage::default(), estimated_input: 0, chunks: vec![],
         })
     }
 }

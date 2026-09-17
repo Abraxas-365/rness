@@ -371,6 +371,7 @@ impl Accumulator {
             content,
             stop,
             usage: self.usage,
+            estimated_input: 0,
             chunks: self.chunks,
         }
     }

@@ -27,6 +27,7 @@ impl Provider for OneAnswer {
             content: vec![ContentPart::Text { text: "hola desde el modelo".into() }],
             stop: StopReason::EndTurn,
             usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+            estimated_input: 0,
             chunks: vec![],
         })
     }

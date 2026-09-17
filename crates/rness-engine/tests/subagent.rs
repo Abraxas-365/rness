@@ -33,6 +33,7 @@ impl Provider for EchoCount {
             content: vec![ContentPart::Text { text: format!("saw {seen} turns") }],
             stop: StopReason2::EndTurn,
             usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+            estimated_input: 0,
             chunks: vec![],
         })
     }
@@ -120,7 +121,7 @@ async fn activity_is_scoped_to_parent_call_and_excludes_fork_seed() {
     log.append(&SessionEvent::AssistantMessage(AssistantMessage {
         model: "fake".into(), content: ["a", "b"].into_iter().map(|call| ContentPart::ToolUse {
             call: call.into(), name: "subagent".into(), args: serde_json::json!({"prompt":"inspect"}),
-        }).collect(), stop: StopReason2::ToolUse, usage: Usage::default(), chunks: vec![],
+        }).collect(), stop: StopReason2::ToolUse, usage: Usage::default(), estimated_input: 0, chunks: vec![],
     })).unwrap();
     drop(log);
     let reopened = service(dir.path());
@@ -597,6 +598,7 @@ impl Provider for GatedStep {
             content: vec![ContentPart::Text { text: format!("turno con {} entradas", request.context.turns.len()) }],
             stop: StopReason2::EndTurn,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }

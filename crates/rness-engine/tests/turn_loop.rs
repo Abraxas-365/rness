@@ -295,6 +295,93 @@ async fn context_usage_matches_request_meter_not_reported_usage() {
 }
 
 #[tokio::test]
+async fn calibration_scales_pressure_and_commit_records_estimate() {
+    use rness_engine::turn::compaction::{calibration, Meter};
+    use rness_protocol::frames::Frame;
+    // (seed estimate, seed real input, expects compaction)
+    // ratio 2.0: the meter under-counts; calibrated pressure crosses the
+    // threshold even though the raw estimate stays below it.
+    // ratio None (legacy message without estimate): raw pressure, no compaction.
+    for (seeded, expect_compaction) in [(true, true), (false, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::RequestConfig(CallConfig {
+            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            ..Default::default()
+        })).unwrap();
+        let mut previous = assistant(&"old ".repeat(3000), StopReason::EndTurn, vec![]);
+        previous.usage.input_tokens = 150;
+        previous.usage.cache_read_tokens = 50;
+        previous.estimated_input = if seeded { 100 } else { 0 }; // real/est = 2.0
+        log.append(&SessionEvent::AssistantMessage(previous)).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "recent ".repeat(50) }], source: None })).unwrap();
+        let replayed = replay(&store, log.session()).unwrap();
+        let ratio = calibration(&replayed.history);
+        assert_eq!(ratio, seeded.then_some(2.0));
+        let raw = Meter::default().pressure(&replayed.context, "", &[]);
+        let threshold = raw + raw / 2; // raw < threshold < 2*raw
+        let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(threshold))].into(), ..Default::default() };
+        let mut steps = vec![];
+        if expect_compaction { steps.push(StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))); }
+        steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+        let provider = Scripted::new(steps);
+        let frames = Mutex::new(Vec::new());
+        run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
+            &CancellationToken::new(), &mut Vec::new, 1, &|f| frames.lock().unwrap().push(f)).await.unwrap();
+        let frames = frames.into_inner().unwrap();
+        let compacted = frames.iter().any(|f| matches!(f, Frame::CompactionStarted { .. }));
+        assert_eq!(compacted, expect_compaction, "seeded={seeded}");
+        if seeded {
+            // Published estimates are calibrated: the first Measuring frame
+            // reports roughly twice the raw estimate.
+            let first = frames.iter().find_map(|f| match f {
+                Frame::ContextUsage { estimated_tokens, .. } => Some(*estimated_tokens), _ => None }).unwrap();
+            assert!(first > raw, "calibrated {first} should exceed raw {raw}");
+        }
+        // The committed step recorded its own estimate for future calibration.
+        let history = store.history(log.session()).unwrap();
+        let last = history.iter().rev().find_map(|e| match &e.event {
+            SessionEvent::AssistantMessage(m) => Some(m), _ => None }).unwrap();
+        assert!(last.estimated_input > 0);
+        // Post-compaction the ratio derives from the newest step's own
+        // estimate — bounded, not the stale pre-compaction provider count.
+        let ratio = calibration(&history).unwrap();
+        assert!((0.25..=4.0).contains(&ratio));
+    }
+}
+
+#[tokio::test]
+async fn calibration_clamps_degenerate_ratios_and_skips_missing_data() {
+    use rness_engine::turn::compaction::calibration;
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    assert_eq!(calibration(&store.history(log.session()).unwrap()), None);
+    // Over-estimating meter: real is far below the estimate; the ratio
+    // clamps at 0.25 so pressure never collapses to nothing.
+    let mut over = assistant("m", StopReason::EndTurn, vec![]);
+    over.usage.input_tokens = 10;
+    over.estimated_input = 1000;
+    log.append(&SessionEvent::AssistantMessage(over)).unwrap();
+    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(0.25));
+    // Degenerate provider report (zero real tokens) is skipped, keeping
+    // the previous usable ratio.
+    let mut zero = assistant("m", StopReason::EndTurn, vec![]);
+    zero.usage = Usage::default();
+    zero.estimated_input = 500;
+    log.append(&SessionEvent::AssistantMessage(zero)).unwrap();
+    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(0.25));
+    // Wildly under-estimating meter clamps at 4.0.
+    let mut under = assistant("m", StopReason::EndTurn, vec![]);
+    under.usage.input_tokens = 100_000;
+    under.estimated_input = 100;
+    log.append(&SessionEvent::AssistantMessage(under)).unwrap();
+    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(4.0));
+}
+
+#[tokio::test]
 async fn overflowing_indivisible_request_does_not_retry() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
@@ -438,6 +525,7 @@ fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> Ass
         content,
         stop,
         usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+        estimated_input: 0,
         chunks: vec![TimedChunk { ms: 1, delta: ChunkDelta::Text { t: text.into() } }],
     }
 }

@@ -95,9 +95,37 @@ impl Meter {
             + tools.iter().map(|t| self.text(&t.name) + self.text(&t.description)
                 + self.text(&t.input_schema.to_string()) + self.message_tokens).sum::<u64>()
     }
-    pub fn pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
-        self.measure(context, system, tools).saturating_add(self.output_reserve.max(u64::from(context.config.max_output_tokens.unwrap_or(0))))
+    fn reserve(&self, context: &ModelContext) -> u64 {
+        self.output_reserve.max(u64::from(context.config.max_output_tokens.unwrap_or(0)))
     }
+    pub fn pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
+        self.measure(context, system, tools).saturating_add(self.reserve(context))
+    }
+    /// Pressure with the input estimate scaled by an observed
+    /// real/estimated calibration ratio (see [`calibration`]). The output
+    /// reserve is real tokens and is never scaled.
+    pub fn calibrated_pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec], ratio: Option<f64>) -> u64 {
+        let measured = self.measure(context, system, tools);
+        let measured = ratio.map_or(measured, |r| (measured as f64 * r).round() as u64);
+        measured.saturating_add(self.reserve(context))
+    }
+}
+
+/// Ratio of provider-reported input tokens (including cache reads/writes)
+/// to the meter estimate recorded for the same request, from the latest
+/// committed step carrying both. The ratio compares one request with its
+/// own estimate, so it stays valid across compactions — unlike the raw
+/// provider count, which describes a context that may no longer exist.
+/// Clamped to guard against degenerate provider reports; `None` until a
+/// step records an estimate (legacy logs, fresh sessions).
+pub fn calibration(history: &[rness_protocol::events::Envelope]) -> Option<f64> {
+    history.iter().rev().find_map(|e| match &e.event {
+        SessionEvent::AssistantMessage(m) if m.estimated_input > 0 => {
+            let real = m.usage.input_tokens + m.usage.cache_read_tokens + m.usage.cache_write_tokens;
+            (real > 0).then(|| (real as f64 / m.estimated_input as f64).clamp(0.25, 4.0))
+        }
+        _ => None,
+    })
 }
 /// Default heuristic retained for callers without an explicit route policy.
 pub fn measure(context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
@@ -224,7 +252,11 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
             changed = true;
         }
         replayed = replay(store, log.session())?;
-        let pressure = policy.meter.pressure(&replayed.context, system, tools);
+        // Calibrated: scale the heuristic by the observed real/estimated
+        // ratio of the latest committed step, so the threshold compares
+        // against something close to what the provider will actually count.
+        let pressure = policy.meter.calibrated_pressure(&replayed.context, system, tools,
+            calibration(&replayed.history));
         // Manual regions lack the main request's system/tools; do not publish
         // their partial measurement as the automatic compaction estimate.
         if region.is_none() {

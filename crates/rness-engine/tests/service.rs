@@ -240,6 +240,7 @@ fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> Ass
         content,
         stop,
         usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+        estimated_input: 0,
         chunks: vec![TimedChunk { ms: 1, delta: ChunkDelta::Text { t: text.into() } }],
     }
 }
@@ -324,7 +325,7 @@ async fn retry_preserves_committed_tool_results_and_allows_config_change() {
     let tools = Arc::new(ToolRegistry::default());
     tools.register(Arc::new(Count(count.clone())));
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(AssistantMessage { model: "test".into(), content: vec![ContentPart::ToolUse { call: "once".into(), name: "Count".into(), args: serde_json::json!({}) }], stop: StopReason::ToolUse, usage: Usage::default(), chunks: vec![] }),
+        StepOutcome::Committed(AssistantMessage { model: "test".into(), content: vec![ContentPart::ToolUse { call: "once".into(), name: "Count".into(), args: serde_json::json!({}) }], stop: StopReason::ToolUse, usage: Usage::default(), estimated_input: 0, chunks: vec![] }),
         StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "HTTP", retry_after: None, message: "offline".into(), retryable: false }, partial: vec![] },
         StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
     ]);

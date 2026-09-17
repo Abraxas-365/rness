@@ -359,6 +359,7 @@ impl Accumulator {
             content,
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
+            estimated_input: 0,
             chunks: self.chunks,
         }
     }

@@ -15,7 +15,7 @@ impl Provider for Answer {
     async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
         StepOutcome::Committed(AssistantMessage {
             model: "test".into(), content: vec![], stop: StopReason::EndTurn,
-            usage: Usage::default(), chunks: vec![],
+            usage: Usage::default(), estimated_input: 0, chunks: vec![],
         })
     }
 }

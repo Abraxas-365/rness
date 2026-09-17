@@ -28,6 +28,7 @@ fn assistant_tool_use() -> SessionEvent {
         ],
         stop: StopReason::ToolUse,
         usage: Usage { input_tokens: 100, output_tokens: 20, ..Default::default() },
+        estimated_input: 0,
         chunks: vec![TimedChunk { ms: 90, delta: ChunkDelta::Text { t: "reading the file".into() } }],
     })
 }
@@ -38,6 +39,7 @@ fn assistant_final(text: &str) -> SessionEvent {
         content: vec![ContentPart::Text { text: text.into() }],
         stop: StopReason::EndTurn,
         usage: Usage { input_tokens: 150, output_tokens: 10, ..Default::default() },
+        estimated_input: 0,
         chunks: vec![],
     })
 }
@@ -145,6 +147,7 @@ fn replay_repairs_orphan_tool_use_without_mutating_history() {
         // loop: the call was committed but never dispatched.
         stop: StopReason::MaxTokens,
         usage: Usage::default(),
+        estimated_input: 0,
         chunks: vec![],
     })).unwrap();
     log.append(&user("continue")).unwrap();

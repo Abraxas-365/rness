@@ -234,6 +234,12 @@ The default `statusline` plugin shows two independent segments, for example
   `context_usage` frames arrive at the post-prune threshold check and before a
   model request after context reduction. Streaming output and pending tool results
   do not continuously update it. The threshold is not the model's context window.
+  The estimate is **calibrated**: each committed step records the meter's
+  estimate for its own request, and later measurements are scaled by the
+  observed real/estimated ratio (clamped to 0.25–4×) so the heuristic tracks
+  the provider's actual tokenizer. Compaction triggers on this calibrated
+  pressure. Fresh sessions and legacy logs without a recorded estimate use
+  the raw heuristic until the first calibrated step commits.
 - With no compaction policy, the estimate has no denominator (`46.3k est tok`).
 - `last input` is the latest recorded provider input usage, not an estimate of the
   next request. It is never compared with the compaction threshold. The plugin

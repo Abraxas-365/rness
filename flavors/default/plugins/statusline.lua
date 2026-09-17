@@ -1,6 +1,8 @@
 -- Structured statusline: active model, live status, session ID, and cached
 -- context estimates / last provider input. Estimates are boundary snapshots,
 -- not a live token counter; only the engine's context_usage frame sets them.
+-- The engine calibrates estimates against real provider usage, so est tok
+-- tracks the provider's tokenizer once a step has committed.
 
 local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 

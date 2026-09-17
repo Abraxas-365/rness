@@ -335,6 +335,11 @@ pub struct AssistantMessage {
     pub content: Vec<ContentPart>,
     pub stop: StopReason,
     pub usage: Usage,
+    /// Meter-estimated input tokens of the request that produced this
+    /// message (0 = unknown/legacy). Recorded at commit so later turns can
+    /// calibrate the heuristic meter against `usage`'s real counts.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub estimated_input: u64,
     /// The exact timed stream that produced `content`.
     pub chunks: Vec<TimedChunk>,
 }

@@ -200,9 +200,14 @@ async fn drive(
             attempts += 1;
             let default_meter = compaction::Meter::default();
             let meter = policy.map_or(&default_meter, |p| &p.meter);
+            // Estimate for THIS request (no output reserve): recorded on the
+            // committed message so later turns can calibrate the meter
+            // against the provider-reported usage of the same request.
+            let estimated_input = meter.measure(&replayed.context, &step_system, &tool_specs);
             frames(Frame::ContextUsage {
                 session: session.clone(),
-                estimated_tokens: meter.pressure(&replayed.context, &step_system, &tool_specs),
+                estimated_tokens: meter.calibrated_pressure(&replayed.context, &step_system, &tool_specs,
+                    compaction::calibration(&replayed.history)),
                 threshold_tokens: policy.map(|p| p.threshold_tokens),
             });
             frames(Frame::StepStarted { session: session.clone(), turn: turn_no });
@@ -216,7 +221,10 @@ async fn drive(
                 on_delta: Some(&on_delta),
             };
             match provider.step(request, cancel).await {
-                StepOutcome::Committed(msg) => break msg,
+                StepOutcome::Committed(mut msg) => {
+                    msg.estimated_input = estimated_input;
+                    break msg;
+                }
                 StepOutcome::Cancelled { partial } => {
                     log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
                         model: provider.model().to_string(),

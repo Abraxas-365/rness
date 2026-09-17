@@ -111,7 +111,7 @@ impl Provider for TaskAnswer {
         StepOutcome::Committed(AssistantMessage {
             model: self.model().into(),
             content: if first { vec![ContentPart::ToolUse { call: "task-call".into(), name: "TaskWrite".into(), args: serde_json::json!({"tasks":[{"id":"test","content":"test persisted tasks","status":"pending"}]}) }] } else { vec![ContentPart::Text { text: "done".into() }] },
-            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), chunks: vec![],
+            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), estimated_input: 0, chunks: vec![],
         })
     }
 }
@@ -149,6 +149,7 @@ impl Provider for OneAnswer {
             content: vec![ContentPart::Text { text: "respuesta del servidor".into() }],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }
@@ -184,6 +185,7 @@ impl Provider for ToolThenDone {
             content,
             stop,
             usage: Usage::default(),
+            estimated_input: 0,
             chunks: vec![],
         })
     }

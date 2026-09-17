@@ -52,6 +52,7 @@ fn all_event_kinds_roundtrip() {
             ],
             stop: StopReason::ToolUse,
             usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            estimated_input: 12,
             chunks: vec![
                 TimedChunk { ms: 100, delta: ChunkDelta::Thinking { t: "hmm".into() } },
                 TimedChunk { ms: 250, delta: ChunkDelta::Text { t: "hello".into() } },

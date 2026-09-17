@@ -12,7 +12,7 @@ impl rness_engine::turn::provider::Provider for ReviewProvider {
         assert_eq!(request.system.contains("Plan mode is active"), first);
         rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {
             model: "plan-test".into(), content: if first { vec![ContentPart::ToolUse { call: "review".into(), name: "exit_plan_mode".into(), args: serde_json::json!({"plan":"# Implementation\nAdd tests"}) }] } else { vec![ContentPart::Text { text: "execution begins".into() }] },
-            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), chunks: vec![],
+            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), estimated_input: 0, chunks: vec![],
         })
     }
 }
