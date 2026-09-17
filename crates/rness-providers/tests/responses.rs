@@ -31,7 +31,9 @@ fn store_with_tokens(dir: &TempDir, access: &str) -> CredentialStore {
     let mut tokens = Tokens {
         access_token: access.into(),
         refresh_token: "rt-1".into(),
-        expires_at: Some((jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3600)).to_string()),
+        expires_at: Some(
+            (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3600)).to_string(),
+        ),
         ..Default::default()
     };
     tokens.extra.insert("accountId".into(), json!("acct-42"));
@@ -50,14 +52,21 @@ async fn wire_capture_matches_bytes_and_failed_audit_blocks_send() {
     for mode in ["accept", "reject", "drop_ack", "drop_receiver"] {
         let dir = TempDir::new().unwrap();
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/codex/responses"))
+        Mock::given(method("POST"))
+            .and(path("/codex/responses"))
             .respond_with(sse(&happy_events()))
-            .expect(if mode == "accept" { 1 } else { 0 }).mount(&server).await;
+            .expect(if mode == "accept" { 1 } else { 0 })
+            .mount(&server)
+            .await;
         let provider = provider_for(&server, store_with_tokens(&dir, "secret-access-token"));
         let context = user_context("source \"quoted\"\n日本語");
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
         let capture = async {
-            if mode == "drop_receiver" { drop(receiver); return None; }
+            if mode == "drop_receiver" {
+                drop(receiver);
+                return None;
+            }
             let record = receiver.recv().await.unwrap();
             assert!(server.received_requests().await.unwrap().is_empty());
             assert!(!record.body.contains("secret-access-token"));
@@ -69,11 +78,20 @@ async fn wire_capture_matches_bytes_and_failed_audit_blocks_send() {
             Some(record.body)
         };
         let (outcome, body) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(rness_engine::turn::provider::WIRE_CAPTURE.scope(sender, step(&provider, &context, "system")), capture)
-        }).await.expect("capture must not hang");
+            tokio::join!(
+                rness_engine::turn::provider::WIRE_CAPTURE
+                    .scope(sender, step(&provider, &context, "system")),
+                capture
+            )
+        })
+        .await
+        .expect("capture must not hang");
         if mode == "accept" {
             assert!(matches!(outcome, StepOutcome::Committed(_)));
-            assert_eq!(server.received_requests().await.unwrap()[0].body, body.unwrap().as_bytes());
+            assert_eq!(
+                server.received_requests().await.unwrap()[0].body,
+                body.unwrap().as_bytes()
+            );
         } else {
             assert!(matches!(outcome, StepOutcome::Failed { error, .. } if error.code == "AUDIT"));
         }
@@ -93,7 +111,12 @@ fn user_context(text: &str) -> ModelContext {
 async fn step(provider: &ResponsesProvider, context: &ModelContext, system: &str) -> StepOutcome {
     provider
         .step(
-            StepRequest { context, system, tools: &[], on_delta: None },
+            StepRequest {
+                context,
+                system,
+                tools: &[],
+                on_delta: None,
+            },
             &CancellationToken::new(),
         )
         .await
@@ -101,7 +124,10 @@ async fn step(provider: &ResponsesProvider, context: &ModelContext, system: &str
 
 fn happy_events() -> Vec<(&'static str, serde_json::Value)> {
     vec![
-        ("response.output_text.delta", json!({"item_id": "msg_1", "delta": "hello"})),
+        (
+            "response.output_text.delta",
+            json!({"item_id": "msg_1", "delta": "hello"}),
+        ),
         (
             "response.output_item.done",
             json!({"item": {"type": "message", "role": "assistant", "content": [
@@ -148,11 +174,41 @@ async fn sends_bearer_account_header_and_codex_body_shape() {
     let StepOutcome::Committed(msg) = outcome else {
         panic!("expected commit");
     };
-    assert_eq!(msg.content, vec![ContentPart::Text { text: "hello".into() }]);
+    assert_eq!(
+        msg.content,
+        vec![ContentPart::Text {
+            text: "hello".into()
+        }]
+    );
     assert_eq!(msg.stop, StopReason::EndTurn);
     assert_eq!(msg.usage.input_tokens, 12);
     assert_eq!(msg.usage.output_tokens, 5);
     assert!(matches!(&msg.chunks[0].delta, ChunkDelta::Text { t } if t == "hello"));
+    let body: serde_json::Value = server.received_requests().await.unwrap()[0]
+        .body_json()
+        .unwrap();
+    assert!(body.get("max_output_tokens").is_none());
+}
+
+#[tokio::test]
+async fn explicit_output_limit_is_sent_when_configured() {
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(body_partial_json(json!({"max_output_tokens": 32_000})))
+        .respond_with(sse(&happy_events()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut context = user_context("hi");
+    context.config.max_output_tokens = Some(32_000);
+    let provider = provider_for(&server, store_with_tokens(&dir, "at-1"));
+    assert!(matches!(
+        step(&provider, &context, "").await,
+        StepOutcome::Committed(_)
+    ));
 }
 
 #[tokio::test]
@@ -169,7 +225,10 @@ async fn empty_completed_output_backfills_from_done_items() {
                 json!({"item": {"type": "function_call", "call_id": "c9",
                     "name": "Read", "arguments": "{\"path\":\"x\"}"}}),
             ),
-            ("response.completed", json!({"response": {"status": "completed", "output": []}})),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed", "output": []}}),
+            ),
         ]))
         .mount(&server)
         .await;
@@ -214,16 +273,27 @@ async fn history_replays_as_function_call_items() {
 
     let context = ModelContext {
         turns: vec![
-            ModelTurn::User { content: vec![ContentPart::Text { text: "go".into() }] },
+            ModelTurn::User {
+                content: vec![ContentPart::Text { text: "go".into() }],
+            },
             ModelTurn::Assistant {
                 content: vec![
-                    ContentPart::Text { text: "using tool".into() },
-                    ContentPart::ToolUse { call: "c1".into(), name: "Echo".into(), args: json!({}) },
+                    ContentPart::Text {
+                        text: "using tool".into(),
+                    },
+                    ContentPart::ToolUse {
+                        call: "c1".into(),
+                        name: "Echo".into(),
+                        args: json!({}),
+                    },
                 ],
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
-                    content: vec![], tasks: None, plan_review: None, presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
+                    content: vec![],
+                    tasks: None,
+                    plan_review: None,
+                    presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),
@@ -236,7 +306,10 @@ async fn history_replays_as_function_call_items() {
     };
 
     let provider = provider_for(&server, store_with_tokens(&dir, "at-1"));
-    assert!(matches!(step(&provider, &context, "").await, StepOutcome::Committed(_)));
+    assert!(matches!(
+        step(&provider, &context, "").await,
+        StepOutcome::Committed(_)
+    ));
     let requests = server.received_requests().await.unwrap();
     assert!(!requests.is_empty());
     for request in requests {
@@ -317,7 +390,10 @@ async fn response_failed_event_maps_to_retryable_failure() {
     Mock::given(method("POST"))
         .and(path("/codex/responses"))
         .respond_with(sse(&[
-            ("response.output_text.delta", json!({"item_id": "m", "delta": "part"})),
+            (
+                "response.output_text.delta",
+                json!({"item_id": "m", "delta": "part"}),
+            ),
             (
                 "response.failed",
                 json!({"response": {"status": "failed",
@@ -343,7 +419,10 @@ async fn reasoning_summary_becomes_thinking() {
     Mock::given(method("POST"))
         .and(path("/codex/responses"))
         .respond_with(sse(&[
-            ("response.reasoning_summary_text.delta", json!({"delta": "pondering"})),
+            (
+                "response.reasoning_summary_text.delta",
+                json!({"delta": "pondering"}),
+            ),
             (
                 "response.output_item.done",
                 json!({"item": {"type": "reasoning", "summary": [
@@ -356,7 +435,10 @@ async fn reasoning_summary_becomes_thinking() {
                     {"type": "output_text", "text": "answer"},
                 ]}}),
             ),
-            ("response.completed", json!({"response": {"status": "completed"}})),
+            (
+                "response.completed",
+                json!({"response": {"status": "completed"}}),
+            ),
         ]))
         .mount(&server)
         .await;
@@ -368,8 +450,13 @@ async fn reasoning_summary_becomes_thinking() {
     assert_eq!(
         msg.content,
         vec![
-            ContentPart::Thinking { text: "pondering".into(), signature: None },
-            ContentPart::Text { text: "answer".into() },
+            ContentPart::Thinking {
+                text: "pondering".into(),
+                signature: None
+            },
+            ContentPart::Text {
+                text: "answer".into()
+            },
         ]
     );
     assert!(matches!(&msg.chunks[0].delta, ChunkDelta::Thinking { t } if t == "pondering"));

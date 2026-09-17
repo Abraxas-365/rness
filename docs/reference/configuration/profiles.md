@@ -7,7 +7,7 @@ rness.profiles.declare("coding", {
   provider = "anthropic",
   model = "claude-sonnet-5",
   options = {
-    max_output_tokens = 8192,
+    max_output_tokens = 32000,
   },
 })
 ```
@@ -23,7 +23,7 @@ The connection must be configured, and the model must be available to your accou
 | `model` | string | Yes | Nonempty upstream model ID |
 | `options` | table | No | Omitted means no explicit generation preferences |
 | `options.reasoning` | tagged table | No | Reasoning effort or token budget |
-| `options.max_output_tokens` | positive integer | No | Explicit output limit |
+| `options.max_output_tokens` | positive integer | No | Explicit per-request output limit; it overrides the adapter fallback and cannot exceed the model's declared `max_output_tokens` |
 | `options.temperature` | finite number | No | Sampling preference |
 
 Unknown declaration and option fields are rejected. Model-capability validation occurs when a profile is resolved; registering a profile is not a network check.
@@ -46,7 +46,7 @@ These are alternatives, not two simultaneous settings. The service requires manu
 
 Acceptance of a named effort by configuration parsing does not guarantee that a particular model or gateway supports it. Do not infer enabled reasoning from whether a stream includes visible thinking text.
 
-If output and thinking budgets are incompatible, the request fails rather than silently increasing an explicit output limit. Omitted generation fields retain adapter behavior, which may itself include protocol defaults.
+If output and thinking budgets are incompatible, the request fails rather than silently increasing an explicit output limit. For Anthropic, omitted `options.max_output_tokens` uses the adapter's 32,000-token fallback; a profile should set an explicit value when a workload needs a smaller or larger budget. For ChatGPT Responses, an explicit profile value is sent as `max_output_tokens`; omitting it leaves the field out so ChatGPT selects its model default. The declared model `max_output_tokens` remains a ceiling, not a request default. Other adapters may omit the request field and let their upstream service select a default.
 
 ## Defaults and resolution
 

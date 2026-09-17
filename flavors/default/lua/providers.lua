@@ -21,9 +21,9 @@ for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6
     provider = "chatgpt", model = model,
     capabilities = {
       context_window = 1050000, max_output_tokens = 128000, image_input = true,
-      -- The ChatGPT subscription endpoint is not the public Responses API.
-      -- Output limits are unsupported here; temperature support is unverified.
-      output_token_limit = false,
+      -- The subscription Responses endpoint accepts an explicit output cap.
+      -- Omit it to let ChatGPT select the model default.
+      output_token_limit = true,
       reasoning = { efforts = model == "gpt-6-astra"
         and { "low", "medium", "high", "xhigh", "max" }
         or { "none", "low", "medium", "high", "xhigh", "max" } },

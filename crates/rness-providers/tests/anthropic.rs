@@ -917,6 +917,44 @@ async fn thinking_blocks_accumulate_and_replay_in_requests() {
 }
 
 #[tokio::test]
+async fn default_output_budget_is_32k() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({"max_tokens": 32_000})))
+        .respond_with(sse_response(&stream_happy("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = AnthropicProvider::new("k", "m").with_base_url(server.uri());
+    assert!(matches!(
+        step(&provider, &user_context("hi"), "", &[]).await,
+        StepOutcome::Committed(_)
+    ));
+}
+
+#[tokio::test]
+async fn explicit_output_budget_overrides_the_default() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(body_partial_json(json!({"max_tokens": 4_096})))
+        .respond_with(sse_response(&stream_happy("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut context = user_context("hi");
+    context.config.max_output_tokens = Some(4_096);
+    let provider = AnthropicProvider::new("k", "m").with_base_url(server.uri());
+    assert!(matches!(
+        step(&provider, &context, "", &[]).await,
+        StepOutcome::Committed(_)
+    ));
+}
+
+#[tokio::test]
 async fn reasoning_budget_uses_explicit_max_tokens() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

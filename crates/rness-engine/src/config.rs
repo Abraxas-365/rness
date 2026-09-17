@@ -48,7 +48,9 @@ pub enum Profile {
         #[serde(default)]
         options: RequestOptions,
     },
-    ByProvider { by_provider: BTreeMap<String, ProfileVariant> },
+    ByProvider {
+        by_provider: BTreeMap<String, ProfileVariant>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,21 +120,39 @@ impl ModelRegistry {
     }
 
     pub fn declare_profile(&mut self, name: String, profile: Profile) -> Result<(), String> {
-        if name.is_empty() { return Err("profile requires a name".into()); }
+        if name.is_empty() {
+            return Err("profile requires a name".into());
+        }
         let variants: Vec<_> = match &profile {
-            Profile::Fixed { provider, model, options } => vec![(provider, model, options)],
+            Profile::Fixed {
+                provider,
+                model,
+                options,
+            } => vec![(provider, model, options)],
             Profile::ByProvider { by_provider } => {
-                if by_provider.is_empty() { return Err("by_provider requires at least one connection".into()); }
-                by_provider.iter().map(|(provider, variant)| (provider, &variant.model, &variant.options)).collect()
+                if by_provider.is_empty() {
+                    return Err("by_provider requires at least one connection".into());
+                }
+                by_provider
+                    .iter()
+                    .map(|(provider, variant)| (provider, &variant.model, &variant.options))
+                    .collect()
             }
         };
         for (provider, model, options) in variants {
             if provider.trim().is_empty() || model.trim().is_empty() {
                 return Err("profile requires nonempty provider and model names".into());
             }
-            self.validate(&CallConfig { selection: Some(ModelSelection { route: provider.clone(), model: model.clone() }),
-                reasoning: options.reasoning.clone(), max_output_tokens: options.max_output_tokens,
-                temperature: options.temperature, ..Default::default() })?;
+            self.validate(&CallConfig {
+                selection: Some(ModelSelection {
+                    route: provider.clone(),
+                    model: model.clone(),
+                }),
+                reasoning: options.reasoning.clone(),
+                max_output_tokens: options.max_output_tokens,
+                temperature: options.temperature,
+                ..Default::default()
+            })?;
         }
         if self.profiles.contains_key(&name) {
             return Err(format!("duplicate profile: {name}"));
@@ -146,20 +166,33 @@ impl ModelRegistry {
     }
 
     pub fn model_names(&self) -> Vec<String> {
-        let mut names: Vec<_> = self.models.keys().map(|(provider, model)| format!("{provider}/{model}")).collect();
+        let mut names: Vec<_> = self
+            .models
+            .keys()
+            .map(|(provider, model)| format!("{provider}/{model}"))
+            .collect();
         names.sort();
         names
     }
 
     pub fn capabilities(&self, selection: &ModelSelection) -> Option<&ModelCapabilities> {
-        self.models.get(&(selection.route.clone(), selection.model.clone()))
+        self.models
+            .get(&(selection.route.clone(), selection.model.clone()))
     }
 
     pub fn validate_profile(&self, name: &str) -> Result<(), String> {
-        match self.profiles.get(name).ok_or_else(|| format!("unknown profile: {name}"))? {
-            Profile::Fixed { .. } => { self.resolve_profile(name)?; }
+        match self
+            .profiles
+            .get(name)
+            .ok_or_else(|| format!("unknown profile: {name}"))?
+        {
+            Profile::Fixed { .. } => {
+                self.resolve_profile(name)?;
+            }
             Profile::ByProvider { by_provider } => {
-                for provider in by_provider.keys() { self.resolve_profile_for(name, Some(provider))?; }
+                for provider in by_provider.keys() {
+                    self.resolve_profile_for(name, Some(provider))?;
+                }
             }
         }
         Ok(())
@@ -169,13 +202,28 @@ impl ModelRegistry {
         self.resolve_profile_for(name, None)
     }
 
-    pub fn resolve_profile_for(&self, name: &str, provider: Option<&str>) -> Result<CallConfig, String> {
-        let profile = self.profiles.get(name).ok_or_else(|| format!("unknown profile: {name}"))?;
+    pub fn resolve_profile_for(
+        &self,
+        name: &str,
+        provider: Option<&str>,
+    ) -> Result<CallConfig, String> {
+        let profile = self
+            .profiles
+            .get(name)
+            .ok_or_else(|| format!("unknown profile: {name}"))?;
         let (provider, model, options) = match profile {
-            Profile::Fixed { provider, model, options } => (provider.as_str(), model, options),
+            Profile::Fixed {
+                provider,
+                model,
+                options,
+            } => (provider.as_str(), model, options),
             Profile::ByProvider { by_provider } => {
-                let provider = provider.ok_or_else(|| format!("profile '{name}' requires a current provider connection"))?;
-                let variant = by_provider.get(provider).ok_or_else(|| format!("profile '{name}' has no variant for provider '{provider}'"))?;
+                let provider = provider.ok_or_else(|| {
+                    format!("profile '{name}' requires a current provider connection")
+                })?;
+                let variant = by_provider.get(provider).ok_or_else(|| {
+                    format!("profile '{name}' has no variant for provider '{provider}'")
+                })?;
                 (provider, &variant.model, &variant.options)
             }
         };
@@ -203,11 +251,16 @@ impl ModelRegistry {
         if config.temperature.is_some_and(|value| !value.is_finite()) {
             return Err("temperature must be finite".into());
         }
-        let caps = config.selection.as_ref().and_then(|selection| self.capabilities(selection));
+        let caps = config
+            .selection
+            .as_ref()
+            .and_then(|selection| self.capabilities(selection));
         if config.temperature.is_some() && caps.and_then(|caps| caps.temperature) == Some(false) {
             return Err("temperature is not supported by this model".into());
         }
-        if config.max_output_tokens.is_some() && caps.and_then(|caps| caps.output_token_limit) == Some(false) {
+        if config.max_output_tokens.is_some()
+            && caps.and_then(|caps| caps.output_token_limit) == Some(false)
+        {
             return Err("max_output_tokens is not supported by this model".into());
         }
         if let (Some(requested), Some(limit)) = (
@@ -215,7 +268,9 @@ impl ModelRegistry {
             caps.and_then(|caps| caps.max_output_tokens),
         ) {
             if requested > limit {
-                return Err(format!("max_output_tokens {requested} exceeds declared limit {limit}"));
+                return Err(format!(
+                    "max_output_tokens {requested} exceeds declared limit {limit}"
+                ));
             }
         }
         match &config.reasoning {
@@ -223,11 +278,14 @@ impl ModelRegistry {
                 if effort.is_empty() {
                     return Err("reasoning effort must not be empty".into());
                 }
-                if let Some(efforts) = caps.and_then(|caps| caps.reasoning.as_ref())
+                if let Some(efforts) = caps
+                    .and_then(|caps| caps.reasoning.as_ref())
                     .and_then(|reasoning| reasoning.efforts.as_ref())
                 {
                     if !efforts.contains(effort) {
-                        return Err(format!("reasoning effort not declared as supported: {effort}"));
+                        return Err(format!(
+                            "reasoning effort not declared as supported: {effort}"
+                        ));
                     }
                 }
             }
@@ -235,7 +293,8 @@ impl ModelRegistry {
                 if *tokens == 0 {
                     return Err("reasoning budget must be positive".into());
                 }
-                if let Some(range) = caps.and_then(|caps| caps.reasoning.as_ref())
+                if let Some(range) = caps
+                    .and_then(|caps| caps.reasoning.as_ref())
                     .and_then(|reasoning| reasoning.budget_tokens.as_ref())
                 {
                     if *tokens < range.min || *tokens > range.max {
@@ -256,12 +315,22 @@ mod tests {
     #[test]
     fn explicitly_unsupported_generation_controls_are_rejected() {
         let mut registry = ModelRegistry::default();
-        registry.declare_model(ModelDeclaration {
-            provider: "p".into(), model: "m".into(),
-            capabilities: ModelCapabilities { temperature: Some(false), output_token_limit: Some(false), ..Default::default() },
-        }).unwrap();
+        registry
+            .declare_model(ModelDeclaration {
+                provider: "p".into(),
+                model: "m".into(),
+                capabilities: ModelCapabilities {
+                    temperature: Some(false),
+                    output_token_limit: Some(false),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
         let mut config = CallConfig {
-            selection: Some(ModelSelection { route: "p".into(), model: "m".into() }),
+            selection: Some(ModelSelection {
+                route: "p".into(),
+                model: "m".into(),
+            }),
             ..Default::default()
         };
         assert!(registry.validate(&config).is_ok());
@@ -278,28 +347,51 @@ mod tests {
             serde_json::json!({"provider":"a","model":"b","by_provider":{"a":{"model":"c"}}}),
             serde_json::json!({"by_provider":{"a":{"model":"c","provider":"other"}}}),
             serde_json::json!({"by_provider":{"a":{"model":"c"}},"options":{}}),
-        ] { assert!(serde_json::from_value::<Profile>(value).is_err()); }
+        ] {
+            assert!(serde_json::from_value::<Profile>(value).is_err());
+        }
         for value in [
             serde_json::json!({"by_provider":{}}),
             serde_json::json!({"by_provider":{"a":{"model":""}}}),
             serde_json::json!({"by_provider":{"a":{"model":"c","options":{"max_output_tokens":0}}}}),
         ] {
             let profile = serde_json::from_value(value).unwrap();
-            assert!(ModelRegistry::default().declare_profile("small".into(), profile).is_err());
+            assert!(
+                ModelRegistry::default()
+                    .declare_profile("small".into(), profile)
+                    .is_err()
+            );
         }
         let mut registry = ModelRegistry::default();
-        registry.declare_profile("small".into(), serde_json::from_value(serde_json::json!({"by_provider":{"a":{"model":"c"}}})).unwrap()).unwrap();
+        registry
+            .declare_profile(
+                "small".into(),
+                serde_json::from_value(serde_json::json!({"by_provider":{"a":{"model":"c"}}}))
+                    .unwrap(),
+            )
+            .unwrap();
         assert!(registry.validate_profile("small").is_ok());
-        assert!(registry.resolve_profile("small").unwrap_err().contains("current provider"));
+        assert!(
+            registry
+                .resolve_profile("small")
+                .unwrap_err()
+                .contains("current provider")
+        );
     }
 
     #[test]
     fn profile_resolves_without_catalog_and_unknown_profile_fails() {
         let mut registry = ModelRegistry::default();
-        registry.declare_profile("local".into(), Profile::Fixed {
-            provider: "ollama".into(), model: "qwen3:14b".into(),
-            options: RequestOptions::default(),
-        }).unwrap();
+        registry
+            .declare_profile(
+                "local".into(),
+                Profile::Fixed {
+                    provider: "ollama".into(),
+                    model: "qwen3:14b".into(),
+                    options: RequestOptions::default(),
+                },
+            )
+            .unwrap();
         let config = registry.resolve_profile("local").unwrap();
         assert_eq!(config.selection.unwrap().model, "qwen3:14b");
         assert_eq!(config.profile.as_deref(), Some("local"));
@@ -308,17 +400,50 @@ mod tests {
     }
 
     #[test]
+    fn profile_preserves_an_explicit_output_limit() {
+        let mut registry = ModelRegistry::default();
+        registry
+            .declare_profile(
+                "coding".into(),
+                Profile::Fixed {
+                    provider: "chatgpt".into(),
+                    model: "gpt".into(),
+                    options: RequestOptions {
+                        max_output_tokens: Some(32_000),
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .resolve_profile("coding")
+                .unwrap()
+                .max_output_tokens,
+            Some(32_000)
+        );
+    }
+
+    #[test]
     fn limits_are_scoped_to_connection_and_do_not_clamp() {
         let mut registry = ModelRegistry::default();
-        registry.declare_model(ModelDeclaration {
-            provider: "one".into(), model: "same".into(),
-            capabilities: ModelCapabilities {
-                max_output_tokens: Some(100), ..Default::default()
-            },
-        }).unwrap();
+        registry
+            .declare_model(ModelDeclaration {
+                provider: "one".into(),
+                model: "same".into(),
+                capabilities: ModelCapabilities {
+                    max_output_tokens: Some(100),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
         let mut config = CallConfig {
-            selection: Some(ModelSelection { route: "one".into(), model: "same".into() }),
-            max_output_tokens: Some(101), ..Default::default()
+            selection: Some(ModelSelection {
+                route: "one".into(),
+                model: "same".into(),
+            }),
+            max_output_tokens: Some(101),
+            ..Default::default()
         };
         assert!(registry.validate(&config).is_err());
         assert_eq!(config.max_output_tokens, Some(101));
@@ -330,8 +455,12 @@ mod tests {
     fn malformed_and_duplicate_declarations_fail() {
         let mut registry = ModelRegistry::default();
         let mut declaration = ModelDeclaration {
-            provider: "p".into(), model: "m".into(),
-            capabilities: ModelCapabilities { context_window: Some(0), ..Default::default() },
+            provider: "p".into(),
+            model: "m".into(),
+            capabilities: ModelCapabilities {
+                context_window: Some(0),
+                ..Default::default()
+            },
         };
         assert!(registry.declare_model(declaration.clone()).is_err());
         declaration.capabilities.context_window = Some(100);

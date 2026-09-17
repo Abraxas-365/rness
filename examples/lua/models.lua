@@ -9,7 +9,9 @@
 -- context_window: published total context capacity (input + output).
 -- max_output_tokens: published output ceiling, NOT a default request size.
 -- reasoning: documented efforts or manual thinking budget range.
--- Declarations validate explicit request options but do not choose defaults.
+-- Anthropic's adapter uses 32000 if a session/profile omits this setting.
+-- ChatGPT Responses omits its field when unset, so ChatGPT chooses its default.
+-- Set an explicit profile value when latency/cost or deep reasoning needs differ.
 -- They do not register providers or guarantee account access.
 -- Codex/ChatGPT may impose smaller limits than the public OpenAI API; override
 -- these values for your account before relying on autocompact's threshold.
