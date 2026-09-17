@@ -114,6 +114,13 @@ impl JobState {
     fn visible_to(&self, session: Option<&str>) -> bool {
         self.owner.is_none() || self.owner.as_deref() == session
     }
+    /// `bash-output` entries are foreground-command output captures, not
+    /// background jobs: they settle instantly and duplicate output already
+    /// returned inline. They stay retrievable by id via `job_output`, but
+    /// are noise in job-listing surfaces meant for actual background work.
+    fn listable(&self, session: Option<&str>) -> bool {
+        self.visible_to(session) && self.kind != "bash-output"
+    }
 }
 
 struct Job {
@@ -587,14 +594,14 @@ impl JobRegistry {
     pub fn count(&self, session: &str) -> usize {
         self.inner.jobs.lock().expect("jobs lock").values().filter(|job| {
             let state = job.state.lock().expect("job lock");
-            state.visible_to(Some(session)) && !state.settled
+            state.listable(Some(session)) && !state.settled
         }).count()
     }
 
     pub fn list(&self, session: &str) -> Vec<JobSnapshot> {
         let mut jobs: Vec<_> = self.inner.jobs.lock().expect("jobs lock").iter().filter_map(|(id, job)| {
             let state = job.state.lock().expect("job lock");
-            state.visible_to(Some(session)).then(|| job.snapshot(id, &state))
+            state.listable(Some(session)).then(|| job.snapshot(id, &state))
         }).collect();
         jobs.sort_by(|a, b| a.job_id.len().cmp(&b.job_id.len()).then_with(|| a.job_id.cmp(&b.job_id)));
         jobs
@@ -945,6 +952,35 @@ mod isolation_tests {
         assert!(writer.cancelled().is_cancelled());
     }
 
+    /// Foreground `Bash` capture artifacts (`kind: "bash-output"`) are not
+    /// background jobs: they must not clutter `count`, `list`, or `job_list`,
+    /// but stay fully readable by id via `job_output`.
+    #[tokio::test]
+    async fn bash_output_captures_are_hidden_from_listings_but_remain_readable() {
+        let registry = JobRegistry::new();
+        let owner = "owner".to_string();
+        let (capture_id, capture) = registry.capture("cd x && grep -rn foo".into(), Some(&owner));
+        capture.append(b"foo.rs:1:foo");
+        capture.settle(JobStatus::Exited(Some(0)));
+        let (bg_id, bg) = registry.start_owned("bash", "sleep 100".into(), Some(&owner));
+        bg.append(b"still going");
+
+        assert_eq!(registry.count(&owner), 1, "only the real background job should count");
+        let listed = registry.list(&owner);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, bg_id);
+
+        let list = JobListTool::new(registry.clone());
+        let (text, metadata) = list.list_presented(Some(&owner)).unwrap();
+        assert!(!text.contains("bash-output"), "{text}");
+        assert!(text.contains("sleep 100"), "{text}");
+        assert_eq!(metadata["total"], 1);
+
+        // Still fully retrievable by id, just not listed.
+        let output = JobOutputTool::new(registry);
+        assert!(output.execute_in(&owner, json!({"job_id":capture_id})).await.unwrap().contains("foo.rs:1:foo"));
+    }
+
     #[test]
     fn recovered_jobs_preserve_session_isolation() {
         let directory = tempfile::tempdir().unwrap();
@@ -1151,7 +1187,7 @@ impl JobListTool {
             .iter()
             .filter_map(|(id, job)| {
                 let state = job.state.lock().expect("job lock");
-                if !state.visible_to(session) { return None; }
+                if !state.listable(session) { return None; }
                 let n: u64 = id[1..].parse().unwrap_or(0);
                 let record = json!({"job_id":id,"kind":state.kind,"status":state.marker(),"label":state.label});
                 metadata_bytes += serde_json::to_vec(&record).unwrap().len();
