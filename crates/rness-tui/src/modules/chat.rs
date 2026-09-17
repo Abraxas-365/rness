@@ -640,7 +640,10 @@ const SELECTION_KEYS: &[(&str, &[&str], &str)] = &[
 impl Chat {
     /// Independent interaction state backed by a host-published card cache.
     pub fn with_cards(cards: CardCache) -> Self {
-        Self { cards, ..Default::default() }
+        Self {
+            cards,
+            ..Default::default()
+        }
     }
 
     fn selection_keys(&self, action: &str, defaults: &[&str]) -> Vec<String> {
@@ -692,31 +695,51 @@ impl Component for Chat {
             && key.kind != crossterm::event::KeyEventKind::Release
         {
             let selected_call = self.selected_message.as_ref().and_then(|id| {
-                ctx.model.entry_ids.iter().position(|entry| entry == id)
+                ctx.model
+                    .entry_ids
+                    .iter()
+                    .position(|entry| entry == id)
                     .and_then(|index| ctx.model.entries.get(index))
                     .and_then(|entry| match entry {
                         Entry::ToolResult { call, .. } => Some(call),
-                        Entry::Assistant { content, .. } => content.iter().find_map(|part| match part {
-                            ContentPart::ToolUse { call, name, .. } if name == "subagent" || name == "send_message" => Some(call),
-                            _ => None,
-                        }),
+                        Entry::Assistant { content, .. } => {
+                            content.iter().find_map(|part| match part {
+                                ContentPart::ToolUse { call, name, .. }
+                                    if name == "subagent" || name == "send_message" =>
+                                {
+                                    Some(call)
+                                }
+                                _ => None,
+                            })
+                        }
                         _ => None,
-                    }).or(Some(id))
+                    })
+                    .or(Some(id))
             });
             if let Some(call) = selected_call.or(self.focused_call.as_ref()) {
                 let durable = ctx.model.entries.iter().find_map(|entry| {
                     if let Entry::Assistant { content, .. } = entry {
                         content.iter().find_map(|part| match part {
-                            ContentPart::ToolUse { call: id, name, args } if id == call => Some((name.as_str(), args.clone())),
+                            ContentPart::ToolUse {
+                                call: id,
+                                name,
+                                args,
+                            } if id == call => Some((name.as_str(), args.clone())),
                             _ => None,
                         })
-                    } else { None }
+                    } else {
+                        None
+                    }
                 });
                 let tool = durable.or_else(|| {
                     let live = ctx.model.live.as_ref()?;
                     let (_, name) = live.running_tools.iter().find(|(id, _)| id == call)?;
-                    let args = live.tool_args.iter().find(|(id, _)| id == call)
-                        .and_then(|(_, args)| serde_json::from_str(args).ok()).unwrap_or_default();
+                    let args = live
+                        .tool_args
+                        .iter()
+                        .find(|(id, _)| id == call)
+                        .and_then(|(_, args)| serde_json::from_str(args).ok())
+                        .unwrap_or_default();
                     Some((name.as_str(), args))
                 });
                 if let Some(("subagent" | "send_message", args)) = tool {
@@ -735,14 +758,21 @@ impl Component for Chat {
                 return KeyOutcome::consumed();
             }
             let selected_action = SELECTION_KEYS.iter().find_map(|(action, defaults, _)| {
-                self.selection_keys(action, defaults).iter().any(|value| {
-                    crate::keys::Chord::parse(value).is_some_and(|chord| {
-                        crate::keymaps::ComponentBinding { action, chord }.matches_key(&key)
+                self.selection_keys(action, defaults)
+                    .iter()
+                    .any(|value| {
+                        crate::keys::Chord::parse(value).is_some_and(|chord| {
+                            crate::keymaps::ComponentBinding { action, chord }.matches_key(&key)
+                        })
                     })
-                }).then_some(*action)
+                    .then_some(*action)
             });
-            if ctx.model.live.as_ref().is_some_and(|live| live.running_tools.iter()
-                .any(|(call, _)| call == &id)) {
+            if ctx
+                .model
+                .live
+                .as_ref()
+                .is_some_and(|live| live.running_tools.iter().any(|(call, _)| call == &id))
+            {
                 match selected_action {
                     Some("selection_close") => self.selected_message = None,
                     Some("selection_toggle") => {
@@ -869,9 +899,19 @@ impl Component for Chat {
         if action == "select_message" {
             // Selection navigates transcript entries, not temporary live tool IDs.
             // A live call has no entry row and would lose focus on the next redraw.
-            self.selected_message = ctx.model.entry_ids.iter().enumerate().rev().find(|(i, _)| {
-                ctx.model.entries.get(*i).is_some_and(|entry| !message_text(entry).is_empty())
-            }).map(|(_, id)| id.clone());
+            self.selected_message = ctx
+                .model
+                .entry_ids
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(i, _)| {
+                    ctx.model
+                        .entries
+                        .get(*i)
+                        .is_some_and(|entry| !message_text(entry).is_empty())
+                })
+                .map(|(_, id)| id.clone());
             self.message_expanded = true;
             self.message_scroll = 0;
             return KeyOutcome::consumed();
@@ -1447,7 +1487,9 @@ impl Component for Chat {
                             if let Entry::Compaction { summary, shadowed } = entry {
                                 let mut options =
                                     merge_options(&self.config["tool"], &self.config["compaction"]);
-                                if self.expanded.get(&ctx.model.entry_ids[entry_index]) == Some(&true) {
+                                if self.expanded.get(&ctx.model.entry_ids[entry_index])
+                                    == Some(&true)
+                                {
                                     options["display"] = serde_json::json!("expanded");
                                 }
                                 if options["visible"] == false {
@@ -1534,7 +1576,7 @@ impl Component for Chat {
                                             match part {
                                 ContentPart::Text { text } if role == "assistant" => body.extend(crate::core::render::render_markdown_configured(text, inner_width, theme, &options["markdown"])),
                                 ContentPart::Text { text } => body.extend(text.lines().map(|s| Line::raw(sanitize(s)))),
-                                ContentPart::Thinking { text, .. } if self.config["thinking"]["visible"] != false => {
+                                ContentPart::Thinking { text, .. } if !text.is_empty() && self.config["thinking"]["visible"] != false => {
                                     let mut options = merge_options(&serde_json::json!({"label":{"text":"Thinking"},"style":"thinking"}), &self.config["thinking"]);
                                     let key = (assistant_index, thinking_index);
                                     thinking_index += 1;
@@ -1735,7 +1777,10 @@ impl Component for Chat {
                                             let remaining =
                                                 limit.saturating_add(1).saturating_sub(rows.len());
                                             let rendered = card_rows_limited(
-                                                row.clone(), inner, theme, remaining,
+                                                row.clone(),
+                                                inner,
+                                                theme,
+                                                remaining,
                                             );
                                             if row.is_header {
                                                 rows.extend(rendered.into_iter().map(|line| {
@@ -2276,23 +2321,41 @@ mod tests {
     #[test]
     fn inspect_agent_from_focused_or_selected_tool() {
         use super::*;
-        use crate::{app::{Action, Model}, theme::Theme};
+        use crate::{
+            app::{Action, Model},
+            theme::Theme,
+        };
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut model = Model::new("root".into(), String::new());
-        model.entries.push(Entry::Assistant { model: "m".into(), content: vec![ContentPart::ToolUse {
-            call: "call".into(), name: "send_message".into(), args: serde_json::json!({"agent_id":"child"}),
-        }] });
-        model.entries.push(Entry::ToolResult { call: "call".into(), name: "send_message".into(), output: "ok".into(), is_error: false });
+        model.entries.push(Entry::Assistant {
+            model: "m".into(),
+            content: vec![ContentPart::ToolUse {
+                call: "call".into(),
+                name: "send_message".into(),
+                args: serde_json::json!({"agent_id":"child"}),
+            }],
+        });
+        model.entries.push(Entry::ToolResult {
+            call: "call".into(),
+            name: "send_message".into(),
+            output: "ok".into(),
+            is_error: false,
+        });
         model.entry_ids = vec!["assistant".into(), "result".into()];
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         for selected in [None, Some("assistant"), Some("result")] {
             let mut chat = Chat::with_cards(CardCache::default());
             chat.focused_call = Some("call".into());
             chat.selected_message = selected.map(str::to_owned);
             let outcome = chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-            assert!(matches!(outcome.actions.as_slice(), [Action::Custom(name, payload)]
-                if name == "agents:inspect" && payload["call"] == "call" && payload["target"] == "child" && payload["session"] == "root"));
+            assert!(
+                matches!(outcome.actions.as_slice(), [Action::Custom(name, payload)]
+                if name == "agents:inspect" && payload["call"] == "call" && payload["target"] == "child" && payload["session"] == "root")
+            );
         }
     }
 
@@ -2652,35 +2715,41 @@ mod tests {
                 is_error: false,
             },
         ] {
-        model.entries = vec![entry];
-        model.entry_ids = vec!["compaction:checkpoint".into()];
-        model.history_revision = 1;
-        model.history_epoch = 1;
-        let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
-        let area = Rect::new(0, 0, 100, 20);
-        let mut chat = Chat {
-            config: serde_json::json!({
-                "tool": {"display": "preview", "preview_lines": 1},
-                "compaction": {"display": "preview", "preview_lines": 1}
-            }),
-            ..Default::default()
-        };
-        let mut buffer = Buffer::empty(area);
-        chat.render(&ctx, area, &mut buffer);
-        chat.on_binding(&ctx, "select_message");
-        chat.render(&ctx, area, &mut buffer);
-        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-        assert!(!text.contains("Expanded detail"));
-        for expanded in [true, false, true] {
-            chat.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            buffer = Buffer::empty(area);
+            model.entries = vec![entry];
+            model.entry_ids = vec!["compaction:checkpoint".into()];
+            model.history_revision = 1;
+            model.history_epoch = 1;
+            let theme = Theme::default();
+            let ctx = Ctx {
+                model: &model,
+                theme: &theme,
+            };
+            let area = Rect::new(0, 0, 100, 20);
+            let mut chat = Chat {
+                config: serde_json::json!({
+                    "tool": {"display": "preview", "preview_lines": 1},
+                    "compaction": {"display": "preview", "preview_lines": 1}
+                }),
+                ..Default::default()
+            };
+            let mut buffer = Buffer::empty(area);
+            chat.render(&ctx, area, &mut buffer);
+            chat.on_binding(&ctx, "select_message");
             chat.render(&ctx, area, &mut buffer);
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
-            assert_eq!(text.contains("Expanded detail"), expanded, "{text}");
-            assert!(text.contains("Preview text"), "{text}");
-            assert_eq!(chat.selected_message.as_deref(), Some("compaction:checkpoint"));
-        }
+            assert!(!text.contains("Expanded detail"));
+            for expanded in [true, false, true] {
+                chat.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                buffer = Buffer::empty(area);
+                chat.render(&ctx, area, &mut buffer);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert_eq!(text.contains("Expanded detail"), expanded, "{text}");
+                assert!(text.contains("Preview text"), "{text}");
+                assert_eq!(
+                    chat.selected_message.as_deref(),
+                    Some("compaction:checkpoint")
+                );
+            }
         }
     }
 
@@ -2705,7 +2774,10 @@ mod tests {
             ..Default::default()
         });
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut chat = Chat {
             config: serde_json::json!({}),
             ..Default::default()
@@ -2713,15 +2785,15 @@ mod tests {
         let area = Rect::new(0, 0, 100, 20);
         let mut buffer = Buffer::empty(area);
         chat.render(&ctx, area, &mut buffer);
-        assert!(chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT)).handled);
+        assert!(
+            chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT))
+                .handled
+        );
         chat.render(&ctx, area, &mut buffer);
         assert!(chat.captures_input());
         assert_eq!(chat.selected_message.as_deref(), Some("latest"));
 
-        for (key, expected) in [
-            (KeyCode::Up, "earlier"),
-            (KeyCode::Down, "latest"),
-        ] {
+        for (key, expected) in [(KeyCode::Up, "earlier"), (KeyCode::Down, "latest")] {
             assert!(chat.on_key(&ctx, KeyEvent::from(key)).handled);
             chat.render(&ctx, area, &mut buffer);
             assert!(chat.captures_input());
@@ -2739,19 +2811,33 @@ mod tests {
         use crossterm::event::{KeyCode, KeyEvent};
         let mut model = Model::new("selection".into(), "fake".into());
         model.entries.push(Entry::ToolResult {
-            call: "child-call".into(), name: "subagent".into(),
-            output: "child running".into(), is_error: false,
+            call: "child-call".into(),
+            name: "subagent".into(),
+            output: "child running".into(),
+            is_error: false,
         });
         model.entry_ids = vec!["result".into()];
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut chat = Chat {
-            session: Some("selection".into()), selected_message: Some("result".into()),
+            session: Some("selection".into()),
+            selected_message: Some("result".into()),
             config: serde_json::json!({"keys":{"selection_stop":"x"}}),
             ..Default::default()
         };
-        assert!(chat.on_key(&ctx, KeyEvent::from(KeyCode::Char('x'))).actions.is_empty());
-        assert!(!SELECTION_KEYS.iter().any(|(name, _, _)| *name == "selection_stop"));
+        assert!(
+            chat.on_key(&ctx, KeyEvent::from(KeyCode::Char('x')))
+                .actions
+                .is_empty()
+        );
+        assert!(
+            !SELECTION_KEYS
+                .iter()
+                .any(|(name, _, _)| *name == "selection_stop")
+        );
         chat.on_key(&ctx, KeyEvent::from(KeyCode::Enter));
         assert_eq!(chat.expanded.get("child-call"), Some(&true));
     }
@@ -3526,10 +3612,11 @@ mod tests {
                     let area = Rect::new(0, 0, 80, 10);
                     let mut buf = Buffer::empty(area);
                     render_bottom_anchored(&rows, 0, area, &mut buf);
-                    assert!(buf
-                        .content
-                        .iter()
-                        .all(|cell| !cell.symbol().chars().any(char::is_control)));
+                    assert!(
+                        buf.content
+                            .iter()
+                            .all(|cell| !cell.symbol().chars().any(char::is_control))
+                    );
                 }
             }
         }

@@ -95,7 +95,12 @@ impl TokenResponse {
                 (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(self.expires_in))
                     .to_string()
             }),
-            scopes: self.scope.split(' ').filter(|s| !s.is_empty()).map(String::from).collect(),
+            scopes: self
+                .scope
+                .split(' ')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
             ..Default::default()
         };
         if let Some(account) = self.account {
@@ -120,7 +125,10 @@ pub struct OAuthClient {
 
 impl OAuthClient {
     pub fn new(config: OAuthConfig) -> Self {
-        Self { config, http: reqwest::Client::new() }
+        Self {
+            config,
+            http: reqwest::Client::new(),
+        }
     }
 
     pub fn authorize_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
@@ -137,11 +145,18 @@ impl OAuthClient {
     }
 
     async fn token_request(&self, body: serde_json::Value) -> Result<Tokens, AuthError> {
-        let response = self.http.post(&self.config.token_url).json(&body).send().await?;
+        let response = self
+            .http
+            .post(&self.config.token_url)
+            .json(&body)
+            .send()
+            .await?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::OAuth(format!("token endpoint http {status}: {text}")));
+            return Err(AuthError::OAuth(format!(
+                "token endpoint http {status}: {text}"
+            )));
         }
         let parsed: TokenResponse = serde_json::from_str(&text)
             .map_err(|e| AuthError::OAuth(format!("bad token response: {e}")))?;
@@ -166,7 +181,11 @@ impl OAuthClient {
         .await
     }
 
-    pub async fn refresh(&self, refresh_token: &str, scopes: &[String]) -> Result<Tokens, AuthError> {
+    pub async fn refresh(
+        &self,
+        refresh_token: &str,
+        scopes: &[String],
+    ) -> Result<Tokens, AuthError> {
         self.token_request(json!({
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
@@ -185,7 +204,10 @@ impl OAuthClient {
             .send()
             .await?;
         if !response.status().is_success() {
-            return Err(AuthError::OAuth(format!("profile http {}", response.status())));
+            return Err(AuthError::OAuth(format!(
+                "profile http {}",
+                response.status()
+            )));
         }
         Ok(response.json().await?)
     }
@@ -263,7 +285,9 @@ pub async fn login(
         return Err(AuthError::OAuth("state mismatch (possible CSRF)".into()));
     }
 
-    let mut tokens = client.exchange_code(&code, &verifier, &redirect_uri, &state).await?;
+    let mut tokens = client
+        .exchange_code(&code, &verifier, &redirect_uri, &state)
+        .await?;
 
     // Profile fetch is best-effort.
     if let Ok(profile) = client.profile(&tokens.access_token).await {
@@ -295,9 +319,7 @@ fn parse_callback_query(request: &str) -> Option<String> {
 pub(crate) fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        (k == name).then(|| {
-            url_decode(v)
-        })
+        (k == name).then(|| url_decode(v))
     })
 }
 
@@ -395,24 +417,23 @@ impl CredentialSource {
 
     pub async fn resolve(&self) -> Result<Credential, AuthError> {
         if self.oauth_key.is_none() {
-        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
-            if !key.is_empty() {
+            if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+                if !key.is_empty() {
+                    return Ok(Credential::ApiKey(key));
+                }
+            }
+            if let Some(key) = self.store.api_key("anthropic")? {
                 return Ok(Credential::ApiKey(key));
             }
         }
-        if let Some(key) = self.store.api_key("anthropic")? {
-            return Ok(Credential::ApiKey(key));
-        }
-        }
         if let Some(tokens) = self.store.tokens(self.token_key())? {
             if !tokens.access_token.is_empty() {
-                let tokens = if tokens.is_expired(REFRESH_BUFFER_SECS)
-                    && !tokens.refresh_token.is_empty()
-                {
-                    self.refresh(tokens).await?
-                } else {
-                    tokens
-                };
+                let tokens =
+                    if tokens.is_expired(REFRESH_BUFFER_SECS) && !tokens.refresh_token.is_empty() {
+                        self.refresh(tokens).await?
+                    } else {
+                        tokens
+                    };
                 return Ok(Credential::OAuth(tokens.access_token));
             }
         }
@@ -435,14 +456,17 @@ impl CredentialSource {
         let _guard = self.refresh_lock.lock().await;
         // Double-check: another task may have refreshed while we waited.
         if let Some(current) = self.store.tokens(self.token_key())? {
-            if current.access_token != old.access_token
-                && !current.is_expired(REFRESH_BUFFER_SECS)
+            if current.access_token != old.access_token && !current.is_expired(REFRESH_BUFFER_SECS)
             {
                 return Ok(current);
             }
         }
         let mut new = self.client.refresh(&old.refresh_token, &old.scopes).await?;
-        // Preserve fields the refresh response does not return.
+        // Preserve fields the refresh response does not return. In particular,
+        // an OAuth server may not rotate refresh tokens on every grant.
+        if new.refresh_token.is_empty() {
+            new.refresh_token = old.refresh_token.clone();
+        }
         if new.subscription_type.is_empty() {
             new.subscription_type = old.subscription_type;
         }

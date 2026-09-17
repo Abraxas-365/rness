@@ -129,6 +129,42 @@ fn full_turn_with_attempt_projects_and_replays() {
 }
 
 #[test]
+fn replay_repairs_orphan_tool_use_without_mutating_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    log.append(&user("write the report")).unwrap();
+    log.append(&SessionEvent::AssistantMessage(AssistantMessage {
+        model: "m1".into(),
+        content: vec![
+            ContentPart::Text { text: "Writing it now.".into() },
+            ContentPart::ToolUse { call: "orphan".into(), name: "Write".into(), args: serde_json::json!({}) },
+        ],
+        // This reproduces a provider output-limit stop from the older turn
+        // loop: the call was committed but never dispatched.
+        stop: StopReason::MaxTokens,
+        usage: Usage::default(),
+        chunks: vec![],
+    })).unwrap();
+    log.append(&user("continue")).unwrap();
+    drop(log);
+
+    let replayed = replay(&store, &sid).unwrap();
+    assert_eq!(replayed.history.len(), 4, "the durable log stays intact");
+    assert_eq!(replayed.context.turns.len(), 3);
+    match &replayed.context.turns[1] {
+        ModelTurn::Assistant { content } => {
+            assert!(content.iter().any(|part| matches!(part, ContentPart::Text { text } if text == "Writing it now.")));
+            assert!(!content.iter().any(|part| matches!(part, ContentPart::ToolUse { .. })));
+        }
+        other => panic!("expected repaired assistant turn, got {other:?}"),
+    }
+    assert!(matches!(&replayed.context.turns[2], ModelTurn::User { content }
+        if matches!(&content[0], ContentPart::Text { text } if text == "continue")));
+}
+
+#[test]
 fn steer_and_inject_intents_reach_model_context() {
     // All three intents are user/message events; the difference is WHEN the
     // turn loop lets them in, not whether they replay.

@@ -15,12 +15,12 @@
 use std::time::Instant;
 
 use async_trait::async_trait;
-use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepRequest};
 use rness_engine::session::projection::ModelTurn;
+use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepRequest};
 use rness_protocol::events::{
     AssistantMessage, ChunkDelta, ContentPart, Reasoning, StopReason, TimedChunk, Usage,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthError, Credential, CredentialSource};
@@ -46,7 +46,10 @@ enum Auth {
 }
 
 pub struct AnthropicProvider {
-    images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
+    images: Option<(
+        std::sync::Arc<rness_engine::images::ImageStore>,
+        rness_engine::images::ImagePolicy,
+    )>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     headers: crate::headers::ProviderHeaders,
@@ -57,13 +60,20 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
+    pub fn with_images(
+        mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) -> Self {
         self.images = Some((store, policy));
         self
     }
 
     /// Apply validated headers to inference and file requests, never OAuth.
-    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+    pub fn with_headers(
+        mut self,
+        headers: crate::headers::ProviderHeaders,
+    ) -> Result<Self, reqwest::Error> {
         self.client = headers.client()?;
         self.headers = headers;
         Ok(self)
@@ -122,13 +132,31 @@ impl AnthropicProvider {
 
     fn build_body(&self, request: &StepRequest<'_>, oauth: bool) -> Result<Value, ProviderError> {
         crate::validate_image_roles(request.context, self.images.is_some())?;
-        let images = self.images.as_ref().map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
-        let projected = images.as_ref().map(|(store, policy)| store.project_request(request.context, policy)).transpose().map_err(crate::image_error)?;
-        let request = StepRequest { context: projected.as_ref().unwrap_or(request.context), system: request.system, tools: request.tools, on_delta: request.on_delta };
-        let max_tokens = request.context.config.max_output_tokens.unwrap_or(self.max_tokens);
+        let images = self
+            .images
+            .as_ref()
+            .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
+        let projected = images
+            .as_ref()
+            .map(|(store, policy)| store.project_request(request.context, policy))
+            .transpose()
+            .map_err(crate::image_error)?;
+        let request = StepRequest {
+            context: projected.as_ref().unwrap_or(request.context),
+            system: request.system,
+            tools: request.tools,
+            on_delta: request.on_delta,
+        };
+        let max_tokens = request
+            .context
+            .config
+            .max_output_tokens
+            .unwrap_or(self.max_tokens);
         if let Some(Reasoning::BudgetTokens { tokens }) = &request.context.config.reasoning {
             if *tokens < 1024 || *tokens >= max_tokens {
-                return Err(ProviderError { code: "PROVIDER", retry_after: None,
+                return Err(ProviderError {
+                    code: "PROVIDER",
+                    retry_after: None,
                     message: format!(
                         "Anthropic reasoning budget must satisfy 1024 <= budget < max_output_tokens ({max_tokens})"
                     ),
@@ -143,35 +171,63 @@ impl AnthropicProvider {
             "messages": messages_from_context(request.context),
         });
         if let Some((store, policy)) = &images {
-            for (index, turn) in request.context.turns.iter().enumerate() {
+            let mut message_index = 0;
+            for turn in &request.context.turns {
+                if !has_serialized_message(turn) {
+                    continue;
+                }
                 if let ModelTurn::ToolResults { results } = turn {
                     for (result_index, result) in results.iter().enumerate() {
-                        if !result.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) { continue; }
+                        if !result.content.iter().any(|p| {
+                            matches!(
+                                p,
+                                rness_protocol::events::ToolResultContentPart::Image { .. }
+                            )
+                        }) {
+                            continue;
+                        }
                         let mut blocks = Vec::new();
                         for part in result.effective_content() {
                             match part {
-                                rness_protocol::events::ToolResultContentPart::Text { text } => blocks.push(json!({"type":"text", "text":text})),
-                                rness_protocol::events::ToolResultContentPart::Image { attachment } => {
-                                    let (mime, data) = store.request_image(&attachment, policy).map_err(crate::image_error)?;
+                                rness_protocol::events::ToolResultContentPart::Text { text }
+                                    if !text.is_empty() =>
+                                {
+                                    blocks.push(json!({"type":"text", "text":text}))
+                                }
+                                rness_protocol::events::ToolResultContentPart::Text { .. } => {}
+                                rness_protocol::events::ToolResultContentPart::Image {
+                                    attachment,
+                                } => {
+                                    let (mime, data) = store
+                                        .request_image(&attachment, policy)
+                                        .map_err(crate::image_error)?;
                                     use base64::Engine;
                                     blocks.push(json!({"type":"image", "source":{"type":"base64", "media_type":mime, "data":base64::engine::general_purpose::STANDARD.encode(data)}}));
                                 }
                             }
                         }
-                        body["messages"][index]["content"][result_index]["content"] = json!(blocks);
+                        body["messages"][message_index]["content"][result_index]["content"] =
+                            json!(blocks);
                     }
                 }
                 if let ModelTurn::User { content } = turn {
-                    for (part_index, part) in content.iter().enumerate() {
+                    for (part_index, part) in content
+                        .iter()
+                        .filter(|part| is_serialized_part(part))
+                        .enumerate()
+                    {
                         if let ContentPart::Image { attachment } = part {
-                            let (mime, data) = store.request_image(attachment, policy).map_err(crate::image_error)?;
+                            let (mime, data) = store
+                                .request_image(attachment, policy)
+                                .map_err(crate::image_error)?;
                             use base64::Engine;
-                            body["messages"][index]["content"][part_index] = json!({"type":"image", "source":{
+                            body["messages"][message_index]["content"][part_index] = json!({"type":"image", "source":{
                                 "type":"base64", "media_type":mime, "data":base64::engine::general_purpose::STANDARD.encode(data)
                             }});
                         }
                     }
                 }
+                message_index += 1;
             }
         }
         if let Some(reasoning) = &request.context.config.reasoning {
@@ -218,43 +274,93 @@ impl AnthropicProvider {
         Ok(body)
     }
 
-    async fn reuse_image_uploads(&self, body: &mut Value, credential: &Credential, cancel: &CancellationToken, rejected: &[(String, String)], used: &mut Vec<(String, String)>) -> Result<(), ProviderError> {
-        use sha2::{Digest, Sha256};
+    async fn reuse_image_uploads(
+        &self,
+        body: &mut Value,
+        credential: &Credential,
+        cancel: &CancellationToken,
+        rejected: &[(String, String)],
+        used: &mut Vec<(String, String)>,
+    ) -> Result<(), ProviderError> {
         use base64::Engine;
-        static UPLOADS: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>> = std::sync::OnceLock::new();
-        let Some((store, policy)) = &self.images else { return Ok(()); };
-        if !store.effective_request_policy(policy).anthropic_files { return Ok(()); }
+        use sha2::{Digest, Sha256};
+        static UPLOADS: std::sync::OnceLock<
+            tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
+        > = std::sync::OnceLock::new();
+        let Some((store, policy)) = &self.images else {
+            return Ok(());
+        };
+        if !store.effective_request_policy(policy).anthropic_files {
+            return Ok(());
+        }
         let Credential::ApiKey(key) = credential else {
             return Err(crate::image_error("Anthropic file reuse requires API-key authentication; disable anthropic_files for OAuth".into()));
         };
         let mut paths = Vec::new();
-        for (mi, message) in body["messages"].as_array().into_iter().flatten().enumerate() {
-            for (ci, part) in message["content"].as_array().into_iter().flatten().enumerate() {
-                if part["type"] == "image" { paths.push(format!("/messages/{mi}/content/{ci}/source")); }
+        for (mi, message) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (ci, part) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if part["type"] == "image" {
+                    paths.push(format!("/messages/{mi}/content/{ci}/source"));
+                }
                 if part["type"] == "tool_result" {
-                    for (ti, inner) in part["content"].as_array().into_iter().flatten().enumerate() {
-                        if inner["type"] == "image" { paths.push(format!("/messages/{mi}/content/{ci}/content/{ti}/source")); }
+                    for (ti, inner) in part["content"].as_array().into_iter().flatten().enumerate()
+                    {
+                        if inner["type"] == "image" {
+                            paths.push(format!("/messages/{mi}/content/{ci}/content/{ti}/source"));
+                        }
                     }
                 }
             }
         }
         let mut protected = Vec::new();
         for path in paths {
-            let source = body.pointer(&path).ok_or_else(|| crate::image_error("missing image source".into()))?;
-            let data = source["data"].as_str().ok_or_else(|| crate::image_error("missing inline image bytes".into()))?;
-            let mime = source["media_type"].as_str().ok_or_else(|| crate::image_error("missing image media type".into()))?;
+            let source = body
+                .pointer(&path)
+                .ok_or_else(|| crate::image_error("missing image source".into()))?;
+            let data = source["data"]
+                .as_str()
+                .ok_or_else(|| crate::image_error("missing inline image bytes".into()))?;
+            let mime = source["media_type"]
+                .as_str()
+                .ok_or_else(|| crate::image_error("missing image media type".into()))?;
             let upload_credential = self.headers.upload_credential(key);
-            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, &upload_credential, mime, data)).map_err(|e| crate::image_error(e.to_string()))?));
+            let cache_key = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(&self.base_url, &upload_credential, mime, data))
+                        .map_err(|e| crate::image_error(e.to_string()))?
+                )
+            );
             let mut cache = tokio::select! {
                 _ = cancel.cancelled() => return Err(crate::image_error("image upload cancelled".into())),
                 guard = UPLOADS.get_or_init(Default::default).lock() => guard,
             };
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| crate::image_error(e.to_string()))?.as_secs();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| crate::image_error(e.to_string()))?
+                .as_secs();
             cache.retain(|_, (_, expires)| *expires > now.saturating_add(60));
-            let mut cached = cache.get(&cache_key).cloned().or(store.cached_upload(&cache_key, now).map_err(crate::image_error)?);
-            if cached.as_ref().is_some_and(|(id, _)| rejected.contains(&(cache_key.clone(), id.clone()))) {
+            let mut cached = cache.get(&cache_key).cloned().or(store
+                .cached_upload(&cache_key, now)
+                .map_err(crate::image_error)?);
+            if cached
+                .as_ref()
+                .is_some_and(|(id, _)| rejected.contains(&(cache_key.clone(), id.clone())))
+            {
                 cache.remove(&cache_key);
-                store.cache_upload(&cache_key, "expired", 0).map_err(crate::image_error)?;
+                store
+                    .cache_upload(&cache_key, "expired", 0)
+                    .map_err(crate::image_error)?;
                 cached = None;
             }
             if let Some((id, _)) = &cached {
@@ -264,29 +370,74 @@ impl AnthropicProvider {
                 };
                 if metadata.status() == reqwest::StatusCode::NOT_FOUND {
                     cache.remove(&cache_key);
-                    store.cache_upload(&cache_key, "expired", 0).map_err(crate::image_error)?;
+                    store
+                        .cache_upload(&cache_key, "expired", 0)
+                        .map_err(crate::image_error)?;
                     cached = None;
-                } else { metadata.error_for_status().map_err(|e| crate::image_error(format!("image lookup failed: {e}")))?; }
+                } else {
+                    metadata
+                        .error_for_status()
+                        .map_err(|e| crate::image_error(format!("image lookup failed: {e}")))?;
+                }
             }
-            let file_id = if let Some((id, _)) = cached { id } else {
+            let file_id = if let Some((id, _)) = cached {
+                id
+            } else {
                 let expires = now.saturating_add(3500);
-                let bytes = base64::engine::general_purpose::STANDARD.decode(data).map_err(|e| crate::image_error(e.to_string()))?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| crate::image_error(e.to_string()))?;
                 let endpoint = format!("{}/v1/files", self.base_url);
                 let scope = crate::upload_scope(&endpoint, &upload_credential);
-                let value = crate::upload_with_quota_recovery(store, &scope, &protected, || {
-                    let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("image").mime_str(mime).map_err(|e| crate::image_error(e.to_string()))?;
-                    let form = reqwest::multipart::Form::new().part("file", part).text("expires_in_seconds", "3600");
-                    Ok(self.client.post(&endpoint).header("x-api-key", key).header("anthropic-version", API_VERSION).multipart(form))
-                }, |id| self.client.delete(format!("{endpoint}/{id}")).header("x-api-key", key).header("anthropic-version", API_VERSION), cancel).await?;
-                let id = value["id"].as_str().filter(|id| id.starts_with("file_") && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')).ok_or_else(|| crate::image_error("image upload returned no file ID".into()))?.to_owned();
-                store.record_owned_upload(&scope, &id, expires).map_err(crate::image_error)?;
-                store.cache_upload(&cache_key, &id, expires).map_err(crate::image_error)?;
+                let value = crate::upload_with_quota_recovery(
+                    store,
+                    &scope,
+                    &protected,
+                    || {
+                        let part = reqwest::multipart::Part::bytes(bytes.clone())
+                            .file_name("image")
+                            .mime_str(mime)
+                            .map_err(|e| crate::image_error(e.to_string()))?;
+                        let form = reqwest::multipart::Form::new()
+                            .part("file", part)
+                            .text("expires_in_seconds", "3600");
+                        Ok(self
+                            .client
+                            .post(&endpoint)
+                            .header("x-api-key", key)
+                            .header("anthropic-version", API_VERSION)
+                            .multipart(form))
+                    },
+                    |id| {
+                        self.client
+                            .delete(format!("{endpoint}/{id}"))
+                            .header("x-api-key", key)
+                            .header("anthropic-version", API_VERSION)
+                    },
+                    cancel,
+                )
+                .await?;
+                let id = value["id"]
+                    .as_str()
+                    .filter(|id| {
+                        id.starts_with("file_")
+                            && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                    })
+                    .ok_or_else(|| crate::image_error("image upload returned no file ID".into()))?
+                    .to_owned();
+                store
+                    .record_owned_upload(&scope, &id, expires)
+                    .map_err(crate::image_error)?;
+                store
+                    .cache_upload(&cache_key, &id, expires)
+                    .map_err(crate::image_error)?;
                 cache.insert(cache_key.clone(), (id.clone(), expires));
                 id
             };
             used.push((cache_key, file_id.clone()));
             protected.push(file_id.clone());
-            *body.pointer_mut(&path).expect("existing image source") = json!({"type":"file", "file_id":file_id});
+            *body.pointer_mut(&path).expect("existing image source") =
+                json!({"type":"file", "file_id":file_id});
         }
         Ok(())
     }
@@ -309,19 +460,43 @@ impl AnthropicProvider {
     }
 }
 
+fn is_serialized_part(part: &ContentPart) -> bool {
+    match part {
+        ContentPart::Text { text } => !text.is_empty(),
+        // Thinking blocks contain provider-specific opaque continuation
+        // tokens. They cannot safely survive a provider/model switch,
+        // compaction, or replay, so never include them in Anthropic input.
+        ContentPart::Thinking { .. } => false,
+        ContentPart::Image { .. } | ContentPart::ToolUse { .. } => true,
+    }
+}
+
+fn has_serialized_message(turn: &ModelTurn) -> bool {
+    match turn {
+        ModelTurn::User { content } | ModelTurn::Assistant { content } => {
+            !parts_to_json(content).is_empty()
+        }
+        ModelTurn::ToolResults { .. } => true,
+    }
+}
+
 /// Map the replay-derived context onto Anthropic `messages`.
 fn messages_from_context(context: &rness_engine::session::projection::ModelContext) -> Vec<Value> {
     let mut messages = Vec::new();
     for turn in &context.turns {
         match turn {
-            ModelTurn::User { content } => messages.push(json!({
-                "role": "user",
-                "content": parts_to_json(content),
-            })),
-            ModelTurn::Assistant { content } => messages.push(json!({
-                "role": "assistant",
-                "content": parts_to_json(content),
-            })),
+            ModelTurn::User { content } => {
+                let content = parts_to_json(content);
+                if !content.is_empty() {
+                    messages.push(json!({ "role": "user", "content": content }));
+                }
+            }
+            ModelTurn::Assistant { content } => {
+                let content = parts_to_json(content);
+                if !content.is_empty() {
+                    messages.push(json!({ "role": "assistant", "content": content }));
+                }
+            }
             ModelTurn::ToolResults { results } => messages.push(json!({
                 "role": "user",
                 "content": results
@@ -342,20 +517,19 @@ fn messages_from_context(context: &rness_engine::session::projection::ModelConte
 fn parts_to_json(parts: &[ContentPart]) -> Vec<Value> {
     parts
         .iter()
-        .map(|p| match p {
-            ContentPart::Image { .. } => Value::Null, // Filled from the validated attachment store before sending.
-            ContentPart::Text { text } => json!({ "type": "text", "text": text }),
-            ContentPart::Thinking { text, signature } => json!({
-                "type": "thinking",
-                "thinking": text,
-                "signature": signature.as_deref().unwrap_or(""),
-            }),
-            ContentPart::ToolUse { call, name, args } => json!({
+        .filter_map(|p| match p {
+            ContentPart::Image { .. } => Some(Value::Null), // Filled from the validated attachment store before sending.
+            ContentPart::Text { text } if !text.is_empty() => {
+                Some(json!({ "type": "text", "text": text }))
+            }
+            ContentPart::Thinking { .. } => None,
+            ContentPart::ToolUse { call, name, args } => Some(json!({
                 "type": "tool_use",
                 "id": call,
                 "name": name,
                 "input": args,
-            }),
+            })),
+            ContentPart::Text { .. } => None,
         })
         .collect()
 }
@@ -365,8 +539,15 @@ fn parts_to_json(parts: &[ContentPart]) -> Vec<Value> {
 /// One in-flight content block being assembled from deltas.
 enum Block {
     Text(String),
-    Thinking { text: String, signature: String },
-    ToolUse { call: String, name: String, args_json: String },
+    Thinking {
+        text: String,
+        signature: String,
+    },
+    ToolUse {
+        call: String,
+        name: String,
+        args_json: String,
+    },
 }
 
 #[derive(Default)]
@@ -382,20 +563,49 @@ impl Accumulator {
         let content = self
             .blocks
             .into_iter()
-            .map(|b| match b {
-                Block::Text(text) => ContentPart::Text { text },
-                Block::Thinking { text, signature } => ContentPart::Thinking {
+            .filter_map(|b| match b {
+                // Providers may start a text block and finish without deltas;
+                // do not persist a block Anthropic will later reject on replay.
+                Block::Text(text) if text.is_empty() => None,
+                Block::Text(text) => Some(ContentPart::Text { text }),
+                // Anthropic starts thinking blocks before it necessarily
+                // emits a delta. Empty blocks have no useful transcript
+                // content and otherwise render as a ghost "Thinking" panel.
+                Block::Thinking { text, .. } if text.is_empty() => None,
+                Block::Thinking { text, signature } => Some(ContentPart::Thinking {
                     text,
                     signature: (!signature.is_empty()).then_some(signature),
-                },
-                Block::ToolUse { call, name, args_json } => ContentPart::ToolUse {
+                }),
+                Block::ToolUse {
                     call,
                     name,
-                    // No-arg calls stream no input_json_delta: empty buffer
-                    // must replay as {} — the API rejects null input.
-                    args: serde_json::from_str(&args_json)
-                        .unwrap_or_else(|_| Value::Object(Default::default())),
-                },
+                    args_json,
+                } if args_json.is_empty() => Some(ContentPart::ToolUse {
+                    call,
+                    name,
+                    // No-arg calls stream no input_json_delta; Anthropic
+                    // requires an object rather than null when replayed.
+                    args: Value::Object(Default::default()),
+                }),
+                // A nonempty partial_json which does not parse means the
+                // output limit cut a tool call mid-arguments. Never turn it
+                // into `{}`: that can execute a different, unsafe command.
+                // Dropping it also keeps the next replay valid (there is no
+                // unmatched tool_use requiring a tool_result).
+                Block::ToolUse { args_json, .. }
+                    if serde_json::from_str::<Value>(&args_json).is_err() =>
+                {
+                    None
+                }
+                Block::ToolUse {
+                    call,
+                    name,
+                    args_json,
+                } => Some(ContentPart::ToolUse {
+                    call,
+                    name,
+                    args: serde_json::from_str(&args_json).expect("validated above"),
+                }),
             })
             .collect();
         AssistantMessage {
@@ -423,9 +633,10 @@ impl Accumulator {
                 let block = &v["content_block"];
                 match block["type"].as_str().unwrap_or("") {
                     "text" => self.blocks.push(Block::Text(String::new())),
-                    "thinking" => self
-                        .blocks
-                        .push(Block::Thinking { text: String::new(), signature: String::new() }),
+                    "thinking" => self.blocks.push(Block::Thinking {
+                        text: String::new(),
+                        signature: String::new(),
+                    }),
                     "tool_use" => self.blocks.push(Block::ToolUse {
                         call: block["id"].as_str().unwrap_or("").to_string(),
                         name: block["name"].as_str().unwrap_or("").to_string(),
@@ -454,12 +665,20 @@ impl Accumulator {
                             delta: ChunkDelta::Thinking { t: t.to_string() },
                         });
                     }
-                    ("input_json_delta", Block::ToolUse { call, args_json, .. }) => {
+                    (
+                        "input_json_delta",
+                        Block::ToolUse {
+                            call, args_json, ..
+                        },
+                    ) => {
                         let t = delta["partial_json"].as_str().unwrap_or("");
                         args_json.push_str(t);
                         self.chunks.push(TimedChunk {
                             ms: at_ms,
-                            delta: ChunkDelta::ToolArgs { call: call.clone(), t: t.to_string() },
+                            delta: ChunkDelta::ToolArgs {
+                                call: call.clone(),
+                                t: t.to_string(),
+                            },
                         });
                     }
                     // The thinking block's integrity signature — required
@@ -500,7 +719,11 @@ impl Accumulator {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
-    fn configure_images(&mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) {
+    fn configure_images(
+        &mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) {
         self.images = Some((store, policy));
     }
     fn model(&self) -> &str {
@@ -515,7 +738,12 @@ impl Provider for AnthropicProvider {
             Err(e) => {
                 let retryable = !matches!(e, AuthError::NoCredentials);
                 return StepOutcome::Failed {
-                    error: ProviderError { code: "PROVIDER", retry_after: None, message: e.to_string(), retryable },
+                    error: ProviderError {
+                        code: "PROVIDER",
+                        retry_after: None,
+                        message: e.to_string(),
+                        retryable,
+                    },
                     partial: vec![],
                 };
             }
@@ -525,16 +753,33 @@ impl Provider for AnthropicProvider {
 
         loop {
             let mut used = Vec::new();
-            let mut body = match self.build_body(&request, matches!(credential, Credential::OAuth(_))) {
-                Ok(body) => body,
-                Err(error) => return StepOutcome::Failed { error, partial: vec![] },
-            };
-            if let Err(error) = self.reuse_image_uploads(&mut body, &credential, cancel, &rejected, &mut used).await {
-                if cancel.is_cancelled() { return StepOutcome::Cancelled { partial: vec![] }; }
-                return StepOutcome::Failed { error, partial: vec![] };
+            let mut body =
+                match self.build_body(&request, matches!(credential, Credential::OAuth(_))) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        return StepOutcome::Failed {
+                            error,
+                            partial: vec![],
+                        };
+                    }
+                };
+            if let Err(error) = self
+                .reuse_image_uploads(&mut body, &credential, cancel, &rejected, &mut used)
+                .await
+            {
+                if cancel.is_cancelled() {
+                    return StepOutcome::Cancelled { partial: vec![] };
+                }
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                };
             }
             if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-                return StepOutcome::Failed { error, partial: vec![] };
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                };
             }
             let response = tokio::select! {
                 biased;
@@ -547,12 +792,14 @@ impl Provider for AnthropicProvider {
                 Ok(r) => r,
                 Err(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { code: "PROVIDER", retry_after: None,
+                        error: ProviderError {
+                            code: "PROVIDER",
+                            retry_after: None,
                             message: format!("transport: {e}"),
                             retryable: true,
                         },
                         partial: vec![],
-                    }
+                    };
                 }
             };
 
@@ -560,8 +807,7 @@ impl Provider for AnthropicProvider {
             if !status.is_success() {
                 // 401 with OAuth: force-refresh once and retry.
                 if status.as_u16() == 401 && !refreshed_once {
-                    if let (Auth::Source(source), Credential::OAuth(_)) =
-                        (&self.auth, &credential)
+                    if let (Auth::Source(source), Credential::OAuth(_)) = (&self.auth, &credential)
                     {
                         if let Ok(new) = source.handle_unauthorized().await {
                             credential = new;
@@ -579,14 +825,21 @@ impl Provider for AnthropicProvider {
                 };
                 if rejected.is_empty() && matches!(status.as_u16(), 400 | 404 | 410 | 422) {
                     rejected = crate::rejected_uploads(&body, &used);
-                    if !rejected.is_empty() { continue; }
+                    if !rejected.is_empty() {
+                        continue;
+                    }
                 }
                 let message = serde_json::from_str::<Value>(&body)
                     .ok()
                     .and_then(|v| v["error"]["message"].as_str().map(String::from))
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { code: crate::request_error_code(status.as_u16(), &body), retry_after, message, retryable },
+                    error: ProviderError {
+                        code: crate::request_error_code(status.as_u16(), &body),
+                        retry_after,
+                        message,
+                        retryable,
+                    },
                     partial: vec![],
                 };
             }

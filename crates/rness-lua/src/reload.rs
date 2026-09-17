@@ -112,7 +112,7 @@ fn watch_selected(
     let startup_file = root.join("init.lua");
     let startup_modules = root.join("lua");
 
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+    let handler = move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else { return };
         let source_change = event.paths.iter().any(|p| {
             p.extension().is_some_and(|x| x == "lua")
@@ -129,11 +129,32 @@ fn watch_selected(
             let selected = !explicit || event.paths.iter().any(|p| watched_files.contains(p) || watched_directories.iter().any(|dir| p.starts_with(dir)));
             if startup || selected { let _ = tx.send(startup); }
         }
-    })
-    .map_err(|e| e.to_string())?;
-    for path in watch_roots {
-        watcher.watch(&path, notify::RecursiveMode::Recursive).map_err(|e| e.to_string())?;
-    }
+    };
+    // notify's fsevents backend blocks inside watch(): FSEventStreamStart's
+    // mach RPC stalls while syspolicyd/Gatekeeper assesses the calling
+    // binary (tens of seconds for unsigned dev/test builds), and can
+    // deadlock outright (notify-rs/notify#942) since watch() waits on the
+    // runloop thread with an unbounded recv. Register on a disposable
+    // thread with a deadline so the worst case costs one leaked (parked)
+    // thread and disables hot-reload instead of freezing the process.
+    let init_roots = watch_roots;
+    let (built_tx, built_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("rness-lua watch init".into())
+        .spawn(move || {
+            let build = (|| {
+                let mut watcher = notify::recommended_watcher(handler).map_err(|e| e.to_string())?;
+                for path in &init_roots {
+                    watcher.watch(path, notify::RecursiveMode::Recursive).map_err(|e| e.to_string())?;
+                }
+                Ok::<_, String>(watcher)
+            })();
+            let _ = built_tx.send(build);
+        })
+        .map_err(|e| format!("spawn watcher init thread: {e}"))?;
+    let watcher = built_rx
+        .recv_timeout(Duration::from_secs(120))
+        .map_err(|_| "filesystem watcher initialization stalled (fseventsd unresponsive); plugin hot-reload disabled".to_string())??;
 
     let task = tokio::spawn(async move {
         let mut lua_tools = initial_tools;

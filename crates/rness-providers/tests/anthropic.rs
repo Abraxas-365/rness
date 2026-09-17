@@ -7,7 +7,7 @@ use rness_engine::tools::ToolSpec;
 use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
 use rness_protocol::events::*;
 use rness_providers::anthropic::AnthropicProvider;
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -28,48 +28,148 @@ fn sse_response(events: &[(&str, serde_json::Value)]) -> ResponseTemplate {
 #[tokio::test]
 async fn files_are_reused_and_missing_files_reuploaded() {
     let server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"}))).expect(1).mount(&server).await;
-    Mock::given(method("GET")).and(path("/v1/files/file_image")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"}))).expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(sse_response(&[])).expect(2).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/files/file_image"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_image"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&[]))
+        .expect(2)
+        .mount(&server)
+        .await;
     let dir = tempfile::tempdir().unwrap();
-    let policy = rness_engine::images::ImagePolicy { anthropic_files:true, ..Default::default() };
-    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let policy = rness_engine::images::ImagePolicy {
+        anthropic_files: true,
+        ..Default::default()
+    };
+    let store = std::sync::Arc::new(
+        rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap(),
+    );
     let mut bytes = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
     let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
-    let context = ModelContext { turns:vec![ModelTurn::User { content:vec![ContentPart::Image { attachment }] }], ..Default::default() };
-    let provider = AnthropicProvider::new("key", "vision").with_base_url(server.uri()).with_images(store, policy)
-        .with_headers(rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "tenant-secret".into())].into()).unwrap()).unwrap();
+    let context = ModelContext {
+        turns: vec![ModelTurn::User {
+            content: vec![ContentPart::Image { attachment }],
+        }],
+        ..Default::default()
+    };
+    let provider = AnthropicProvider::new("key", "vision")
+        .with_base_url(server.uri())
+        .with_images(store, policy)
+        .with_headers(
+            rness_providers::headers::ProviderHeaders::new(
+                &[("X-Tenant".into(), "tenant-secret".into())].into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
     for _ in 0..2 {
-        let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+        let _ = provider
+            .step(
+                StepRequest {
+                    context: &context,
+                    system: "",
+                    tools: &[],
+                    on_delta: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await;
     }
-    for request in server.received_requests().await.unwrap().iter().filter(|r| r.url.path() == "/v1/messages") {
-        let body:serde_json::Value = request.body_json().unwrap();
-        assert_eq!(body["messages"][0]["content"][0]["source"], json!({"type":"file","file_id":"file_image"}));
-    }
-    for request in server.received_requests().await.unwrap() {
-        assert_eq!(request.headers["x-tenant"], "tenant-secret");
-    }
-    server.verify().await;
-    server.reset().await;
-    Mock::given(method("GET")).respond_with(ResponseTemplate::new(404)).expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_reuploaded"}))).expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1/messages")).and(body_partial_json(json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_reuploaded"}}]}]}))).respond_with(sse_response(&[])).expect(1).mount(&server).await;
-    let _ = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
-    for request in server.received_requests().await.unwrap() {
-        assert_eq!(request.headers["x-tenant"], "tenant-secret");
-    }
-    server.verify().await;
-    server.reset().await;
-    Mock::given(method("GET")).respond_with(ResponseTemplate::new(200)).expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1/files")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_recovered"}))).expect(1).mount(&server).await;
-    Mock::given(method("POST")).and(path("/v1/messages")).respond_with(|request: &wiremock::Request| {
+    for request in server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/messages")
+    {
         let body: serde_json::Value = request.body_json().unwrap();
-        if body["messages"][0]["content"][0]["source"]["file_id"] == "file_reuploaded" {
-            ResponseTemplate::new(400).set_body_json(json!({"error":{"message":"file_reuploaded file expired"}}))
-        } else { sse_response(&stream_happy("recovered")) }
-    }).expect(2).mount(&server).await;
-    let outcome = provider.step(StepRequest { context:&context, system:"", tools:&[], on_delta:None }, &CancellationToken::new()).await;
+        assert_eq!(
+            body["messages"][0]["content"][0]["source"],
+            json!({"type":"file","file_id":"file_image"})
+        );
+    }
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_reuploaded"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST")).and(path("/v1/messages")).and(body_partial_json(json!({"messages":[{"role":"user","content":[{"type":"image","source":{"type":"file","file_id":"file_reuploaded"}}]}]}))).respond_with(sse_response(&[])).expect(1).mount(&server).await;
+    let _ = provider
+        .step(
+            StepRequest {
+                context: &context,
+                system: "",
+                tools: &[],
+                on_delta: None,
+            },
+            &CancellationToken::new(),
+        )
+        .await;
+    for request in server.received_requests().await.unwrap() {
+        assert_eq!(request.headers["x-tenant"], "tenant-secret");
+    }
+    server.verify().await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"file_recovered"})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(|request: &wiremock::Request| {
+            let body: serde_json::Value = request.body_json().unwrap();
+            if body["messages"][0]["content"][0]["source"]["file_id"] == "file_reuploaded" {
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"error":{"message":"file_reuploaded file expired"}}))
+            } else {
+                sse_response(&stream_happy("recovered"))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    let outcome = provider
+        .step(
+            StepRequest {
+                context: &context,
+                system: "",
+                tools: &[],
+                on_delta: None,
+            },
+            &CancellationToken::new(),
+        )
+        .await;
     assert!(matches!(outcome, StepOutcome::Committed(_)));
 }
 
@@ -79,12 +179,20 @@ async fn live_sonnet_5_image_inference() {
     use rness_providers::auth::{CredentialSource, CredentialStore};
     let dir = tempfile::tempdir().unwrap();
     let policy = rness_engine::images::ImagePolicy::default();
-    let store = std::sync::Arc::new(rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap());
+    let store = std::sync::Arc::new(
+        rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap(),
+    );
     let pixels = image::RgbImage::from_fn(128, 64, |x, _| {
-        if x < 64 { image::Rgb([255, 0, 0]) } else { image::Rgb([0, 0, 255]) }
+        if x < 64 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
     });
     let mut bytes = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgb8(pixels).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    image::DynamicImage::ImageRgb8(pixels)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
     let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
     let mut context = ModelContext {
         turns: vec![ModelTurn::User { content: vec![
@@ -96,25 +204,45 @@ async fn live_sonnet_5_image_inference() {
     let credentials = CredentialSource::new(CredentialStore::new(CredentialStore::default_path()))
         .oauth_only("anthropic".into());
     let provider = AnthropicProvider::with_credentials(credentials, "claude-sonnet-5")
-        .with_max_tokens(128).with_images(store, policy);
+        .with_max_tokens(128)
+        .with_images(store, policy);
     for attempt in 0..2 {
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(120),
-            step(&provider, &context, "", &[])).await.expect("live request timed out");
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            step(&provider, &context, "", &[]),
+        )
+        .await
+        .expect("live request timed out");
         match outcome {
             StepOutcome::Committed(message) => {
-                let text = message.content.iter().filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                }).collect::<Vec<_>>().join(" ");
+                let text = message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 println!("live claude-sonnet-5 request {}: {}", attempt + 1, text);
                 let lower = text.to_lowercase();
-                assert!(lower.find("red").zip(lower.find("blue")).is_some_and(|(red, blue)| red < blue), "incorrect image interpretation");
-                context.turns.push(ModelTurn::Assistant { content: message.content });
+                assert!(
+                    lower
+                        .find("red")
+                        .zip(lower.find("blue"))
+                        .is_some_and(|(red, blue)| red < blue),
+                    "incorrect image interpretation"
+                );
+                context.turns.push(ModelTurn::Assistant {
+                    content: message.content,
+                });
                 context.turns.push(ModelTurn::User { content: vec![ContentPart::Text {
                     text: "Using the earlier image, repeat its colors from left to right. Only the names.".into()
                 }] });
             }
-            StepOutcome::Failed { error, .. } => panic!("live request failed: {} {}", error.code, error.message),
+            StepOutcome::Failed { error, .. } => {
+                panic!("live request failed: {} {}", error.code, error.message)
+            }
             StepOutcome::Cancelled { .. } => panic!("live request cancelled"),
         }
     }
@@ -124,14 +252,21 @@ async fn live_sonnet_5_image_inference() {
 async fn wire_capture_matches_bytes_and_failed_audit_blocks_send() {
     for mode in ["accept", "reject", "drop_ack", "drop_receiver"] {
         let server = MockServer::start().await;
-        Mock::given(method("POST")).and(path("/v1/messages"))
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
             .respond_with(sse_response(&stream_happy("done")))
-            .expect(if mode == "accept" { 1 } else { 0 }).mount(&server).await;
+            .expect(if mode == "accept" { 1 } else { 0 })
+            .mount(&server)
+            .await;
         let provider = AnthropicProvider::new("secret-api-key", "test").with_base_url(server.uri());
         let context = user_context("source \"quoted\"\n日本語");
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<rness_engine::turn::provider::WireCapture>(1);
         let capture = async {
-            if mode == "drop_receiver" { drop(receiver); return None; }
+            if mode == "drop_receiver" {
+                drop(receiver);
+                return None;
+            }
             let record = receiver.recv().await.unwrap();
             assert!(server.received_requests().await.unwrap().is_empty());
             assert!(!record.body.contains("secret-api-key"));
@@ -143,11 +278,20 @@ async fn wire_capture_matches_bytes_and_failed_audit_blocks_send() {
             Some(record.body)
         };
         let (outcome, body) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(rness_engine::turn::provider::WIRE_CAPTURE.scope(sender, step(&provider, &context, "system", &[])), capture)
-        }).await.expect("capture must not hang");
+            tokio::join!(
+                rness_engine::turn::provider::WIRE_CAPTURE
+                    .scope(sender, step(&provider, &context, "system", &[])),
+                capture
+            )
+        })
+        .await
+        .expect("capture must not hang");
         if mode == "accept" {
             assert!(matches!(outcome, StepOutcome::Committed(_)));
-            assert_eq!(server.received_requests().await.unwrap()[0].body, body.unwrap().as_bytes());
+            assert_eq!(
+                server.received_requests().await.unwrap()[0].body,
+                body.unwrap().as_bytes()
+            );
         } else {
             assert!(matches!(outcome, StepOutcome::Failed { error, .. } if error.code == "AUDIT"));
         }
@@ -166,11 +310,23 @@ fn user_context(text: &str) -> ModelContext {
 
 fn stream_happy(text: &str) -> Vec<(&'static str, serde_json::Value)> {
     vec![
-        ("message_start", json!({"message": {"usage": {"input_tokens": 10}}})),
-        ("content_block_start", json!({"content_block": {"type": "text"}})),
-        ("content_block_delta", json!({"delta": {"type": "text_delta", "text": text}})),
+        (
+            "message_start",
+            json!({"message": {"usage": {"input_tokens": 10}}}),
+        ),
+        (
+            "content_block_start",
+            json!({"content_block": {"type": "text"}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"delta": {"type": "text_delta", "text": text}}),
+        ),
         ("content_block_stop", json!({})),
-        ("message_delta", json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}})),
+        (
+            "message_delta",
+            json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}),
+        ),
         ("message_stop", json!({})),
     ]
 }
@@ -183,10 +339,169 @@ async fn step(
 ) -> StepOutcome {
     provider
         .step(
-            StepRequest { context, system, tools, on_delta: None },
+            StepRequest {
+                context,
+                system,
+                tools,
+                on_delta: None,
+            },
             &CancellationToken::new(),
         )
         .await
+}
+
+#[tokio::test]
+async fn max_tokens_with_incomplete_tool_args_drops_the_tool_call() {
+    let server = MockServer::start().await;
+    let stream = [
+        ("message_start", json!({"message":{"usage":{}}})),
+        (
+            "content_block_start",
+            json!({"content_block":{"type":"tool_use","id":"cut","name":"Write"}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}),
+        ),
+        (
+            "message_delta",
+            json!({"delta":{"stop_reason":"max_tokens"},"usage":{}}),
+        ),
+        ("message_stop", json!({})),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&stream))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("key", "test").with_base_url(server.uri());
+    let StepOutcome::Committed(message) = step(&provider, &user_context("write it"), "", &[]).await
+    else {
+        panic!("expected committed truncated message");
+    };
+    assert_eq!(message.stop, StopReason::MaxTokens);
+    assert!(
+        message.content.is_empty(),
+        "incomplete JSON must not become a no-argument tool call: {:?}",
+        message.content
+    );
+    assert!(message.chunks.iter().any(|chunk| matches!(&chunk.delta,
+        ChunkDelta::ToolArgs { call, t } if call == "cut" && t == "{\"path\":")));
+}
+
+#[tokio::test]
+async fn empty_anthropic_thinking_block_is_not_persisted() {
+    let server = MockServer::start().await;
+    let stream = [
+        ("message_start", json!({"message":{"usage":{}}})),
+        (
+            "content_block_start",
+            json!({"content_block":{"type":"thinking"}}),
+        ),
+        ("content_block_stop", json!({})),
+        (
+            "message_delta",
+            json!({"delta":{"stop_reason":"end_turn"},"usage":{}}),
+        ),
+        ("message_stop", json!({})),
+    ];
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&stream))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("key", "test").with_base_url(server.uri());
+    let StepOutcome::Committed(message) = step(&provider, &user_context("think"), "", &[]).await
+    else {
+        panic!("expected committed message");
+    };
+    assert!(message.content.is_empty());
+}
+
+#[tokio::test]
+async fn anthropic_omits_empty_text_blocks_without_shifting_images() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&[
+            ("message_start", json!({"message":{"usage":{}}})),
+            (
+                "content_block_start",
+                json!({"content_block":{"type":"text"}}),
+            ),
+            ("content_block_stop", json!({})),
+            (
+                "message_delta",
+                json!({"delta":{"stop_reason":"end_turn"},"usage":{}}),
+            ),
+            ("message_stop", json!({})),
+        ]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy::default();
+    let store = std::sync::Arc::new(
+        rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap(),
+    );
+    let mut image_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut image_bytes, image::ImageFormat::Png)
+        .unwrap();
+    let attachment = store.admit(image_bytes.get_ref(), "image/png").unwrap();
+    let context = ModelContext {
+        turns: vec![
+            ModelTurn::User {
+                content: vec![
+                    ContentPart::Text {
+                        text: String::new(),
+                    },
+                    ContentPart::Image { attachment },
+                    ContentPart::Text {
+                        text: "hello".into(),
+                    },
+                ],
+            },
+            ModelTurn::Assistant {
+                content: vec![ContentPart::Thinking {
+                    text: "foreign trace".into(),
+                    signature: None,
+                }],
+            },
+        ],
+        ..Default::default()
+    };
+    let provider = AnthropicProvider::new("key", "test")
+        .with_base_url(server.uri())
+        .with_images(store, policy);
+    let StepOutcome::Committed(message) = step(&provider, &context, "", &[]).await else {
+        panic!("expected commit");
+    };
+    assert!(message.content.is_empty());
+    let body: Value = server
+        .received_requests()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap()
+        .body_json()
+        .unwrap();
+    assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(body["messages"][0]["content"][0]["type"], "image");
+    assert!(
+        body["messages"][0]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "thinking")
+    );
+    assert_eq!(
+        body["messages"][0]["content"][1],
+        json!({"type":"text","text":"hello"})
+    );
+    assert!(!body.to_string().contains("\"text\":\"\""));
 }
 
 #[tokio::test]
@@ -194,9 +509,16 @@ async fn clean_eof_without_terminal_event_is_failure_not_commit() {
     let server = MockServer::start().await;
     let mut events = stream_happy("partial");
     events.pop();
-    Mock::given(method("POST")).respond_with(sse_response(&events)).mount(&server).await;
+    Mock::given(method("POST"))
+        .respond_with(sse_response(&events))
+        .mount(&server)
+        .await;
     let provider = AnthropicProvider::new("fake", "test").with_base_url(server.uri());
-    let StepOutcome::Failed { error, partial } = step(&provider, &user_context("hi"), "", &[]).await else { panic!("truncated stream committed") };
+    let StepOutcome::Failed { error, partial } =
+        step(&provider, &user_context("hi"), "", &[]).await
+    else {
+        panic!("truncated stream committed")
+    };
     assert!(error.message.contains("message_stop"));
     assert!(error.retryable);
     assert!(!partial.is_empty());
@@ -220,15 +542,19 @@ async fn happy_path_text_stream_commits_with_chunks_and_usage() {
         .mount(&server)
         .await;
 
-    let provider =
-        AnthropicProvider::new("test-key", "claude-test-1").with_base_url(server.uri());
+    let provider = AnthropicProvider::new("test-key", "claude-test-1").with_base_url(server.uri());
     let outcome = step(&provider, &user_context("hi"), "be brief", &[]).await;
 
     let StepOutcome::Committed(msg) = outcome else {
         panic!("expected commit");
     };
     assert_eq!(msg.model, "claude-test-1");
-    assert_eq!(msg.content, vec![ContentPart::Text { text: "hello there".into() }]);
+    assert_eq!(
+        msg.content,
+        vec![ContentPart::Text {
+            text: "hello there".into()
+        }]
+    );
     assert_eq!(msg.stop, StopReason::EndTurn);
     assert_eq!(msg.usage.input_tokens, 10);
     assert_eq!(msg.usage.output_tokens, 7);
@@ -246,9 +572,18 @@ async fn tool_use_stream_assembles_args_and_advertises_tools() {
             "tools": [{"name": "Read", "description": "read a file"}],
         })))
         .respond_with(sse_response(&[
-            ("message_start", json!({"message": {"usage": {"input_tokens": 1}}})),
-            ("content_block_start", json!({"content_block": {"type": "text"}})),
-            ("content_block_delta", json!({"delta": {"type": "text_delta", "text": "reading"}})),
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"content_block": {"type": "text"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta": {"type": "text_delta", "text": "reading"}}),
+            ),
             ("content_block_stop", json!({})),
             (
                 "content_block_start",
@@ -263,7 +598,10 @@ async fn tool_use_stream_assembles_args_and_advertises_tools() {
                 json!({"delta": {"type": "input_json_delta", "partial_json": "\"a.txt\"}"}}),
             ),
             ("content_block_stop", json!({})),
-            ("message_delta", json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}})),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 3}}),
+            ),
             ("message_stop", json!({})),
         ]))
         .expect(1)
@@ -309,13 +647,19 @@ async fn no_arg_tool_call_commits_empty_object_args() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(sse_response(&[
-            ("message_start", json!({"message": {"usage": {"input_tokens": 1}}})),
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 1}}}),
+            ),
             (
                 "content_block_start",
                 json!({"content_block": {"type": "tool_use", "id": "call_1", "name": "job_list"}}),
             ),
             ("content_block_stop", json!({})),
-            ("message_delta", json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}})),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}}),
+            ),
             ("message_stop", json!({})),
         ]))
         .expect(1)
@@ -330,7 +674,11 @@ async fn no_arg_tool_call_commits_empty_object_args() {
     };
     assert_eq!(
         msg.content[0],
-        ContentPart::ToolUse { call: "call_1".into(), name: "job_list".into(), args: json!({}) }
+        ContentPart::ToolUse {
+            call: "call_1".into(),
+            name: "job_list".into(),
+            args: json!({})
+        }
     );
 }
 
@@ -358,16 +706,27 @@ async fn tool_results_map_to_tool_result_messages() {
 
     let context = ModelContext {
         turns: vec![
-            ModelTurn::User { content: vec![ContentPart::Text { text: "go".into() }] },
+            ModelTurn::User {
+                content: vec![ContentPart::Text { text: "go".into() }],
+            },
             ModelTurn::Assistant {
                 content: vec![
-                    ContentPart::Text { text: "using tool".into() },
-                    ContentPart::ToolUse { call: "c1".into(), name: "Echo".into(), args: json!({}) },
+                    ContentPart::Text {
+                        text: "using tool".into(),
+                    },
+                    ContentPart::ToolUse {
+                        call: "c1".into(),
+                        name: "Echo".into(),
+                        args: json!({}),
+                    },
                 ],
             },
             ModelTurn::ToolResults {
                 results: vec![ToolResult {
-                    content: vec![], tasks: None, plan_review: None, presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
+                    content: vec![],
+                    tasks: None,
+                    plan_review: None,
+                    presentation: Some(json!({"private_snapshot":"UI_ONLY_SENTINEL"})),
                     call: "c1".into(),
                     name: "Echo".into(),
                     output: "out".into(),
@@ -438,10 +797,22 @@ async fn stream_error_event_preserves_partial_chunks() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(sse_response(&[
-            ("message_start", json!({"message": {"usage": {"input_tokens": 1}}})),
-            ("content_block_start", json!({"content_block": {"type": "text"}})),
-            ("content_block_delta", json!({"delta": {"type": "text_delta", "text": "partial "}})),
-            ("error", json!({"error": {"type": "overloaded_error", "message": "overloaded"}})),
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"content_block": {"type": "text"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta": {"type": "text_delta", "text": "partial "}}),
+            ),
+            (
+                "error",
+                json!({"error": {"type": "overloaded_error", "message": "overloaded"}}),
+            ),
         ]))
         .mount(&server)
         .await;
@@ -471,7 +842,15 @@ async fn pre_cancelled_token_cancels_before_sending() {
     cancel.cancel();
     let ctx = user_context("hi");
     let outcome = provider
-        .step(StepRequest { context: &ctx, system: "", tools: &[], on_delta: None }, &cancel)
+        .step(
+            StepRequest {
+                context: &ctx,
+                system: "",
+                tools: &[],
+                on_delta: None,
+            },
+            &cancel,
+        )
         .await;
     assert!(matches!(outcome, StepOutcome::Cancelled { .. }));
 }
@@ -482,14 +861,35 @@ async fn thinking_blocks_accumulate_and_replay_in_requests() {
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(sse_response(&[
-            ("message_start", json!({"message": {"usage": {"input_tokens": 1}}})),
-            ("content_block_start", json!({"content_block": {"type": "thinking"}})),
-            ("content_block_delta", json!({"delta": {"type": "thinking_delta", "thinking": "hmm"}})),
-            ("content_block_delta", json!({"delta": {"type": "signature_delta", "signature": "sig_abc123"}})),
+            (
+                "message_start",
+                json!({"message": {"usage": {"input_tokens": 1}}}),
+            ),
+            (
+                "content_block_start",
+                json!({"content_block": {"type": "thinking"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta": {"type": "thinking_delta", "thinking": "hmm"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta": {"type": "signature_delta", "signature": "sig_abc123"}}),
+            ),
             ("content_block_stop", json!({})),
-            ("content_block_start", json!({"content_block": {"type": "text"}})),
-            ("content_block_delta", json!({"delta": {"type": "text_delta", "text": "answer"}})),
-            ("message_delta", json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}})),
+            (
+                "content_block_start",
+                json!({"content_block": {"type": "text"}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"delta": {"type": "text_delta", "text": "answer"}}),
+            ),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 2}}),
+            ),
             ("message_stop", json!({})),
         ]))
         .mount(&server)
@@ -505,8 +905,13 @@ async fn thinking_blocks_accumulate_and_replay_in_requests() {
         vec![
             // Signature captured: replaying thinking without it is
             // rejected by the API ("thinking.signature: Field required").
-            ContentPart::Thinking { text: "hmm".into(), signature: Some("sig_abc123".into()) },
-            ContentPart::Text { text: "answer".into() },
+            ContentPart::Thinking {
+                text: "hmm".into(),
+                signature: Some("sig_abc123".into())
+            },
+            ContentPart::Text {
+                text: "answer".into()
+            },
         ]
     );
 }
@@ -525,7 +930,11 @@ async fn reasoning_budget_uses_explicit_max_tokens() {
         .await;
 
     let mut context = user_context("hi");
-    context.config = CallConfig { reasoning: Some(rness_protocol::events::Reasoning::BudgetTokens { tokens: 8192 }), max_output_tokens: Some(16384), ..Default::default() };
+    context.config = CallConfig {
+        reasoning: Some(rness_protocol::events::Reasoning::BudgetTokens { tokens: 8192 }),
+        max_output_tokens: Some(16384),
+        ..Default::default()
+    };
     let provider = AnthropicProvider::new("k", "m").with_base_url(server.uri());
     let outcome = step(&provider, &context, "", &[]).await;
     assert!(matches!(outcome, StepOutcome::Committed(_)));
@@ -546,7 +955,12 @@ async fn named_reasoning_sent_as_adaptive_thinking_with_effort() {
         .await;
 
     let mut context = user_context("hi");
-    context.config = CallConfig { reasoning: Some(rness_protocol::events::Reasoning::Effort { effort: "high".into() }), ..Default::default() };
+    context.config = CallConfig {
+        reasoning: Some(rness_protocol::events::Reasoning::Effort {
+            effort: "high".into(),
+        }),
+        ..Default::default()
+    };
     let provider = AnthropicProvider::new("k", "m").with_base_url(server.uri());
     let outcome = step(&provider, &context, "", &[]).await;
     assert!(matches!(outcome, StepOutcome::Committed(_)));

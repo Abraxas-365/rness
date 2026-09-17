@@ -9,7 +9,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{callback_query, pkce, query_param, respond_html, AuthError, LoginPrompt, TokensError};
+use super::{AuthError, LoginPrompt, TokensError, callback_query, pkce, query_param, respond_html};
 use crate::auth::{CredentialStore, Tokens};
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -45,7 +45,11 @@ pub struct TokenResponse {
 impl TokenResponse {
     /// Convert to persisted form, extracting account id + email from JWTs.
     pub fn into_tokens(self) -> Tokens {
-        let expires_in = if self.expires_in > 0 { self.expires_in } else { 3600 };
+        let expires_in = if self.expires_in > 0 {
+            self.expires_in
+        } else {
+            3600
+        };
         let mut tokens = Tokens {
             access_token: self.access_token,
             refresh_token: self.refresh_token,
@@ -54,13 +58,13 @@ impl TokenResponse {
             ),
             ..Default::default()
         };
-        if let Some(id) = extract_account_id(&self.id_token)
-            .or_else(|| extract_account_id(&tokens.access_token))
+        if let Some(id) =
+            extract_account_id(&self.id_token).or_else(|| extract_account_id(&tokens.access_token))
         {
             tokens.extra.insert("accountId".into(), Value::String(id));
         }
-        if let Some(email) = jwt_claims(&self.id_token)
-            .and_then(|c| c["email"].as_str().map(String::from))
+        if let Some(email) =
+            jwt_claims(&self.id_token).and_then(|c| c["email"].as_str().map(String::from))
         {
             tokens.extra.insert("email".into(), Value::String(email));
         }
@@ -77,13 +81,18 @@ pub fn account_id(tokens: &Tokens) -> Option<&str> {
 fn jwt_claims(token: &str) -> Option<Value> {
     use base64::Engine as _;
     let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 fn extract_account_id(token: &str) -> Option<String> {
     let claims = jwt_claims(token)?;
-    if let Some(id) = claims["chatgpt_account_id"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(id) = claims["chatgpt_account_id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+    {
         return Some(id.to_string());
     }
     if let Some(id) = claims[JWT_CLAIM_PATH]["chatgpt_account_id"]
@@ -145,7 +154,9 @@ impl CodexOAuthClient {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(AuthError::OAuth(format!("token endpoint http {status}: {text}")));
+            return Err(AuthError::OAuth(format!(
+                "token endpoint http {status}: {text}"
+            )));
         }
         serde_json::from_str(&text)
             .map_err(|e| AuthError::OAuth(format!("bad token response: {e}")))
@@ -250,7 +261,10 @@ pub async fn login_with(
         return Err(AuthError::OAuth("state mismatch (possible CSRF)".into()));
     }
 
-    let tokens = client.exchange_code(&code, &verifier, &redirect_uri).await?.into_tokens();
+    let tokens = client
+        .exchange_code(&code, &verifier, &redirect_uri)
+        .await?
+        .into_tokens();
     store.save_tokens(STORE_KEY, &tokens)?;
     Ok(tokens)
 }
@@ -300,8 +314,7 @@ impl CodexCredentialSource {
             .tokens(&self.credential)?
             .filter(|t| !t.access_token.is_empty())
             .ok_or(AuthError::NoCredentials)?;
-        let tokens = if tokens.is_expired(REFRESH_BUFFER_SECS) && !tokens.refresh_token.is_empty()
-        {
+        let tokens = if tokens.is_expired(REFRESH_BUFFER_SECS) && !tokens.refresh_token.is_empty() {
             self.refresh(tokens).await?
         } else {
             tokens
@@ -323,8 +336,7 @@ impl CodexCredentialSource {
         let _guard = self.refresh_lock.lock().await;
         // Double-check: another task may have refreshed while we waited.
         if let Some(current) = self.store.tokens(&self.credential)? {
-            if current.access_token != old.access_token
-                && !current.is_expired(REFRESH_BUFFER_SECS)
+            if current.access_token != old.access_token && !current.is_expired(REFRESH_BUFFER_SECS)
             {
                 return Ok(current);
             }
@@ -357,7 +369,12 @@ mod tests {
     fn fake_jwt(payload: serde_json::Value) -> String {
         use base64::Engine as _;
         let enc = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
-        format!("{}.{}.{}", enc(b"{}"), enc(payload.to_string().as_bytes()), enc(b"sig"))
+        format!(
+            "{}.{}.{}",
+            enc(b"{}"),
+            enc(payload.to_string().as_bytes()),
+            enc(b"sig")
+        )
     }
 
     #[test]

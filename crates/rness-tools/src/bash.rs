@@ -225,9 +225,25 @@ impl Tool for BashTool {
         ),
         String,
     > {
-        let (output, mut presentation) = self
-            .run_presented(args, Some(_session), Some(_call))
-            .await?;
+        // Foreground commands must die with the turn: racing the cancel
+        // token and DROPPING the run future kills the shell's process
+        // group (ShellGroup::drop) and settles the capture as
+        // Interrupted (CaptureGuard). Background jobs are owned by the
+        // job registry, not the turn, so they are not raced here.
+        let background = args["run_in_background"].as_bool().unwrap_or(false);
+        let run = self.run_presented(args, Some(_session), Some(_call));
+        let (output, mut presentation) = if background {
+            run.await?
+        } else {
+            tokio::pin!(run);
+            tokio::select! {
+                biased;
+                _ = _cancel.cancelled() => {
+                    return Err("command cancelled; its process group was killed".into());
+                }
+                result = &mut run => result?,
+            }
+        };
         presentation["sandbox"] = json!(match self.sandbox {
             rness_protocol::sandbox::SandboxMode::ReadOnly => "read-only",
             rness_protocol::sandbox::SandboxMode::WorkspaceWrite => "workspace-write",
@@ -471,6 +487,39 @@ mod tests {
         let error = rebound.execute(args("touch should-not-run", &workspace)).await.unwrap_err();
         assert!(error.contains("no longer a canonical directory"), "{error}");
         assert!(!outside.join("should-not-run").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_interrupts_foreground_command_and_kills_its_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        let tool = BashTool::new(Workspace::new(dir.path()), JobRegistry::new());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let command = format!("sleep 30 && touch {}", marker.display());
+        let session = "session".to_string();
+        let call = "call".to_string();
+        let run = tool.execute_presented(
+            &session,
+            &call,
+            args(&command, dir.path()),
+            &cancel,
+        );
+        tokio::pin!(run);
+        // Let the shell start, then cancel mid-flight.
+        tokio::select! {
+            _ = &mut run => panic!("command finished before cancellation"),
+            _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        }
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("cancellation must settle the call promptly");
+        let error = result.unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        // The killed process group cannot resurrect and touch the marker.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]

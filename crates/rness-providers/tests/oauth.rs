@@ -15,10 +15,22 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn sse_ok() -> ResponseTemplate {
     let body = [
-        ("message_start", json!({"message": {"usage": {"input_tokens": 1}}})),
-        ("content_block_start", json!({"content_block": {"type": "text"}})),
-        ("content_block_delta", json!({"delta": {"type": "text_delta", "text": "ok"}})),
-        ("message_delta", json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}})),
+        (
+            "message_start",
+            json!({"message": {"usage": {"input_tokens": 1}}}),
+        ),
+        (
+            "content_block_start",
+            json!({"content_block": {"type": "text"}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"delta": {"type": "text_delta", "text": "ok"}}),
+        ),
+        (
+            "message_delta",
+            json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}}),
+        ),
         ("message_stop", json!({})),
     ]
     .iter()
@@ -31,7 +43,9 @@ fn sse_ok() -> ResponseTemplate {
 
 fn context() -> ModelContext {
     ModelContext {
-        turns: vec![ModelTurn::User { content: vec![ContentPart::Text { text: "hi".into() }] }],
+        turns: vec![ModelTurn::User {
+            content: vec![ContentPart::Text { text: "hi".into() }],
+        }],
         ..Default::default()
     }
 }
@@ -39,17 +53,20 @@ fn context() -> ModelContext {
 fn store_with_oauth(dir: &std::path::Path, access: &str, expires_in_secs: i64) -> CredentialStore {
     let store = CredentialStore::new(dir.join("credentials.json"));
     store
-        .save_tokens("anthropic", &Tokens {
-            access_token: access.into(),
-            refresh_token: "rt-1".into(),
-            expires_at: Some(
-                (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(expires_in_secs))
-                    .to_string(),
-            ),
-            scopes: vec!["user:inference".into()],
-            subscription_type: "max".into(),
-            ..Default::default()
-        })
+        .save_tokens(
+            "anthropic",
+            &Tokens {
+                access_token: access.into(),
+                refresh_token: "rt-1".into(),
+                expires_at: Some(
+                    (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(expires_in_secs))
+                        .to_string(),
+                ),
+                scopes: vec!["user:inference".into()],
+                subscription_type: "max".into(),
+                ..Default::default()
+            },
+        )
         .unwrap();
     store
 }
@@ -58,7 +75,12 @@ async fn run_step(provider: &AnthropicProvider) -> StepOutcome {
     let ctx = context();
     provider
         .step(
-            StepRequest { context: &ctx, system: "sys", tools: &[], on_delta: None },
+            StepRequest {
+                context: &ctx,
+                system: "sys",
+                tools: &[],
+                on_delta: None,
+            },
             &CancellationToken::new(),
         )
         .await
@@ -91,7 +113,10 @@ async fn oauth_credential_sends_bearer_spoof_headers_and_billing_block() {
     let store = store_with_oauth(dir.path(), "at-valid", 3600);
     let provider = AnthropicProvider::with_credentials(CredentialSource::new(store), "m")
         .with_base_url(server.uri());
-    assert!(matches!(run_step(&provider).await, StepOutcome::Committed(_)));
+    assert!(matches!(
+        run_step(&provider).await,
+        StepOutcome::Committed(_)
+    ));
 }
 
 #[tokio::test]
@@ -113,7 +138,10 @@ async fn api_key_credential_still_uses_x_api_key_without_spoof() {
     store.save_api_key("anthropic", "sk-stored").unwrap();
     let provider = AnthropicProvider::with_credentials(CredentialSource::new(store), "m")
         .with_base_url(server.uri());
-    assert!(matches!(run_step(&provider).await, StepOutcome::Committed(_)));
+    assert!(matches!(
+        run_step(&provider).await,
+        StepOutcome::Committed(_)
+    ));
 }
 
 #[tokio::test]
@@ -152,6 +180,47 @@ async fn expired_token_refreshes_before_request_and_persists() {
     assert_eq!(saved.access_token, "at-fresh");
     assert_eq!(saved.refresh_token, "rt-2");
     assert_eq!(saved.subscription_type, "max");
+}
+
+#[tokio::test]
+async fn refresh_without_a_rotated_token_keeps_the_existing_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .and(body_partial_json(json!({
+            "grant_type": "refresh_token",
+            "refresh_token": "rt-1",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "access_token": "at-fresh",
+            "expires_in": 3600,
+            "scope": "user:inference",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_with_oauth(dir.path(), "at-stale", -60);
+    let config = OAuthConfig {
+        token_url: format!("{}/token", server.uri()),
+        ..Default::default()
+    };
+    let source = CredentialSource::new(store).with_oauth_client(OAuthClient::new(config));
+
+    assert_eq!(
+        source.resolve().await.unwrap(),
+        Credential::OAuth("at-fresh".into())
+    );
+    assert_eq!(
+        source
+            .store()
+            .tokens("anthropic")
+            .unwrap()
+            .unwrap()
+            .refresh_token,
+        "rt-1"
+    );
 }
 
 #[tokio::test]
@@ -197,11 +266,20 @@ async fn http_401_refreshes_once_and_retries() {
         ..Default::default()
     };
     let source = CredentialSource::new(store).with_oauth_client(OAuthClient::new(config));
-    let provider =
-        AnthropicProvider::with_credentials(source, "m").with_base_url(server.uri())
-            .with_headers(rness_providers::headers::ProviderHeaders::new(&[("X-Tenant".into(), "secret".into())].into()).unwrap()).unwrap();
+    let provider = AnthropicProvider::with_credentials(source, "m")
+        .with_base_url(server.uri())
+        .with_headers(
+            rness_providers::headers::ProviderHeaders::new(
+                &[("X-Tenant".into(), "secret".into())].into(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
-    assert!(matches!(run_step(&provider).await, StepOutcome::Committed(_)));
+    assert!(matches!(
+        run_step(&provider).await,
+        StepOutcome::Committed(_)
+    ));
     for request in server.received_requests().await.unwrap() {
         if request.url.path() == "/token" {
             assert!(!request.headers.contains_key("x-tenant"));
@@ -220,7 +298,10 @@ async fn env_var_wins_over_stored_oauth() {
     let store = store_with_oauth(dir.path(), "at-oauth", 3600);
     store.save_api_key("anthropic", "sk-key").unwrap();
     let source = CredentialSource::new(store);
-    assert_eq!(source.resolve().await.unwrap(), Credential::ApiKey("sk-key".into()));
+    assert_eq!(
+        source.resolve().await.unwrap(),
+        Credential::ApiKey("sk-key".into())
+    );
 }
 
 #[tokio::test]

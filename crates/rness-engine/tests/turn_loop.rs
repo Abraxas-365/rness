@@ -457,6 +457,50 @@ fn no_steers() -> impl FnMut() -> Vec<Pending> + Send {
     Vec::new
 }
 
+#[tokio::test]
+async fn max_tokens_stop_with_tool_use_dispatches_and_continues() {
+    // A provider can truncate mid tool-call (hitting the output limit
+    // while still streaming a `tool_use` block). Anthropic requires every
+    // `tool_use` to have a matching `tool_result` in the very next
+    // message, so this must run the tool — not be treated as a terminal
+    // stop, which would leave a dangling `tool_use` that corrupts replay.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let provider = Scripted::new(vec![
+        StepOutcome::Committed(assistant("truncated", StopReason::MaxTokens, vec![("cut-off", "Echo")])),
+        StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
+    ]);
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(Echo));
+    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
+        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+    let history = store.history(log.session()).unwrap();
+    assert!(history.iter().any(|event| matches!(&event.event,
+        SessionEvent::ToolResult(result) if result.call == "cut-off")));
+    let context = replay(&store, log.session()).unwrap().context;
+    let rendered = serde_json::to_value(&context.turns).unwrap();
+    // The tool_use turn must be immediately followed by its tool_result
+    // turn — no terminal-stop short-circuit in between.
+    assert!(rendered.as_array().unwrap().windows(2).any(|pair| {
+        pair[0]["Assistant"]["content"].as_array().is_some_and(|c| c.iter().any(|p| p["call"] == "cut-off" && p["kind"] == "tool_use"))
+            && pair[1]["ToolResults"]["results"].as_array().is_some_and(|r| r.iter().any(|res| res["call"] == "cut-off"))
+    }));
+}
+
+#[tokio::test]
+async fn max_tokens_stop_without_tool_use_completes_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("truncated text", StopReason::MaxTokens, vec![]))]);
+    let tools = ToolRegistry::default();
+    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
+        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    assert_eq!(outcome, TurnOutcome::Completed);
+}
+
 // -- tests -----------------------------------------------------------------
 
 struct RestrictedRequest(AtomicUsize);

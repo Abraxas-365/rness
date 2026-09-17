@@ -292,8 +292,16 @@ async fn drive(
         })?;
 
         match stop {
-            StopReason::EndTurn | StopReason::MaxTokens => return Ok(TurnOutcome::Completed),
-            StopReason::ToolUse => {
+            StopReason::EndTurn => return Ok(TurnOutcome::Completed),
+            // A max-tokens stop with no tool_use content is a normal
+            // truncated-but-complete turn. When content does include a
+            // (possibly truncated) tool_use, Anthropic requires every
+            // tool_use to be followed immediately by a tool_result — so
+            // this must be treated like ToolUse, not a terminal stop, or
+            // the dangling call corrupts the next request (naked
+            // "tool_use ids were found without tool_result" rejection).
+            StopReason::MaxTokens if calls.is_empty() => return Ok(TurnOutcome::Completed),
+            StopReason::MaxTokens | StopReason::ToolUse => {
                 for call in &calls {
                     frames(Frame::ToolStarted {
                         session: session.clone(),

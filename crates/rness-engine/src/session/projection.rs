@@ -190,7 +190,71 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
         }
     }
     flush_tools(&mut ctx, &mut pending_tools);
+    ctx.turns = repair_tool_pairs(ctx.turns);
     ctx
+}
+
+/// Tool protocols require each assistant `tool_use` to be followed by its
+/// matching `tool_result` turn. A crash or an output-limit truncation from an
+/// older runtime could durably commit a call without its result; replaying it
+/// makes providers reject every later request. Repair that derived context
+/// without mutating the append-only session log: retain ordinary assistant
+/// content, only paired calls/results, and discard orphan result turns.
+fn repair_tool_pairs(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
+    let mut repaired = Vec::with_capacity(turns.len());
+    let mut index = 0;
+    while index < turns.len() {
+        let ModelTurn::Assistant { content } = &turns[index] else {
+            if !matches!(turns[index], ModelTurn::ToolResults { .. }) {
+                repaired.push(turns[index].clone());
+            }
+            index += 1;
+            continue;
+        };
+        let calls: HashSet<_> = content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolUse { call, .. } => Some(call.as_str()),
+                _ => None,
+            })
+            .collect();
+        if calls.is_empty() {
+            repaired.push(turns[index].clone());
+            index += 1;
+            continue;
+        }
+        let Some(ModelTurn::ToolResults { results }) = turns.get(index + 1) else {
+            let content = content
+                .iter()
+                .filter(|part| !matches!(part, ContentPart::ToolUse { .. }))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !content.is_empty() {
+                repaired.push(ModelTurn::Assistant { content });
+            }
+            index += 1;
+            continue;
+        };
+        let returned: HashSet<_> = results.iter().map(|result| result.call.as_str()).collect();
+        let content = content
+            .iter()
+            .filter(|part| !matches!(part, ContentPart::ToolUse { call, .. } if !returned.contains(call.as_str())))
+            .cloned()
+            .collect::<Vec<_>>();
+        let results = results
+            .iter()
+            .filter(|result| calls.contains(result.call.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !content.is_empty() {
+            repaired.push(ModelTurn::Assistant { content });
+        }
+        if !results.is_empty() {
+            repaired.push(ModelTurn::ToolResults { results });
+        }
+        index += 2;
+    }
+    repaired
 }
 
 /// Derive the frontend transcript (attempts and all). Shadowed events

@@ -40,15 +40,23 @@ pub struct Tokens {
 impl Tokens {
     /// Expired (or expiring within `buffer_secs`)?
     pub fn is_expired(&self, buffer_secs: i64) -> bool {
-        let Some(at) = &self.expires_at else { return false };
-        let Ok(ts) = at.parse::<jiff::Timestamp>() else { return false };
+        let Some(at) = &self.expires_at else {
+            return false;
+        };
+        let Ok(ts) = at.parse::<jiff::Timestamp>() else {
+            return false;
+        };
         jiff::Timestamp::now() + jiff::SignedDuration::from_secs(buffer_secs) > ts
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ProviderCreds {
-    #[serde(rename = "oauthTokens", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "oauthTokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     oauth_tokens: Option<Tokens>,
     #[serde(rename = "apiKey", default, skip_serializing_if = "String::is_empty")]
     api_key: String,
@@ -99,7 +107,9 @@ impl CredentialStore {
         let home = std::env::var("RNESS_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".rness")
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".rness")
             });
         home.join("credentials.json")
     }
@@ -111,9 +121,7 @@ impl CredentialStore {
     fn read(&self) -> Result<FileData, TokensError> {
         let raw = match std::fs::read(&self.path) {
             Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(FileData::default())
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileData::default()),
             Err(e) => return Err(TokensError::Io(e)),
         };
         let mut data: FileData = serde_json::from_slice(&raw)?;
@@ -147,13 +155,19 @@ impl CredentialStore {
     // -- provider-keyed records (any provider) -----------------------------
 
     pub fn tokens(&self, provider: &str) -> Result<Option<Tokens>, TokensError> {
-        Ok(self.read()?.providers.get(provider).and_then(|p| p.oauth_tokens.clone()))
+        Ok(self
+            .read()?
+            .providers
+            .get(provider)
+            .and_then(|p| p.oauth_tokens.clone()))
     }
 
     pub fn save_tokens(&self, provider: &str, tokens: &Tokens) -> Result<(), TokensError> {
         let mut data = self.read()?;
-        data.providers.entry(provider.into()).or_default().oauth_tokens =
-            Some(tokens.clone());
+        data.providers
+            .entry(provider.into())
+            .or_default()
+            .oauth_tokens = Some(tokens.clone());
         self.write(&data)
     }
 
@@ -224,7 +238,10 @@ mod tests {
         store.save_api_key("anthropic", "sk-test").unwrap();
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(raw["providers"]["codex"]["codexTokens"]["accessToken"], "cx");
+        assert_eq!(
+            raw["providers"]["codex"]["codexTokens"]["accessToken"],
+            "cx"
+        );
         assert_eq!(raw["providers"]["anthropic"]["apiKey"], "sk-test");
         assert_eq!(
             raw["providers"]["anthropic"]["oauthTokens"]["tokenAccount"]["uuid"],
@@ -244,15 +261,22 @@ mod tests {
         .unwrap();
 
         let store = CredentialStore::new(&path);
-        assert_eq!(store.tokens("anthropic").unwrap().unwrap().access_token, "legacy");
+        assert_eq!(
+            store.tokens("anthropic").unwrap().unwrap().access_token,
+            "legacy"
+        );
         assert_eq!(store.api_key("anthropic").unwrap().unwrap(), "old-key");
     }
 
     #[test]
     fn expiry_buffer() {
-        let mut t = Tokens { access_token: "x".into(), ..Default::default() };
+        let mut t = Tokens {
+            access_token: "x".into(),
+            ..Default::default()
+        };
         assert!(!t.is_expired(300), "no expiry set");
-        t.expires_at = Some((jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600)).to_string());
+        t.expires_at =
+            Some((jiff::Timestamp::now() + jiff::SignedDuration::from_secs(600)).to_string());
         assert!(!t.is_expired(300));
         assert!(t.is_expired(900), "inside the buffer");
     }
@@ -264,7 +288,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CredentialStore::new(dir.path().join("credentials.json"));
         store.save_api_key("anthropic", "k").unwrap();
-        let mode = std::fs::metadata(store.path()).unwrap().permissions().mode();
+        let mode = std::fs::metadata(store.path())
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
 }
