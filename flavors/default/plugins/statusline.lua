@@ -28,7 +28,12 @@ end
 local function refresh(session)
   local ok, usage = pcall(rness.session.usage, session)
   if not ok then return end
-  tokens[session] = k(usage.input) .. " last input"
+  local text = k(usage.input) .. " last input"
+  local cached = (usage.cache_read or 0) + (usage.cache_write or 0)
+  if cached > 0 then
+    text = text .. " (+" .. k(cached) .. " cached)"
+  end
+  tokens[session] = text
 end
 
 local function append_usage(parts, session)

@@ -39,6 +39,42 @@ async fn status(host: &LuaHost, session: &str) -> String {
 }
 
 #[tokio::test]
+async fn cache_read_and_write_tokens_are_shown_alongside_input() {
+    let host = LuaHost::spawn().unwrap();
+    host.load(
+        "usage-stub",
+        r#"
+        rness.session = {
+          usage = function(session)
+            return {input = 2200, cache_read = 148000, cache_write = 500}
+          end,
+          config = function() error('UI must not resolve thresholds') end,
+        }
+        rness.compaction = {default = {threshold_tokens = 165000}}
+    "#,
+    )
+    .await
+    .unwrap();
+    host.load(
+        "statusline",
+        include_str!("../../../flavors/default/plugins/statusline.lua"),
+    )
+    .await
+    .unwrap();
+    let text = status(&host, "one").await;
+    assert!(text.contains("2.2k last input"), "{text}");
+    assert!(text.contains("(+148.5k cached)"), "{text}");
+}
+
+#[tokio::test]
+async fn no_cache_usage_omits_cached_suffix() {
+    let host = host().await;
+    let text = status(&host, "one").await;
+    assert!(text.contains("120.0k last input"), "{text}");
+    assert!(!text.contains("cached"), "{text}");
+}
+
+#[tokio::test]
 async fn old_binary_and_resume_show_unknown_estimate_without_provider_ratio() {
     let host = host().await;
     for _ in 0..5 {
