@@ -74,7 +74,10 @@ pub enum SubagentError {
     #[error("delegation depth {depth} exceeds max {max}")]
     DepthExceeded { depth: u32, max: u32 },
     #[error("provider '{provider}' does not support {capability}")]
-    Unsupported { provider: String, capability: &'static str },
+    Unsupported {
+        provider: String,
+        capability: &'static str,
+    },
     #[error("not authorized: {0}")]
     NotAuthorized(String),
     #[error(transparent)]
@@ -105,7 +108,10 @@ impl SubagentProvider for SpawnProvider {
         "spawn"
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { inherits_parent_context: false, continuable: true }
+        Capabilities {
+            inherits_parent_context: false,
+            continuable: true,
+        }
     }
     fn create_child(
         &self,
@@ -130,7 +136,10 @@ impl SubagentProvider for ForkProvider {
         "fork"
     }
     fn capabilities(&self) -> Capabilities {
-        Capabilities { inherits_parent_context: true, continuable: true }
+        Capabilities {
+            inherits_parent_context: true,
+            continuable: true,
+        }
     }
     fn create_child(
         &self,
@@ -187,38 +196,44 @@ impl SubagentRuntime {
         // final output to the parent, steering a busy turn or waking an idle
         // parent. Teardown only logs the notice. One-shot jobs are untouched.
         let watch_sessions = Arc::clone(&sessions);
-        let disposer = sessions.bus().on::<SessionIdleEv>(move |child: &SessionId| {
-            let Ok(Some(d)) = watch_sessions.store().delegation(child) else {
-                return;
-            };
-            if d.mode != DelegationMode::Continuable {
-                return;
-            }
-            let run = match settle_last_turn(&watch_sessions, child) {
-                Ok(run) => run,
-                Err(e) => {
-                    tracing::error!(child = %child, error = %e, "settle read failed");
+        let disposer = sessions
+            .bus()
+            .on::<SessionIdleEv>(move |child: &SessionId| {
+                let Ok(Some(d)) = watch_sessions.store().delegation(child) else {
+                    return;
+                };
+                if d.mode != DelegationMode::Continuable {
                     return;
                 }
-            };
-            let stop = match run.stop {
-                StopReason::Completed => "completed",
-                StopReason::Aborted => "aborted",
-                StopReason::Error => "error",
-            };
-            let text = format!(
-                "[subagent {child} settled: {stop}]\n{}",
-                if run.output.is_empty() { "(no output)" } else { &run.output }
-            );
-            // Never block the child's idle event on a parent reservation (the
-            // parent may itself be waiting for this child to finish).
-            let sessions = Arc::clone(&watch_sessions);
-            tokio::spawn(async move {
-                if let Err(e) = sessions.notify_subagent_settled(&d.parent, text).await {
-                    tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
-                }
+                let run = match settle_last_turn(&watch_sessions, child) {
+                    Ok(run) => run,
+                    Err(e) => {
+                        tracing::error!(child = %child, error = %e, "settle read failed");
+                        return;
+                    }
+                };
+                let stop = match run.stop {
+                    StopReason::Completed => "completed",
+                    StopReason::Aborted => "aborted",
+                    StopReason::Error => "error",
+                };
+                let text = format!(
+                    "[subagent {child} settled: {stop}]\n{}",
+                    if run.output.is_empty() {
+                        "(no output)"
+                    } else {
+                        &run.output
+                    }
+                );
+                // Never block the child's idle event on a parent reservation (the
+                // parent may itself be waiting for this child to finish).
+                let sessions = Arc::clone(&watch_sessions);
+                tokio::spawn(async move {
+                    if let Err(e) = sessions.notify_subagent_settled(&d.parent, text).await {
+                        tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
+                    }
+                });
             });
-        });
         rt.watchers.lock().expect("watchers lock").push(disposer);
         rt
     }
@@ -254,19 +269,32 @@ impl SubagentRuntime {
     }
 
     pub fn roster(&self) -> std::collections::BTreeMap<String, String> {
-        self.sessions.agents().iter().filter(|(_, agent)| agent.subagent)
-            .map(|(name, agent)| (name.clone(), agent.description.clone())).collect()
+        self.sessions
+            .agents()
+            .iter()
+            .filter(|(_, agent)| agent.subagent)
+            .map(|(name, agent)| (name.clone(), agent.description.clone()))
+            .collect()
     }
 
     pub fn provider_names(&self) -> Vec<String> {
-        let mut v: Vec<_> =
-            self.providers.read().expect("providers lock").keys().cloned().collect();
+        let mut v: Vec<_> = self
+            .providers
+            .read()
+            .expect("providers lock")
+            .keys()
+            .cloned()
+            .collect();
         v.sort();
         v
     }
 
     pub fn capabilities(&self, provider: &str) -> Option<Capabilities> {
-        self.providers.read().expect("providers lock").get(provider).map(|p| p.capabilities())
+        self.providers
+            .read()
+            .expect("providers lock")
+            .get(provider)
+            .map(|p| p.capabilities())
     }
 
     /// Delegate: create the child, send the prompt, await idle, settle.
@@ -281,7 +309,9 @@ impl SubagentRuntime {
     }
 
     pub async fn start_presented(
-        &self, provider: &str, request: SubagentRequest,
+        &self,
+        provider: &str,
+        request: SubagentRequest,
         presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SubagentRun, SubagentError> {
         self.validate_agent(request.agent.as_deref())?;
@@ -302,12 +332,21 @@ impl SubagentRuntime {
             .unwrap_or(0);
         let depth = parent_depth + 1;
         if depth > self.max_depth {
-            return Err(SubagentError::DepthExceeded { depth, max: self.max_depth });
+            return Err(SubagentError::DepthExceeded {
+                depth,
+                max: self.max_depth,
+            });
         }
-        let delegation =
-            Delegation { parent: request.parent.clone(), call: presentation.as_ref().map(|(call, _)| call.clone()), depth, mode: DelegationMode::OneShot };
+        let delegation = Delegation {
+            parent: request.parent.clone(),
+            call: presentation.as_ref().map(|(call, _)| call.clone()),
+            depth,
+            mode: DelegationMode::OneShot,
+        };
 
-        let config = self.sessions.delegated_config(&request.parent, request.agent.as_deref())?;
+        let config = self
+            .sessions
+            .delegated_config(&request.parent, request.agent.as_deref())?;
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
 
@@ -316,17 +355,22 @@ impl SubagentRuntime {
         // fork never re-reads inherited assistant text as its "result".
         let boundary = self.sessions.store().history(&child)?.len();
         if let Some((call, args)) = presentation {
-            self.activity.register(&self.sessions, &request.parent, &call, &child, args);
+            self.activity
+                .register(&self.sessions, &request.parent, &call, &child, args);
         }
 
-        self.sessions.send(
-            &child,
-            UserIntent::Followup,
-            vec![ContentPart::Text { text: request.prompt.clone() }],
-        ).map_err(|error| {
-            self.activity.failed(&child);
-            error
-        })?;
+        self.sessions
+            .send(
+                &child,
+                UserIntent::Followup,
+                vec![ContentPart::Text {
+                    text: request.prompt.clone(),
+                }],
+            )
+            .map_err(|error| {
+                self.activity.failed(&child);
+                error
+            })?;
         self.sessions.join(&child).await;
 
         Ok(settle(&self.sessions, &child, boundary)?)
@@ -348,7 +392,9 @@ impl SubagentRuntime {
     }
 
     pub fn start_continuable_presented(
-        &self, provider: &str, request: SubagentRequest,
+        &self,
+        provider: &str,
+        request: SubagentRequest,
         presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SessionId, SubagentError> {
         self.validate_agent(request.agent.as_deref())?;
@@ -374,7 +420,10 @@ impl SubagentRuntime {
             .unwrap_or(0);
         let depth = parent_depth + 1;
         if depth > self.max_depth {
-            return Err(SubagentError::DepthExceeded { depth, max: self.max_depth });
+            return Err(SubagentError::DepthExceeded {
+                depth,
+                max: self.max_depth,
+            });
         }
         let delegation = Delegation {
             parent: request.parent.clone(),
@@ -383,20 +432,27 @@ impl SubagentRuntime {
             mode: DelegationMode::Continuable,
         };
 
-        let config = self.sessions.delegated_config(&request.parent, request.agent.as_deref())?;
+        let config = self
+            .sessions
+            .delegated_config(&request.parent, request.agent.as_deref())?;
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
         if let Some((call, args)) = presentation {
-            self.activity.register(&self.sessions, &request.parent, &call, &child, args);
+            self.activity
+                .register(&self.sessions, &request.parent, &call, &child, args);
         }
-        self.sessions.send(
-            &child,
-            UserIntent::Followup,
-            vec![ContentPart::Text { text: request.prompt.clone() }],
-        ).map_err(|error| {
-            self.activity.failed(&child);
-            error
-        })?;
+        self.sessions
+            .send(
+                &child,
+                UserIntent::Followup,
+                vec![ContentPart::Text {
+                    text: request.prompt.clone(),
+                }],
+            )
+            .map_err(|error| {
+                self.activity.failed(&child);
+                error
+            })?;
         Ok(child)
     }
 
@@ -452,10 +508,17 @@ impl SubagentRuntime {
         text: String,
     ) -> Result<Disposition, SubagentError> {
         if text.trim().is_empty() {
-            return Err(ServiceError::InvalidConfig("user steering requires a message".into()).into());
+            return Err(
+                ServiceError::InvalidConfig("user steering requires a message".into()).into(),
+            );
         }
         self.authorize_descendant(caller, target)?;
-        if self.sessions.store().delegation(target)?.is_none_or(|d| d.mode != DelegationMode::Continuable) {
+        if self
+            .sessions
+            .store()
+            .delegation(target)?
+            .is_none_or(|d| d.mode != DelegationMode::Continuable)
+        {
             return Err(SubagentError::NotAuthorized(
                 "user steering requires a continuable subagent; one-shot children cannot receive messages".into(),
             ));
@@ -485,25 +548,29 @@ impl SubagentRuntime {
     /// followups stay parked, descendants keep running, the child stays
     /// available. Caller must be a delegation ancestor of the target.
     /// Interrupting an idle child is an accepted no-op.
-    pub fn interrupt(
-        &self,
-        caller: &SessionId,
-        target: &SessionId,
-    ) -> Result<(), SubagentError> {
+    pub fn interrupt(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
         self.authorize_descendant(caller, target)?;
         self.sessions.cancel(target);
         Ok(())
     }
 
-    fn authorize_descendant(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
+    fn authorize_descendant(
+        &self,
+        caller: &SessionId,
+        target: &SessionId,
+    ) -> Result<(), SubagentError> {
         // Follow durable ancestry, not caller-supplied depth or UI membership.
         // A visited set rejects malformed cycles without relying on today's
         // max-depth setting (which may differ from the creation-time setting).
         let mut cursor = target.clone();
         let mut seen = std::collections::HashSet::from([target.clone()]);
         while let Some(d) = self.sessions.store().delegation(&cursor)? {
-            if !seen.insert(d.parent.clone()) { break; }
-            if &d.parent == caller { return Ok(()); }
+            if !seen.insert(d.parent.clone()) {
+                break;
+            }
+            if &d.parent == caller {
+                return Ok(());
+            }
             cursor = d.parent;
         }
         Err(SubagentError::NotAuthorized(format!(
@@ -532,16 +599,26 @@ impl SubagentRuntime {
         let mut agents = self.list_delegated(root, true, true)?;
         agents.sort_by(|a, b| a.session.cmp(&b.session));
         for child in &agents {
-            if !ids.contains(&child.session) { ids.push(child.session.clone()); }
+            if !ids.contains(&child.session) {
+                ids.push(child.session.clone());
+            }
         }
         agents.sort_by_key(|child| ids.iter().position(|id| id == &child.session).unwrap());
         for child in &mut agents {
-            child.alias = Some(format!("a{}", ids.iter().position(|id| id == &child.session).unwrap() + 1));
+            child.alias = Some(format!(
+                "a{}",
+                ids.iter().position(|id| id == &child.session).unwrap() + 1
+            ));
         }
         Ok(agents)
     }
 
-    fn list_delegated(&self, root: &SessionId, descendants: bool, include_one_shot: bool) -> Result<Vec<ChildAgent>, SubagentError> {
+    fn list_delegated(
+        &self,
+        root: &SessionId,
+        descendants: bool,
+        include_one_shot: bool,
+    ) -> Result<Vec<ChildAgent>, SubagentError> {
         // Delegation stamps only name the parent, so build the child
         // index by scanning the store once.
         let mut by_parent: HashMap<SessionId, Vec<(SessionId, Delegation)>> = HashMap::new();
@@ -559,7 +636,9 @@ impl SubagentRuntime {
         let mut out = Vec::new();
         let mut stack: Vec<SessionId> = vec![root.clone()];
         while let Some(node) = stack.pop() {
-            let Some(children) = by_parent.get(&node) else { continue };
+            let Some(children) = by_parent.get(&node) else {
+                continue;
+            };
             for (id, d) in children {
                 out.push(ChildAgent {
                     alias: None,
@@ -663,5 +742,9 @@ fn settle_events(
         })
         .unwrap_or_default();
 
-    Ok(SubagentRun { session: child.clone(), stop, output })
+    Ok(SubagentRun {
+        session: child.clone(),
+        stop,
+        output,
+    })
 }

@@ -1,8 +1,16 @@
 //! Reduction at writer-owned model-step boundaries. Policy is supplied by Lua.
-use crate::session::{branch::SessionStore, log::SessionLog, projection::{ModelContext, ModelTurn}, replay::replay};
+use crate::session::{
+    branch::SessionStore,
+    log::SessionLog,
+    projection::{ModelContext, ModelTurn},
+    replay::replay,
+};
 use crate::tools::ToolSpec;
-use crate::turn::{provider::{Provider, StepOutcome, StepRequest}, TurnError};
-use rness_protocol::events::{Compaction, ContentPart, SessionEvent, Prune};
+use crate::turn::{
+    provider::{Provider, StepOutcome, StepRequest},
+    TurnError,
+};
+use rness_protocol::events::{Compaction, ContentPart, Prune, SessionEvent};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -41,19 +49,35 @@ impl<'de> serde::Deserialize<'de> for Policy {
 }
 impl Policy {
     pub fn validate(&self) -> Result<(), String> {
-        if self.meter.bytes_per_token == 0 || self.meter.bytes_per_token > 16
-            || self.meter.message_tokens > 1_000_000 || self.meter.image_tokens > 1_000_000
-            || self.meter.output_reserve >= self.threshold_tokens {
+        if self.meter.bytes_per_token == 0
+            || self.meter.bytes_per_token > 16
+            || self.meter.message_tokens > 1_000_000
+            || self.meter.image_tokens > 1_000_000
+            || self.meter.output_reserve >= self.threshold_tokens
+        {
             return Err("invalid route measurement budgets".into());
         }
-        if self.summary_profile.as_ref().is_some_and(|name| name.trim().is_empty()) {
+        if self
+            .summary_profile
+            .as_ref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
             return Err("summary_profile must be a nonempty profile name".into());
         }
-        if self.threshold_tokens == 0 || self.retain_tokens >= self.threshold_tokens
-            || self.summary_tokens == 0 || self.system_prompt.trim().is_empty() || self.prompt.trim().is_empty()
+        if self.threshold_tokens == 0
+            || self.retain_tokens >= self.threshold_tokens
+            || self.summary_tokens == 0
+            || self.system_prompt.trim().is_empty()
+            || self.prompt.trim().is_empty()
             || self.max_compactions == 0
-            || self.max_compactions > 10 || self.max_overflow_retries > 10
-            || self.prune_head.saturating_add(self.prune_tail).saturating_add(128) >= self.prune_threshold {
+            || self.max_compactions > 10
+            || self.max_overflow_retries > 10
+            || self
+                .prune_head
+                .saturating_add(self.prune_tail)
+                .saturating_add(128)
+                >= self.prune_threshold
+        {
             return Err("invalid compaction prompts, budgets, or retry limits".into());
         }
         Ok(())
@@ -70,11 +94,18 @@ pub struct Meter {
 }
 impl Default for Meter {
     fn default() -> Self {
-        Self { bytes_per_token: 4, message_tokens: 8, image_tokens: 4096, output_reserve: 0 }
+        Self {
+            bytes_per_token: 4,
+            message_tokens: 8,
+            image_tokens: 4096,
+            output_reserve: 0,
+        }
     }
 }
 impl Meter {
-    fn text(&self, text: &str) -> u64 { (text.len() as u64).div_ceil(self.bytes_per_token.max(1)) }
+    fn text(&self, text: &str) -> u64 {
+        (text.len() as u64).div_ceil(self.bytes_per_token.max(1))
+    }
     fn part(&self, part: &ContentPart) -> u64 {
         match part {
             ContentPart::Image { .. } => self.image_tokens,
@@ -82,29 +113,62 @@ impl Meter {
         }
     }
     fn turn(&self, turn: &ModelTurn) -> u64 {
-        self.message_tokens + match turn {
-            ModelTurn::User { content } | ModelTurn::Assistant { content } => content.iter().map(|p| self.part(p)).sum::<u64>(),
-            ModelTurn::ToolResults { results } => results.iter().map(|r| {
-                self.text(&r.output) + self.text(&r.call) + self.text(&r.name)
-                    + r.content.iter().filter(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })).count() as u64 * self.image_tokens
-            }).sum::<u64>(),
-        }
+        self.message_tokens
+            + match turn {
+                ModelTurn::User { content } | ModelTurn::Assistant { content } => {
+                    content.iter().map(|p| self.part(p)).sum::<u64>()
+                }
+                ModelTurn::ToolResults { results } => results
+                    .iter()
+                    .map(|r| {
+                        self.text(&r.output)
+                            + self.text(&r.call)
+                            + self.text(&r.name)
+                            + r.content
+                                .iter()
+                                .filter(|p| {
+                                    matches!(
+                                        p,
+                                        rness_protocol::events::ToolResultContentPart::Image { .. }
+                                    )
+                                })
+                                .count() as u64
+                                * self.image_tokens
+                    })
+                    .sum::<u64>(),
+            }
     }
     pub fn measure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
-        context.turns.iter().map(|t| self.turn(t)).sum::<u64>() + self.text(system)
-            + tools.iter().map(|t| self.text(&t.name) + self.text(&t.description)
-                + self.text(&t.input_schema.to_string()) + self.message_tokens).sum::<u64>()
+        context.turns.iter().map(|t| self.turn(t)).sum::<u64>()
+            + self.text(system)
+            + tools
+                .iter()
+                .map(|t| {
+                    self.text(&t.name)
+                        + self.text(&t.description)
+                        + self.text(&t.input_schema.to_string())
+                        + self.message_tokens
+                })
+                .sum::<u64>()
     }
     fn reserve(&self, context: &ModelContext) -> u64 {
-        self.output_reserve.max(u64::from(context.config.max_output_tokens.unwrap_or(0)))
+        self.output_reserve
+            .max(u64::from(context.config.max_output_tokens.unwrap_or(0)))
     }
     pub fn pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 {
-        self.measure(context, system, tools).saturating_add(self.reserve(context))
+        self.measure(context, system, tools)
+            .saturating_add(self.reserve(context))
     }
     /// Pressure with the input estimate scaled by an observed
     /// real/estimated calibration ratio (see [`calibration`]). The output
     /// reserve is real tokens and is never scaled.
-    pub fn calibrated_pressure(&self, context: &ModelContext, system: &str, tools: &[ToolSpec], ratio: Option<f64>) -> u64 {
+    pub fn calibrated_pressure(
+        &self,
+        context: &ModelContext,
+        system: &str,
+        tools: &[ToolSpec],
+        ratio: Option<f64>,
+    ) -> u64 {
         let measured = self.measure(context, system, tools);
         let measured = ratio.map_or(measured, |r| (measured as f64 * r).round() as u64);
         measured.saturating_add(self.reserve(context))
@@ -121,7 +185,8 @@ impl Meter {
 pub fn calibration(history: &[rness_protocol::events::Envelope]) -> Option<f64> {
     history.iter().rev().find_map(|e| match &e.event {
         SessionEvent::AssistantMessage(m) if m.estimated_input > 0 => {
-            let real = m.usage.input_tokens + m.usage.cache_read_tokens + m.usage.cache_write_tokens;
+            let real =
+                m.usage.input_tokens + m.usage.cache_read_tokens + m.usage.cache_write_tokens;
             (real > 0).then(|| (real as f64 / m.estimated_input as f64).clamp(0.25, 4.0))
         }
         _ => None,
@@ -134,7 +199,10 @@ pub fn measure(context: &ModelContext, system: &str, tools: &[ToolSpec]) -> u64 
 
 // ModelContext sources has one id per message, but one per RESULT in a group.
 fn source_count(turn: &ModelTurn) -> usize {
-    match turn { ModelTurn::ToolResults { results } => results.len(), _ => 1 }
+    match turn {
+        ModelTurn::ToolResults { results } => results.len(),
+        _ => 1,
+    }
 }
 fn prefix(context: &ModelContext, retain: u64, meter: &Meter) -> usize {
     let mut kept = 0;
@@ -154,17 +222,34 @@ fn prefix(context: &ModelContext, retain: u64, meter: &Meter) -> usize {
 /// a paid request or discard a checkpoint that landed before the interruption.
 pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError> {
     let history = log.read_all()?;
-    let finished: std::collections::HashSet<_> = history.iter().filter_map(|e| match &e.event {
-        SessionEvent::CompactionFinished { started, .. } => Some(started.clone()), _ => None,
-    }).collect();
+    let finished: std::collections::HashSet<_> = history
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::CompactionFinished { started, .. } => Some(started.clone()),
+            _ => None,
+        })
+        .collect();
     for (index, event) in history.iter().enumerate() {
-        if !matches!(event.event, SessionEvent::CompactionStarted { .. }) || finished.contains(&event.id) { continue; }
-        let committed = history[index + 1..].iter()
+        if !matches!(event.event, SessionEvent::CompactionStarted { .. })
+            || finished.contains(&event.id)
+        {
+            continue;
+        }
+        let committed = history[index + 1..]
+            .iter()
             .take_while(|e| !matches!(e.event, SessionEvent::CompactionStarted { .. }))
             .any(|e| matches!(e.event, SessionEvent::Compaction(_)));
-        log.append(&SessionEvent::CompactionFinished { started: event.id.clone(),
-            outcome: if committed { "committed_before_interruption" } else { "interrupted" }.into(),
-            usage: Default::default(), chunks: vec![] })?;
+        log.append(&SessionEvent::CompactionFinished {
+            started: event.id.clone(),
+            outcome: if committed {
+                "committed_before_interruption"
+            } else {
+                "interrupted"
+            }
+            .into(),
+            usage: Default::default(),
+            chunks: vec![],
+        })?;
     }
     Ok(())
 }
@@ -172,34 +257,81 @@ pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError
 /// Returns true only after a durable model-visible reduction. Runs on the
 /// turn's existing log writer; never opens a competing session writer.
 #[allow(clippy::too_many_arguments)]
-pub async fn reduce(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
-    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool, cancel: &CancellationToken,
+pub async fn reduce(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    cancel: &CancellationToken,
 ) -> Result<bool, TurnError> {
-    reduce_with_progress(store, log, provider, system, tools, policy, overflow, cancel, &|_| {}).await
+    reduce_with_progress(
+        store,
+        log,
+        provider,
+        system,
+        tools,
+        policy,
+        overflow,
+        cancel,
+        &|_| {},
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn reduce_with_progress(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
-    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool, cancel: &CancellationToken,
+pub async fn reduce_with_progress(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    cancel: &CancellationToken,
     progress: &(dyn Fn(CompactionProgress) + Send + Sync),
 ) -> Result<bool, TurnError> {
-    reduce_region_with_progress(store, log, provider, system, tools, policy, overflow, None, cancel, progress).await
+    reduce_region_with_progress(
+        store, log, provider, system, tools, policy, overflow, None, cancel, progress,
+    )
+    .await
 }
 
 pub enum CompactionProgress {
-    Measuring { estimated_tokens: u64, threshold_tokens: u64 },
-    Summarizing { events: usize, estimated_tokens: u64 },
+    Measuring {
+        estimated_tokens: u64,
+        threshold_tokens: u64,
+    },
+    Summarizing {
+        events: usize,
+        estimated_tokens: u64,
+    },
 }
 
 impl CompactionProgress {
-    pub fn frame(self, session: rness_protocol::events::SessionId) -> rness_protocol::frames::Frame {
+    pub fn frame(
+        self,
+        session: rness_protocol::events::SessionId,
+    ) -> rness_protocol::frames::Frame {
         use rness_protocol::frames::Frame;
         match self {
-            Self::Measuring { estimated_tokens, threshold_tokens } => Frame::ContextUsage {
-                session, estimated_tokens, threshold_tokens: Some(threshold_tokens),
+            Self::Measuring {
+                estimated_tokens,
+                threshold_tokens,
+            } => Frame::ContextUsage {
+                session,
+                estimated_tokens,
+                threshold_tokens: Some(threshold_tokens),
             },
-            Self::Summarizing { events, estimated_tokens } => Frame::CompactionStarted {
-                session, events, estimated_tokens,
+            Self::Summarizing {
+                events,
+                estimated_tokens,
+            } => Frame::CompactionStarted {
+                session,
+                events,
+                estimated_tokens,
             },
         }
     }
@@ -207,68 +339,154 @@ impl CompactionProgress {
 
 /// Explicit half-open region of model messages; endpoints preserve tool pairs.
 #[allow(clippy::too_many_arguments)]
-pub async fn reduce_region(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
-    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool,
-    region: Option<std::ops::Range<usize>>, cancel: &CancellationToken,
+pub async fn reduce_region(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    region: Option<std::ops::Range<usize>>,
+    cancel: &CancellationToken,
 ) -> Result<bool, TurnError> {
-    reduce_region_with_progress(store, log, provider, system, tools, policy, overflow, region, cancel, &|_| {}).await
+    reduce_region_with_progress(
+        store,
+        log,
+        provider,
+        system,
+        tools,
+        policy,
+        overflow,
+        region,
+        cancel,
+        &|_| {},
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut SessionLog, provider: &dyn Provider,
-    system: &str, tools: &[ToolSpec], policy: &Policy, overflow: bool,
-    region: Option<std::ops::Range<usize>>, cancel: &CancellationToken,
+pub async fn reduce_region_with_progress(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    region: Option<std::ops::Range<usize>>,
+    cancel: &CancellationToken,
     progress: &(dyn Fn(CompactionProgress) + Send + Sync),
 ) -> Result<bool, TurnError> {
-    policy.validate().map_err(|last| TurnError::ModelExhausted { attempts: 0, last })?;
+    policy
+        .validate()
+        .map_err(|last| TurnError::ModelExhausted { attempts: 0, last })?;
     let mut changed = false;
     for _ in 0..policy.max_compactions {
-        if cancel.is_cancelled() { return Ok(changed); }
+        if cancel.is_cancelled() {
+            return Ok(changed);
+        }
         let mut replayed = replay(store, log.session())?;
         if let Some(r) = &region {
-            if r.start >= r.end || r.end > replayed.context.turns.len()
-                || matches!(replayed.context.turns.get(r.start), Some(ModelTurn::ToolResults { .. }))
-                || matches!(replayed.context.turns.get(r.end), Some(ModelTurn::ToolResults { .. })) {
-                return Err(TurnError::ModelExhausted { attempts: 0, last: "invalid compaction region or split tool pair".into() });
+            if r.start >= r.end
+                || r.end > replayed.context.turns.len()
+                || matches!(
+                    replayed.context.turns.get(r.start),
+                    Some(ModelTurn::ToolResults { .. })
+                )
+                || matches!(
+                    replayed.context.turns.get(r.end),
+                    Some(ModelTurn::ToolResults { .. })
+                )
+            {
+                return Err(TurnError::ModelExhausted {
+                    attempts: 0,
+                    last: "invalid compaction region or split tool pair".into(),
+                });
             }
         }
         let cut = prefix(&replayed.context, policy.retain_tokens, &policy.meter);
         let n: usize = replayed.context.turns[..cut].iter().map(source_count).sum();
-        let eligible: std::collections::HashSet<_> = replayed.context.sources[..n].iter().cloned().collect();
+        let eligible: std::collections::HashSet<_> =
+            replayed.context.sources[..n].iter().cloned().collect();
         for event in &replayed.history {
-            if region.is_some() { break; }
-            if cancel.is_cancelled() { return Ok(changed); }
-            if !eligible.contains(&event.id) { continue; }
-            let SessionEvent::ToolResult(result) = &event.event else { continue };
-            if result.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) { continue; }
+            if region.is_some() {
+                break;
+            }
+            if cancel.is_cancelled() {
+                return Ok(changed);
+            }
+            if !eligible.contains(&event.id) {
+                continue;
+            }
+            let SessionEvent::ToolResult(result) = &event.event else {
+                continue;
+            };
+            if result.content.iter().any(|p| {
+                matches!(
+                    p,
+                    rness_protocol::events::ToolResultContentPart::Image { .. }
+                )
+            }) {
+                continue;
+            }
             let chars = result.output.chars().count();
-            if chars <= policy.prune_threshold { continue; }
+            if chars <= policy.prune_threshold {
+                continue;
+            }
             let head: String = result.output.chars().take(policy.prune_head).collect();
-            let tail: String = result.output.chars().skip(chars - policy.prune_tail).collect();
+            let tail: String = result
+                .output
+                .chars()
+                .skip(chars - policy.prune_tail)
+                .collect();
             let mut replacement = result.clone();
             replacement.content.clear();
             replacement.output = format!("{head}\n[tool result middle pruned]\n{tail}");
-            log.append(&SessionEvent::Prune(Prune { replaces: event.id.clone(), result: replacement }))?;
+            log.append(&SessionEvent::Prune(Prune {
+                replaces: event.id.clone(),
+                result: replacement,
+            }))?;
             changed = true;
         }
         replayed = replay(store, log.session())?;
         // Calibrated: scale the heuristic by the observed real/estimated
         // ratio of the latest committed step, so the threshold compares
         // against something close to what the provider will actually count.
-        let pressure = policy.meter.calibrated_pressure(&replayed.context, system, tools,
-            calibration(&replayed.history));
+        let pressure = policy.meter.calibrated_pressure(
+            &replayed.context,
+            system,
+            tools,
+            calibration(&replayed.history),
+        );
         // Manual regions lack the main request's system/tools; do not publish
         // their partial measurement as the automatic compaction estimate.
         if region.is_none() {
-            progress(CompactionProgress::Measuring { estimated_tokens: pressure, threshold_tokens: policy.threshold_tokens });
+            progress(CompactionProgress::Measuring {
+                estimated_tokens: pressure,
+                threshold_tokens: policy.threshold_tokens,
+            });
         }
-        if region.is_none() && ((!overflow && pressure < policy.threshold_tokens) || (changed && overflow)) { break; }
-        let cut = region.as_ref().map_or_else(|| prefix(&replayed.context, policy.retain_tokens, &policy.meter), |r| r.end);
+        if region.is_none()
+            && ((!overflow && pressure < policy.threshold_tokens) || (changed && overflow))
+        {
+            break;
+        }
+        let cut = region.as_ref().map_or_else(
+            || prefix(&replayed.context, policy.retain_tokens, &policy.meter),
+            |r| r.end,
+        );
         let start = region.as_ref().map_or(0, |r| r.start);
-        if cut == 0 { break; }
-        let first: usize = replayed.context.turns[..start].iter().map(source_count).sum();
+        if cut == 0 {
+            break;
+        }
+        let first: usize = replayed.context.turns[..start]
+            .iter()
+            .map(source_count)
+            .sum();
         let n: usize = replayed.context.turns[..cut].iter().map(source_count).sum();
-        let mut selected: std::collections::HashSet<_> = replayed.context.sources[first..n].iter().cloned().collect();
+        let mut selected: std::collections::HashSet<_> =
+            replayed.context.sources[first..n].iter().cloned().collect();
         // Checkpoints and prunes may themselves be folded. Claim their ancestors
         // so older full-fidelity content cannot reappear on subsequent replay.
         loop {
@@ -277,33 +495,63 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
                 if selected.contains(&e.id) {
                     match &e.event {
                         SessionEvent::Compaction(c) => selected.extend(c.replaces.iter().cloned()),
-                        SessionEvent::Prune(p) => { selected.insert(p.replaces.clone()); },
+                        SessionEvent::Prune(p) => {
+                            selected.insert(p.replaces.clone());
+                        }
                         _ => {}
                     }
                 }
             }
-            if before == selected.len() { break; }
+            if before == selected.len() {
+                break;
+            }
         }
-        let replaces: Vec<_> = replayed.history.iter().filter(|e| selected.contains(&e.id)).map(|e| e.id.clone()).collect();
-        let mut context = ModelContext { turns: replayed.context.turns[start..cut].to_vec(), ..Default::default() };
+        let replaces: Vec<_> = replayed
+            .history
+            .iter()
+            .filter(|e| selected.contains(&e.id))
+            .map(|e| e.id.clone())
+            .collect();
+        let mut context = ModelContext {
+            turns: replayed.context.turns[start..cut].to_vec(),
+            ..Default::default()
+        };
         let before = policy.meter.measure(&context, "", &[]);
-        progress(CompactionProgress::Summarizing { events: replaces.len(), estimated_tokens: before });
-        context.config = provider.summary_config().cloned().unwrap_or_else(|| replayed.context.config.clone());
+        progress(CompactionProgress::Summarizing {
+            events: replaces.len(),
+            estimated_tokens: before,
+        });
+        context.config = provider
+            .summary_config()
+            .cloned()
+            .unwrap_or_else(|| replayed.context.config.clone());
         if provider.summary_supports_max_output_tokens() {
             context.config.max_output_tokens = Some(policy.summary_tokens);
         } else {
             context.config.max_output_tokens = None;
         }
-        context.turns.push(ModelTurn::User { content: vec![ContentPart::Text { text: policy.prompt.clone() }] });
-        let request = StepRequest { context: &context, system: &policy.system_prompt, tools: &[], on_delta: None };
+        context.turns.push(ModelTurn::User {
+            content: vec![ContentPart::Text {
+                text: policy.prompt.clone(),
+            }],
+        });
+        let request = StepRequest {
+            context: &context,
+            system: &policy.system_prompt,
+            tools: &[],
+            on_delta: None,
+        };
         let started = log.append(&SessionEvent::CompactionStarted {
-            model: provider.summary_model().into(), sources: replayed.context.sources[first..n].to_vec(),
+            model: provider.summary_model().into(),
+            sources: replayed.context.sources[first..n].to_vec(),
             estimated_input: measure(&context, request.system, &[]),
             request: serde_json::json!({"system": request.system, "turns": context.turns,
                 "config": context.config, "tools": []}),
         })?;
-        let (sender, mut captures) = tokio::sync::mpsc::channel::<crate::turn::provider::WireCapture>(1);
-        let call = crate::turn::provider::WIRE_CAPTURE.scope(sender, provider.summarize_step(request, cancel));
+        let (sender, mut captures) =
+            tokio::sync::mpsc::channel::<crate::turn::provider::WireCapture>(1);
+        let call = crate::turn::provider::WIRE_CAPTURE
+            .scope(sender, provider.summarize_step(request, cancel));
         tokio::pin!(call);
         let outcome = loop {
             tokio::select! {
@@ -323,33 +571,78 @@ pub async fn reduce_region_with_progress(store: &SessionStore, log: &mut Session
         };
         let (usage, chunks) = match &outcome {
             StepOutcome::Committed(m) => (m.usage, m.chunks.clone()),
-            StepOutcome::Cancelled { partial } | StepOutcome::Failed { partial, .. } => (Default::default(), partial.clone()),
+            StepOutcome::Cancelled { partial } | StepOutcome::Failed { partial, .. } => {
+                (Default::default(), partial.clone())
+            }
         };
         let message = match outcome {
             StepOutcome::Committed(message) => message,
             other => {
                 let outcome = match other {
-                    StepOutcome::Failed { error, .. } => format!("failed: {}: {}", error.code, error.message),
+                    StepOutcome::Failed { error, .. } => {
+                        format!("failed: {}: {}", error.code, error.message)
+                    }
                     _ => "cancelled".into(),
                 };
-                log.append(&SessionEvent::CompactionFinished { started: started.id, outcome, usage, chunks })?;
+                log.append(&SessionEvent::CompactionFinished {
+                    started: started.id,
+                    outcome,
+                    usage,
+                    chunks,
+                })?;
                 break;
             }
         };
-        let summary = message.content.iter().filter_map(|p| match p { ContentPart::Text { text } => Some(text.as_str()), _ => None }).collect::<Vec<_>>().join("\n");
-        let summary_context = ModelContext { turns: vec![ModelTurn::User { content: vec![ContentPart::Text { text: format!("[conversation summary — earlier history compacted]\n{summary}") }] }], ..Default::default() };
-        let rejection = if cancel.is_cancelled() { Some("cancelled") }
-            else if summary.trim().is_empty() { Some("empty") }
-            else if policy.meter.measure(&summary_context, "", &[]) >= before { Some("non_shrinking") }
-            else { None };
+        let summary = message
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary_context = ModelContext {
+            turns: vec![ModelTurn::User {
+                content: vec![ContentPart::Text {
+                    text: format!("[conversation summary — earlier history compacted]\n{summary}"),
+                }],
+            }],
+            ..Default::default()
+        };
+        let rejection = if cancel.is_cancelled() {
+            Some("cancelled")
+        } else if summary.trim().is_empty() {
+            Some("empty")
+        } else if policy.meter.measure(&summary_context, "", &[]) >= before {
+            Some("non_shrinking")
+        } else {
+            None
+        };
         if let Some(outcome) = rejection {
-            log.append(&SessionEvent::CompactionFinished { started: started.id, outcome: outcome.into(), usage, chunks })?;
+            log.append(&SessionEvent::CompactionFinished {
+                started: started.id,
+                outcome: outcome.into(),
+                usage,
+                chunks,
+            })?;
             break;
         }
-        log.append(&SessionEvent::Compaction(Compaction { replaces, summary, model: provider.summary_model().into() }))?;
-        log.append(&SessionEvent::CompactionFinished { started: started.id, outcome: "committed".into(), usage, chunks })?;
+        log.append(&SessionEvent::Compaction(Compaction {
+            replaces,
+            summary,
+            model: provider.summary_model().into(),
+        }))?;
+        log.append(&SessionEvent::CompactionFinished {
+            started: started.id,
+            outcome: "committed".into(),
+            usage,
+            chunks,
+        })?;
         changed = true;
-        if overflow || region.is_some() { break; }
+        if overflow || region.is_some() {
+            break;
+        }
     }
     Ok(changed)
 }

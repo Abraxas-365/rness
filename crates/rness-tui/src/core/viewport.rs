@@ -40,7 +40,11 @@ mod tests {
     use super::*;
 
     fn row(buf: &Buffer, y: u16, width: u16) -> String {
-        (0..width).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()
+        (0..width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     #[test]

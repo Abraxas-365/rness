@@ -1,8 +1,8 @@
 //! Durable sandbox policy at the service and turn boundaries (no OS backend required).
 
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use async_trait::async_trait;
@@ -13,7 +13,7 @@ use rness_engine::session::branch::SessionStore;
 use rness_engine::subagent::{ForkProvider, SpawnProvider, SubagentRequest, SubagentRuntime};
 use rness_engine::tools::ToolRegistry;
 use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
-use rness_engine::turn::{TurnConfig, TurnError, run_turn};
+use rness_engine::turn::{run_turn, TurnConfig, TurnError};
 use rness_kernel::EventBus;
 use rness_protocol::branch::{Delegation, DelegationMode};
 use rness_protocol::events::*;
@@ -113,14 +113,12 @@ fn defaults_remain_opt_in_even_with_a_named_profile() {
     let sessions = roles(service(dir.path()));
     let id = sessions.create(None).unwrap();
     assert_eq!(sessions.config(&id).unwrap(), CallConfig::default());
-    assert!(
-        !sessions
-            .store()
-            .history(&id)
-            .unwrap()
-            .iter()
-            .any(|entry| matches!(entry.event, SessionEvent::RequestConfig(_)))
-    );
+    assert!(!sessions
+        .store()
+        .history(&id)
+        .unwrap()
+        .iter()
+        .any(|entry| matches!(entry.event, SessionEvent::RequestConfig(_))));
     sessions.set_config(&id, CallConfig::default()).unwrap();
     for name in ["plain", "profile"] {
         sessions.select_agent(&id, name).unwrap();
@@ -157,7 +155,9 @@ fn reopening_with_a_restricted_default_does_not_change_absent_durable_policy() {
         });
         assert!(current.create(None).is_err());
         let workspace = tempfile::tempdir().unwrap();
-        let fresh = current.create(Some(workspace.path().display().to_string())).unwrap();
+        let fresh = current
+            .create(Some(workspace.path().display().to_string()))
+            .unwrap();
         assert_eq!(current.config(&fresh).unwrap().sandbox, Some(default));
     }
 }
@@ -199,13 +199,11 @@ fn omitted_sandbox_survives_updates_forks_and_restart() {
         let before = sessions.store().history(&id).unwrap().len();
         sessions.set_config(&id, CallConfig::default()).unwrap();
         for mode in [SandboxMode::WorkspaceWrite, SandboxMode::DangerFullAccess] {
-            assert!(
-                sessions
-                    .set_config(&id, policy(mode))
-                    .unwrap_err()
-                    .to_string()
-                    .contains("cannot be broadened")
-            );
+            assert!(sessions
+                .set_config(&id, policy(mode))
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be broadened"));
         }
         assert_eq!(sessions.store().history(&id).unwrap().len(), before);
         let child = sessions.fork(&id, None).unwrap();
@@ -259,13 +257,11 @@ fn creation_checks_resolved_seed_before_writing_and_retains_global_restriction()
         policy(SandboxMode::ReadOnly),
         Arc::new(|_| Ok(Arc::new(Answer::default()))),
     );
-    assert!(
-        sessions
-            .create(None)
-            .unwrap_err()
-            .to_string()
-            .contains("workspace")
-    );
+    assert!(sessions
+        .create(None)
+        .unwrap_err()
+        .to_string()
+        .contains("workspace"));
     assert!(sessions.list().unwrap().is_empty());
     let workspace = tempfile::tempdir().unwrap();
     let id = sessions
@@ -328,36 +324,75 @@ fn historical_fork_retains_current_policy(delegated: bool) {
         let dir = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let sessions = service(dir.path());
-        let parent = sessions.create(Some(workspace.path().display().to_string())).unwrap();
-        sessions.set_config(&parent, CallConfig {
-            sandbox,
-            temperature: Some(0.2),
-            ..Default::default()
-        }).unwrap();
-        let at = sessions.store().history(&parent).unwrap().last().unwrap().id.clone();
-        sessions.set_config(&parent, CallConfig {
-            sandbox: Some(SandboxMode::ReadOnly),
-            temperature: Some(0.8),
-            ..Default::default()
-        }).unwrap();
+        let parent = sessions
+            .create(Some(workspace.path().display().to_string()))
+            .unwrap();
+        sessions
+            .set_config(
+                &parent,
+                CallConfig {
+                    sandbox,
+                    temperature: Some(0.2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let at = sessions
+            .store()
+            .history(&parent)
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        sessions
+            .set_config(
+                &parent,
+                CallConfig {
+                    sandbox: Some(SandboxMode::ReadOnly),
+                    temperature: Some(0.8),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let before = sessions.store().history(&parent).unwrap().len();
         let child = if delegated {
-            sessions.fork_delegated(&parent, Some(at), Delegation {
-                parent: parent.clone(), call: None, depth: 1, mode: DelegationMode::OneShot,
-            }).unwrap()
+            sessions
+                .fork_delegated(
+                    &parent,
+                    Some(at),
+                    Delegation {
+                        parent: parent.clone(),
+                        call: None,
+                        depth: 1,
+                        mode: DelegationMode::OneShot,
+                    },
+                )
+                .unwrap()
         } else {
             sessions.fork(&parent, Some(at)).unwrap()
         };
         let config = sessions.config(&child).unwrap();
         assert_eq!(config.sandbox, Some(SandboxMode::ReadOnly));
-        assert_eq!(config.temperature, Some(0.2), "retain historical request options");
+        assert_eq!(
+            config.temperature,
+            Some(0.2),
+            "retain historical request options"
+        );
         assert_eq!(sessions.store().history(&parent).unwrap().len(), before);
-        assert!(sessions.set_config(&child, policy(SandboxMode::WorkspaceWrite)).is_err());
+        assert!(sessions
+            .set_config(&child, policy(SandboxMode::WorkspaceWrite))
+            .is_err());
         drop(sessions);
         let reopened = service(dir.path());
-        assert_eq!(reopened.config(&child).unwrap().sandbox, Some(SandboxMode::ReadOnly));
-        assert_eq!(reopened.replay(&child).unwrap().context.config.sandbox,
-            Some(SandboxMode::ReadOnly));
+        assert_eq!(
+            reopened.config(&child).unwrap().sandbox,
+            Some(SandboxMode::ReadOnly)
+        );
+        assert_eq!(
+            reopened.replay(&child).unwrap().context.config.sandbox,
+            Some(SandboxMode::ReadOnly)
+        );
     }
 }
 

@@ -2,7 +2,7 @@ use super::{ToolCall, ToolRegistry, ToolSpec};
 use mlua::{Lua, LuaSerdeExt};
 use rness_protocol::events::{SessionEvent, ToolResult, ToolResultContentPart};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     sync::{Arc, Mutex},
@@ -73,23 +73,68 @@ impl Exposure {
             .ok_or("query must be a nonempty string")?;
         let query = query.trim();
         let exact = query.strip_prefix("select:");
-        let requested: Vec<_> = exact.map(|names| names.split(',').map(str::trim).filter(|name| !name.is_empty()).collect()).unwrap_or_default();
-        if exact.is_some() && requested.is_empty() { return Err("select: requires at least one tool name".into()); }
-        let words: BTreeSet<_> = query.to_lowercase().split_whitespace().map(str::to_owned).collect();
-        let mut matches: Vec<_> = tools.specs().into_iter().filter_map(|spec| {
-            let name = spec.name.to_lowercase();
-            let description = spec.description.to_lowercase();
-            let score = if exact.is_some() {
-                usize::from(requested.iter().any(|requested| requested.eq_ignore_ascii_case(&spec.name)))
-            } else {
-                words.iter().map(|word| if name == *word { 8 } else if name.contains(word.as_str()) { 4 } else if description.contains(word.as_str()) { 1 } else { 0 }).sum()
-            };
-            (score > 0).then_some((score, spec))
-        }).collect();
+        let requested: Vec<_> = exact
+            .map(|names| {
+                names
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if exact.is_some() && requested.is_empty() {
+            return Err("select: requires at least one tool name".into());
+        }
+        let words: BTreeSet<_> = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect();
+        let mut matches: Vec<_> = tools
+            .specs()
+            .into_iter()
+            .filter_map(|spec| {
+                let name = spec.name.to_lowercase();
+                let description = spec.description.to_lowercase();
+                let score = if exact.is_some() {
+                    usize::from(
+                        requested
+                            .iter()
+                            .any(|requested| requested.eq_ignore_ascii_case(&spec.name)),
+                    )
+                } else {
+                    words
+                        .iter()
+                        .map(|word| {
+                            if name == *word {
+                                8
+                            } else if name.contains(word.as_str()) {
+                                4
+                            } else if description.contains(word.as_str()) {
+                                1
+                            } else {
+                                0
+                            }
+                        })
+                        .sum()
+                };
+                (score > 0).then_some((score, spec))
+            })
+            .collect();
         matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
         let total_matches = matches.len();
-        let missing: Vec<_> = requested.iter().filter(|name| !matches.iter().any(|(_, spec)| name.eq_ignore_ascii_case(&spec.name))).copied().collect();
-        if exact.is_none() { matches.truncate(20); }
+        let missing: Vec<_> = requested
+            .iter()
+            .filter(|name| {
+                !matches
+                    .iter()
+                    .any(|(_, spec)| name.eq_ignore_ascii_case(&spec.name))
+            })
+            .copied()
+            .collect();
+        if exact.is_none() {
+            matches.truncate(20);
+        }
         let names: Vec<_> = matches.iter().map(|(_, spec)| spec.name.clone()).collect();
         let guidance = if matches.is_empty() {
             "No permitted registered tools matched. Try a shorter keyword or select: with a known tool name. An empty result does not establish whether an MCP server is connected."
@@ -97,7 +142,9 @@ impl Exposure {
             "Results are truncated to the top 20 matches. Narrow the query or use select:Name,Other for specific tools."
         } else if !missing.is_empty() {
             "Some requested names were not found among permitted registered tools. Check their spelling and tool registration."
-        } else { "Returned tools are available next step; in ptc mode use run_code." };
+        } else {
+            "Returned tools are available next step; in ptc mode use run_code."
+        };
         let output = serde_json::to_string(&json!({
             "tools": matches.iter().map(|(_, s)| json!({"name":s.name,"description":s.description,"input_schema":s.input_schema})).collect::<Vec<_>>(),
             "total_matches": total_matches,
@@ -224,7 +271,9 @@ pub async fn program(
     for (_, output) in &nested {
         for part in &output.content {
             if let ToolResultContentPart::Image { attachment } = part {
-                if seen.insert(attachment.id.clone()) { outer.content.push(part.clone()); }
+                if seen.insert(attachment.id.clone()) {
+                    outer.content.push(part.clone());
+                }
             }
         }
     }

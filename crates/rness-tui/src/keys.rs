@@ -26,7 +26,9 @@ impl Chord {
                 "alt" => mods |= KeyModifiers::ALT,
                 "shift" => mods |= KeyModifiers::SHIFT,
                 p => {
-                    if code.is_some() { return None; }
+                    if code.is_some() {
+                        return None;
+                    }
                     code = Some(match p {
                         "enter" => KeyCode::Enter,
                         "esc" => KeyCode::Esc,
@@ -52,11 +54,17 @@ impl Chord {
                 }
             }
         }
-        Some(Chord { mods, code: normalize(code?) })
+        Some(Chord {
+            mods,
+            code: normalize(code?),
+        })
     }
 
     pub fn of(key: &KeyEvent) -> Chord {
-        Chord { mods: key.modifiers, code: normalize(key.code) }
+        Chord {
+            mods: key.modifiers,
+            code: normalize(key.code),
+        }
     }
 
     pub fn matches(&self, key: &KeyEvent) -> bool {

@@ -52,12 +52,23 @@ tokio::task_local! {
 /// Called by adapters for each actual model request, including transport retries.
 /// Auth headers, URLs, and credential exchange requests are never captured.
 pub async fn capture_wire(body: &serde_json::Value) -> Result<(), ProviderError> {
-    let Ok(sender) = WIRE_CAPTURE.try_with(Clone::clone) else { return Ok(()); };
+    let Ok(sender) = WIRE_CAPTURE.try_with(Clone::clone) else {
+        return Ok(());
+    };
     let (ack, done) = tokio::sync::oneshot::channel();
-    let failure = |message: String| ProviderError { code: "AUDIT", retry_after: None, message, retryable: false };
+    let failure = |message: String| ProviderError {
+        code: "AUDIT",
+        retry_after: None,
+        message,
+        retryable: false,
+    };
     let body = serde_json::to_string(body).map_err(|e| failure(e.to_string()))?;
-    sender.send(WireCapture { body, ack }).await.map_err(|_| failure("request audit receiver closed".into()))?;
-    done.await.map_err(|_| failure("request audit acknowledgement lost".into()))?
+    sender
+        .send(WireCapture { body, ack })
+        .await
+        .map_err(|_| failure("request audit receiver closed".into()))?;
+    done.await
+        .map_err(|_| failure("request audit acknowledgement lost".into()))?
         .map_err(failure)
 }
 
@@ -68,7 +79,10 @@ pub enum StepOutcome {
     /// Cancelled mid-stream; whatever streamed is preserved.
     Cancelled { partial: Vec<TimedChunk> },
     /// The request/stream failed; partial chunks preserved.
-    Failed { error: ProviderError, partial: Vec<TimedChunk> },
+    Failed {
+        error: ProviderError,
+        partial: Vec<TimedChunk>,
+    },
 }
 
 /// Enforces the selected model's declared modalities on every request,
@@ -79,24 +93,46 @@ pub(crate) struct ImageCapabilityProvider {
 
 #[async_trait]
 impl Provider for ImageCapabilityProvider {
-    fn model(&self) -> &str { self.inner.model() }
-    fn supports_max_output_tokens(&self) -> bool { self.inner.supports_max_output_tokens() }
-    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { self.inner.summary_config() }
-    fn summary_model(&self) -> &str { self.inner.summary_model() }
-    fn summary_supports_max_output_tokens(&self) -> bool { self.inner.summary_supports_max_output_tokens() }
+    fn model(&self) -> &str {
+        self.inner.model()
+    }
+    fn supports_max_output_tokens(&self) -> bool {
+        self.inner.supports_max_output_tokens()
+    }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> {
+        self.inner.summary_config()
+    }
+    fn summary_model(&self) -> &str {
+        self.inner.summary_model()
+    }
+    fn summary_supports_max_output_tokens(&self) -> bool {
+        self.inner.summary_supports_max_output_tokens()
+    }
 
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         use crate::session::projection::ModelTurn;
         use rness_protocol::events::{ContentPart, ToolResultContentPart};
-        if cancel.is_cancelled() { return StepOutcome::Cancelled { partial: vec![] }; }
+        if cancel.is_cancelled() {
+            return StepOutcome::Cancelled { partial: vec![] };
+        }
         let has_images = request.context.turns.iter().any(|turn| match turn {
-            ModelTurn::User { content } | ModelTurn::Assistant { content } => content.iter().any(|p| matches!(p, ContentPart::Image { .. })),
-            ModelTurn::ToolResults { results } => results.iter().any(|r| r.content.iter().any(|p| matches!(p, ToolResultContentPart::Image { .. }))),
+            ModelTurn::User { content } | ModelTurn::Assistant { content } => content
+                .iter()
+                .any(|p| matches!(p, ContentPart::Image { .. })),
+            ModelTurn::ToolResults { results } => results.iter().any(|r| {
+                r.content
+                    .iter()
+                    .any(|p| matches!(p, ToolResultContentPart::Image { .. }))
+            }),
         });
         if has_images {
             return StepOutcome::Failed {
-                error: ProviderError { code: "UNSUPPORTED_CONTENT", retry_after: None,
-                    message: "selected model explicitly disables image input".into(), retryable: false },
+                error: ProviderError {
+                    code: "UNSUPPORTED_CONTENT",
+                    retry_after: None,
+                    message: "selected model explicitly disables image input".into(),
+                    retryable: false,
+                },
                 partial: vec![],
             };
         }
@@ -107,13 +143,15 @@ impl Provider for ImageCapabilityProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rness_protocol::events::*;
     use crate::session::projection::ModelTurn;
+    use rness_protocol::events::*;
 
     struct NeverCalled;
     #[async_trait]
     impl Provider for NeverCalled {
-        fn model(&self) -> &str { "text-only" }
+        fn model(&self) -> &str {
+            "text-only"
+        }
         async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
             panic!("image request reached text-only provider")
         }
@@ -124,40 +162,93 @@ mod tests {
         struct Tagged(&'static str);
         #[async_trait]
         impl Provider for Tagged {
-            fn model(&self) -> &str { self.0 }
+            fn model(&self) -> &str {
+                self.0
+            }
             async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
-                StepOutcome::Failed { error: ProviderError { code: self.0, retry_after: None,
-                    message: self.0.into(), retryable: false }, partial: vec![] }
+                StepOutcome::Failed {
+                    error: ProviderError {
+                        code: self.0,
+                        retry_after: None,
+                        message: self.0.into(),
+                        retryable: false,
+                    },
+                    partial: vec![],
+                }
             }
         }
-        let provider = SummaryProvider { main: std::sync::Arc::new(Tagged("main")), summary: std::sync::Arc::new(Tagged("summary")), config: Default::default() };
+        let provider = SummaryProvider {
+            main: std::sync::Arc::new(Tagged("main")),
+            summary: std::sync::Arc::new(Tagged("summary")),
+            config: Default::default(),
+        };
         let context = ModelContext::default();
-        let request = || StepRequest { context: &context, system: "", tools: &[], on_delta: None };
+        let request = || StepRequest {
+            context: &context,
+            system: "",
+            tools: &[],
+            on_delta: None,
+        };
         let cancel = CancellationToken::new();
-        let StepOutcome::Failed { error, .. } = provider.step(request(), &cancel).await else { panic!() };
+        let StepOutcome::Failed { error, .. } = provider.step(request(), &cancel).await else {
+            panic!()
+        };
         assert_eq!(error.code, "main");
-        let StepOutcome::Failed { error, .. } = provider.summarize_step(request(), &cancel).await else { panic!() };
+        let StepOutcome::Failed { error, .. } = provider.summarize_step(request(), &cancel).await
+        else {
+            panic!()
+        };
         assert_eq!(error.code, "summary");
         assert_eq!(provider.summary_model(), "summary");
     }
 
     #[tokio::test]
     async fn tool_images_are_rejected_before_provider_request() {
-        let provider = ImageCapabilityProvider { inner: std::sync::Arc::new(NeverCalled) };
-        let context = ModelContext { turns: vec![ModelTurn::ToolResults { results: vec![ToolResult {
-            call: "camera-1".into(), name: "camera".into(), output: String::new(),
-            content: vec![ToolResultContentPart::Image { attachment: ImageRef {
-                id: "stored".into(), media_type: "image/png".into(), bytes: 1, width: 1, height: 1,
-            } }], is_error: false, duration_ms: 0, tasks: None, plan_review: None, presentation: None,
-        }] }], ..Default::default() };
-        let request = || StepRequest { context: &context, system: "", tools: &[], on_delta: None };
+        let provider = ImageCapabilityProvider {
+            inner: std::sync::Arc::new(NeverCalled),
+        };
+        let context = ModelContext {
+            turns: vec![ModelTurn::ToolResults {
+                results: vec![ToolResult {
+                    call: "camera-1".into(),
+                    name: "camera".into(),
+                    output: String::new(),
+                    content: vec![ToolResultContentPart::Image {
+                        attachment: ImageRef {
+                            id: "stored".into(),
+                            media_type: "image/png".into(),
+                            bytes: 1,
+                            width: 1,
+                            height: 1,
+                        },
+                    }],
+                    is_error: false,
+                    duration_ms: 0,
+                    tasks: None,
+                    plan_review: None,
+                    presentation: None,
+                }],
+            }],
+            ..Default::default()
+        };
+        let request = || StepRequest {
+            context: &context,
+            system: "",
+            tools: &[],
+            on_delta: None,
+        };
         let cancel = CancellationToken::new();
-        let StepOutcome::Failed { error, partial } = provider.step(request(), &cancel).await else { panic!("expected rejection") };
+        let StepOutcome::Failed { error, partial } = provider.step(request(), &cancel).await else {
+            panic!("expected rejection")
+        };
         assert_eq!(error.code, "UNSUPPORTED_CONTENT");
         assert!(!error.retryable);
         assert!(partial.is_empty());
         cancel.cancel();
-        assert!(matches!(provider.step(request(), &cancel).await, StepOutcome::Cancelled { .. }));
+        assert!(matches!(
+            provider.step(request(), &cancel).await,
+            StepOutcome::Cancelled { .. }
+        ));
     }
 }
 
@@ -168,14 +259,26 @@ pub(crate) struct SummaryProvider {
 }
 #[async_trait]
 impl Provider for SummaryProvider {
-    fn model(&self) -> &str { self.main.model() }
-    fn summary_model(&self) -> &str { self.summary.model() }
-    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { Some(&self.config) }
-    fn summary_supports_max_output_tokens(&self) -> bool { self.summary.supports_max_output_tokens() }
+    fn model(&self) -> &str {
+        self.main.model()
+    }
+    fn summary_model(&self) -> &str {
+        self.summary.model()
+    }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> {
+        Some(&self.config)
+    }
+    fn summary_supports_max_output_tokens(&self) -> bool {
+        self.summary.supports_max_output_tokens()
+    }
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         self.main.step(request, cancel).await
     }
-    async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+    async fn summarize_step(
+        &self,
+        request: StepRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> StepOutcome {
         self.summary.step(request, cancel).await
     }
 }
@@ -186,16 +289,33 @@ pub trait Provider: Send + Sync {
     fn model(&self) -> &str;
 
     /// Configure attachment resolution before the provider is shared.
-    fn configure_images(&mut self, _store: std::sync::Arc<crate::images::ImageStore>, _policy: crate::images::ImagePolicy) {}
+    fn configure_images(
+        &mut self,
+        _store: std::sync::Arc<crate::images::ImageStore>,
+        _policy: crate::images::ImagePolicy,
+    ) {
+    }
 
     /// Whether this provider accepts `max_output_tokens` in requests.
-    fn supports_max_output_tokens(&self) -> bool { true }
+    fn supports_max_output_tokens(&self) -> bool {
+        true
+    }
 
     /// Separate summarization route, when explicitly configured by the host.
-    fn summary_model(&self) -> &str { self.model() }
-    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> { None }
-    fn summary_supports_max_output_tokens(&self) -> bool { self.supports_max_output_tokens() }
-    async fn summarize_step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+    fn summary_model(&self) -> &str {
+        self.model()
+    }
+    fn summary_config(&self) -> Option<&rness_protocol::events::CallConfig> {
+        None
+    }
+    fn summary_supports_max_output_tokens(&self) -> bool {
+        self.supports_max_output_tokens()
+    }
+    async fn summarize_step(
+        &self,
+        request: StepRequest<'_>,
+        cancel: &CancellationToken,
+    ) -> StepOutcome {
         self.step(request, cancel).await
     }
 

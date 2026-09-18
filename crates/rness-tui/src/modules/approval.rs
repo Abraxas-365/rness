@@ -27,7 +27,9 @@ pub struct PendingApproval {
 
 impl std::fmt::Debug for PendingApproval {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingApproval").field("request", &self.request).finish_non_exhaustive()
+        f.debug_struct("PendingApproval")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
     }
 }
 
@@ -62,7 +64,9 @@ impl Component for ApprovalOverlay {
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
-        let Some(pending) = &ctx.model.pending_approval else { return };
+        let Some(pending) = &ctx.model.pending_approval else {
+            return;
+        };
         Clear.render(area, buf);
         let block = Block::default()
             .borders(Borders::ALL)

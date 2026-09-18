@@ -41,8 +41,14 @@ impl GrepTool {
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn concurrency_safe(&self, _: &Value) -> bool { true }
-    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+    fn for_workspace(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }
     fn name(&self) -> &str {
@@ -77,11 +83,27 @@ impl Tool for GrepTool {
     }
 
     async fn execute_presented(
-        &self, _session: &String, _call: &String, args: Value,
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
         _cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, presentation) = self.grep_presented(args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(presentation),
+        ))
     }
 }
 
@@ -89,7 +111,10 @@ impl GrepTool {
     async fn grep_presented(&self, args: Value) -> Result<(String, Value), String> {
         let pattern = required_str(&args, "pattern")?.to_string();
         let base = self.ws.resolve(args["path"].as_str().unwrap_or("."));
-        let mode = args["output_mode"].as_str().unwrap_or("files_with_matches").to_string();
+        let mode = args["output_mode"]
+            .as_str()
+            .unwrap_or("files_with_matches")
+            .to_string();
         let case_insensitive = args["case_insensitive"].as_bool().unwrap_or(false);
         let file_glob = match args["glob"].as_str() {
             Some(g) => Some(

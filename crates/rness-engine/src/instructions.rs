@@ -121,7 +121,11 @@ pub fn render(config: &InstructionsConfig) -> Option<Baseline> {
         if take < f.text.len() {
             chunk.push_str("\n[... truncated: instruction budget exceeded ...]");
         }
-        body.push_str(&format!("Instructions from: {}\n\n{}\n\n", f.path.display(), chunk));
+        body.push_str(&format!(
+            "Instructions from: {}\n\n{}\n\n",
+            f.path.display(),
+            chunk
+        ));
         remaining = remaining.saturating_sub(take);
     }
 
@@ -144,7 +148,10 @@ pub fn render(config: &InstructionsConfig) -> Option<Baseline> {
         hasher.update(f.path.to_string_lossy().as_bytes());
         hasher.update(f.text.as_bytes());
     }
-    Some(Baseline { identity: hasher.hex(), text })
+    Some(Baseline {
+        identity: hasher.hex(),
+        text,
+    })
 }
 
 fn floor_char_boundary(s: &str, mut i: usize) -> usize {
@@ -167,7 +174,11 @@ struct Sha1 {
 
 impl Sha1 {
     fn new() -> Self {
-        Self { state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0], buf: Vec::new(), len: 0 }
+        Self {
+            state: [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0],
+            buf: Vec::new(),
+            len: 0,
+        }
     }
 
     fn update(&mut self, data: impl AsRef<[u8]>) {
@@ -223,8 +234,7 @@ impl Sha1 {
             self.buf.push(0);
         }
         self.buf.extend_from_slice(&len_bits.to_be_bytes());
-        let blocks: Vec<[u8; 64]> =
-            self.buf.chunks(64).map(|c| c.try_into().unwrap()).collect();
+        let blocks: Vec<[u8; 64]> = self.buf.chunks(64).map(|c| c.try_into().unwrap()).collect();
         for b in &blocks {
             self.compress(b);
         }
@@ -261,8 +271,7 @@ mod tests {
         std::fs::write(root.join("sub/CLAUDE.md"), "sub rules").unwrap();
 
         let files = discover(&cfg(&root.join("sub/deeper"), 4096));
-        let names: Vec<String> =
-            files.iter().map(|f| f.text.clone()).collect();
+        let names: Vec<String> = files.iter().map(|f| f.text.clone()).collect();
         assert_eq!(names, vec!["root rules", "sub rules"]);
     }
 
@@ -309,7 +318,10 @@ mod tests {
 
         // Budget fits only the specific file: broad one dropped whole.
         let b = render(&cfg(&root.join("sub"), 90)).unwrap();
-        assert!(!b.text.contains(&"B".repeat(100)), "broad file must be dropped whole");
+        assert!(
+            !b.text.contains(&"B".repeat(100)),
+            "broad file must be dropped whole"
+        );
         assert!(b.text.contains(&"S".repeat(80)));
 
         // Budget below the specific file alone: it truncates, marked.

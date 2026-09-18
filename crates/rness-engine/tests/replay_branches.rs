@@ -19,7 +19,9 @@ fn assistant_tool_use() -> SessionEvent {
     SessionEvent::AssistantMessage(AssistantMessage {
         model: "m1".into(),
         content: vec![
-            ContentPart::Text { text: "reading the file".into() },
+            ContentPart::Text {
+                text: "reading the file".into(),
+            },
             ContentPart::ToolUse {
                 call: "c1".into(),
                 name: "Read".into(),
@@ -27,9 +29,18 @@ fn assistant_tool_use() -> SessionEvent {
             },
         ],
         stop: StopReason::ToolUse,
-        usage: Usage { input_tokens: 100, output_tokens: 20, ..Default::default() },
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        },
         estimated_input: 0,
-        chunks: vec![TimedChunk { ms: 90, delta: ChunkDelta::Text { t: "reading the file".into() } }],
+        chunks: vec![TimedChunk {
+            ms: 90,
+            delta: ChunkDelta::Text {
+                t: "reading the file".into(),
+            },
+        }],
     })
 }
 
@@ -38,7 +49,11 @@ fn assistant_final(text: &str) -> SessionEvent {
         model: "m1".into(),
         content: vec![ContentPart::Text { text: text.into() }],
         stop: StopReason::EndTurn,
-        usage: Usage { input_tokens: 150, output_tokens: 10, ..Default::default() },
+        usage: Usage {
+            input_tokens: 150,
+            output_tokens: 10,
+            ..Default::default()
+        },
         estimated_input: 0,
         chunks: vec![],
     })
@@ -57,15 +72,26 @@ fn full_turn_with_attempt_projects_and_replays() {
     // First model call dies (overloaded) — preserved as an attempt.
     log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
         model: "m1".into(),
-        outcome: AttemptOutcome::Error { code: None, retry_in_ms: None, message: "overloaded".into(), retryable: true },
-        chunks: vec![TimedChunk { ms: 10, delta: ChunkDelta::Text { t: "wha".into() } }],
+        outcome: AttemptOutcome::Error {
+            code: None,
+            retry_in_ms: None,
+            message: "overloaded".into(),
+            retryable: true,
+        },
+        chunks: vec![TimedChunk {
+            ms: 10,
+            delta: ChunkDelta::Text { t: "wha".into() },
+        }],
     }))
     .unwrap();
 
     // Retry succeeds with a tool call, tool result commits, final answer.
     log.append(&assistant_tool_use()).unwrap();
     log.append(&SessionEvent::ToolResult(ToolResult {
-        content: vec![], tasks: None, plan_review: None, presentation: Some(serde_json::json!({
+        content: vec![],
+        tasks: None,
+        plan_review: None,
+        presentation: Some(serde_json::json!({
             "version":1,"kind":"read","text":"127.0.0.1 localhost","start_line":1,
         })),
         call: "c1".into(),
@@ -76,24 +102,38 @@ fn full_turn_with_attempt_projects_and_replays() {
     }))
     .unwrap();
     let final_msg = log.append(&assistant_final("it maps localhost")).unwrap();
-    log.append(&SessionEvent::TurnEnded { turn: 1, outcome: TurnOutcome::Completed }).unwrap();
+    log.append(&SessionEvent::TurnEnded {
+        turn: 1,
+        outcome: TurnOutcome::Completed,
+    })
+    .unwrap();
     drop(log);
 
     // Reopen through a fresh store, not an in-memory event cache.
     let store = SessionStore::new(dir.path());
     let replayed = replay(&store, &sid).unwrap();
-    let result = replayed.history.iter().find_map(|env| match &env.event {
-        SessionEvent::ToolResult(result) => Some(result),
-        _ => None,
-    }).unwrap();
-    assert_eq!(result.presentation.as_ref().unwrap()["text"], "127.0.0.1 localhost");
+    let result = replayed
+        .history
+        .iter()
+        .find_map(|env| match &env.event {
+            SessionEvent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        result.presentation.as_ref().unwrap()["text"],
+        "127.0.0.1 localhost"
+    );
     assert_eq!(result.output, "127.0.0.1 localhost");
 
     // Model context: user -> assistant(tool_use) -> tool_results -> assistant.
     // The attempt is NOT there; turn markers are NOT there.
     assert_eq!(replayed.context.turns.len(), 4);
     assert!(matches!(replayed.context.turns[0], ModelTurn::User { .. }));
-    assert!(matches!(replayed.context.turns[1], ModelTurn::Assistant { .. }));
+    assert!(matches!(
+        replayed.context.turns[1],
+        ModelTurn::Assistant { .. }
+    ));
     match &replayed.context.turns[2] {
         ModelTurn::ToolResults { results } => {
             assert_eq!(results.len(), 1);
@@ -101,13 +141,19 @@ fn full_turn_with_attempt_projects_and_replays() {
         }
         other => panic!("expected tool results, got {other:?}"),
     }
-    assert!(matches!(replayed.context.turns[3], ModelTurn::Assistant { .. }));
+    assert!(matches!(
+        replayed.context.turns[3],
+        ModelTurn::Assistant { .. }
+    ));
     assert_eq!(replayed.context.usage.input_tokens, 250);
     assert_eq!(replayed.context.usage.output_tokens, 30);
 
     // Transcript: the attempt IS visible to frontends.
     let t = transcript(&replayed.history);
-    assert!(t.items.iter().any(|i| matches!(i, TranscriptItem::Attempt { .. })));
+    assert!(t
+        .items
+        .iter()
+        .any(|i| matches!(i, TranscriptItem::Attempt { .. })));
     assert_eq!(t.items.len(), 5); // user, attempt, assistant, tool, assistant
 
     // Fork at the tool-use assistant message: context on the branch stops there.
@@ -124,7 +170,7 @@ fn full_turn_with_attempt_projects_and_replays() {
 
     let branch = replay(&store, &child_id).unwrap();
     assert_eq!(branch.context.turns.len(), 2); // user + assistant(tool_use)
-    // The final answer belongs only to the parent.
+                                               // The final answer belongs only to the parent.
     assert!(!branch.history.iter().any(|e| e.id == final_msg.id));
     // Parent unaffected.
     assert_eq!(replay(&store, &sid).unwrap().context.turns.len(), 4);
@@ -140,8 +186,14 @@ fn replay_repairs_orphan_tool_use_without_mutating_history() {
     log.append(&SessionEvent::AssistantMessage(AssistantMessage {
         model: "m1".into(),
         content: vec![
-            ContentPart::Text { text: "Writing it now.".into() },
-            ContentPart::ToolUse { call: "orphan".into(), name: "Write".into(), args: serde_json::json!({}) },
+            ContentPart::Text {
+                text: "Writing it now.".into(),
+            },
+            ContentPart::ToolUse {
+                call: "orphan".into(),
+                name: "Write".into(),
+                args: serde_json::json!({}),
+            },
         ],
         // This reproduces a provider output-limit stop from the older turn
         // loop: the call was committed but never dispatched.
@@ -149,7 +201,8 @@ fn replay_repairs_orphan_tool_use_without_mutating_history() {
         usage: Usage::default(),
         estimated_input: 0,
         chunks: vec![],
-    })).unwrap();
+    }))
+    .unwrap();
     log.append(&user("continue")).unwrap();
     drop(log);
 
@@ -158,13 +211,19 @@ fn replay_repairs_orphan_tool_use_without_mutating_history() {
     assert_eq!(replayed.context.turns.len(), 3);
     match &replayed.context.turns[1] {
         ModelTurn::Assistant { content } => {
-            assert!(content.iter().any(|part| matches!(part, ContentPart::Text { text } if text == "Writing it now.")));
-            assert!(!content.iter().any(|part| matches!(part, ContentPart::ToolUse { .. })));
+            assert!(content.iter().any(
+                |part| matches!(part, ContentPart::Text { text } if text == "Writing it now.")
+            ));
+            assert!(!content
+                .iter()
+                .any(|part| matches!(part, ContentPart::ToolUse { .. })));
         }
         other => panic!("expected repaired assistant turn, got {other:?}"),
     }
-    assert!(matches!(&replayed.context.turns[2], ModelTurn::User { content }
-        if matches!(&content[0], ContentPart::Text { text } if text == "continue")));
+    assert!(
+        matches!(&replayed.context.turns[2], ModelTurn::User { content }
+        if matches!(&content[0], ContentPart::Text { text } if text == "continue"))
+    );
 }
 
 #[test]
@@ -178,7 +237,9 @@ fn steer_and_inject_intents_reach_model_context() {
     for intent in [UserIntent::Followup, UserIntent::Steer, UserIntent::Inject] {
         log.append(&SessionEvent::UserMessage(UserMessage {
             intent,
-            content: vec![ContentPart::Text { text: format!("{intent:?}") }],
+            content: vec![ContentPart::Text {
+                text: format!("{intent:?}"),
+            }],
             source: None,
         }))
         .unwrap();

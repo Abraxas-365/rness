@@ -79,10 +79,17 @@ impl AppsState {
 
     pub fn set_session(&self, session: String) {
         let mut inner = self.inner.write().expect("apps lock");
-        if inner.session.as_ref() == Some(&session) { return; }
+        if inner.session.as_ref() == Some(&session) {
+            return;
+        }
         inner.session = Some(session);
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         inner.views.clear();
         inner.active = None;
     }
@@ -91,7 +98,9 @@ impl AppsState {
     /// key with a newly selected session's identity.
     pub fn context_if_current(&self, generation: u64, name: &str) -> Option<serde_json::Value> {
         let inner = self.inner.read().expect("apps lock");
-        if inner.generation != generation || inner.active.as_deref() != Some(name) { return None; }
+        if inner.generation != generation || inner.active.as_deref() != Some(name) {
+            return None;
+        }
         let app = inner.apps.iter().find(|app| app.name == name)?;
         let mut ctx = serde_json::json!({"session":inner.session.as_ref()?});
         if let Some((rows, cols)) = inner.viewports.get(&app.slot) {
@@ -108,10 +117,17 @@ impl AppsState {
     /// Reload may replace callbacks without changing any app metadata.
     pub fn set_runtime_generation(&self, generation: u64) {
         let mut inner = self.inner.write().expect("apps lock");
-        if inner.runtime_generation == generation { return; }
+        if inner.runtime_generation == generation {
+            return;
+        }
         inner.runtime_generation = generation;
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         inner.views.clear();
     }
 
@@ -126,8 +142,13 @@ impl AppsState {
     pub fn set_apps(&self, apps: Vec<AppInfo>) {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.apps != apps {
-            inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            inner.generation = inner
+                .generation
+                .checked_add(1)
+                .expect("app generation exhausted");
+            if let Some(epoch) = &inner.input_epoch {
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             inner.views.clear();
         }
         // Active app that vanished (reload) closes.
@@ -136,12 +157,16 @@ impl AppsState {
                 inner.active = None;
             }
         }
-        inner.views.retain(|name, _| apps.iter().any(|app| &app.name == name));
+        inner
+            .views
+            .retain(|name, _| apps.iter().any(|app| &app.name == name));
         inner.apps = apps;
         let active = inner.active.clone();
         drop(inner);
         // Refresh visible content even when a reload keeps identical metadata.
-        if let Some(active) = active { self.send(AppEvent::Shown(active)); }
+        if let Some(active) = active {
+            self.send(AppEvent::Shown(active));
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -151,8 +176,13 @@ impl AppsState {
     /// Invalidate even if a replacement keeps the same app metadata.
     pub fn invalidate(&self) {
         let mut inner = self.inner.write().expect("apps lock");
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         inner.views.clear();
         inner.active = None;
     }
@@ -179,7 +209,9 @@ impl AppsState {
         *self.events.write().expect("apps lock") = Some(tx);
     }
 
-    pub fn active_overlay(&self) -> bool { self.active_in_slot(OVERLAY).is_some() }
+    pub fn active_overlay(&self) -> bool {
+        self.active_in_slot(OVERLAY).is_some()
+    }
 
     pub fn activation(&self) -> (Option<String>, u64) {
         let inner = self.inner.read().expect("apps lock");
@@ -189,8 +221,13 @@ impl AppsState {
     pub fn close_activation(&self, name: &str, generation: u64) {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.active.as_deref() == Some(name) && inner.generation == generation {
-            inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            inner.generation = inner
+                .generation
+                .checked_add(1)
+                .expect("app generation exhausted");
+            if let Some(epoch) = &inner.input_epoch {
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             inner.active = None;
         }
     }
@@ -216,21 +253,36 @@ impl AppsState {
     /// Hide the active app (host applies this after a "close" outcome).
     pub fn close(&self) {
         let mut inner = self.inner.write().expect("apps lock");
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         inner.active = None;
     }
 
     /// Apply synchronous host effects only while this interaction still owns focus.
     /// The callback must not call back into AppsState.
-    pub fn apply_key_if_current(&self, generation: u64, name: &str, effect: impl FnOnce() -> bool) -> bool {
+    pub fn apply_key_if_current(
+        &self,
+        generation: u64,
+        name: &str,
+        effect: impl FnOnce() -> bool,
+    ) -> bool {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.generation != generation || inner.active.as_deref() != Some(name) {
             return false;
         }
         if effect() {
-            inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+            inner.generation = inner
+                .generation
+                .checked_add(1)
+                .expect("app generation exhausted");
+            if let Some(epoch) = &inner.input_epoch {
+                epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             inner.active = None;
         }
         true
@@ -258,9 +310,16 @@ impl AppsState {
     /// views and key effects from a previous command cannot leak into it.
     pub fn open(&self, name: &str) -> bool {
         let mut inner = self.inner.write().expect("apps lock");
-        if !inner.apps.iter().any(|app| app.name == name) { return false; }
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        if !inner.apps.iter().any(|app| app.name == name) {
+            return false;
+        }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         inner.active = Some(name.into());
         inner.views.remove(name);
         drop(inner);
@@ -271,7 +330,12 @@ impl AppsState {
     pub fn refresh_ms(&self) -> Option<u64> {
         let inner = self.inner.read().expect("apps lock");
         let active = inner.active.as_ref()?;
-        inner.apps.iter().find(|app| &app.name == active)?.refresh_ms.map(|ms| ms.clamp(50, 60_000))
+        inner
+            .apps
+            .iter()
+            .find(|app| &app.name == active)?
+            .refresh_ms
+            .map(|ms| ms.clamp(50, 60_000))
     }
 
     /// Toggle the app bound to this key, if any. Returns true if handled.
@@ -285,8 +349,13 @@ impl AppsState {
         else {
             return false;
         };
-        inner.generation = inner.generation.checked_add(1).expect("app generation exhausted");
-        if let Some(epoch) = &inner.input_epoch { epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst); }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("app generation exhausted");
+        if let Some(epoch) = &inner.input_epoch {
+            epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if inner.active.as_deref() == Some(&app) {
             inner.active = None;
         } else {
@@ -300,7 +369,11 @@ impl AppsState {
     fn active_in_slot(&self, slot: &str) -> Option<AppInfo> {
         let inner = self.inner.read().expect("apps lock");
         let active = inner.active.as_ref()?;
-        inner.apps.iter().find(|a| &a.name == active && a.slot == slot).cloned()
+        inner
+            .apps
+            .iter()
+            .find(|a| &a.name == active && a.slot == slot)
+            .cloned()
     }
 
     fn view_of(&self, name: &str) -> Vec<String> {
@@ -357,12 +430,26 @@ struct ExtApp {
 
 impl Component for ExtApp {
     fn binding_help(&self) -> Vec<String> {
-        let Some(app) = self.state.active_in_slot(self.slot) else { return Vec::new(); };
-        let mut lines = vec![format!("App {}: Escape closes; other keys are forwarded to the plugin", app.name)];
-        if let Some(help) = self.state.inner.read().expect("apps lock").key_help.get(&app.name) {
+        let Some(app) = self.state.active_in_slot(self.slot) else {
+            return Vec::new();
+        };
+        let mut lines = vec![format!(
+            "App {}: Escape closes; other keys are forwarded to the plugin",
+            app.name
+        )];
+        if let Some(help) = self
+            .state
+            .inner
+            .read()
+            .expect("apps lock")
+            .key_help
+            .get(&app.name)
+        {
             lines.extend(help.iter().map(|line| format!("Plugin-declared: {line}")));
         }
-        if let Some(key) = app.keymap { lines.push(format!("App {}: {key:?} toggles closed", app.name)); }
+        if let Some(key) = app.keymap {
+            lines.push(format!("App {}: {key:?} toggles closed", app.name));
+        }
         lines
     }
 
@@ -378,36 +465,85 @@ impl Component for ExtApp {
         let app = self.state.active_in_slot(self.slot)?;
         match self.slot {
             // Reinterpreted as width by the sidebar slot.
-            SIDEBAR => Some(app.config["width"].as_u64().unwrap_or(u64::from(34.min(width / 3))).min(u64::from(width)) as u16),
+            SIDEBAR => Some(
+                app.config["width"]
+                    .as_u64()
+                    .unwrap_or(u64::from(34.min(width / 3)))
+                    .min(u64::from(width)) as u16,
+            ),
             _ => {
-                let lines = self.state.view_of(&app.name).len().saturating_add(2).clamp(5, 30);
-                Some(app.config["height"].as_u64().unwrap_or(lines as u64).min(u64::from(u16::MAX)) as u16)
+                let lines = self
+                    .state
+                    .view_of(&app.name)
+                    .len()
+                    .saturating_add(2)
+                    .clamp(5, 30);
+                Some(
+                    app.config["height"]
+                        .as_u64()
+                        .unwrap_or(lines as u64)
+                        .min(u64::from(u16::MAX)) as u16,
+                )
             }
         }
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
-        let Some(app) = self.state.active_in_slot(self.slot) else { return };
+        let Some(app) = self.state.active_in_slot(self.slot) else {
+            return;
+        };
         use crate::core::terminal_text::sanitize;
         use ratatui::widgets::BorderType;
-        let width = app.config["width"].as_u64().unwrap_or(u64::from(area.width)).min(u64::from(area.width)) as u16;
-        let area = Rect::new(area.x + (area.width - width) / 2, area.y, width, area.height);
-        let resolve = |value: &serde_json::Value, fallback| ctx.theme.resolve_style(value, fallback).unwrap_or(fallback);
+        let width = app.config["width"]
+            .as_u64()
+            .unwrap_or(u64::from(area.width))
+            .min(u64::from(area.width)) as u16;
+        let area = Rect::new(
+            area.x + (area.width - width) / 2,
+            area.y,
+            width,
+            area.height,
+        );
+        let resolve = |value: &serde_json::Value, fallback| {
+            ctx.theme.resolve_style(value, fallback).unwrap_or(fallback)
+        };
         let style = resolve(&app.config["style"], ctx.theme.overlay);
         let border = &app.config["border"];
         let kind = border["kind"].as_str().unwrap_or("plain");
         let block = Block::default()
-            .borders(if kind == "none" { Borders::NONE } else { Borders::ALL })
-            .border_type(match kind { "rounded" => BorderType::Rounded, "double" => BorderType::Double, _ => BorderType::Plain })
+            .borders(if kind == "none" {
+                Borders::NONE
+            } else {
+                Borders::ALL
+            })
+            .border_type(match kind {
+                "rounded" => BorderType::Rounded,
+                "double" => BorderType::Double,
+                _ => BorderType::Plain,
+            })
             .border_style(resolve(&border["style"], ctx.theme.overlay_border))
-            .title(Line::styled(format!(" {} ", sanitize(&app.title)), resolve(&app.config["title_style"], style)));
+            .title(Line::styled(
+                format!(" {} ", sanitize(&app.title)),
+                resolve(&app.config["title_style"], style),
+            ));
         let content = block.inner(area);
         let viewport = (content.height, content.width);
-        let previous = self.state.inner.write().expect("apps lock")
-            .viewports.insert(self.slot.into(), viewport);
-        if previous != Some(viewport) { self.state.send(AppEvent::Shown(app.name.clone())); }
-        let lines: Vec<Line> = self.state.view_of(&app.name).into_iter()
-            .map(|line| Line::from(sanitize(&line))).collect();
+        let previous = self
+            .state
+            .inner
+            .write()
+            .expect("apps lock")
+            .viewports
+            .insert(self.slot.into(), viewport);
+        if previous != Some(viewport) {
+            self.state.send(AppEvent::Shown(app.name.clone()));
+        }
+        let lines: Vec<Line> = self
+            .state
+            .view_of(&app.name)
+            .into_iter()
+            .map(|line| Line::from(sanitize(&line)))
+            .collect();
         // Clear symbols AND old style flags before painting the opaque panel.
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
@@ -415,7 +551,10 @@ impl Component for ExtApp {
                 buf[(x, y)].set_style(style);
             }
         }
-        Paragraph::new(lines).style(style).block(block).render(area, buf);
+        Paragraph::new(lines)
+            .style(style)
+            .block(block)
+            .render(area, buf);
     }
 
     fn on_key(&mut self, _ctx: &Ctx<'_>, key: KeyEvent) -> KeyOutcome {
@@ -432,7 +571,8 @@ impl Component for ExtApp {
             return KeyOutcome::consumed();
         }
         if let Some(k) = key_string(&key) {
-            self.state.send(AppEvent::Key(app.name, k, self.state.generation()));
+            self.state
+                .send(AppEvent::Key(app.name, k, self.state.generation()));
             return KeyOutcome::consumed();
         }
         KeyOutcome::consumed()
@@ -448,8 +588,22 @@ pub fn handle_global_key(state: &AppsState, key: &KeyEvent) -> bool {
 /// Mount one ExtApp per slot kind. Returns the shared state handle.
 pub fn install(slots: &mut Slots) -> AppsState {
     let state = AppsState::default();
-    slots.mount(SIDEBAR, 10, Box::new(ExtApp { state: state.clone(), slot: SIDEBAR }));
-    slots.mount(OVERLAY, 5, Box::new(ExtApp { state: state.clone(), slot: OVERLAY }));
+    slots.mount(
+        SIDEBAR,
+        10,
+        Box::new(ExtApp {
+            state: state.clone(),
+            slot: SIDEBAR,
+        }),
+    );
+    slots.mount(
+        OVERLAY,
+        5,
+        Box::new(ExtApp {
+            state: state.clone(),
+            slot: OVERLAY,
+        }),
+    );
     state
 }
 
@@ -465,8 +619,13 @@ mod tests {
         let state = install(&mut slots);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.connect(tx);
-        state.set_apps(vec![AppInfo { name: "jobs".into(), slot: OVERLAY.into(),
-            refresh_ms: Some(250), capture_escape: true, ..Default::default() }]);
+        state.set_apps(vec![AppInfo {
+            name: "jobs".into(),
+            slot: OVERLAY.into(),
+            refresh_ms: Some(250),
+            capture_escape: true,
+            ..Default::default()
+        }]);
         assert_eq!(state.refresh_ms(), None);
         assert!(!state.open("missing"));
         assert!(state.open("jobs"));
@@ -478,16 +637,28 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("jobs".into()));
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
-        slots.focused_mut(&ctx).unwrap().on_key(&ctx, key(KeyCode::Esc, KeyModifiers::NONE));
-        assert_eq!(rx.try_recv().unwrap(), AppEvent::Key("jobs".into(), "esc".into(), state.generation()));
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        slots
+            .focused_mut(&ctx)
+            .unwrap()
+            .on_key(&ctx, key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AppEvent::Key("jobs".into(), "esc".into(), state.generation())
+        );
         assert_eq!(state.active().as_deref(), Some("jobs"));
         let generation = state.generation();
         state.set_session("s".into());
         assert_eq!(state.context_if_current(generation, "jobs"), None);
         state.open("jobs");
         let generation = state.generation();
-        assert_eq!(state.context_if_current(generation, "jobs").unwrap()["session"], "s");
+        assert_eq!(
+            state.context_if_current(generation, "jobs").unwrap()["session"],
+            "s"
+        );
         state.set_runtime_generation(7);
         assert_eq!(state.context_if_current(generation, "jobs"), None);
         assert_eq!(state.active().as_deref(), Some("jobs"));
@@ -501,21 +672,35 @@ mod tests {
     #[test]
     fn app_layout_styles_and_output_are_safe() {
         let state = AppsState::default();
-        state.set_apps(vec![AppInfo { name: "jobs".into(), slot: OVERLAY.into(),
-            title: "jobs\x1b[2J".into(), config: serde_json::json!({"width":20,"height":8,
-                "style":{"fg":"red"}, "border":{"kind":"none"}}), ..Default::default() }]);
+        state.set_apps(vec![AppInfo {
+            name: "jobs".into(),
+            slot: OVERLAY.into(),
+            title: "jobs\x1b[2J".into(),
+            config: serde_json::json!({"width":20,"height":8,
+                "style":{"fg":"red"}, "border":{"kind":"none"}}),
+            ..Default::default()
+        }]);
         state.open("jobs");
         state.publish("jobs", vec!["a\tb\x1b[2J\x07".into()]);
-        let mut component = ExtApp { state: state.clone(), slot: OVERLAY };
+        let mut component = ExtApp {
+            state: state.clone(),
+            slot: OVERLAY,
+        };
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         assert_eq!(component.height(&ctx, 80), Some(8));
         let area = Rect::new(0, 0, 40, 8);
         let mut buf = Buffer::empty(area);
         component.render(&ctx, area, &mut buf);
         assert_eq!(state.cols_for("jobs"), Some(20));
-        assert!(buf.content.iter().all(|cell| !cell.symbol().chars().any(char::is_control)));
+        assert!(buf
+            .content
+            .iter()
+            .all(|cell| !cell.symbol().chars().any(char::is_control)));
         assert!(buf.content.iter().any(|cell| cell.symbol() == "b"));
         for width in 0..3 {
             let tiny = Rect::new(0, 0, width, 1);
@@ -528,13 +713,22 @@ mod tests {
         let state = AppsState::default();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.connect(tx);
-        let app = AppInfo { name: "probe".into(), slot: "overlay".into(), title: "Before".into(), keymap: Some("ctrl+y".into()), ..Default::default() };
+        let app = AppInfo {
+            name: "probe".into(),
+            slot: "overlay".into(),
+            title: "Before".into(),
+            keymap: Some("ctrl+y".into()),
+            ..Default::default()
+        };
         state.set_apps(vec![app.clone()]);
         state.toggle_by_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
         state.set_apps(vec![app.clone()]);
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
-        state.set_apps(vec![AppInfo { title: "After".into(), ..app }]);
+        state.set_apps(vec![AppInfo {
+            title: "After".into(),
+            ..app
+        }]);
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("probe".into()));
         assert_eq!(state.active().as_deref(), Some("probe"));
     }
@@ -576,8 +770,16 @@ mod tests {
 
     #[test]
     fn task_navigation_keys_reach_apps() {
-        for (code, expected) in [(KeyCode::PageUp, "pageup"), (KeyCode::PageDown, "pagedown"), (KeyCode::Home, "home"), (KeyCode::End, "end")] {
-            assert_eq!(key_string(&KeyEvent::new(code, KeyModifiers::NONE)).as_deref(), Some(expected));
+        for (code, expected) in [
+            (KeyCode::PageUp, "pageup"),
+            (KeyCode::PageDown, "pagedown"),
+            (KeyCode::Home, "home"),
+            (KeyCode::End, "end"),
+        ] {
+            assert_eq!(
+                key_string(&KeyEvent::new(code, KeyModifiers::NONE)).as_deref(),
+                Some(expected)
+            );
         }
     }
 
@@ -636,7 +838,10 @@ mod tests {
         assert_eq!(state.active(), None);
 
         // Unbound key: not handled.
-        assert!(!handle_global_key(&state, &key(KeyCode::Char('x'), KeyModifiers::NONE)));
+        assert!(!handle_global_key(
+            &state,
+            &key(KeyCode::Char('x'), KeyModifiers::NONE)
+        ));
     }
 
     #[test]
@@ -653,14 +858,20 @@ mod tests {
 
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
 
         // Overlay is focused now; a key forwards to the host.
         let focused = slots.focused_mut(&ctx).expect("overlay focused");
         assert_eq!(focused.name(), "ext_apps");
         let out = focused.on_key(&ctx, key(KeyCode::Char('j'), KeyModifiers::NONE));
         assert!(out.handled);
-        assert_eq!(rx.try_recv().unwrap(), AppEvent::Key("sessions".into(), "j".into(), state.generation()));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            AppEvent::Key("sessions".into(), "j".into(), state.generation())
+        );
 
         // Esc closes locally.
         let out = focused.on_key(&ctx, key(KeyCode::Esc, KeyModifiers::NONE));
@@ -684,7 +895,13 @@ mod tests {
         assert!(matches_keymap("ctrl+e", &ctrl_e));
         assert!(!matches_keymap("ctrl+x", &ctrl_e));
         assert!(!matches_keymap("e", &ctrl_e));
-        assert!(matches_keymap("f2", &key(KeyCode::F(2), KeyModifiers::NONE)));
-        assert!(matches_keymap("alt+b", &key(KeyCode::Char('b'), KeyModifiers::ALT)));
+        assert!(matches_keymap(
+            "f2",
+            &key(KeyCode::F(2), KeyModifiers::NONE)
+        ));
+        assert!(matches_keymap(
+            "alt+b",
+            &key(KeyCode::Char('b'), KeyModifiers::ALT)
+        ));
     }
 }

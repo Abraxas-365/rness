@@ -11,7 +11,7 @@ use crate::component::{Component, Ctx};
 use crate::core::render::render_markdown;
 use crate::core::viewport::render_bottom_anchored;
 use crate::modules::tool_cards::CardCache;
-use crate::slots::{MESSAGE_BODY, Slots};
+use crate::slots::{Slots, MESSAGE_BODY};
 
 #[derive(Default)]
 pub struct Chat {
@@ -198,11 +198,9 @@ fn card_rows_limited(
                     sign: &str,
                     style: ratatui::style::Style,
                     colored: Option<&Line<'static>>| {
-        let highlighted = vec![
-            colored
-                .cloned()
-                .unwrap_or_else(|| Line::raw(sanitize(text))),
-        ];
+        let highlighted = vec![colored
+            .cloned()
+            .unwrap_or_else(|| Line::raw(sanitize(text)))];
         for code in highlighted {
             let gutter = if block["line_numbers"] == false {
                 sign.to_owned()
@@ -2497,9 +2495,13 @@ mod tests {
                 // receives the whole 100-line block even with an 8-row preview.
                 for group in 0..count / 5 {
                     for tool in 0..4 {
-                        let source: String = (0..100).map(|line| format!(
+                        let source: String = (0..100)
+                            .map(|line| {
+                                format!(
                             "let value_{line} = inspect(&items[{group}..{tool}]); // source line\n"
-                        )).collect();
+                        )
+                            })
+                            .collect();
                         chat.cards.insert(
                             format!("call-{group}-{tool}"),
                             vec![
@@ -2828,16 +2830,13 @@ mod tests {
             config: serde_json::json!({"keys":{"selection_stop":"x"}}),
             ..Default::default()
         };
-        assert!(
-            chat.on_key(&ctx, KeyEvent::from(KeyCode::Char('x')))
-                .actions
-                .is_empty()
-        );
-        assert!(
-            !SELECTION_KEYS
-                .iter()
-                .any(|(name, _, _)| *name == "selection_stop")
-        );
+        assert!(chat
+            .on_key(&ctx, KeyEvent::from(KeyCode::Char('x')))
+            .actions
+            .is_empty());
+        assert!(!SELECTION_KEYS
+            .iter()
+            .any(|(name, _, _)| *name == "selection_stop"));
         chat.on_key(&ctx, KeyEvent::from(KeyCode::Enter));
         assert_eq!(chat.expanded.get("child-call"), Some(&true));
     }
@@ -2882,18 +2881,14 @@ mod tests {
         assert!(text.contains("Earlier conversation"), "{text}");
         assert!(text.contains("Tasks: readable checklist"), "{text}");
         assert!(!text.contains("{\"tasks\""), "{text}");
-        assert!(
-            buffer
-                .content
-                .iter()
-                .any(|cell| cell.bg == ratatui::style::Color::Rgb(0x45, 0x40, 0x3a))
-        );
-        assert!(
-            !buffer
-                .content
-                .iter()
-                .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED))
-        );
+        assert!(buffer
+            .content
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Rgb(0x45, 0x40, 0x3a)));
+        assert!(!buffer
+            .content
+            .iter()
+            .any(|cell| cell.modifier.contains(ratatui::style::Modifier::REVERSED)));
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         chat.on_key(&ctx, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(chat.message_scroll, 0);
@@ -2939,16 +2934,15 @@ mod tests {
         chat.config["selection"] = serde_json::json!({"style":{"bg":"#504945"},"marker":{"text":">","style":{"fg":"#83a598"}}});
         let mut styled = Buffer::empty(area);
         chat.render(&ctx, area, &mut styled);
-        assert!(
-            styled.content.iter().any(|cell| cell.symbol() == ">"
-                && cell.fg == ratatui::style::Color::Rgb(0x83, 0xa5, 0x98))
-        );
-        assert!(
-            styled
-                .content
-                .iter()
-                .any(|cell| cell.bg == ratatui::style::Color::Rgb(0x50, 0x49, 0x45))
-        );
+        assert!(styled
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == ">"
+                && cell.fg == ratatui::style::Color::Rgb(0x83, 0xa5, 0x98)));
+        assert!(styled
+            .content
+            .iter()
+            .any(|cell| cell.bg == ratatui::style::Color::Rgb(0x50, 0x49, 0x45)));
         chat.config["selection"]["marker"] = serde_json::json!(false);
         let mut disabled = Buffer::empty(area);
         chat.render(&ctx, area, &mut disabled);
@@ -3072,7 +3066,10 @@ mod tests {
                         "{state}/{mode}"
                     );
                     if visible {
-                        assert!(buf.content.iter().any(|cell| cell.bg == ratatui::style::Color::Rgb(0x12,0x34,0x56)));
+                        assert!(buf
+                            .content
+                            .iter()
+                            .any(|cell| cell.bg == ratatui::style::Color::Rgb(0x12, 0x34, 0x56)));
                     }
                 }
             }
@@ -3612,11 +3609,10 @@ mod tests {
                     let area = Rect::new(0, 0, 80, 10);
                     let mut buf = Buffer::empty(area);
                     render_bottom_anchored(&rows, 0, area, &mut buf);
-                    assert!(
-                        buf.content
-                            .iter()
-                            .all(|cell| !cell.symbol().chars().any(char::is_control))
-                    );
+                    assert!(buf
+                        .content
+                        .iter()
+                        .all(|cell| !cell.symbol().chars().any(char::is_control)));
                 }
             }
         }
@@ -3802,14 +3798,12 @@ mod tests {
                 .collect::<String>(),
             "def"
         );
-        assert!(
-            message_rows(
-                original.clone(),
-                &serde_json::json!({"display":"collapsed"}),
-                5
-            )
-            .is_empty()
-        );
+        assert!(message_rows(
+            original.clone(),
+            &serde_json::json!({"display":"collapsed"}),
+            5
+        )
+        .is_empty());
         assert_eq!(
             message_rows(
                 original.clone(),
@@ -3985,14 +3979,12 @@ mod tests {
             &mut buf,
         );
         assert_eq!(chat.total_rows, 1);
-        assert!(
-            chat.entry_cache[0].2[0]
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-                .contains("cancelled")
-        );
+        assert!(chat.entry_cache[0].2[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .contains("cancelled"));
         chat.config["tool"]["visible"] = serde_json::json!(false);
         chat.render(
             &Ctx {
@@ -4213,13 +4205,12 @@ mod tests {
         chat.render(&ctx, area, &mut buf);
         assert_eq!(chat.expanded.get("b"), Some(&true));
         assert_eq!(chat.expanded.get("a"), None);
-        assert!(
-            buf.content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-                .contains("Bash cargo test")
-        );
+        assert!(buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .contains("Bash cargo test"));
         chat.cards.insert(
             "b".into(),
             vec![crate::modules::tool_cards::CardLine {
@@ -4228,13 +4219,12 @@ mod tests {
             }],
         );
         chat.render(&ctx, area, &mut buf);
-        assert!(
-            buf.content
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>()
-                .contains("tests passed")
-        );
+        assert!(buf
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .contains("tests passed"));
     }
 
     #[test]
@@ -4279,18 +4269,15 @@ mod tests {
         assert_eq!(chat.expanded.get("b"), Some(&true));
         chat.config["keys"] = serde_json::json!({"toggle_tool":false});
         assert!(!chat.on_key(&ctx, toggle).handled);
-        assert!(
-            !chat
-                .binding_help()
-                .iter()
-                .any(|line| line.contains("toggle_tool"))
-        );
+        assert!(!chat
+            .binding_help()
+            .iter()
+            .any(|line| line.contains("toggle_tool")));
         chat.config["keys"] = serde_json::json!({"toggle_tool":"f8"});
-        assert!(
-            chat.binding_help()
-                .iter()
-                .any(|line| line.contains("F(8)") && line.contains("toggle_tool"))
-        );
+        assert!(chat
+            .binding_help()
+            .iter()
+            .any(|line| line.contains("F(8)") && line.contains("toggle_tool")));
         assert!(!chat.on_key(&ctx, toggle).handled);
         assert!(chat.on_key(&ctx, KeyEvent::from(KeyCode::F(8))).handled);
         chat.config["keys"] = serde_json::json!({"previous_tool":"f8", "toggle_tool":"f8"});

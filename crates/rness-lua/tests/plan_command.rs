@@ -6,7 +6,8 @@ fn plan_command_messages_describe_the_next_ai_step() {
         include_str!("../../../examples/plugins/plan.lua"),
     ] {
         let lua = mlua::Lua::new();
-        lua.load(r#"
+        lua.load(
+            r#"
             state = { active = false }
             rness = {
                 plan = { enable = function() end },
@@ -17,9 +18,13 @@ fn plan_command_messages_describe_the_next_ai_step() {
                     return state
                 end },
             }
-        "#).exec().unwrap();
+        "#,
+        )
+        .exec()
+        .unwrap();
         lua.load(source).exec().unwrap();
-        lua.load(r#"
+        lua.load(
+            r#"
             local function check(input, message)
                 local result = plan_command.run { session = "test", raw_input = input }
                 assert(result.message == message, result.message)
@@ -37,6 +42,9 @@ fn plan_command_messages_describe_the_next_ai_step() {
             check("status", "Plan mode will deactivate on the next AI step")
             check("on", "Plan mode will activate on the next AI step")
             assert(state.pending == true)
-        "#).exec().unwrap();
+        "#,
+        )
+        .exec()
+        .unwrap();
     }
 }

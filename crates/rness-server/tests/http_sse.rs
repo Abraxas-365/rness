@@ -17,48 +17,148 @@ use tokio_util::sync::CancellationToken;
 #[tokio::test]
 async fn image_upload_validation_and_session_scoped_retrieval() {
     let dir = tempfile::tempdir().unwrap();
-    let (base, sessions, _kernel) = serve_with(dir.path(), Arc::new(OneAnswer), Arc::new(ToolRegistry::default())).await;
-    sessions.set_images(Arc::new(rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default()).unwrap())).unwrap();
+    let (base, sessions, _kernel) = serve_with(
+        dir.path(),
+        Arc::new(OneAnswer),
+        Arc::new(ToolRegistry::default()),
+    )
+    .await;
+    sessions
+        .set_images(Arc::new(
+            rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default())
+                .unwrap(),
+        ))
+        .unwrap();
     let id = sessions.create(None).unwrap();
     let other = sessions.create(None).unwrap();
     let client = reqwest::Client::new();
     let mut data = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2, 2).write_to(&mut data, image::ImageFormat::Png).unwrap();
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut data, image::ImageFormat::Png)
+        .unwrap();
     let upload = format!("{base}/api/sessions/{id}/images");
-    assert_eq!(client.post(&upload).header("content-type", "image/jpeg").body(data.get_ref().clone()).send().await.unwrap().status(), 400);
-    let response = client.post(&upload).header("content-type", "image/png").body(data.get_ref().clone()).send().await.unwrap();
+    assert_eq!(
+        client
+            .post(&upload)
+            .header("content-type", "image/jpeg")
+            .body(data.get_ref().clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
+    let response = client
+        .post(&upload)
+        .header("content-type", "image/png")
+        .body(data.get_ref().clone())
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), 201);
     let reference: ImageRef = response.json().await.unwrap();
     let download = format!("{upload}/{}", reference.id);
-    assert!(sessions.send(&other, UserIntent::Followup, vec![ContentPart::Image { attachment: reference.clone() }]).is_err());
+    assert!(sessions
+        .send(
+            &other,
+            UserIntent::Followup,
+            vec![ContentPart::Image {
+                attachment: reference.clone()
+            }]
+        )
+        .is_err());
     assert_eq!(client.get(&download).send().await.unwrap().status(), 404);
-    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Image { attachment: reference.clone() }]).unwrap();
+    sessions
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Image {
+                attachment: reference.clone(),
+            }],
+        )
+        .unwrap();
     sessions.join(&id).await;
     let response = client.get(&download).send().await.unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.headers()["content-type"], "image/png");
     assert_eq!(response.bytes().await.unwrap().as_ref(), data.get_ref());
-    assert_eq!(client.get(format!("{base}/api/sessions/{other}/images/{}", reference.id)).send().await.unwrap().status(), 404);
+    assert_eq!(
+        client
+            .get(format!(
+                "{base}/api/sessions/{other}/images/{}",
+                reference.id
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
 }
 
 #[tokio::test]
 async fn file_reference_http_is_path_only_and_workspace_scoped() {
     let logs = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    std::fs::write(workspace.path().join("日本語 notes.txt"), "SECRET CONTENT NOT ATTACHED").unwrap();
+    std::fs::write(
+        workspace.path().join("日本語 notes.txt"),
+        "SECRET CONTENT NOT ATTACHED",
+    )
+    .unwrap();
     let mut kernel = Kernel::new();
-    kernel.mount(SessionsPlugin { root: logs.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), sandbox: Default::default(), agents: Default::default(), models: Default::default(), tools: Arc::new(ToolRegistry::default()), config: TurnConfig::default() }).unwrap();
+    kernel
+        .mount(SessionsPlugin {
+            root: logs.path().into(),
+            provider: Arc::new(OneAnswer),
+            resolver: None,
+            creation_seed: Default::default(),
+            sandbox: Default::default(),
+            agents: Default::default(),
+            models: Default::default(),
+            tools: Arc::new(ToolRegistry::default()),
+            config: TurnConfig::default(),
+        })
+        .unwrap();
     let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
-    sessions.reference_service().configure(Some(Default::default()));
-    let id = sessions.create(Some(workspace.path().to_string_lossy().into_owned())).unwrap();
+    sessions
+        .reference_service()
+        .configure(Some(Default::default()));
+    let id = sessions
+        .create(Some(workspace.path().to_string_lossy().into_owned()))
+        .unwrap();
     let state = ServerState::new(sessions.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/api/sessions/{id}/file-references", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap(); });
+    let endpoint = format!(
+        "http://{}/api/sessions/{id}/file-references",
+        listener.local_addr().unwrap()
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
     let client = reqwest::Client::new();
-    let paths: serde_json::Value = client.post(&endpoint).json(&serde_json::json!({"query":"日本語"})).send().await.unwrap().json().await.unwrap();
-    assert_eq!(paths, serde_json::json!([{"path":"日本語 notes.txt", "directory":false}]));
-    assert_eq!(client.post(&endpoint).json(&serde_json::json!({"query":"../"})).send().await.unwrap().status(), 400);
+    let paths: serde_json::Value = client
+        .post(&endpoint)
+        .json(&serde_json::json!({"query":"日本語"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        paths,
+        serde_json::json!([{"path":"日本語 notes.txt", "directory":false}])
+    );
+    assert_eq!(
+        client
+            .post(&endpoint)
+            .json(&serde_json::json!({"query":"../"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
     assert_eq!(sessions.store().history(&id).unwrap().len(), 1);
     server.abort();
 }
@@ -68,34 +168,104 @@ async fn questions_http_sse_validation_resolution_and_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(ToolRegistry::default());
     let mut kernel = Kernel::new();
-    kernel.mount(SessionsPlugin { root: dir.path().into(), provider: Arc::new(OneAnswer), resolver: None, creation_seed: Default::default(), sandbox: Default::default(), agents: Default::default(), models: Default::default(), tools: tools.clone(), config: TurnConfig::default() }).unwrap();
+    kernel
+        .mount(SessionsPlugin {
+            root: dir.path().into(),
+            provider: Arc::new(OneAnswer),
+            resolver: None,
+            creation_seed: Default::default(),
+            sandbox: Default::default(),
+            agents: Default::default(),
+            models: Default::default(),
+            tools: tools.clone(),
+            config: TurnConfig::default(),
+        })
+        .unwrap();
     let sessions = kernel.services().get::<SessionService>("sessions").unwrap();
     let state = ServerState::new(sessions.clone());
     state.questions.set_available(true);
-    tools.register(Arc::new(rness_engine::questions::AskUser(state.questions.clone())));
+    tools.register(Arc::new(rness_engine::questions::AskUser(
+        state.questions.clone(),
+    )));
     let id = sessions.create(None).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap(); });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router(state)).await.unwrap();
+    });
     let http = reqwest::Client::new();
-    let mut stream = http.get(format!("{base}/api/events/{id}")).send().await.unwrap();
+    let mut stream = http
+        .get(format!("{base}/api/events/{id}"))
+        .send()
+        .await
+        .unwrap();
     for cancelled in [false, true] {
-        let token = CancellationToken::new(); let cancel = token.clone(); let registry = tools.clone(); let session = id.clone();
-        let task = tokio::spawn(async move { registry.dispatch(&session, &[rness_engine::tools::ToolCall { call: "q-call".into(), name: "AskUser".into(), args: serde_json::json!({"questions":[{"id":"q","question":"Choose","options":[{"label":"A"},{"label":"B"}],"multi_select":true}]}) }], 1, &token).await });
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let registry = tools.clone();
+        let session = id.clone();
+        let task = tokio::spawn(async move {
+            registry.dispatch(&session, &[rness_engine::tools::ToolCall { call: "q-call".into(), name: "AskUser".into(), args: serde_json::json!({"questions":[{"id":"q","question":"Choose","options":[{"label":"A"},{"label":"B"}],"multi_select":true}]}) }], 1, &token).await
+        });
         let mut received = String::new();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async { while !received.contains("question_requested") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); } }).await.unwrap();
-        let pending: serde_json::Value = http.get(format!("{base}/api/questions")).send().await.unwrap().json().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !received.contains("question_requested") {
+                received.push_str(&String::from_utf8_lossy(
+                    &stream.chunk().await.unwrap().unwrap(),
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        let pending: serde_json::Value = http
+            .get(format!("{base}/api/questions"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         assert_eq!(pending[0]["session"], id);
         let endpoint = format!("{base}/api/questions/{id}/q-call");
-        assert_eq!(http.post(&endpoint).json(&serde_json::json!({"answers":[]})).send().await.unwrap().status(), 400);
-        if cancelled { cancel.cancel(); } else {
+        assert_eq!(
+            http.post(&endpoint)
+                .json(&serde_json::json!({"answers":[]}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        if cancelled {
+            cancel.cancel();
+        } else {
             assert_eq!(http.post(&endpoint).json(&serde_json::json!({"answers":[{"id":"q","selected":["A","B"],"custom":"context"}]})).send().await.unwrap().status(), 204);
         }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task).await.unwrap().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result[0].is_error, cancelled);
         received.clear();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async { while !received.contains("question_resolved") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); } }).await.unwrap();
-        assert_eq!(http.get(format!("{base}/api/questions")).send().await.unwrap().json::<serde_json::Value>().await.unwrap(), serde_json::json!([]));
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !received.contains("question_resolved") {
+                received.push_str(&String::from_utf8_lossy(
+                    &stream.chunk().await.unwrap().unwrap(),
+                ));
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            http.get(format!("{base}/api/questions"))
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap(),
+            serde_json::json!([])
+        );
         assert_eq!(http.delete(&endpoint).send().await.unwrap().status(), 404);
     }
     server.abort();
@@ -104,14 +274,35 @@ async fn questions_http_sse_validation_resolution_and_cancellation() {
 struct TaskAnswer(std::sync::atomic::AtomicBool);
 #[async_trait]
 impl Provider for TaskAnswer {
-    fn model(&self) -> &str { "tasks-test" }
+    fn model(&self) -> &str {
+        "tasks-test"
+    }
     async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
         let first = !self.0.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if !first { assert!(request.system.contains("test persisted tasks")); }
+        if !first {
+            assert!(request.system.contains("test persisted tasks"));
+        }
         StepOutcome::Committed(AssistantMessage {
             model: self.model().into(),
-            content: if first { vec![ContentPart::ToolUse { call: "task-call".into(), name: "TaskWrite".into(), args: serde_json::json!({"tasks":[{"id":"test","content":"test persisted tasks","status":"pending"}]}) }] } else { vec![ContentPart::Text { text: "done".into() }] },
-            stop: if first { StopReason::ToolUse } else { StopReason::EndTurn }, usage: Default::default(), estimated_input: 0, chunks: vec![],
+            content: if first {
+                vec![ContentPart::ToolUse {
+                    call: "task-call".into(),
+                    name: "TaskWrite".into(),
+                    args: serde_json::json!({"tasks":[{"id":"test","content":"test persisted tasks","status":"pending"}]}),
+                }]
+            } else {
+                vec![ContentPart::Text {
+                    text: "done".into(),
+                }]
+            },
+            stop: if first {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            },
+            usage: Default::default(),
+            estimated_input: 0,
+            chunks: vec![],
         })
     }
 }
@@ -121,19 +312,41 @@ async fn tasks_http_snapshot_and_sse_reconciliation() {
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(ToolRegistry::default());
     tools.register(Arc::new(rness_engine::tasks::TaskWrite(Default::default())));
-    let (base, sessions, _kernel) = serve_with(dir.path(), Arc::new(TaskAnswer(Default::default())), tools).await;
+    let (base, sessions, _kernel) =
+        serve_with(dir.path(), Arc::new(TaskAnswer(Default::default())), tools).await;
     let id = sessions.create(None).unwrap();
     let client = reqwest::Client::new();
-    let mut stream = client.get(format!("{base}/api/events/{id}")).send().await.unwrap();
-    assert_eq!(get_json(&format!("{base}/api/sessions/{id}/tasks")).await, serde_json::json!({"tasks":[]}));
-    sessions.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "track".into() }]).unwrap();
+    let mut stream = client
+        .get(format!("{base}/api/events/{id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_json(&format!("{base}/api/sessions/{id}/tasks")).await,
+        serde_json::json!({"tasks":[]})
+    );
+    sessions
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "track".into(),
+            }],
+        )
+        .unwrap();
     sessions.join(&id).await;
     let snapshot = get_json(&format!("{base}/api/sessions/{id}/tasks")).await;
     assert_eq!(snapshot["tasks"][0]["content"], "test persisted tasks");
     let mut received = String::new();
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        while !received.contains("history_changed") { received.push_str(&String::from_utf8_lossy(&stream.chunk().await.unwrap().unwrap())); }
-    }).await.unwrap();
+        while !received.contains("history_changed") {
+            received.push_str(&String::from_utf8_lossy(
+                &stream.chunk().await.unwrap().unwrap(),
+            ));
+        }
+    })
+    .await
+    .unwrap();
 }
 
 struct OneAnswer;
@@ -146,7 +359,9 @@ impl Provider for OneAnswer {
     async fn step(&self, _r: StepRequest<'_>, _c: &CancellationToken) -> StepOutcome {
         StepOutcome::Committed(AssistantMessage {
             model: "fake-1".into(),
-            content: vec![ContentPart::Text { text: "respuesta del servidor".into() }],
+            content: vec![ContentPart::Text {
+                text: "respuesta del servidor".into(),
+            }],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
             estimated_input: 0,
@@ -178,7 +393,12 @@ impl Provider for ToolThenDone {
                 StopReason::ToolUse,
             )
         } else {
-            (vec![ContentPart::Text { text: "hecho".into() }], StopReason::EndTurn)
+            (
+                vec![ContentPart::Text {
+                    text: "hecho".into(),
+                }],
+                StopReason::EndTurn,
+            )
         };
         StepOutcome::Committed(AssistantMessage {
             model: "fake-1".into(),
@@ -228,10 +448,20 @@ async fn serve_with(
             root: dir.to_path_buf(),
             provider,
             resolver: None,
-            creation_seed: Default::default(), sandbox: Default::default(),
-            agents: [("planner".into(), rness_engine::config::AgentDefinition {
-                subagent: false, description: "Planner".into(), instructions: "PLAN_MARKER".into(), profile: None, tools: Some(vec![]), sandbox: None,
-            })].into(),
+            creation_seed: Default::default(),
+            sandbox: Default::default(),
+            agents: [(
+                "planner".into(),
+                rness_engine::config::AgentDefinition {
+                    subagent: false,
+                    description: "Planner".into(),
+                    instructions: "PLAN_MARKER".into(),
+                    profile: None,
+                    tools: Some(vec![]),
+                    sandbox: None,
+                },
+            )]
+            .into(),
             models: Default::default(),
             tools: Arc::clone(&tools),
             config: TurnConfig::default(),
@@ -243,7 +473,9 @@ async fn serve_with(
     let _sub = Box::leak(Box::new(kernel.bus().on::<FrameEv>(state.frame_sink())));
     // Mirror the CLI composition root: the server's remote answerer is
     // the approver whenever the seam is set to `ask`.
-    tools.approvals().set_answerer(Arc::clone(&state.approvals) as _);
+    tools
+        .approvals()
+        .set_answerer(Arc::clone(&state.approvals) as _);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -258,11 +490,15 @@ async fn get_json(url: &str) -> serde_json::Value {
 }
 
 async fn post_json(url: &str, body: serde_json::Value) -> serde_json::Value {
-    let resp = reqwest::Client::new().post(url).json(&body).send().await.unwrap();
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
     let status = resp.status();
     let text = resp.text().await.unwrap();
-    serde_json::from_str(&text)
-        .unwrap_or_else(|_| panic!("POST {url} -> {status}: {text}"))
+    serde_json::from_str(&text).unwrap_or_else(|_| panic!("POST {url} -> {status}: {text}"))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -279,14 +515,20 @@ async fn slash_agent_uses_service_without_starting_model() {
     assert_eq!(response["result"]["message"], "Agent selected: planner");
     let history = sessions.store().history(&id.to_string()).unwrap();
     assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::RequestConfig(c) if c.agent.as_ref().is_some_and(|a| a.name == "planner"))));
-    assert!(!history.iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_) | SessionEvent::AssistantMessage(_))));
+    assert!(!history.iter().any(|e| matches!(
+        e.event,
+        SessionEvent::UserMessage(_) | SessionEvent::AssistantMessage(_)
+    )));
     for text in ["/agent", "/agent missing", "/agent planner extra"] {
         let response = reqwest::Client::new().post(format!("{base}/api/request")).json(&serde_json::json!({
             "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":text}]
         })).send().await.unwrap();
         assert!(!response.status().is_success());
     }
-    assert_eq!(sessions.store().history(&id.to_string()).unwrap().len(), history.len());
+    assert_eq!(
+        sessions.store().history(&id.to_string()).unwrap().len(),
+        history.len()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -296,11 +538,17 @@ async fn remote_sessions_resolve_their_own_workspace() {
     let b = tempfile::tempdir().unwrap();
     let (base, sessions, _kernel) = serve(logs.path()).await;
     sessions.set_input_resolver(Arc::new(|workspace, mut content| {
-        content.push(ContentPart::Text { text: format!("workspace={}", workspace.unwrap().display()) });
+        content.push(ContentPart::Text {
+            text: format!("workspace={}", workspace.unwrap().display()),
+        });
         Ok(content)
     }));
     for project in [&a, &b] {
-        let created = post_json(&format!("{base}/api/sessions"), serde_json::json!({"workspace":project.path()})).await;
+        let created = post_json(
+            &format!("{base}/api/sessions"),
+            serde_json::json!({"workspace":project.path()}),
+        )
+        .await;
         let id = created["session"].as_str().unwrap().to_string();
         let sent = post_json(&format!("{base}/api/request"), serde_json::json!({
             "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":"hello"}]
@@ -308,7 +556,10 @@ async fn remote_sessions_resolve_their_own_workspace() {
         assert_eq!(sent["status"], "started");
         sessions.join(&id).await;
         let history = get_json(&format!("{base}/api/sessions/{id}")).await;
-        assert!(history.to_string().contains(&format!("workspace={}", project.path().canonicalize().unwrap().display())));
+        assert!(history.to_string().contains(&format!(
+            "workspace={}",
+            project.path().canonicalize().unwrap().display()
+        )));
     }
 }
 
@@ -320,7 +571,9 @@ async fn remote_send_uses_shared_resolver_and_rejects_before_logging() {
         if matches!(content.first(), Some(ContentPart::Text { text }) if text == "/skill missing") {
             return Err("unknown skill".into());
         }
-        content.push(ContentPart::Text { text: "resolved instructions".into() });
+        content.push(ContentPart::Text {
+            text: "resolved instructions".into(),
+        });
         Ok(content)
     }));
     let created = post_json(&format!("{base}/api/sessions"), serde_json::json!({})).await;
@@ -330,7 +583,10 @@ async fn remote_send_uses_shared_resolver_and_rejects_before_logging() {
         "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":"/skill missing"}]
     })).send().await.unwrap();
     assert!(!response.status().is_success());
-    assert_eq!(sessions.store().history(&id.to_string()).unwrap().len(), before);
+    assert_eq!(
+        sessions.store().history(&id.to_string()).unwrap().len(),
+        before
+    );
     let sent = post_json(&format!("{base}/api/request"), serde_json::json!({
         "type":"send", "session":id, "intent":"followup", "content":[{"kind":"text","text":"/review input"}]
     })).await;
@@ -378,10 +634,16 @@ async fn full_remote_lifecycle() {
     // History has header + user + assistant + turn markers.
     let history = get_json(&format!("{base}/api/sessions/{id}")).await;
     let envelopes = history["envelopes"].as_array().unwrap();
-    assert!(envelopes.iter().any(|e| e["type"] == "assistant/message" || e["type"] == "message/assistant"));
+    assert!(envelopes
+        .iter()
+        .any(|e| e["type"] == "assistant/message" || e["type"] == "message/assistant"));
 
     // Fork through the API.
-    let forked = post_json(&format!("{base}/api/sessions/{id}/fork"), serde_json::json!({})).await;
+    let forked = post_json(
+        &format!("{base}/api/sessions/{id}/fork"),
+        serde_json::json!({}),
+    )
+    .await;
     assert_ne!(forked["session"], id);
     let list = get_json(&format!("{base}/api/sessions")).await;
     assert_eq!(list.as_array().unwrap().len(), 2);
@@ -396,7 +658,9 @@ async fn frames_stream_over_sse() {
     let id = created["session"].as_str().unwrap().to_string();
 
     // Attach SSE FIRST, then trigger the turn.
-    let response = reqwest::get(format!("{base}/api/events/{id}")).await.unwrap();
+    let response = reqwest::get(format!("{base}/api/events/{id}"))
+        .await
+        .unwrap();
     assert_eq!(response.headers()["content-type"], "text/event-stream");
 
     post_json(
@@ -427,7 +691,9 @@ async fn frames_stream_over_sse() {
     assert!(body.contains("turn_idle"), "{body}");
 
     // Unknown session: 404, not 500.
-    let resp = reqwest::get(format!("{base}/api/sessions/01UNKNOWN")).await.unwrap();
+    let resp = reqwest::get(format!("{base}/api/sessions/01UNKNOWN"))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 404);
 }
 
@@ -439,9 +705,16 @@ async fn ask_server(
 ) -> (String, Arc<SessionService>, Kernel) {
     let tools = Arc::new(ToolRegistry::default());
     tools.register(Arc::new(Danger { ran }));
-    tools.approvals().set_rules([("Danger".into(), rness_engine::approval::ToolPolicy::Ask)].into());
-    assert_eq!(tools.approvals().policy(), rness_engine::approval::Policy::Allow);
-    let provider = Arc::new(ToolThenDone { asked: std::sync::atomic::AtomicBool::new(false) });
+    tools
+        .approvals()
+        .set_rules([("Danger".into(), rness_engine::approval::ToolPolicy::Ask)].into());
+    assert_eq!(
+        tools.approvals().policy(),
+        rness_engine::approval::Policy::Allow
+    );
+    let provider = Arc::new(ToolThenDone {
+        asked: std::sync::atomic::AtomicBool::new(false),
+    });
     serve_with(dir, provider, tools).await
 }
 
@@ -491,7 +764,9 @@ async fn remote_approval_allows_a_sensitive_call() {
         .to_string();
 
     // Attach SSE first: the question must be announced as a frame.
-    let sse = reqwest::get(format!("{base}/api/events/{id}")).await.unwrap();
+    let sse = reqwest::get(format!("{base}/api/events/{id}"))
+        .await
+        .unwrap();
 
     start_turn(&base, &id).await;
 
@@ -511,7 +786,10 @@ async fn remote_approval_allows_a_sensitive_call() {
     assert_eq!(resolved["status"], "resolved");
 
     wait_idle(&base, &id).await;
-    assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "approved tool must run");
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "approved tool must run"
+    );
 
     // The durable log has the real tool output — approval was one-shot glue.
     let history = sessions.store().history(&id).unwrap();
@@ -547,7 +825,10 @@ async fn remote_rejection_blocks_the_tool() {
         .to_string();
 
     start_turn(&base, &id).await;
-    let call = wait_pending(&base).await["call"].as_str().unwrap().to_string();
+    let call = wait_pending(&base).await["call"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     post_json(
         &format!("{base}/api/approvals/{call}"),
@@ -556,7 +837,10 @@ async fn remote_rejection_blocks_the_tool() {
     .await;
 
     wait_idle(&base, &id).await;
-    assert!(!ran.load(std::sync::atomic::Ordering::SeqCst), "rejected tool must not run");
+    assert!(
+        !ran.load(std::sync::atomic::Ordering::SeqCst),
+        "rejected tool must not run"
+    );
     let logged = serde_json::to_string(&sessions.store().history(&id).unwrap()).unwrap();
     assert!(logged.contains("rejected this tool call"), "{logged}");
 
@@ -593,11 +877,19 @@ async fn cancelling_the_turn_withdraws_the_question() {
 
     for _ in 0..200 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        if get_json(&format!("{base}/api/approvals")).await.as_array().unwrap().is_empty() {
+        if get_json(&format!("{base}/api/approvals"))
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
             break;
         }
     }
     let pending = get_json(&format!("{base}/api/approvals")).await;
-    assert!(pending.as_array().unwrap().is_empty(), "withdrawn question leaked: {pending}");
+    assert!(
+        pending.as_array().unwrap().is_empty(),
+        "withdrawn question leaked: {pending}"
+    );
     assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }

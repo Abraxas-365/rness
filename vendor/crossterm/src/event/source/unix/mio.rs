@@ -202,9 +202,10 @@ impl Parser {
             // Emit the first Escape without consuming the start of the next
             // key sequence. Keep parsing the second Escape with its own bytes.
             if self.buffer == [0x1b] && *byte == 0x1b {
-                self.internal_events.push_back(InternalEvent::Event(Event::Key(
-                    crate::event::KeyCode::Esc.into(),
-                )));
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(
+                        crate::event::KeyCode::Esc.into(),
+                    )));
                 self.buffer.clear();
             }
             self.buffer.push(*byte);
@@ -241,7 +242,9 @@ mod escape_regressions {
             parser.advance(&bytes[..split], split < bytes.len());
             parser.advance(&bytes[split..], false);
             let expected: Vec<_> = [KeyCode::Esc, KeyCode::PageDown, KeyCode::PageDown]
-                .into_iter().map(|code| InternalEvent::Event(Event::Key(code.into()))).collect();
+                .into_iter()
+                .map(|code| InternalEvent::Event(Event::Key(code.into())))
+                .collect();
             assert_eq!(parser.collect::<Vec<_>>(), expected, "split {split}");
         }
     }
@@ -250,11 +253,17 @@ mod escape_regressions {
     fn literal_sequence_text_and_double_escape_are_preserved() {
         let mut parser = Parser::default();
         parser.advance(b"[6~", false);
-        let expected: Vec<_> = "[6~".chars().map(|c| InternalEvent::Event(Event::Key(KeyCode::Char(c).into()))).collect();
+        let expected: Vec<_> = "[6~"
+            .chars()
+            .map(|c| InternalEvent::Event(Event::Key(KeyCode::Char(c).into())))
+            .collect();
         assert_eq!(parser.collect::<Vec<_>>(), expected);
         let mut parser = Parser::default();
         parser.advance(b"\x1b\x1b", false);
-        assert_eq!(parser.collect::<Vec<_>>(), vec![InternalEvent::Event(Event::Key(KeyCode::Esc.into())); 2]);
+        assert_eq!(
+            parser.collect::<Vec<_>>(),
+            vec![InternalEvent::Event(Event::Key(KeyCode::Esc.into())); 2]
+        );
     }
 }
 

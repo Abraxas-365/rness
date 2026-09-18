@@ -1,7 +1,7 @@
 //! PKCE (RFC 7636) helpers for the OAuth authorization-code flow.
 
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 

@@ -356,11 +356,9 @@ mod tests {
             serde_json::json!({"by_provider":{"a":{"model":"c","options":{"max_output_tokens":0}}}}),
         ] {
             let profile = serde_json::from_value(value).unwrap();
-            assert!(
-                ModelRegistry::default()
-                    .declare_profile("small".into(), profile)
-                    .is_err()
-            );
+            assert!(ModelRegistry::default()
+                .declare_profile("small".into(), profile)
+                .is_err());
         }
         let mut registry = ModelRegistry::default();
         registry
@@ -371,12 +369,10 @@ mod tests {
             )
             .unwrap();
         assert!(registry.validate_profile("small").is_ok());
-        assert!(
-            registry
-                .resolve_profile("small")
-                .unwrap_err()
-                .contains("current provider")
-        );
+        assert!(registry
+            .resolve_profile("small")
+            .unwrap_err()
+            .contains("current provider"));
     }
 
     #[test]

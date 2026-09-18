@@ -38,8 +38,14 @@ impl ReadTool {
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn concurrency_safe(&self, _: &Value) -> bool { true }
-    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn concurrency_safe(&self, _: &Value) -> bool {
+        true
+    }
+    fn for_workspace(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }
     fn name(&self) -> &str {
@@ -73,9 +79,22 @@ impl Tool for ReadTool {
         _call: &String,
         args: Value,
         _cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, presentation) = self.read_presented(args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text { text: output }], None, false, Some(presentation)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(presentation),
+        ))
     }
 }
 
@@ -94,10 +113,15 @@ impl ReadTool {
 
         let total = content.lines().count();
         if total == 0 {
-            return Ok(("(empty file)".to_string(), json!({"version":1,"kind":"read","path":path,"start_line":1,"total_lines":0,"text":"","truncated":false})));
+            return Ok((
+                "(empty file)".to_string(),
+                json!({"version":1,"kind":"read","path":path,"start_line":1,"total_lines":0,"text":"","truncated":false}),
+            ));
         }
         if offset > total {
-            return Err(format!("offset {offset} is past the end of the file ({total} lines)"));
+            return Err(format!(
+                "offset {offset} is past the end of the file ({total} lines)"
+            ));
         }
 
         let mut out = String::new();

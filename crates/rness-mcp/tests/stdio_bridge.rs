@@ -56,7 +56,9 @@ fn fake_server(dir: &std::path::Path) -> StdioServer {
 async fn bridges_paginated_tools_and_calls_through() {
     let dir = tempfile::tempdir().unwrap();
     let registry = Arc::new(ToolRegistry::default());
-    let conn = McpConnection::connect(fake_server(dir.path())).await.unwrap();
+    let conn = McpConnection::connect(fake_server(dir.path()))
+        .await
+        .unwrap();
 
     let names = conn.bridge_tools(&registry).await.unwrap();
     assert_eq!(names, vec!["mcp__fake__greet", "mcp__fake__fail"]);
@@ -64,18 +66,33 @@ async fn bridges_paginated_tools_and_calls_through() {
 
     // Success path through the registry (as the dispatcher would).
     let tool = registry.get("mcp__fake__greet").unwrap();
-    let out = tool.execute(serde_json::json!({ "who": "rness" })).await.unwrap();
+    let out = tool
+        .execute(serde_json::json!({ "who": "rness" }))
+        .await
+        .unwrap();
     assert_eq!(out, "hola rness");
     for who in ["rness".to_string(), "x".repeat(50 * 1024)] {
-        let results = registry.dispatch(&"s".into(), &[rness_engine::tools::ToolCall {
-            call:"c".into(),name:"mcp__fake__greet".into(),args:serde_json::json!({"who":who}),
-        }], 1, &tokio_util::sync::CancellationToken::new()).await;
+        let results = registry
+            .dispatch(
+                &"s".into(),
+                &[rness_engine::tools::ToolCall {
+                    call: "c".into(),
+                    name: "mcp__fake__greet".into(),
+                    args: serde_json::json!({"who":who}),
+                }],
+                1,
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
         let metadata = results[0].presentation.as_ref().unwrap();
         assert_eq!(results[0].output, format!("hola {who}"));
         assert_eq!(metadata["kind"], "mcp");
         assert_eq!(metadata["truncated"], who.len() > 48 * 1024);
-        if who.len() < 48 * 1024 { assert_eq!(metadata["structured_content"]["who"], who); }
-        else { assert!(metadata.get("structured_content").is_none()); }
+        if who.len() < 48 * 1024 {
+            assert_eq!(metadata["structured_content"]["who"], who);
+        } else {
+            assert!(metadata.get("structured_content").is_none());
+        }
     }
 
     // isError path: an Err result, not a panic.
@@ -85,7 +102,10 @@ async fn bridges_paginated_tools_and_calls_through() {
 
     // Disconnect unregisters everything it registered.
     conn.disconnect(&registry).await;
-    assert!(!registry.names().iter().any(|n| n.starts_with("mcp__fake__")));
+    assert!(!registry
+        .names()
+        .iter()
+        .any(|n| n.starts_with("mcp__fake__")));
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,8 +1,8 @@
 //! Opt-in local transport. Wire v1: handshake + one bounded NDJSON submission.
 use crate::control_journal::{Journal, Request};
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use rness_engine::service::SessionService;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::{
@@ -255,20 +255,18 @@ mod tests {
         assert!(
             crate::Cli::try_parse_from(["rness", "--control-socket", "x", "-p", "hello"]).is_err()
         );
-        assert!(
-            crate::Cli::try_parse_from([
-                "rness",
-                "send",
-                "--socket",
-                "x",
-                "--session",
-                "s",
-                "--id",
-                "i",
-                "hello"
-            ])
-            .is_ok()
-        );
+        assert!(crate::Cli::try_parse_from([
+            "rness",
+            "send",
+            "--socket",
+            "x",
+            "--session",
+            "s",
+            "--id",
+            "i",
+            "hello"
+        ])
+        .is_ok());
     }
     #[tokio::test]
     async fn socket_submission_does_not_answer_pending_questions_or_plan_reviews() {

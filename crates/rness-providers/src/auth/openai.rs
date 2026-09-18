@@ -9,7 +9,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use super::{AuthError, LoginPrompt, TokensError, callback_query, pkce, query_param, respond_html};
+use super::{callback_query, pkce, query_param, respond_html, AuthError, LoginPrompt, TokensError};
 use crate::auth::{CredentialStore, Tokens};
 
 pub const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";

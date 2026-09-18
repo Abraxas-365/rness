@@ -35,12 +35,20 @@ pub struct RemoteApprovals {
 
 impl RemoteApprovals {
     pub fn new(frames: broadcast::Sender<Frame>) -> Self {
-        Self { pending: Mutex::new(HashMap::new()), frames }
+        Self {
+            pending: Mutex::new(HashMap::new()),
+            frames,
+        }
     }
 
     /// Snapshot of every unanswered question (the reconcile endpoint).
     pub fn pending(&self) -> Vec<ApprovalRequest> {
-        self.pending.lock().expect("pending lock").values().map(|p| p.request.clone()).collect()
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .values()
+            .map(|p| p.request.clone())
+            .collect()
     }
 
     /// Answer one question. `false` if the call is unknown — already
@@ -59,7 +67,11 @@ impl RemoteApprovals {
     }
 
     fn withdraw(&self, call: &ToolCallId) -> Option<ApprovalRequest> {
-        self.pending.lock().expect("pending lock").remove(call).map(|p| p.request)
+        self.pending
+            .lock()
+            .expect("pending lock")
+            .remove(call)
+            .map(|p| p.request)
     }
 }
 
@@ -67,10 +79,13 @@ impl RemoteApprovals {
 impl Answerer for RemoteApprovals {
     async fn answer(&self, request: &ApprovalRequest) -> Decision {
         let (respond, answered) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .insert(request.call.clone(), Pending { request: request.clone(), respond });
+        self.pending.lock().expect("pending lock").insert(
+            request.call.clone(),
+            Pending {
+                request: request.clone(),
+                respond,
+            },
+        );
         let _ = self.frames.send(Frame::ApprovalRequested {
             session: request.session.clone(),
             call: request.call.clone(),
@@ -80,7 +95,10 @@ impl Answerer for RemoteApprovals {
 
         // If this future is dropped mid-await (turn cancelled), the guard
         // withdraws the question so the table can't leak a dead entry.
-        let guard = WithdrawGuard { approvals: self, call: request.call.clone() };
+        let guard = WithdrawGuard {
+            approvals: self,
+            call: request.call.clone(),
+        };
         let decision = answered.await.unwrap_or(Decision::Cancelled);
         drop(guard);
 

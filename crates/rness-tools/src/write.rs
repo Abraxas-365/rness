@@ -16,17 +16,35 @@ pub struct WriteTool {
 
 impl WriteTool {
     pub fn new(ws: Arc<Workspace>) -> Self {
-        let policy = crate::sandbox::Policy::new(rness_protocol::sandbox::SandboxMode::DangerFullAccess, ws.root());
+        let policy = crate::sandbox::Policy::new(
+            rness_protocol::sandbox::SandboxMode::DangerFullAccess,
+            ws.root(),
+        );
         Self { ws, policy }
     }
 }
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn for_workspace_with_policy(&self, session: &String, workspace: &std::path::Path, mode: rness_protocol::sandbox::SandboxMode) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self { ws: self.ws.for_session(session, workspace), policy: crate::sandbox::Policy { mode, workspace: workspace.to_owned() } }))
+    fn for_workspace_with_policy(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+        mode: rness_protocol::sandbox::SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            ws: self.ws.for_session(session, workspace),
+            policy: crate::sandbox::Policy {
+                mode,
+                workspace: workspace.to_owned(),
+            },
+        }))
     }
-    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn for_workspace(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }
     fn name(&self) -> &str {
@@ -57,9 +75,28 @@ impl Tool for WriteTool {
         self.apply(args).await.map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, presentation) = self.apply(args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(presentation)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(presentation),
+        ))
     }
 }
 
@@ -86,7 +123,9 @@ impl WriteTool {
                 }
                 Err(_) => None,
             }
-        } else { Some(String::new()) };
+        } else {
+            Some(String::new())
+        };
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
@@ -108,16 +147,35 @@ impl WriteTool {
                 presentation["hunks"] = json!([]);
                 presentation["changes_complete"] = json!(true);
             } else {
-                let mut prefix = before.bytes().zip(content.bytes()).take_while(|(a,b)| a == b).count();
-                while !before.is_char_boundary(prefix) || !content.is_char_boundary(prefix) { prefix -= 1; }
+                let mut prefix = before
+                    .bytes()
+                    .zip(content.bytes())
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                while !before.is_char_boundary(prefix) || !content.is_char_boundary(prefix) {
+                    prefix -= 1;
+                }
                 let start = before[..prefix].rfind('\n').map_or(0, |i| i + 1);
-                let suffix = before.as_bytes()[prefix..].iter().rev().zip(content.as_bytes()[prefix..].iter().rev()).take_while(|(a,b)| a == b).count();
+                let suffix = before.as_bytes()[prefix..]
+                    .iter()
+                    .rev()
+                    .zip(content.as_bytes()[prefix..].iter().rev())
+                    .take_while(|(a, b)| a == b)
+                    .count();
                 let mut old_end = before.len() - suffix;
                 let mut new_end = content.len() - suffix;
-                while !before.is_char_boundary(old_end) { old_end += 1; }
-                while !content.is_char_boundary(new_end) { new_end += 1; }
-                old_end = before[old_end..].find('\n').map_or(before.len(), |i| old_end + i + 1);
-                new_end = content[new_end..].find('\n').map_or(content.len(), |i| new_end + i + 1);
+                while !before.is_char_boundary(old_end) {
+                    old_end += 1;
+                }
+                while !content.is_char_boundary(new_end) {
+                    new_end += 1;
+                }
+                old_end = before[old_end..]
+                    .find('\n')
+                    .map_or(before.len(), |i| old_end + i + 1);
+                new_end = content[new_end..]
+                    .find('\n')
+                    .map_or(content.len(), |i| new_end + i + 1);
                 let changed_bytes = (old_end - start).saturating_add(new_end - start);
                 if changed_bytes <= 48 * 1024 {
                     let line = before[..start].bytes().filter(|b| *b == b'\n').count() + 1;
@@ -139,8 +197,14 @@ impl WriteTool {
                         let last = &group[group.len() - 1];
                         let old_range = first.old_range().start..last.old_range().end;
                         let new_range = first.new_range().start..last.new_range().end;
-                        let old_bytes: usize = diff.old_slices()[old_range.clone()].iter().map(|s| s.len()).sum();
-                        let new_bytes: usize = diff.new_slices()[new_range.clone()].iter().map(|s| s.len()).sum();
+                        let old_bytes: usize = diff.old_slices()[old_range.clone()]
+                            .iter()
+                            .map(|s| s.len())
+                            .sum();
+                        let new_bytes: usize = diff.new_slices()[new_range.clone()]
+                            .iter()
+                            .map(|s| s.len())
+                            .sum();
                         if old_bytes.saturating_add(new_bytes) > budget || hunks.len() >= 100 {
                             complete = false;
                             break;
@@ -148,21 +212,34 @@ impl WriteTool {
                         let hunk = json!({"before":diff.old_slices()[old_range.clone()].concat(),
                             "after":diff.new_slices()[new_range.clone()].concat(),
                             "old_start":old_range.start + 1,"new_start":new_range.start + 1,"fragment":false});
-                        let size = serde_json::to_vec(&hunk).map(|b| b.len()).unwrap_or(usize::MAX);
-                        if size > budget { complete = false; break; }
+                        let size = serde_json::to_vec(&hunk)
+                            .map(|b| b.len())
+                            .unwrap_or(usize::MAX);
+                        if size > budget {
+                            complete = false;
+                            break;
+                        }
                         budget -= size;
                         hunks.push(hunk);
                     }
-                    if !hunks.is_empty() || complete { presentation["hunks"] = json!(hunks); }
+                    if !hunks.is_empty() || complete {
+                        presentation["hunks"] = json!(hunks);
+                    }
                     presentation["changes_complete"] = json!(complete);
-                    if !complete { presentation["capture_reason"] = json!("changed_ranges_exceed_limit"); }
+                    if !complete {
+                        presentation["capture_reason"] = json!("changed_ranges_exceed_limit");
+                    }
                 }
             }
         }
         if presentation["truncated"] == true && presentation.get("hunks").is_none() {
             presentation["changes_complete"] = json!(false);
-            presentation["capture_reason"] = json!("snapshot_or_changed_range_exceeds_limit_or_unreadable");
+            presentation["capture_reason"] =
+                json!("snapshot_or_changed_range_exceeds_limit_or_unreadable");
         }
-        Ok((format!("Wrote {} bytes to {}", content.len(), path.display()), presentation))
+        Ok((
+            format!("Wrote {} bytes to {}", content.len(), path.display()),
+            presentation,
+        ))
     }
 }

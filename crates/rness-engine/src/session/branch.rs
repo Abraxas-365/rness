@@ -33,15 +33,23 @@ pub struct SessionStore {
 
 impl SessionStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into(), readers: Default::default() }
+        Self {
+            root: root.into(),
+            readers: Default::default(),
+        }
     }
 
     fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
         let mut readers = self.readers.lock().unwrap();
         if readers.len() >= 8 && !readers.contains_key(session) {
-            if let Some(oldest) = readers.keys().next().cloned() { readers.remove(&oldest); }
+            if let Some(oldest) = readers.keys().next().cloned() {
+                readers.remove(&oldest);
+            }
         }
-        readers.entry(session.clone()).or_default().read(&self.root, session)
+        readers
+            .entry(session.clone())
+            .or_default()
+            .read(&self.root, session)
     }
 
     /// Read through the first committed event only, without touching the
@@ -62,27 +70,38 @@ impl SessionStore {
             line += 1;
             bytes.clear();
             if reader.read_until(b'\n', &mut bytes)? == 0 || !bytes.ends_with(b"\n") {
-                return Err(LogError::Corrupt { line: 0, reason: "empty log".into() });
+                return Err(LogError::Corrupt {
+                    line: 0,
+                    reason: "empty log".into(),
+                });
             }
             if bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let envelope: Envelope = serde_json::from_slice(&bytes).map_err(|error| {
-                LogError::Corrupt { line, reason: error.to_string() }
-            })?;
+            let envelope: Envelope =
+                serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
+                    line,
+                    reason: error.to_string(),
+                })?;
             let SessionEvent::Header(header) = envelope.event else {
                 return Err(LogError::Corrupt {
-                    line: 1, reason: "first event is not session/header".into(),
+                    line: 1,
+                    reason: "first event is not session/header".into(),
                 });
             };
             if header.version != FORMAT_VERSION {
                 return Err(LogError::Corrupt {
-                    line, reason: format!("unsupported session header version {}", header.version),
+                    line,
+                    reason: format!("unsupported session header version {}", header.version),
                 });
             }
             if &header.session != session {
                 return Err(LogError::Corrupt {
-                    line, reason: format!("session header identity '{}' does not match '{session}'", header.session),
+                    line,
+                    reason: format!(
+                        "session header identity '{}' does not match '{session}'",
+                        header.session
+                    ),
                 });
             }
             return Ok(header);
@@ -107,7 +126,13 @@ impl SessionStore {
         delegation: Delegation,
     ) -> Result<SessionLog, BranchError> {
         let sid = ulid::Ulid::new().to_string();
-        Ok(SessionLog::create(&self.root, &sid, workspace, None, Some(delegation))?)
+        Ok(SessionLog::create(
+            &self.root,
+            &sid,
+            workspace,
+            None,
+            Some(delegation),
+        )?)
     }
 
     pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
@@ -150,7 +175,10 @@ impl SessionStore {
         let at = match at {
             Some(id) => {
                 let pos = events.iter().position(|e| e.id == id).ok_or_else(|| {
-                    BranchError::ForkPointNotFound { session: session.clone(), at: id.clone() }
+                    BranchError::ForkPointNotFound {
+                        session: session.clone(),
+                        at: id.clone(),
+                    }
                 })?;
                 if pos == 0 {
                     return Err(BranchError::ForkAtHeader(session.clone()));
@@ -165,8 +193,17 @@ impl SessionStore {
             _ => unreachable!("read_session guarantees header first"),
         };
         let child = ulid::Ulid::new().to_string();
-        let fork = ForkRef { session: session.clone(), at };
-        Ok(SessionLog::create(&self.root, &child, workspace, Some(fork), delegation)?)
+        let fork = ForkRef {
+            session: session.clone(),
+            at,
+        };
+        Ok(SessionLog::create(
+            &self.root,
+            &child,
+            workspace,
+            Some(fork),
+            delegation,
+        )?)
     }
 
     /// Delegation lineage of a session, if an agent created it.
@@ -182,7 +219,10 @@ impl SessionStore {
     /// Ancestry chain, root first, queried session last. Each hop's
     /// `forked_at` is the fork point INTO the next hop.
     pub fn ancestry(&self, session: &SessionId) -> Result<Vec<AncestryHop>, BranchError> {
-        let mut chain = vec![AncestryHop { session: session.clone(), forked_at: None }];
+        let mut chain = vec![AncestryHop {
+            session: session.clone(),
+            forked_at: None,
+        }];
         let mut cur = session.clone();
         while let Some(fork) = self.parent(&cur)? {
             chain.push(AncestryHop {
@@ -210,9 +250,14 @@ impl SessionStore {
                 continue;
             }
             let child_id: SessionId = entry.file_name().to_string_lossy().into_owned();
-            let Ok(Some(fork)) = self.parent(&child_id) else { continue };
+            let Ok(Some(fork)) = self.parent(&child_id) else {
+                continue;
+            };
             if &fork.session == session && at.is_none_or(|a| a == &fork.at) {
-                out.push(ChildRef { session: child_id, at: fork.at });
+                out.push(ChildRef {
+                    session: child_id,
+                    at: fork.at,
+                });
             }
         }
         out.sort();
@@ -263,34 +308,50 @@ impl SessionStore {
         for id in std::iter::once(caller).chain(target) {
             if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
                 return Err(LogError::Corrupt {
-                    line: 0, reason: "invalid search session ID".into(),
-                }.into());
+                    line: 0,
+                    reason: "invalid search session ID".into(),
+                }
+                .into());
             }
         }
-        let workspace = self.workspace(caller)?.filter(|value| !value.is_empty())
+        let workspace = self
+            .workspace(caller)?
+            .filter(|value| !value.is_empty())
             .ok_or_else(|| LogError::Corrupt {
-                line: 0, reason: "session search requires a caller workspace".into(),
+                line: 0,
+                reason: "session search requires a caller workspace".into(),
             })?;
         if let Some(target) = target {
             if self.workspace(target)?.as_deref() != Some(workspace.as_str()) {
                 return Err(LogError::Corrupt {
-                    line: 0, reason: "target session is outside the caller workspace".into(),
-                }.into());
+                    line: 0,
+                    reason: "target session is outside the caller workspace".into(),
+                }
+                .into());
             }
         }
         Ok(workspace)
     }
 
     /// Local committed events, authorized against the header in the same read.
-    pub fn search_events(&self, caller: &SessionId, target: &SessionId) -> Result<Vec<Envelope>, BranchError> {
+    pub fn search_events(
+        &self,
+        caller: &SessionId,
+        target: &SessionId,
+    ) -> Result<Vec<Envelope>, BranchError> {
         let workspace = self.search_workspace(caller, Some(target))?;
         // Changed files may be replacements, not appends. Bypass the engine's
         // immutable-prefix cache for authoritative search refresh/read.
         let events = super::log::read_envelopes(&super::log::log_file(&self.root.join(target)))?;
         if !matches!(events.first().map(|event| &event.event),
             Some(SessionEvent::Header(header)) if header.session == *target
-                && header.workspace.as_deref() == Some(workspace.as_str())) {
-            return Err(LogError::Corrupt { line: 1, reason: "search session identity changed".into() }.into());
+                && header.workspace.as_deref() == Some(workspace.as_str()))
+        {
+            return Err(LogError::Corrupt {
+                line: 1,
+                reason: "search session identity changed".into(),
+            }
+            .into());
         }
         Ok(events)
     }
@@ -300,16 +361,37 @@ impl SessionStore {
     pub fn search_revision(&self, session: &SessionId) -> Result<String, BranchError> {
         let directory = self.root.join(session);
         let path = super::log::log_file(&directory);
-        if std::fs::symlink_metadata(&directory).map_err(LogError::from)?.file_type().is_symlink()
-            || std::fs::symlink_metadata(&path).map_err(LogError::from)?.file_type().is_symlink() {
-            return Err(LogError::Corrupt { line: 0, reason: "search refuses symlinked logs".into() }.into());
+        if std::fs::symlink_metadata(&directory)
+            .map_err(LogError::from)?
+            .file_type()
+            .is_symlink()
+            || std::fs::symlink_metadata(&path)
+                .map_err(LogError::from)?
+                .file_type()
+                .is_symlink()
+        {
+            return Err(LogError::Corrupt {
+                line: 0,
+                reason: "search refuses symlinked logs".into(),
+            }
+            .into());
         }
         let meta = std::fs::metadata(path).map_err(LogError::from)?;
-        let revision = format!("{}:{:?}", meta.len(), meta.modified().map_err(LogError::from)?);
+        let revision = format!(
+            "{}:{:?}",
+            meta.len(),
+            meta.modified().map_err(LogError::from)?
+        );
         #[cfg(unix)]
         let revision = {
             use std::os::unix::fs::MetadataExt;
-            format!("{revision}:{}:{}:{}:{}", meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+            format!(
+                "{revision}:{}:{}:{}:{}",
+                meta.dev(),
+                meta.ino(),
+                meta.ctime(),
+                meta.ctime_nsec()
+            )
         };
         Ok(revision)
     }
@@ -332,22 +414,32 @@ impl SessionStore {
                 && header.workspace.as_deref() == Some(workspace.as_str()))
         {
             return Err(LogError::Corrupt {
-                line: 1, reason: "session identity or workspace changed during read".into(),
-            }.into());
+                line: 1,
+                reason: "session identity or workspace changed during read".into(),
+            }
+            .into());
         }
         for envelope in events {
-            if envelope.id != event_ref { continue; }
+            if envelope.id != event_ref {
+                continue;
+            }
             let content = match envelope.event {
                 SessionEvent::UserMessage(message) => message.content,
                 SessionEvent::AssistantMessage(message) => message.content,
                 _ => return Ok(None),
             };
-            let text = content.into_iter().filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text),
-                _ => None,
-            }).collect::<Vec<_>>().join("\n");
+            let text = content
+                .into_iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             return Ok(Some(crate::session_search::SearchDocument {
-                session_id: target.clone(), event_ref: envelope.id, text,
+                session_id: target.clone(),
+                event_ref: envelope.id,
+                text,
             }));
         }
         Ok(None)
@@ -385,7 +477,8 @@ impl SessionStore {
                 return Err(LogError::Corrupt {
                     line: 1,
                     reason: "session identity or workspace changed during search".into(),
-                }.into());
+                }
+                .into());
             }
             digest.update((session_id.len() as u64).to_le_bytes());
             digest.update(session_id.as_bytes());
@@ -395,10 +488,14 @@ impl SessionStore {
                     SessionEvent::AssistantMessage(message) => &message.content,
                     _ => continue,
                 };
-                let text = content.iter().filter_map(|part| match part {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("\n");
+                let text = content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 if text.trim().is_empty() {
                     continue;
                 }
@@ -417,17 +514,29 @@ impl SessionStore {
         if previous_revision == Some(revision.as_str()) {
             return Ok(None);
         }
-        Ok(Some(SearchSnapshot { revision, documents }))
+        Ok(Some(SearchSnapshot {
+            revision,
+            documents,
+        }))
     }
 
     /// Return only new local envelopes. An ancestor cursor requires a full
     /// history reload; ancestor prefixes are immutable after a fork.
-    pub fn history_after(&self, session: &SessionId, after: &str) -> Result<Option<Vec<Envelope>>, BranchError> {
+    pub fn history_after(
+        &self,
+        session: &SessionId,
+        after: &str,
+    ) -> Result<Option<Vec<Envelope>>, BranchError> {
         let mut readers = self.readers.lock().unwrap();
         if readers.len() >= 8 && !readers.contains_key(session) {
-            if let Some(key) = readers.keys().next().cloned() { readers.remove(&key); }
+            if let Some(key) = readers.keys().next().cloned() {
+                readers.remove(&key);
+            }
         }
-        Ok(readers.entry(session.clone()).or_default().read_after(&self.root, session, after)?)
+        Ok(readers
+            .entry(session.clone())
+            .or_default()
+            .read_after(&self.root, session, after)?)
     }
 
     /// Session ids with a canonical log and a committed header. Auxiliary
@@ -450,11 +559,19 @@ impl SessionStore {
                 Err(error) => return Err(LogError::from(error).into()),
             };
             let mut header = Vec::new();
-            std::io::BufReader::new(file).read_until(b'\n', &mut header).map_err(LogError::from)?;
+            std::io::BufReader::new(file)
+                .read_until(b'\n', &mut header)
+                .map_err(LogError::from)?;
             if !header.ends_with(b"\n") {
                 continue;
             }
-            if matches!(serde_json::from_slice::<Envelope>(&header), Ok(Envelope { event: SessionEvent::Header(_), .. })) {
+            if matches!(
+                serde_json::from_slice::<Envelope>(&header),
+                Ok(Envelope {
+                    event: SessionEvent::Header(_),
+                    ..
+                })
+            ) {
                 out.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -504,16 +621,28 @@ mod tests {
             let log = store.create(None).unwrap();
             store.history(log.session()).unwrap();
         }
-        let cached: std::collections::HashSet<_> = store.readers.lock().unwrap().keys().cloned().collect();
+        let cached: std::collections::HashSet<_> =
+            store.readers.lock().unwrap().keys().cloned().collect();
         assert_eq!(cached.len(), 8);
         let delegation = Delegation {
-            parent: root_id.clone(), call: Some("call-1".into()), depth: 1, mode: Default::default(),
+            parent: root_id.clone(),
+            call: Some("call-1".into()),
+            depth: 1,
+            mode: Default::default(),
         };
-        let parent = ForkRef { session: root_id, at };
+        let parent = ForkRef {
+            session: root_id,
+            at,
+        };
         let sid = "metadata".to_string();
         let log = SessionLog::create(
-            dir.path(), &sid, Some("/w".into()), Some(parent.clone()), Some(delegation.clone()),
-        ).unwrap();
+            dir.path(),
+            &sid,
+            Some("/w".into()),
+            Some(parent.clone()),
+            Some(delegation.clone()),
+        )
+        .unwrap();
         let path = log.path().to_path_buf();
         let header = std::fs::read(&path).unwrap();
         drop(log);
@@ -529,7 +658,16 @@ mod tests {
             assert_eq!(store.delegation(&sid).unwrap(), Some(delegation.clone()));
             assert_eq!(store.parent(&sid).unwrap(), Some(parent.clone()));
             assert_eq!(store.workspace(&sid).unwrap(), Some("/w".into()));
-            assert_eq!(store.readers.lock().unwrap().keys().cloned().collect::<std::collections::HashSet<_>>(), cached);
+            assert_eq!(
+                store
+                    .readers
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>(),
+                cached
+            );
             // A fresh full-history reader still reports the corrupt body.
             assert!(matches!(
                 SessionStore::new(dir.path()).history(&sid),
@@ -562,7 +700,10 @@ mod tests {
             (header.trim_end().to_string(), 0),
             ("not json\n".into(), 1),
             ("\nnot json\n".into(), 2),
-            ("{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n".into(), 1),
+            (
+                "{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n".into(),
+                1,
+            ),
             (format!("{wrong_version}\n"), 1),
             (format!("{wrong_session}\n"), 1),
             (format!("{missing_version}\n"), 1),
@@ -574,8 +715,11 @@ mod tests {
                 store.parent(&sid).map(|_| ()),
                 store.workspace(&sid).map(|_| ()),
             ] {
-                assert!(matches!(result, Err(BranchError::Log(LogError::Corrupt { line, .. }))
-                    if line == expected_line), "contents: {contents:?}");
+                assert!(
+                    matches!(result, Err(BranchError::Log(LogError::Corrupt { line, .. }))
+                    if line == expected_line),
+                    "contents: {contents:?}"
+                );
             }
             assert!(store.readers.lock().unwrap().is_empty());
         }
@@ -585,7 +729,9 @@ mod tests {
             store.parent(&missing).map(|_| ()),
             store.workspace(&missing).map(|_| ()),
         ] {
-            assert!(matches!(result, Err(BranchError::Log(LogError::NotFound(id))) if id == missing));
+            assert!(
+                matches!(result, Err(BranchError::Log(LogError::NotFound(id))) if id == missing)
+            );
         }
         assert!(store.readers.lock().unwrap().is_empty());
     }
@@ -636,11 +782,15 @@ mod tests {
         let store = SessionStore::new(dir.path());
         let real = store.create(None).unwrap();
         let sid = real.session().clone();
-        let header = std::fs::read_to_string(super::super::log::log_file(&dir.path().join(&sid))).unwrap();
+        let header =
+            std::fs::read_to_string(super::super::log::log_file(&dir.path().join(&sid))).unwrap();
         for (name, contents) in [
             ("empty", ""),
             ("invalid-json", "not json\n"),
-            ("non-header", "{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n"),
+            (
+                "non-header",
+                "{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n",
+            ),
             ("uncommitted-header", header.trim_end()),
         ] {
             let path = dir.path().join(name);
@@ -651,9 +801,12 @@ mod tests {
         // A later corruption must still surface when that session is read.
         drop(real);
         use std::io::Write;
-        std::fs::OpenOptions::new().append(true)
-            .open(super::super::log::log_file(&dir.path().join(&sid))).unwrap()
-            .write_all(b"invalid later event\n").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(super::super::log::log_file(&dir.path().join(&sid)))
+            .unwrap()
+            .write_all(b"invalid later event\n")
+            .unwrap();
         assert_eq!(store.list().unwrap(), vec![sid.clone()]);
         assert!(store.history(&sid).is_err());
     }
@@ -666,14 +819,25 @@ mod tests {
         let sid = root.session().clone();
         let first = root.append(&msg("first")).unwrap();
         store.history(&sid).unwrap();
-        assert!(store.history_after(&sid, &first.id).unwrap().unwrap().is_empty());
+        assert!(store
+            .history_after(&sid, &first.id)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         let second = root.append(&msg("second")).unwrap();
-        assert_eq!(store.history_after(&sid, &first.id).unwrap(), Some(vec![second.clone()]));
+        assert_eq!(
+            store.history_after(&sid, &first.id).unwrap(),
+            Some(vec![second.clone()])
+        );
         let mut child = store.fork(&sid, Some(first.id.clone())).unwrap();
         let child_id = child.session().clone();
         assert!(store.history_after(&child_id, &first.id).unwrap().is_none());
         let own = child.append(&msg("child")).unwrap();
-        assert!(store.history_after(&child_id, &own.id).unwrap().unwrap().is_empty());
+        assert!(store
+            .history_after(&child_id, &own.id)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         assert!(store.history_after(&sid, "missing").unwrap().is_none());
     }
 
@@ -764,8 +928,16 @@ mod tests {
         let root_id = root.session().clone();
         let a = root.append(&msg("a")).unwrap();
         // Root can keep appending AFTER forks exist — parent never blocked.
-        let s1 = store.fork(&root_id, Some(a.id.clone())).unwrap().session().clone();
-        let s2 = store.fork(&root_id, Some(a.id.clone())).unwrap().session().clone();
+        let s1 = store
+            .fork(&root_id, Some(a.id.clone()))
+            .unwrap()
+            .session()
+            .clone();
+        let s2 = store
+            .fork(&root_id, Some(a.id.clone()))
+            .unwrap()
+            .session()
+            .clone();
         root.append(&msg("b")).unwrap();
         drop(root);
 
@@ -782,6 +954,10 @@ mod tests {
 
         // Turn events also flow into history assembly unharmed.
         let mut root = store.open(&root_id).unwrap();
-        root.append(&SessionEvent::TurnEnded { turn: 1, outcome: TurnOutcome::Completed }).unwrap();
+        root.append(&SessionEvent::TurnEnded {
+            turn: 1,
+            outcome: TurnOutcome::Completed,
+        })
+        .unwrap();
     }
 }

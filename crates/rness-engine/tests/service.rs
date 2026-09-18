@@ -12,8 +12,8 @@ use rness_engine::service::{
 };
 use rness_engine::session::branch::SessionStore;
 use rness_engine::tools::{Tool, ToolRegistry};
-use rness_engine::turn::TurnConfig;
 use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
+use rness_engine::turn::TurnConfig;
 use rness_kernel::{EventBus, Kernel};
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
@@ -22,23 +22,38 @@ use tokio_util::sync::CancellationToken;
 async fn external_delivery_is_idle_only_deduplicated_across_restart_and_teardown_safe() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let provider = Scripted::gated(vec![
-        StepOutcome::Committed(assistant("one", StopReason::EndTurn, vec![])),
-        StepOutcome::Committed(assistant("two", StopReason::EndTurn, vec![])),
-    ], gate.clone());
+    let provider = Scripted::gated(
+        vec![
+            StepOutcome::Committed(assistant("one", StopReason::EndTurn, vec![])),
+            StepOutcome::Committed(assistant("two", StopReason::EndTurn, vec![])),
+        ],
+        gate.clone(),
+    );
     let svc = service(dir.path(), provider);
     let sid = svc.create(None).unwrap();
     svc.send(&sid, UserIntent::Followup, text("busy")).unwrap();
-    assert!(!svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
-    gate.add_permits(1); svc.join(&sid).await;
-    assert!(svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
-    assert!(svc.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
-    gate.add_permits(1); svc.join(&sid).await;
+    assert!(!svc
+        .deliver_external_once(&sid, "external", "durable input".into())
+        .unwrap());
+    gate.add_permits(1);
+    svc.join(&sid).await;
+    assert!(svc
+        .deliver_external_once(&sid, "external", "durable input".into())
+        .unwrap());
+    assert!(svc
+        .deliver_external_once(&sid, "external", "durable input".into())
+        .unwrap());
+    gate.add_permits(1);
+    svc.join(&sid).await;
     svc.begin_teardown(&sid);
-    assert!(!svc.deliver_external_once(&sid, "new", "do not wake".into()).unwrap());
+    assert!(!svc
+        .deliver_external_once(&sid, "new", "do not wake".into())
+        .unwrap());
     drop(svc);
     let resumed = service(dir.path(), Scripted::new(vec![]));
-    assert!(resumed.deliver_external_once(&sid, "external", "durable input".into()).unwrap());
+    assert!(resumed
+        .deliver_external_once(&sid, "external", "durable input".into())
+        .unwrap());
     assert_eq!(resumed.store().history(&sid).unwrap().iter().filter(|event| matches!(&event.event,
         SessionEvent::UserMessage(m) if matches!(&m.source, Some(MessageSource::ExternalPrompt { id }) if id == "external"))).count(), 1);
     assert_eq!(resumed.phase(&sid), Phase::Idle);
@@ -47,34 +62,68 @@ async fn external_delivery_is_idle_only_deduplicated_across_restart_and_teardown
 #[tokio::test]
 async fn consecutive_durable_jobs_wake_without_user_input_and_remain_deduplicated() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Scripted::new((0..6).map(|_| StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))).collect());
+    let provider = Scripted::new(
+        (0..6)
+            .map(|_| StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])))
+            .collect(),
+    );
     let svc = service(dir.path(), provider);
     let sid = svc.create(None).unwrap();
     for index in 0..6 {
         let id = format!("job-{index}");
-        svc.notify_job_once(&sid, &id, "finished".into()).await.unwrap();
+        svc.notify_job_once(&sid, &id, "finished".into())
+            .await
+            .unwrap();
         svc.join(&sid).await;
-        assert!(svc.notify_job_once(&sid, &id, "duplicate".into()).await.unwrap());
+        assert!(svc
+            .notify_job_once(&sid, &id, "duplicate".into())
+            .await
+            .unwrap());
         let history = svc.store().history(&sid).unwrap();
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), index + 1);
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), index + 1);
-        assert!(!history.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+                .count(),
+            index + 1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+                .count(),
+            index + 1
+        );
+        assert!(!history.iter().any(
+            |e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)
+        ));
     }
 }
 
 #[tokio::test]
 async fn job_completion_id_survives_lost_ack_and_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done",StopReason::EndTurn,vec![]))]);
-    let first = service(dir.path(),provider);
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+        "done",
+        StopReason::EndTurn,
+        vec![],
+    ))]);
+    let first = service(dir.path(), provider);
     let id = first.create(None).unwrap();
-    let (a,b) = tokio::join!(first.notify_job_once(&id,"job-1","finished".into()), first.notify_job_once(&id,"job-1","changed retry text".into()));
-    a.unwrap(); b.unwrap();
+    let (a, b) = tokio::join!(
+        first.notify_job_once(&id, "job-1", "finished".into()),
+        first.notify_job_once(&id, "job-1", "changed retry text".into())
+    );
+    a.unwrap();
+    b.unwrap();
     first.join(&id).await;
     // Simulate losing the job-side acknowledgment after the session commit.
     drop(first);
-    let recovered = service(dir.path(),Scripted::new(vec![]));
-    assert!(recovered.notify_job_once(&id,"job-1","retry after crash".into()).await.unwrap());
+    let recovered = service(dir.path(), Scripted::new(vec![]));
+    assert!(recovered
+        .notify_job_once(&id, "job-1", "retry after crash".into())
+        .await
+        .unwrap());
     let history = recovered.store().history(&id).unwrap();
     assert_eq!(history.iter().filter(|e| matches!(&e.event,SessionEvent::UserMessage(m) if matches!(&m.source,Some(MessageSource::JobCompletion {id}) if id == "job-1"))).count(),1);
 }
@@ -85,19 +134,48 @@ async fn text_only_model_rejects_images_before_logging() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![]);
     let mut models = ModelRegistry::default();
-    models.declare_model(ModelDeclaration { provider: "test".into(), model: "text-only".into(),
-        capabilities: ModelCapabilities { image_input: Some(false), ..Default::default() } }).unwrap();
+    models
+        .declare_model(ModelDeclaration {
+            provider: "test".into(),
+            model: "text-only".into(),
+            capabilities: ModelCapabilities {
+                image_input: Some(false),
+                ..Default::default()
+            },
+        })
+        .unwrap();
     let resolved = provider.clone();
     let svc = service(dir.path(), provider)
         .with_agents(Default::default(), models)
-        .with_provider_resolver(CallConfig { selection: Some(ModelSelection { route: "test".into(), model: "text-only".into() }), ..Default::default() }, Arc::new(move |_| Ok(resolved.clone())));
-    svc.set_images(Arc::new(rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default()).unwrap())).unwrap();
+        .with_provider_resolver(
+            CallConfig {
+                selection: Some(ModelSelection {
+                    route: "test".into(),
+                    model: "text-only".into(),
+                }),
+                ..Default::default()
+            },
+            Arc::new(move |_| Ok(resolved.clone())),
+        );
+    svc.set_images(Arc::new(
+        rness_engine::images::ImageStore::new(dir.path().join("images"), Default::default())
+            .unwrap(),
+    ))
+    .unwrap();
     let sid = svc.create(None).unwrap();
     let mut bytes = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2, 2).write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
     let attachment = svc.admit_image(&sid, bytes.get_ref(), "image/png").unwrap();
     let before = svc.store().history(&sid).unwrap().len();
-    let error = svc.send(&sid, UserIntent::Followup, vec![ContentPart::Image { attachment }]).unwrap_err();
+    let error = svc
+        .send(
+            &sid,
+            UserIntent::Followup,
+            vec![ContentPart::Image { attachment }],
+        )
+        .unwrap_err();
     assert!(error.to_string().contains("disables image input"));
     assert_eq!(svc.store().history(&sid).unwrap().len(), before);
 }
@@ -109,62 +187,152 @@ async fn workspace_survives_resume_and_controls_instructions_and_input() {
     let launch = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("RULES"), "project-specific-rule").unwrap();
     std::fs::write(launch.path().join("RULES"), "wrong-launch-rule").unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
-    let build = || SessionService::new(SessionStore::new(logs.path()), provider.clone(), Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()));
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+        "done",
+        StopReason::EndTurn,
+        vec![],
+    ))]);
+    let build = || {
+        SessionService::new(
+            SessionStore::new(logs.path()),
+            provider.clone(),
+            Arc::new(ToolRegistry::default()),
+            TurnConfig::default(),
+            Arc::new(EventBus::default()),
+        )
+    };
     let first = build();
-    first.set_default_workspace(project.path().to_str().unwrap().into()).unwrap();
+    first
+        .set_default_workspace(project.path().to_str().unwrap().into())
+        .unwrap();
     let id = first.create(None).unwrap();
     let expected = project.path().canonicalize().unwrap();
     drop(first);
     let resumed = build();
-    resumed.set_default_workspace(launch.path().to_str().unwrap().into()).unwrap();
+    resumed
+        .set_default_workspace(launch.path().to_str().unwrap().into())
+        .unwrap();
     resumed.set_instructions(rness_engine::instructions::InstructionsConfig {
-        cwd: launch.path().into(), candidates: vec!["RULES".into()], max_bytes: 10000,
+        cwd: launch.path().into(),
+        candidates: vec!["RULES".into()],
+        max_bytes: 10000,
     });
     let expected_input = expected.clone();
     resumed.set_input_resolver(Arc::new(move |workspace, content| {
         assert_eq!(workspace, Some(expected_input.as_path()));
         Ok(content)
     }));
-    resumed.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }]).unwrap();
+    resumed
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "hello".into(),
+            }],
+        )
+        .unwrap();
     resumed.join(&id).await;
     let seen = provider.seen().join("\n");
     assert!(seen.contains("project-specific-rule"));
     assert!(!seen.contains("wrong-launch-rule"));
-    let spawned = resumed.create_delegated(None, rness_protocol::branch::Delegation {
-        parent: id.clone(), call: None, depth: 1, mode: Default::default(),
-    }).unwrap();
-    assert_eq!(resumed.store().workspace(&spawned).unwrap().as_deref(), expected.to_str());
+    let spawned = resumed
+        .create_delegated(
+            None,
+            rness_protocol::branch::Delegation {
+                parent: id.clone(),
+                call: None,
+                depth: 1,
+                mode: Default::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        resumed.store().workspace(&spawned).unwrap().as_deref(),
+        expected.to_str()
+    );
     let child = resumed.fork(&id, None).unwrap();
-    assert_eq!(resumed.store().workspace(&child).unwrap().as_deref(), expected.to_str());
-    assert!(resumed.create(Some(project.path().join("missing").to_string_lossy().into_owned())).is_err());
+    assert_eq!(
+        resumed.store().workspace(&child).unwrap().as_deref(),
+        expected.to_str()
+    );
+    assert!(resumed
+        .create(Some(
+            project
+                .path()
+                .join("missing")
+                .to_string_lossy()
+                .into_owned()
+        ))
+        .is_err());
 }
 
 #[tokio::test]
 async fn retry_resumes_failed_context_without_duplicate_user_message() {
     let logs = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![
-        StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "PROVIDER", retry_after: None, message: "offline".into(), retryable: false }, partial: vec![] },
+        StepOutcome::Failed {
+            error: rness_engine::turn::provider::ProviderError {
+                code: "PROVIDER",
+                retry_after: None,
+                message: "offline".into(),
+                retryable: false,
+            },
+            partial: vec![],
+        },
         StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
     ]);
-    let service = SessionService::new(SessionStore::new(logs.path()), provider, Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default()));
+    let service = SessionService::new(
+        SessionStore::new(logs.path()),
+        provider,
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    );
     let id = service.create(None).unwrap();
     assert!(service.retry(&id).is_err());
-    service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }]).unwrap();
+    service
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "hello".into(),
+            }],
+        )
+        .unwrap();
     service.join(&id).await;
     service.retry(&id).unwrap();
     service.join(&id).await;
     let history = service.store().history(&id).unwrap();
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 1);
-    assert!(matches!(history.last().unwrap().event, SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+            .count(),
+        1
+    );
+    assert!(matches!(
+        history.last().unwrap().event,
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
     assert!(service.retry(&id).is_err());
 }
 
 struct PanicCommand;
 impl rness_engine::interaction::Command for PanicCommand {
-    fn name(&self) -> &str { "panic" }
-    fn description(&self) -> &str { "Test unwinding" }
-    fn execute(&self, _: &SessionService, _: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
+    fn name(&self) -> &str {
+        "panic"
+    }
+    fn description(&self) -> &str {
+        "Test unwinding"
+    }
+    fn execute(
+        &self,
+        _: &SessionService,
+        _: rness_engine::interaction::CommandInvocation<'_>,
+    ) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
         panic!("handler panic");
     }
 }
@@ -173,20 +341,58 @@ impl rness_engine::interaction::Command for PanicCommand {
 async fn command_admission_cancellation_drop_and_panic_release_reservations() {
     let logs = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![]);
-    let service = Arc::new(SessionService::new(SessionStore::new(logs.path()), provider.clone(), Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default())));
+    let service = Arc::new(SessionService::new(
+        SessionStore::new(logs.path()),
+        provider.clone(),
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    ));
     service.commands().register(Arc::new(PanicCommand)).unwrap();
     let id = service.create(None).unwrap();
     let before = service.store().history(&id).unwrap();
-    let input = || vec![ContentPart::Text { text: "/panic".into() }];
+    let input = || {
+        vec![ContentPart::Text {
+            text: "/panic".into(),
+        }]
+    };
 
     let pending = service.send_async(id.clone(), UserIntent::Followup, input());
     assert!(service.command_running(&id));
-    assert!(matches!(service.compact(&id, 0).await, Err(rness_engine::service::ServiceError::Busy)));
-    assert!(matches!(service.set_config(&id, service.config(&id).unwrap()), Err(rness_engine::service::ServiceError::Busy)));
-    assert!(matches!(service.select_agent(&id, "any"), Err(rness_engine::service::ServiceError::Busy)));
-    assert!(matches!(service.prune_tool_results(&id, rness_engine::service::PruneOptions { threshold_chars: 100, head_chars: 20, tail_chars: 20, keep_turns: 1 }), Err(rness_engine::service::ServiceError::Busy)));
+    assert!(matches!(
+        service.compact(&id, 0).await,
+        Err(rness_engine::service::ServiceError::Busy)
+    ));
+    assert!(matches!(
+        service.set_config(&id, service.config(&id).unwrap()),
+        Err(rness_engine::service::ServiceError::Busy)
+    ));
+    assert!(matches!(
+        service.select_agent(&id, "any"),
+        Err(rness_engine::service::ServiceError::Busy)
+    ));
+    assert!(matches!(
+        service.prune_tool_results(
+            &id,
+            rness_engine::service::PruneOptions {
+                threshold_chars: 100,
+                head_chars: 20,
+                tail_chars: 20,
+                keep_turns: 1
+            }
+        ),
+        Err(rness_engine::service::ServiceError::Busy)
+    ));
     assert!(service.try_extension_maintenance().is_err());
-    assert!(service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "must not start".into() }]).is_err());
+    assert!(service
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "must not start".into()
+            }]
+        )
+        .is_err());
     service.cancel(&id);
     assert!(pending.await.unwrap_err().to_string().contains("cancelled"));
     assert!(!service.command_running(&id));
@@ -196,30 +402,70 @@ async fn command_admission_cancellation_drop_and_panic_release_reservations() {
     assert!(!service.command_running(&id));
     assert!(service.try_extension_maintenance().is_ok());
 
-    let error = service.send_async(id.clone(), UserIntent::Followup, input()).await.unwrap_err();
+    let error = service
+        .send_async(id.clone(), UserIntent::Followup, input())
+        .await
+        .unwrap_err();
     assert!(error.to_string().contains("panic"));
     assert!(!service.command_running(&id));
     assert!(service.try_extension_maintenance().is_ok());
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.send(&id, UserIntent::Followup, input()))).is_err());
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| service.send(
+            &id,
+            UserIntent::Followup,
+            input()
+        )))
+        .is_err()
+    );
     assert!(!service.command_running(&id));
     assert!(service.try_extension_maintenance().is_ok());
     assert_eq!(service.store().history(&id).unwrap(), before);
     assert!(provider.seen().is_empty());
-    assert!(matches!(service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "/help".into() }]).unwrap(), Disposition::Command(_)));
+    assert!(matches!(
+        service
+            .send(
+                &id,
+                UserIntent::Followup,
+                vec![ContentPart::Text {
+                    text: "/help".into()
+                }]
+            )
+            .unwrap(),
+        Disposition::Command(_)
+    ));
 }
 
 #[tokio::test]
 async fn active_turn_rejects_command_admission_without_losing_cancellation() {
     let logs = tempfile::tempdir().unwrap();
     let provider = Scripted::gated(vec![], Arc::new(tokio::sync::Semaphore::new(0)));
-    let service = Arc::new(SessionService::new(SessionStore::new(logs.path()), provider, Arc::new(ToolRegistry::default()), TurnConfig::default(), Arc::new(EventBus::default())));
+    let service = Arc::new(SessionService::new(
+        SessionStore::new(logs.path()),
+        provider,
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    ));
     let id = service.create(None).unwrap();
-    service.send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "turn".into() }]).unwrap();
-    assert!(matches!(service.prepare_command(&id, "/help"), Err(rness_engine::service::ServiceError::Busy)));
+    service
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "turn".into(),
+            }],
+        )
+        .unwrap();
+    assert!(matches!(
+        service.prepare_command(&id, "/help"),
+        Err(rness_engine::service::ServiceError::Busy)
+    ));
     assert!(!service.command_running(&id));
     assert!(service.try_extension_maintenance().is_err());
     service.cancel(&id);
-    tokio::time::timeout(std::time::Duration::from_secs(3), service.join(&id)).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), service.join(&id))
+        .await
+        .unwrap();
     assert!(service.prepare_command(&id, "/help").unwrap().is_some());
     assert!(service.try_extension_maintenance().is_ok());
 }
@@ -239,9 +485,16 @@ fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> Ass
         model: "fake-1".into(),
         content,
         stop,
-        usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+        usage: Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        },
         estimated_input: 0,
-        chunks: vec![TimedChunk { ms: 1, delta: ChunkDelta::Text { t: text.into() } }],
+        chunks: vec![TimedChunk {
+            ms: 1,
+            delta: ChunkDelta::Text { t: text.into() },
+        }],
     }
 }
 
@@ -257,11 +510,19 @@ struct Scripted {
 
 impl Scripted {
     fn new(steps: Vec<StepOutcome>) -> Arc<Self> {
-        Arc::new(Self { steps: Mutex::new(steps), seen: Mutex::new(vec![]), gate: None })
+        Arc::new(Self {
+            steps: Mutex::new(steps),
+            seen: Mutex::new(vec![]),
+            gate: None,
+        })
     }
 
     fn gated(steps: Vec<StepOutcome>, gate: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
-        Arc::new(Self { steps: Mutex::new(steps), seen: Mutex::new(vec![]), gate: Some(gate) })
+        Arc::new(Self {
+            steps: Mutex::new(steps),
+            seen: Mutex::new(vec![]),
+            gate: Some(gate),
+        })
     }
 
     fn seen(&self) -> Vec<String> {
@@ -314,7 +575,9 @@ async fn retry_preserves_committed_tool_results_and_allows_config_change() {
     struct Count(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]
     impl Tool for Count {
-        fn name(&self) -> &str { "Count" }
+        fn name(&self) -> &str {
+            "Count"
+        }
         async fn execute(&self, _: serde_json::Value) -> Result<String, String> {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("done".into())
@@ -325,39 +588,99 @@ async fn retry_preserves_committed_tool_results_and_allows_config_change() {
     let tools = Arc::new(ToolRegistry::default());
     tools.register(Arc::new(Count(count.clone())));
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(AssistantMessage { model: "test".into(), content: vec![ContentPart::ToolUse { call: "once".into(), name: "Count".into(), args: serde_json::json!({}) }], stop: StopReason::ToolUse, usage: Usage::default(), estimated_input: 0, chunks: vec![] }),
-        StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "HTTP", retry_after: None, message: "offline".into(), retryable: false }, partial: vec![] },
+        StepOutcome::Committed(AssistantMessage {
+            model: "test".into(),
+            content: vec![ContentPart::ToolUse {
+                call: "once".into(),
+                name: "Count".into(),
+                args: serde_json::json!({}),
+            }],
+            stop: StopReason::ToolUse,
+            usage: Usage::default(),
+            estimated_input: 0,
+            chunks: vec![],
+        }),
+        StepOutcome::Failed {
+            error: rness_engine::turn::provider::ProviderError {
+                code: "HTTP",
+                retry_after: None,
+                message: "offline".into(),
+                retryable: false,
+            },
+            partial: vec![],
+        },
         StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
     ]);
-    let svc = SessionService::new(SessionStore::new(dir.path()), provider, tools, TurnConfig::default(), Arc::new(EventBus::default()));
+    let svc = SessionService::new(
+        SessionStore::new(dir.path()),
+        provider,
+        tools,
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    );
     let sid = svc.create(None).unwrap();
-    svc.send(&sid, UserIntent::Followup, text("execute once")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("execute once"))
+        .unwrap();
     svc.join(&sid).await;
     svc.set_config(&sid, svc.config(&sid).unwrap()).unwrap();
     svc.retry(&sid).unwrap();
     assert!(svc.retry(&sid).is_err());
     svc.join(&sid).await;
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(svc.store().history(&sid).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::ToolResult(_))).count(), 1);
+    assert_eq!(
+        svc.store()
+            .history(&sid)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::ToolResult(_)))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
 async fn cancellation_interrupts_retry_after_without_another_request() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Failed { error: rness_engine::turn::provider::ProviderError { code: "HTTP", retry_after: Some(std::time::Duration::from_secs(60)), message: "rate limited".into(), retryable: true }, partial: vec![] }]);
+    let provider = Scripted::new(vec![StepOutcome::Failed {
+        error: rness_engine::turn::provider::ProviderError {
+            code: "HTTP",
+            retry_after: Some(std::time::Duration::from_secs(60)),
+            message: "rate limited".into(),
+            retryable: true,
+        },
+        partial: vec![],
+    }]);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
     svc.send(&sid, UserIntent::Followup, text("go")).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if svc.store().history(&sid).unwrap().iter().any(|e| matches!(e.event, SessionEvent::AssistantAttempt(_))) { break; }
+            if svc
+                .store()
+                .history(&sid)
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::AssistantAttempt(_)))
+            {
+                break;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     svc.cancel(&sid);
-    tokio::time::timeout(std::time::Duration::from_secs(2), svc.join(&sid)).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), svc.join(&sid))
+        .await
+        .unwrap();
     assert_eq!(provider.seen().len(), 1);
-    assert!(matches!(svc.store().history(&sid).unwrap().last().unwrap().event, SessionEvent::TurnEnded { outcome: TurnOutcome::Cancelled, .. }));
+    assert!(matches!(
+        svc.store().history(&sid).unwrap().last().unwrap().event,
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Cancelled,
+            ..
+        }
+    ));
 }
 
 struct Echo;
@@ -394,29 +717,51 @@ async fn extension_maintenance_excludes_bursts_and_new_input() {
     use rness_engine::service::ServiceError;
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let provider = Scripted::gated(vec![
-        StepOutcome::Committed(assistant("one", StopReason::EndTurn, vec![])),
-        StepOutcome::Committed(assistant("two", StopReason::EndTurn, vec![])),
-    ], gate.clone());
+    let provider = Scripted::gated(
+        vec![
+            StepOutcome::Committed(assistant("one", StopReason::EndTurn, vec![])),
+            StepOutcome::Committed(assistant("two", StopReason::EndTurn, vec![])),
+        ],
+        gate.clone(),
+    );
     let svc = service(dir.path(), provider);
     let sid = svc.create(None).unwrap();
     let other = svc.create(None).unwrap();
     let maintenance = svc.try_extension_maintenance().unwrap();
-    assert!(matches!(svc.try_extension_maintenance(), Err(ServiceError::Busy)));
-    assert!(matches!(svc.send(&sid, UserIntent::Followup, text("blocked")), Err(ServiceError::Busy)));
-    assert!(matches!(svc.send(&other, UserIntent::Inject, text("blocked")), Err(ServiceError::Busy)));
-    assert!(matches!(svc.compact(&sid, 1).await, Err(ServiceError::Busy)));
+    assert!(matches!(
+        svc.try_extension_maintenance(),
+        Err(ServiceError::Busy)
+    ));
+    assert!(matches!(
+        svc.send(&sid, UserIntent::Followup, text("blocked")),
+        Err(ServiceError::Busy)
+    ));
+    assert!(matches!(
+        svc.send(&other, UserIntent::Inject, text("blocked")),
+        Err(ServiceError::Busy)
+    ));
+    assert!(matches!(
+        svc.compact(&sid, 1).await,
+        Err(ServiceError::Busy)
+    ));
     assert!(svc.transcript(&sid).unwrap().items.is_empty());
     drop(maintenance);
     svc.send(&sid, UserIntent::Followup, text("one")).unwrap();
     svc.send(&sid, UserIntent::Followup, text("two")).unwrap();
-    assert!(matches!(svc.try_extension_maintenance(), Err(ServiceError::Busy)));
+    assert!(matches!(
+        svc.try_extension_maintenance(),
+        Err(ServiceError::Busy)
+    ));
     gate.add_permits(2);
     svc.join(&sid).await;
     let maintenance = svc.try_extension_maintenance().unwrap();
-    assert!(matches!(svc.send(&other, UserIntent::Followup, text("blocked")), Err(ServiceError::Busy)));
+    assert!(matches!(
+        svc.send(&other, UserIntent::Followup, text("blocked")),
+        Err(ServiceError::Busy)
+    ));
     drop(maintenance);
-    svc.send(&other, UserIntent::Inject, text("allowed")).unwrap();
+    svc.send(&other, UserIntent::Inject, text("allowed"))
+        .unwrap();
 }
 
 #[tokio::test]
@@ -490,7 +835,11 @@ async fn steer_while_running_lands_mid_turn() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let provider = Scripted::gated(
         vec![
-            StepOutcome::Committed(assistant("using tool", StopReason::ToolUse, vec![("c1", "Echo")])),
+            StepOutcome::Committed(assistant(
+                "using tool",
+                StopReason::ToolUse,
+                vec![("c1", "Echo")],
+            )),
             StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
         ],
         Arc::clone(&gate),
@@ -505,7 +854,9 @@ async fn steer_while_running_lands_mid_turn() {
         tokio::task::yield_now().await;
     }
     // Steer while the first step is in flight.
-    let disp = svc.send(&sid, UserIntent::Steer, text("actually stop")).unwrap();
+    let disp = svc
+        .send(&sid, UserIntent::Steer, text("actually stop"))
+        .unwrap();
     assert_eq!(disp, Disposition::Queued);
 
     gate.add_permits(1);
@@ -523,7 +874,9 @@ async fn inject_while_idle_logs_without_running() {
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
 
-    let disp = svc.send(&sid, UserIntent::Inject, text("context note")).unwrap();
+    let disp = svc
+        .send(&sid, UserIntent::Inject, text("context note"))
+        .unwrap();
     assert_eq!(disp, Disposition::LogOnly);
     assert_eq!(svc.phase(&sid), Phase::Idle);
     assert!(provider.seen().is_empty());
@@ -541,13 +894,18 @@ async fn cancel_ends_the_burst_and_returns_to_idle() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let provider = Scripted::gated(
-        vec![StepOutcome::Committed(assistant("never", StopReason::EndTurn, vec![]))],
+        vec![StepOutcome::Committed(assistant(
+            "never",
+            StopReason::EndTurn,
+            vec![],
+        ))],
         Arc::clone(&gate),
     );
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
 
-    svc.send(&sid, UserIntent::Followup, text("long task")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("long task"))
+        .unwrap();
     while svc.phase(&sid) != Phase::Running {
         tokio::task::yield_now().await;
     }
@@ -559,7 +917,10 @@ async fn cancel_ends_the_burst_and_returns_to_idle() {
     let history = svc.store().history(&sid).unwrap();
     assert!(history.iter().any(|e| matches!(
         e.event,
-        SessionEvent::TurnEnded { outcome: TurnOutcome::Cancelled, .. }
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Cancelled,
+            ..
+        }
     )));
     assert!(history
         .iter()
@@ -617,7 +978,8 @@ async fn fork_from_service_creates_working_branch() {
     svc.join(&root).await;
 
     let child = svc.fork(&root, None).unwrap();
-    svc.send(&child, UserIntent::Followup, text("branch off")).unwrap();
+    svc.send(&child, UserIntent::Followup, text("branch off"))
+        .unwrap();
     svc.join(&child).await;
 
     // Child request replayed the root's prefix.
@@ -663,7 +1025,11 @@ async fn lifecycle_events_fire_on_the_bus() {
 async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(assistant("using tool", StopReason::ToolUse, vec![("c1", "Echo")])),
+        StepOutcome::Committed(assistant(
+            "using tool",
+            StopReason::ToolUse,
+            vec![("c1", "Echo")],
+        )),
         StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
     ]);
     let bus = Arc::new(EventBus::default());
@@ -751,13 +1117,17 @@ async fn kernel_plugin_provides_the_sessions_service() {
         .get::<SessionService>("sessions")
         .expect("plugin provided the service");
     let sid = svc.create(None).unwrap();
-    svc.send(&sid, UserIntent::Followup, text("hello kernel")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("hello kernel"))
+        .unwrap();
     svc.join(&sid).await;
     assert_eq!(svc.transcript(&sid).unwrap().items.len(), 2);
 
     // Unmount removes the service (reversible effects).
     kernel.unmount("sessions").unwrap();
-    assert!(kernel.services().get::<SessionService>("sessions").is_none());
+    assert!(kernel
+        .services()
+        .get::<SessionService>("sessions")
+        .is_none());
 }
 
 // -- compaction ------------------------------------------------------------
@@ -765,7 +1135,8 @@ async fn kernel_plugin_provides_the_sessions_service() {
 /// Run `n` completed simple turns ("m1".."mn") against scripted answers.
 async fn run_turns(svc: &SessionService, sid: &SessionId, n: usize) {
     for i in 1..=n {
-        svc.send(sid, UserIntent::Followup, text(&format!("m{i}"))).unwrap();
+        svc.send(sid, UserIntent::Followup, text(&format!("m{i}")))
+            .unwrap();
         svc.join(sid).await;
     }
 }
@@ -781,7 +1152,11 @@ async fn compact_folds_old_turns_and_keeps_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     // 3 turns + 1 summarizer request.
     let mut steps = scripted_answers(3);
-    steps.push(StepOutcome::Committed(assistant("SUMMARY", StopReason::EndTurn, vec![])));
+    steps.push(StepOutcome::Committed(assistant(
+        "SUMMARY",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let provider = Scripted::new(steps);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
@@ -794,14 +1169,19 @@ async fn compact_folds_old_turns_and_keeps_the_tail() {
     // The summarizer request saw ONLY the folding region + instruction.
     let last_seen = provider.seen().last().unwrap().clone();
     assert!(last_seen.starts_with("m1|m2|"), "saw: {last_seen}");
-    assert!(!last_seen.contains("m3"), "tail leaked into summarizer: {last_seen}");
+    assert!(
+        !last_seen.contains("m3"),
+        "tail leaked into summarizer: {last_seen}"
+    );
 
     // Next projection: summary replaces turns 1-2, turn 3 verbatim.
     let replayed = svc.replay(&sid).unwrap();
     let first = &replayed.context.turns[0];
     match first {
         rness_engine::session::projection::ModelTurn::User { content } => {
-            let ContentPart::Text { text } = &content[0] else { panic!() };
+            let ContentPart::Text { text } = &content[0] else {
+                panic!()
+            };
             assert!(text.contains("SUMMARY"), "summary not replayed: {text}");
         }
         _ => panic!("first turn should be the summary user message"),
@@ -823,9 +1203,21 @@ async fn compact_folds_old_turns_and_keeps_the_tail() {
 async fn recompaction_folds_the_previous_checkpoint() {
     let dir = tempfile::tempdir().unwrap();
     let mut steps = scripted_answers(2);
-    steps.push(StepOutcome::Committed(assistant("S1", StopReason::EndTurn, vec![])));
-    steps.push(StepOutcome::Committed(assistant("a3", StopReason::EndTurn, vec![])));
-    steps.push(StepOutcome::Committed(assistant("S2", StopReason::EndTurn, vec![])));
+    steps.push(StepOutcome::Committed(assistant(
+        "S1",
+        StopReason::EndTurn,
+        vec![],
+    )));
+    steps.push(StepOutcome::Committed(assistant(
+        "a3",
+        StopReason::EndTurn,
+        vec![],
+    )));
+    steps.push(StepOutcome::Committed(assistant(
+        "S2",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let provider = Scripted::new(steps);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
@@ -840,13 +1232,17 @@ async fn recompaction_folds_the_previous_checkpoint() {
     let replayed = svc.replay(&sid).unwrap();
     // S2 + m3(the last turn kept) + its answer
     assert_eq!(replayed.context.turns.len(), 3);
-    let rness_engine::session::projection::ModelTurn::User { content } =
-        &replayed.context.turns[0]
+    let rness_engine::session::projection::ModelTurn::User { content } = &replayed.context.turns[0]
     else {
         panic!()
     };
-    let ContentPart::Text { text } = &content[0] else { panic!() };
-    assert!(text.contains("S2") && !text.contains("S1"), "wrong summary: {text}");
+    let ContentPart::Text { text } = &content[0] else {
+        panic!()
+    };
+    assert!(
+        text.contains("S2") && !text.contains("S1"),
+        "wrong summary: {text}"
+    );
 }
 
 #[tokio::test]
@@ -854,7 +1250,11 @@ async fn compact_refuses_when_busy_or_empty() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let provider = Scripted::gated(
-        vec![StepOutcome::Committed(assistant("x", StopReason::EndTurn, vec![]))],
+        vec![StepOutcome::Committed(assistant(
+            "x",
+            StopReason::EndTurn,
+            vec![],
+        ))],
         Arc::clone(&gate),
     );
     let svc = service(dir.path(), provider.clone());
@@ -862,7 +1262,10 @@ async fn compact_refuses_when_busy_or_empty() {
 
     // Nothing to compact on a fresh session.
     let err = svc.compact(&sid, 1).await.unwrap_err();
-    assert!(matches!(err, rness_engine::service::ServiceError::NothingToCompact));
+    assert!(matches!(
+        err,
+        rness_engine::service::ServiceError::NothingToCompact
+    ));
 
     // Busy while a turn runs.
     svc.send(&sid, UserIntent::Followup, text("go")).unwrap();
@@ -876,15 +1279,26 @@ async fn compact_refuses_when_busy_or_empty() {
 
     // keep_turns covering everything -> nothing to fold.
     let err = svc.compact(&sid, 5).await.unwrap_err();
-    assert!(matches!(err, rness_engine::service::ServiceError::NothingToCompact));
+    assert!(matches!(
+        err,
+        rness_engine::service::ServiceError::NothingToCompact
+    ));
 }
 
 #[tokio::test]
 async fn compacted_session_stays_replayable_and_forkable() {
     let dir = tempfile::tempdir().unwrap();
     let mut steps = scripted_answers(2);
-    steps.push(StepOutcome::Committed(assistant("SUM", StopReason::EndTurn, vec![])));
-    steps.push(StepOutcome::Committed(assistant("post", StopReason::EndTurn, vec![])));
+    steps.push(StepOutcome::Committed(assistant(
+        "SUM",
+        StopReason::EndTurn,
+        vec![],
+    )));
+    steps.push(StepOutcome::Committed(assistant(
+        "post",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let provider = Scripted::new(steps);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
@@ -895,7 +1309,10 @@ async fn compacted_session_stays_replayable_and_forkable() {
     svc.send(&sid, UserIntent::Followup, text("after")).unwrap();
     svc.join(&sid).await;
     let last = provider.seen().last().unwrap().clone();
-    assert!(last.contains("SUM") && last.contains("m2|after"), "saw: {last}");
+    assert!(
+        last.contains("SUM") && last.contains("m2|after"),
+        "saw: {last}"
+    );
     assert!(!last.contains("m1"), "folded turn leaked: {last}");
 
     // Fork of a compacted session replays identically (shadowing crosses
@@ -933,7 +1350,11 @@ async fn prune_shortens_old_tool_results_and_keeps_the_tail() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![
         // turn 1: tool call + answer
-        StepOutcome::Committed(assistant("using tool", StopReason::ToolUse, vec![("c1", "Big")])),
+        StepOutcome::Committed(assistant(
+            "using tool",
+            StopReason::ToolUse,
+            vec![("c1", "Big")],
+        )),
         StepOutcome::Committed(assistant("a1", StopReason::EndTurn, vec![])),
         // turn 2: another tool call + answer (protected tail)
         StepOutcome::Committed(assistant("again", StopReason::ToolUse, vec![("c2", "Big")])),
@@ -976,14 +1397,21 @@ async fn prune_shortens_old_tool_results_and_keeps_the_tail() {
     svc.send(&sid, UserIntent::Followup, text("go on")).unwrap();
     svc.join(&sid).await;
     let last = provider.seen().last().unwrap().clone();
-    assert!(!last.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), "original leaked");
+    assert!(
+        !last.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+        "original leaked"
+    );
 }
 
 #[tokio::test]
 async fn compact_folds_pruned_results_cleanly() {
     let dir = tempfile::tempdir().unwrap();
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(assistant("using tool", StopReason::ToolUse, vec![("c1", "Big")])),
+        StepOutcome::Committed(assistant(
+            "using tool",
+            StopReason::ToolUse,
+            vec![("c1", "Big")],
+        )),
         StepOutcome::Committed(assistant("a1", StopReason::EndTurn, vec![])),
         StepOutcome::Committed(assistant("a2", StopReason::EndTurn, vec![])),
         StepOutcome::Committed(assistant("SUM", StopReason::EndTurn, vec![])),
@@ -1005,18 +1433,23 @@ async fn compact_folds_pruned_results_cleanly() {
     // the projection cites) — replay stays invariant-clean.
     svc.compact(&sid, 1).await.unwrap();
     let replayed = svc.replay(&sid).unwrap();
-    let rness_engine::session::projection::ModelTurn::User { content } =
-        &replayed.context.turns[0]
+    let rness_engine::session::projection::ModelTurn::User { content } = &replayed.context.turns[0]
     else {
         panic!()
     };
-    let ContentPart::Text { text: t } = &content[0] else { panic!() };
+    let ContentPart::Text { text: t } = &content[0] else {
+        panic!()
+    };
     assert!(t.contains("SUM"));
     // The pruned ORIGINAL must not resurface anywhere in the context.
     for turn in &replayed.context.turns {
         if let rness_engine::session::projection::ModelTurn::ToolResults { results } = turn {
             for r in results {
-                assert!(r.output.len() < 100, "original resurfaced: {} chars", r.output.len());
+                assert!(
+                    r.output.len() < 100,
+                    "original resurfaced: {} chars",
+                    r.output.len()
+                );
             }
         }
     }
@@ -1044,7 +1477,10 @@ async fn named_agent_selection_is_durable_and_unknown_names_do_not_mutate() {
     let sid = svc.create(None).unwrap();
     svc.select_agent(&sid, "reviewer").unwrap();
     let config = svc.config(&sid).unwrap();
-    assert_eq!(config.agent.as_ref().unwrap().instructions, "Inspect without edits");
+    assert_eq!(
+        config.agent.as_ref().unwrap().instructions,
+        "Inspect without edits"
+    );
     assert!(svc.select_agent(&sid, "missing").is_err());
     assert_eq!(svc.config(&sid).unwrap(), config);
     let restored = service(dir.path(), Scripted::new(vec![]));
@@ -1110,13 +1546,11 @@ fn configured_sandbox_requires_a_workspace_but_absent_setup_does_not() {
         default: SandboxMode::WorkspaceWrite,
         ..Default::default()
     });
-    assert!(
-        restricted
-            .create(None)
-            .unwrap_err()
-            .to_string()
-            .contains("session workspace is required")
-    );
+    assert!(restricted
+        .create(None)
+        .unwrap_err()
+        .to_string()
+        .contains("session workspace is required"));
 }
 
 fn enable_instructions(svc: &SessionService, ws: &std::path::Path, max: usize) {
@@ -1167,8 +1601,13 @@ async fn instructions_baseline_injected_once_before_the_first_prompt() {
 
     // The FIRST provider request already carried the baseline, before m1.
     let first_seen = provider.seen()[0].clone();
-    let rule = first_seen.find("REGLA").expect("baseline missing from request");
-    assert!(rule < first_seen.find("m1").unwrap(), "baseline must precede the prompt");
+    let rule = first_seen
+        .find("REGLA")
+        .expect("baseline missing from request");
+    assert!(
+        rule < first_seen.find("m1").unwrap(),
+        "baseline must precede the prompt"
+    );
 
     // Injected once, not per turn.
     let history = svc.store().history(&sid).unwrap();
@@ -1177,7 +1616,10 @@ async fn instructions_baseline_injected_once_before_the_first_prompt() {
         .filter(|e| {
             matches!(
                 &e.event,
-                SessionEvent::UserMessage(UserMessage { source: Some(_), .. })
+                SessionEvent::UserMessage(UserMessage {
+                    source: Some(_),
+                    ..
+                })
             )
         })
         .count();
@@ -1193,8 +1635,16 @@ async fn instructions_reinjected_after_compaction_folds_them() {
 
     // 3 turns + summarizer + 1 post-compact turn.
     let mut steps = scripted_answers(3);
-    steps.push(StepOutcome::Committed(assistant("SUMMARY", StopReason::EndTurn, vec![])));
-    steps.push(StepOutcome::Committed(assistant("a4", StopReason::EndTurn, vec![])));
+    steps.push(StepOutcome::Committed(assistant(
+        "SUMMARY",
+        StopReason::EndTurn,
+        vec![],
+    )));
+    steps.push(StepOutcome::Committed(assistant(
+        "a4",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let provider = Scripted::new(steps);
     let svc = service(dir.path(), provider.clone());
     enable_instructions(&svc, ws.path(), 4096);
@@ -1212,7 +1662,10 @@ async fn instructions_reinjected_after_compaction_folds_them() {
     svc.send(&sid, UserIntent::Followup, text("m4")).unwrap();
     svc.join(&sid).await;
     let last_seen = provider.seen().last().unwrap().clone();
-    assert!(last_seen.contains("REGLA"), "baseline not re-injected: {last_seen}");
+    assert!(
+        last_seen.contains("REGLA"),
+        "baseline not re-injected: {last_seen}"
+    );
 
     // And it is a NEW durable event, not resurrection of the folded one.
     let history = svc.store().history(&sid).unwrap();
@@ -1221,7 +1674,10 @@ async fn instructions_reinjected_after_compaction_folds_them() {
         .filter(|e| {
             matches!(
                 &e.event,
-                SessionEvent::UserMessage(UserMessage { source: Some(_), .. })
+                SessionEvent::UserMessage(UserMessage {
+                    source: Some(_),
+                    ..
+                })
             )
         })
         .count();
@@ -1245,7 +1701,10 @@ async fn instructions_change_on_disk_reinjects_with_new_identity() {
     run_turns(&svc, &sid, 1).await;
 
     let last_seen = provider.seen().last().unwrap().clone();
-    assert!(last_seen.contains("version-dos"), "fresh content missing: {last_seen}");
+    assert!(
+        last_seen.contains("version-dos"),
+        "fresh content missing: {last_seen}"
+    );
     // Old baseline is still durable history (append-only log).
     assert!(last_seen.contains("version-uno"), "history is append-only");
 }
@@ -1265,7 +1724,10 @@ async fn no_instruction_files_means_no_injection() {
     let history = svc.store().history(&sid).unwrap();
     assert!(history.iter().all(|e| !matches!(
         &e.event,
-        SessionEvent::UserMessage(UserMessage { source: Some(_), .. })
+        SessionEvent::UserMessage(UserMessage {
+            source: Some(_),
+            ..
+        })
     )));
 }
 
@@ -1277,28 +1739,35 @@ async fn selection_seed_resolves_each_session_and_survives_reopen() {
     let first = Scripted::new(scripted_answers(1));
     let second = Scripted::new(scripted_answers(1));
     let seed = CallConfig {
-        selection: Some(ModelSelection { route: "test".into(), model: "first".into() }),
-        reasoning: Some(Reasoning::Effort { effort: "high".into() }),
+        selection: Some(ModelSelection {
+            route: "test".into(),
+            model: "first".into(),
+        }),
+        reasoning: Some(Reasoning::Effort {
+            effort: "high".into(),
+        }),
         ..Default::default()
     };
     let a = first.clone();
     let b = second.clone();
-    let resolver: Arc<rness_engine::service::ProviderResolver> = Arc::new(move |selection| {
-        match selection.model.as_str() {
+    let resolver: Arc<rness_engine::service::ProviderResolver> =
+        Arc::new(move |selection| match selection.model.as_str() {
             "first" => Ok(a.clone() as Arc<dyn Provider>),
             "second" => Ok(b.clone() as Arc<dyn Provider>),
             _ => Err("unknown model".into()),
-        }
-    });
-    let svc = service(dir.path(), first.clone())
-        .with_provider_resolver(seed.clone(), resolver.clone());
+        });
+    let svc =
+        service(dir.path(), first.clone()).with_provider_resolver(seed.clone(), resolver.clone());
     let sid = svc.create(None).unwrap();
     assert_eq!(svc.config(&sid).unwrap(), seed);
     run_turns(&svc, &sid, 1).await;
     let child = svc.fork(&sid, None).unwrap();
     assert_eq!(svc.config(&child).unwrap(), seed);
     let changed = CallConfig {
-        selection: Some(ModelSelection { route: "test".into(), model: "second".into() }),
+        selection: Some(ModelSelection {
+            route: "test".into(),
+            model: "second".into(),
+        }),
         ..Default::default()
     };
     svc.set_config(&child, changed.clone()).unwrap();
@@ -1320,13 +1789,37 @@ async fn request_config_latest_wins_and_resume_restores_it() {
     // Never set -> default (all None).
     assert_eq!(svc.config(&sid).unwrap(), CallConfig::default());
 
-    svc.set_config(&sid, CallConfig { reasoning: Some(Reasoning::BudgetTokens { tokens: 8192 }), ..Default::default() }).unwrap();
-    svc.set_config(&sid, CallConfig { reasoning: Some(Reasoning::BudgetTokens { tokens: 2048 }), ..Default::default() }).unwrap();
-    assert_eq!(svc.config(&sid).unwrap().reasoning, Some(Reasoning::BudgetTokens { tokens: 2048 }));
+    svc.set_config(
+        &sid,
+        CallConfig {
+            reasoning: Some(Reasoning::BudgetTokens { tokens: 8192 }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    svc.set_config(
+        &sid,
+        CallConfig {
+            reasoning: Some(Reasoning::BudgetTokens { tokens: 2048 }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        svc.config(&sid).unwrap().reasoning,
+        Some(Reasoning::BudgetTokens { tokens: 2048 })
+    );
 
     // Restating the effective config is a no-op: no new event logged.
     let before = svc.store().history(&sid).unwrap().len();
-    svc.set_config(&sid, CallConfig { reasoning: Some(Reasoning::BudgetTokens { tokens: 2048 }), ..Default::default() }).unwrap();
+    svc.set_config(
+        &sid,
+        CallConfig {
+            reasoning: Some(Reasoning::BudgetTokens { tokens: 2048 }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     assert_eq!(svc.store().history(&sid).unwrap().len(), before);
 
     // Clearing IS a change: back to the provider's default, durably.
@@ -1343,14 +1836,28 @@ async fn request_config_latest_wins_and_resume_restores_it() {
 async fn request_config_survives_compaction() {
     let dir = tempfile::tempdir().unwrap();
     let mut steps = scripted_answers(3);
-    steps.push(StepOutcome::Committed(assistant("SUMMARY", StopReason::EndTurn, vec![])));
+    steps.push(StepOutcome::Committed(assistant(
+        "SUMMARY",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let svc = service(dir.path(), Scripted::new(steps));
     let sid = svc.create(None).unwrap();
-    svc.set_config(&sid, CallConfig { reasoning: Some(Reasoning::BudgetTokens { tokens: 8192 }), ..Default::default() }).unwrap();
+    svc.set_config(
+        &sid,
+        CallConfig {
+            reasoning: Some(Reasoning::BudgetTokens { tokens: 8192 }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
     run_turns(&svc, &sid, 3).await;
 
     svc.compact(&sid, 1).await.unwrap();
     // Config is request-header state, not conversation: folding turns
     // must not lose it.
-    assert_eq!(svc.config(&sid).unwrap().reasoning, Some(Reasoning::BudgetTokens { tokens: 8192 }));
+    assert_eq!(
+        svc.config(&sid).unwrap().reasoning,
+        Some(Reasoning::BudgetTokens { tokens: 8192 })
+    );
 }

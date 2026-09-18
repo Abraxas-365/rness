@@ -43,9 +43,15 @@ pub struct Skill {
 /// Conventional roots for a workspace: project `.rness/skills` (rank 0)
 /// shadowing user `~/.rness/skills` (rank 1).
 pub fn default_roots(workspace: &Path) -> Vec<SkillRoot> {
-    let mut roots = vec![SkillRoot { path: workspace.join(".rness/skills"), rank: 0 }];
+    let mut roots = vec![SkillRoot {
+        path: workspace.join(".rness/skills"),
+        rank: 0,
+    }];
     if let Some(home) = dirs_home() {
-        roots.push(SkillRoot { path: home.join(".rness/skills"), rank: 1 });
+        roots.push(SkillRoot {
+            path: home.join(".rness/skills"),
+            rank: 1,
+        });
     }
     roots
 }
@@ -59,7 +65,9 @@ fn dirs_home() -> Option<PathBuf> {
 pub fn discover(roots: &[SkillRoot]) -> Vec<Skill> {
     let mut found: Vec<Skill> = Vec::new();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root.path) else { continue };
+        let Ok(entries) = std::fs::read_dir(&root.path) else {
+            continue;
+        };
         let mut names: Vec<_> = entries.flatten().collect();
         names.sort_by_key(|e| e.file_name());
         for entry in names {
@@ -72,7 +80,9 @@ pub fn discover(roots: &[SkillRoot]) -> Vec<Skill> {
             } else {
                 None
             };
-            let Some((file, dir)) = candidate else { continue };
+            let Some((file, dir)) = candidate else {
+                continue;
+            };
             let Some((name, description)) = parse_frontmatter_summary(&file) else {
                 tracing::warn!(path = %file.display(), "skill skipped: invalid frontmatter");
                 continue;
@@ -80,7 +90,13 @@ pub fn discover(roots: &[SkillRoot]) -> Vec<Skill> {
             if found.iter().any(|s| s.name == name) {
                 continue; // earlier (lower-rank) root already claimed it
             }
-            found.push(Skill { name, description, path: file, dir, rank: root.rank });
+            found.push(Skill {
+                name,
+                description,
+                path: file,
+                dir,
+                rank: root.rank,
+            });
         }
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
@@ -100,13 +116,17 @@ fn parse_frontmatter_summary(path: &Path) -> Option<(String, String)> {
 
 fn split_frontmatter(raw: &str) -> Option<(Vec<(String, String)>, String)> {
     let rest = raw.strip_prefix("---")?;
-    let rest = rest.strip_prefix("\r\n").or_else(|| rest.strip_prefix('\n'))?;
+    let rest = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))?;
     let end = rest.find("\n---")?;
     let yaml = &rest[..end];
     let body = rest[end + 4..].trim_start_matches(['\r', '\n']).to_string();
     let mut fields = Vec::new();
     for line in yaml.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let v = v.trim().trim_matches('"').trim_matches('\'');
         fields.push((k.trim().to_string(), v.to_string()));
     }
@@ -126,7 +146,10 @@ fn field(fields: &[(String, String)], key: &str) -> Option<String> {
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.split('-').all(|seg| {
-            !seg.is_empty() && seg.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            !seg.is_empty()
+                && seg
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
         })
 }
 
@@ -138,15 +161,35 @@ pub fn load(roots: &[SkillRoot], name: &str) -> Option<(Skill, String)> {
     Some((skill, body))
 }
 
-pub fn resolve_input(roots: &[SkillRoot], mut content: Vec<rness_protocol::events::ContentPart>) -> Result<Vec<rness_protocol::events::ContentPart>, String> {
+pub fn resolve_input(
+    roots: &[SkillRoot],
+    mut content: Vec<rness_protocol::events::ContentPart>,
+) -> Result<Vec<rness_protocol::events::ContentPart>, String> {
     use rness_protocol::events::ContentPart;
-    let Some(ContentPart::Text { text }) = content.first() else { return Ok(content); };
+    let Some(ContentPart::Text { text }) = content.first() else {
+        return Ok(content);
+    };
     let (head, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
-    let name = if head == "/skill" { rest.split_whitespace().next().unwrap_or("") } else { head.strip_prefix('/').unwrap_or("") };
-    if ["agent", "unload"].contains(&name) && head != "/skill" { return Ok(content); }
+    let name = if head == "/skill" {
+        rest.split_whitespace().next().unwrap_or("")
+    } else {
+        head.strip_prefix('/').unwrap_or("")
+    };
+    if ["agent", "unload"].contains(&name) && head != "/skill" {
+        return Ok(content);
+    }
     if let Some((skill, body)) = load(roots, name) {
-        content.push(ContentPart::Text { text: format!("Skill: {}\nResource directory: {}\n\n{}", skill.name, skill.dir.display(), body) });
-    } else if head == "/skill" { return Err(format!("Unknown skill: {name}")); }
+        content.push(ContentPart::Text {
+            text: format!(
+                "Skill: {}\nResource directory: {}\n\n{}",
+                skill.name,
+                skill.dir.display(),
+                body
+            ),
+        });
+    } else if head == "/skill" {
+        return Err(format!("Unknown skill: {name}"));
+    }
     Ok(content)
 }
 
@@ -191,7 +234,11 @@ impl SkillTool {
 
 #[async_trait]
 impl Tool for SkillTool {
-    fn for_workspace(&self, _session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn for_workspace(
+        &self,
+        _session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(default_roots(workspace))))
     }
     fn name(&self) -> &str {
@@ -219,9 +266,28 @@ impl Tool for SkillTool {
         self.load_presented(args).map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, metadata) = self.load_presented(args)?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(metadata),
+        ))
     }
 }
 
@@ -231,12 +297,15 @@ impl SkillTool {
         let (skill, body) = load(&self.roots, name)
             .ok_or_else(|| format!("skill '{name}' is unknown or no longer available"))?;
         let metadata = json!({"version":1,"kind":"skill","name":skill.name,"path":skill.path,"resource_dir":skill.dir,"body_bytes":body.len()});
-        Ok((format!(
-            "<skill_content name=\"{}\" resource_dir=\"{}\">\n{}\n</skill_content>",
-            skill.name,
-            skill.dir.display(),
-            body.trim_end(),
-        ), metadata))
+        Ok((
+            format!(
+                "<skill_content name=\"{}\" resource_dir=\"{}\">\n{}\n</skill_content>",
+                skill.name,
+                skill.dir.display(),
+                body.trim_end(),
+            ),
+            metadata,
+        ))
     }
 }
 

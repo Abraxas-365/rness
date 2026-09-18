@@ -39,12 +39,21 @@ pub struct ManagedConnection {
     cancel: tokio_util::sync::CancellationToken,
 }
 impl Drop for ManagedConnection {
-    fn drop(&mut self) { self.cancel.cancel(); }
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
 }
 pub type McpConnections = Arc<Mutex<HashMap<String, Arc<ManagedConnection>>>>;
 
-fn supervise(managed: &Arc<ManagedConnection>, registry: &Arc<ToolRegistry>, policy: rness_mcp::reconnect::ReconnectPolicy, rt: &tokio::runtime::Handle) {
-    if !policy.enabled { return; }
+fn supervise(
+    managed: &Arc<ManagedConnection>,
+    registry: &Arc<ToolRegistry>,
+    policy: rness_mcp::reconnect::ReconnectPolicy,
+    rt: &tokio::runtime::Handle,
+) {
+    if !policy.enabled {
+        return;
+    }
     let weak = Arc::downgrade(managed);
     let registry = Arc::downgrade(registry);
     let cancel = managed.cancel.clone();
@@ -99,10 +108,11 @@ pub fn install(
     mcp.set(
         "connect",
         lua.create_function(move |lua, spec: Table| {
-            let policy: rness_mcp::reconnect::ReconnectPolicy = match spec.get::<Option<Table>>("reconnect")? {
-                Some(table) => lua.from_value(mlua::Value::Table(table))?,
-                None => Default::default(),
-            };
+            let policy: rness_mcp::reconnect::ReconnectPolicy =
+                match spec.get::<Option<Table>>("reconnect")? {
+                    Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                    None => Default::default(),
+                };
             policy.validate().map_err(err)?;
             let sse: rness_mcp::http::SsePolicy = match spec.get::<Option<Table>>("sse")? {
                 Some(table) => lua.from_value(mlua::Value::Table(table))?,
@@ -112,8 +122,12 @@ pub fn install(
             let name: String = spec.get("name")?;
             let command: Option<String> = spec.get("command")?;
             let url: Option<String> = spec.get("url")?;
-            if command.is_some() == url.is_some() { return Err(err("MCP requires exactly one of command or url")); }
-            let headers: HashMap<String, String> = spec.get::<Option<HashMap<String, String>>>("headers")?.unwrap_or_default();
+            if command.is_some() == url.is_some() {
+                return Err(err("MCP requires exactly one of command or url"));
+            }
+            let headers: HashMap<String, String> = spec
+                .get::<Option<HashMap<String, String>>>("headers")?
+                .unwrap_or_default();
             let args: Vec<String> = spec.get::<Option<Vec<String>>>("args")?.unwrap_or_default();
             let env: Vec<(String, String)> = spec
                 .get::<Option<HashMap<String, String>>>("env")?
@@ -126,27 +140,45 @@ pub fn install(
             if conns.lock().expect("mcp lock").contains_key(&name) {
                 return Err(err(format!("mcp server '{name}' is already connected")));
             }
-            if timeout_ms == 0 { return Err(err("MCP timeout_ms must be positive")); }
+            if timeout_ms == 0 {
+                return Err(err("MCP timeout_ms must be positive"));
+            }
             let (conn, tools) = handle
                 .block_on(async {
                     let conn = if let Some(url) = url {
                         McpConnection::connect_http(rness_mcp::http::HttpServer {
-                            name: name.clone(), url, headers: headers.into_iter().collect(), timeout: Duration::from_millis(timeout_ms), sse,
-                        }).await?
+                            name: name.clone(),
+                            url,
+                            headers: headers.into_iter().collect(),
+                            timeout: Duration::from_millis(timeout_ms),
+                            sse,
+                        })
+                        .await?
                     } else {
                         McpConnection::connect(StdioServer {
-                            name: name.clone(), command: command.expect("validated command"), args, env, timeout: Duration::from_millis(timeout_ms),
-                        }).await?
+                            name: name.clone(),
+                            command: command.expect("validated command"),
+                            args,
+                            env,
+                            timeout: Duration::from_millis(timeout_ms),
+                        })
+                        .await?
                     };
                     let tools = match conn.bridge_tools(&reg).await {
                         Ok(tools) => tools,
-                        Err(error) => { conn.disconnect(&reg).await; return Err(error); },
+                        Err(error) => {
+                            conn.disconnect(&reg).await;
+                            return Err(error);
+                        }
                     };
                     Ok::<_, rness_mcp::McpError>((conn, tools))
                 })
                 .map_err(err)?;
             handle.block_on(conn.watch(&reg, defer_tools));
-            let managed = Arc::new(ManagedConnection { connection: tokio::sync::Mutex::new(conn), cancel: Default::default() });
+            let managed = Arc::new(ManagedConnection {
+                connection: tokio::sync::Mutex::new(conn),
+                cancel: Default::default(),
+            });
             supervise(&managed, &reg, policy, &handle);
             conns.lock().expect("mcp lock").insert(name, managed);
             Ok(tools)
@@ -181,18 +213,26 @@ pub fn install(
     let conns = Arc::clone(&connections);
     let reg = Arc::clone(&registry);
     let handle = rt.clone();
-    mcp.set("reconnect", lua.create_function(move |_, name: String| {
-        let old = conns.lock().expect("mcp lock").get(&name).cloned().ok_or_else(|| err("unknown MCP server"))?;
-        handle.block_on(async {
-            let mut connection = old.connection.lock().await;
-            let deferred = connection.tools_deferred();
-            let fresh = connection.reconnect(&reg).await.map_err(err)?;
-            fresh.watch(&reg, deferred).await;
-            let names = fresh.tool_names(&reg);
-            *connection = fresh;
-            Ok(names)
-        })
-    })?)?;
+    mcp.set(
+        "reconnect",
+        lua.create_function(move |_, name: String| {
+            let old = conns
+                .lock()
+                .expect("mcp lock")
+                .get(&name)
+                .cloned()
+                .ok_or_else(|| err("unknown MCP server"))?;
+            handle.block_on(async {
+                let mut connection = old.connection.lock().await;
+                let deferred = connection.tools_deferred();
+                let fresh = connection.reconnect(&reg).await.map_err(err)?;
+                fresh.watch(&reg, deferred).await;
+                let names = fresh.tool_names(&reg);
+                *connection = fresh;
+                Ok(names)
+            })
+        })?,
+    )?;
 
     rness.set("mcp", mcp)?;
     Ok(())

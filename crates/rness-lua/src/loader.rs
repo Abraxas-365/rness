@@ -35,7 +35,11 @@ pub struct PluginSource {
 }
 
 pub fn validate_name(name: &str) -> Result<(), String> {
-    if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-') {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+    {
         return Err("plugin name must contain only ASCII letters, digits, '_' or '-' (no path or .lua suffix)".into());
     }
     Ok(())
@@ -156,21 +160,48 @@ fn graph_order(nodes: &[(&str, &[String], bool)]) -> Result<Vec<usize>, String> 
 
 /// Resolve explicit specifications without searching alternate source types.
 pub fn discover_specs(root: &Path, specs: &[PluginSpec]) -> std::io::Result<Vec<PluginSource>> {
-    let quote = |text: &str| format!("\"{}\"", text.as_bytes().iter().map(|b| format!("\\{b:03}")).collect::<String>());
+    let quote = |text: &str| {
+        format!(
+            "\"{}\"",
+            text.as_bytes()
+                .iter()
+                .map(|b| format!("\\{b:03}"))
+                .collect::<String>()
+        )
+    };
     let mut result = Vec::new();
-    let order = dependency_order(specs).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let order = dependency_order(specs)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     for index in order {
         let spec = &specs[index];
         let chunk = match &spec.source {
             PluginLocation::File(path) => {
-                let path = if path.is_absolute() { path.clone() } else { root.join(path) };
-                let source = std::fs::read_to_string(&path).map_err(|error| std::io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
-                format!("assert(load({}, {}, 't', _ENV))()", quote(&source), quote(&format!("@{}", path.display())))
+                let path = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    root.join(path)
+                };
+                let source = std::fs::read_to_string(&path).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+                })?;
+                format!(
+                    "assert(load({}, {}, 't', _ENV))()",
+                    quote(&source),
+                    quote(&format!("@{}", path.display()))
+                )
             }
             PluginLocation::Package(name) => {
                 let inventory = crate::packages::inventory(root)?;
-                let package = inventory.get(name).ok_or_else(|| std::io::Error::other(format!("package {name} is not installed; install or link it before enabling")))?;
-                if spec.watch && package.revision.is_some() { return Err(std::io::Error::other("watch is only supported for linked development packages")); }
+                let package = inventory.get(name).ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "package {name} is not installed; install or link it before enabling"
+                    ))
+                })?;
+                if spec.watch && package.revision.is_some() {
+                    return Err(std::io::Error::other(
+                        "watch is only supported for linked development packages",
+                    ));
+                }
                 let sources = discover_package(root, name)?;
                 format!("(function() {} end)()", sources.source)
             }
@@ -179,13 +210,19 @@ pub fn discover_specs(root: &Path, specs: &[PluginSpec]) -> std::io::Result<Vec<
         let opts = serde_json::to_string(&spec.opts).map_err(std::io::Error::other)?;
         let keys = serde_json::to_string(&spec.keys).map_err(std::io::Error::other)?;
         let source = format!("local setup = {chunk}\nlocal opts = rness.json.decode({})\nlocal plugin = __rness_plugin_context(rness.json.decode({}))\nif type(setup) == 'function' then setup(opts, plugin) elseif setup ~= nil then error('plugin entrypoint must return a setup function or nil') elseif next(opts) ~= nil then error('plugin options require a setup function') end\nplugin.__finish()", quote(&opts), quote(&keys));
-        result.push(PluginSource { name: spec.name.clone(), source, dependencies: spec.dependencies.clone() });
+        result.push(PluginSource {
+            name: spec.name.clone(),
+            source,
+            dependencies: spec.dependencies.clone(),
+        });
     }
     Ok(result)
 }
 
 fn discover_package(root: &Path, name: &str) -> std::io::Result<PluginSource> {
-    discover_selected(root, &[name.to_owned()], true)?.pop().ok_or_else(|| std::io::Error::other("missing package"))
+    discover_selected(root, &[name.to_owned()], true)?
+        .pop()
+        .ok_or_else(|| std::io::Error::other("missing package"))
 }
 
 /// Read only explicitly selected plugins, preserving declaration order.
@@ -194,25 +231,47 @@ pub fn discover(root: &Path, names: &[String]) -> std::io::Result<Vec<PluginSour
     discover_selected(root, names, false)
 }
 
-fn discover_selected(root: &Path, names: &[String], package_only: bool) -> std::io::Result<Vec<PluginSource>> {
+fn discover_selected(
+    root: &Path,
+    names: &[String],
+    package_only: bool,
+) -> std::io::Result<Vec<PluginSource>> {
     let installed = crate::packages::inventory(root)?;
-    names.iter().map(|name| {
-        validate_name(name).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        if let Some(package) = installed.get(name) {
-            if !package_only && root.join(format!("plugins/{name}.lua")).exists() {
-                return Err(std::io::Error::other(format!("ambiguous plugin name: {name}")));
-            }
-            let manifest = crate::packages::manifest(&package.directory)?;
-            if manifest.name != *name { return Err(std::io::Error::other("linked package changed its name")); }
-            let path = package.directory.join(manifest.entrypoint);
-            let quote = |s: &str| -> String {
-                format!("\"{}\"", s.as_bytes().iter().map(|b| format!("\\{b:03}")).collect::<String>())
-            };
-            let modules = package.directory.join("lua");
-            let mut sources = std::collections::BTreeMap::new();
-            collect_modules(&modules, &modules, &mut sources)?;
-            let entries = sources.iter().map(|(name, source)| format!("[{}]={}", quote(name), quote(source))).collect::<Vec<_>>().join(",");
-            let source = format!(r#"local sources = {{{entries}}}
+    names
+        .iter()
+        .map(|name| {
+            validate_name(name)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            if let Some(package) = installed.get(name) {
+                if !package_only && root.join(format!("plugins/{name}.lua")).exists() {
+                    return Err(std::io::Error::other(format!(
+                        "ambiguous plugin name: {name}"
+                    )));
+                }
+                let manifest = crate::packages::manifest(&package.directory)?;
+                if manifest.name != *name {
+                    return Err(std::io::Error::other("linked package changed its name"));
+                }
+                let path = package.directory.join(manifest.entrypoint);
+                let quote = |s: &str| -> String {
+                    format!(
+                        "\"{}\"",
+                        s.as_bytes()
+                            .iter()
+                            .map(|b| format!("\\{b:03}"))
+                            .collect::<String>()
+                    )
+                };
+                let modules = package.directory.join("lua");
+                let mut sources = std::collections::BTreeMap::new();
+                collect_modules(&modules, &modules, &mut sources)?;
+                let entries = sources
+                    .iter()
+                    .map(|(name, source)| format!("[{}]={}", quote(name), quote(source)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let source = format!(
+                    r#"local sources = {{{entries}}}
 local cache, loading = {{}}, {{}}
 local fallback = require
 local env = setmetatable({{}}, {{__index = _ENV, __newindex = _ENV}})
@@ -235,33 +294,67 @@ rawset(env, 'require', package_require)
 local chunk, err = load({}, '@' .. {}, 't', env)
 if not chunk then error(err) end
 return chunk()
-"#, quote(&std::fs::read_to_string(path)?), quote(name));
-            return Ok(PluginSource { name: name.clone(), source, dependencies: Vec::new() });
-        }
-        let name = format!("plugins/{name}.lua");
-        let path = root.join(&name);
-        let source = std::fs::read_to_string(&path).map_err(|e| {
-            std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))
-        })?;
-        Ok(PluginSource { name, source, dependencies: Vec::new() })
-    }).collect()
+"#,
+                    quote(&std::fs::read_to_string(path)?),
+                    quote(name)
+                );
+                return Ok(PluginSource {
+                    name: name.clone(),
+                    source,
+                    dependencies: Vec::new(),
+                });
+            }
+            let name = format!("plugins/{name}.lua");
+            let path = root.join(&name);
+            let source = std::fs::read_to_string(&path)
+                .map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))?;
+            Ok(PluginSource {
+                name,
+                source,
+                dependencies: Vec::new(),
+            })
+        })
+        .collect()
 }
 
-fn collect_modules(base: &Path, directory: &Path, sources: &mut std::collections::BTreeMap<String, String>) -> std::io::Result<()> {
-    if !directory.exists() { return Ok(()); }
+fn collect_modules(
+    base: &Path,
+    directory: &Path,
+    sources: &mut std::collections::BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let kind = entry.file_type()?;
         let path = entry.path();
-        if kind.is_symlink() { return Err(std::io::Error::other("package modules must not contain symlinks")); }
-        if kind.is_dir() { collect_modules(base, &path, sources)?; }
-        else if path.extension().is_some_and(|ext| ext == "lua") {
+        if kind.is_symlink() {
+            return Err(std::io::Error::other(
+                "package modules must not contain symlinks",
+            ));
+        }
+        if kind.is_dir() {
+            collect_modules(base, &path, sources)?;
+        } else if path.extension().is_some_and(|ext| ext == "lua") {
             let relative = path.strip_prefix(base).map_err(std::io::Error::other)?;
-            let mut parts = relative.with_extension("").components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>();
-            if parts.last().is_some_and(|p| p == "init") { parts.pop(); }
+            let mut parts = relative
+                .with_extension("")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if parts.last().is_some_and(|p| p == "init") {
+                parts.pop();
+            }
             let name = parts.join(".");
-            if name.is_empty() || sources.insert(name.clone(), std::fs::read_to_string(path)?).is_some() {
-                return Err(std::io::Error::other(format!("ambiguous package module: {name}")));
+            if name.is_empty()
+                || sources
+                    .insert(name.clone(), std::fs::read_to_string(path)?)
+                    .is_some()
+            {
+                return Err(std::io::Error::other(format!(
+                    "ambiguous package module: {name}"
+                )));
             }
         }
     }
@@ -279,10 +372,17 @@ pub async fn load_all(host: &LuaHost, sources: &[PluginSource]) -> Vec<(String, 
     let mut errors = Vec::new();
     let mut failed = std::collections::HashSet::new();
     for p in sources {
-        let result = if let Some(dependency) = p.dependencies.iter().find(|name| failed.contains(name.as_str())) {
-            Err(format!("dependency {dependency} failed or was skipped in this batch"))
+        let result = if let Some(dependency) = p
+            .dependencies
+            .iter()
+            .find(|name| failed.contains(name.as_str()))
+        {
+            Err(format!(
+                "dependency {dependency} failed or was skipped in this batch"
+            ))
         } else {
-            host.load_with_dependencies(&p.name, &p.source, &p.dependencies).await
+            host.load_with_dependencies(&p.name, &p.source, &p.dependencies)
+                .await
         };
         if let Err(e) = result {
             failed.insert(p.name.as_str());
@@ -422,18 +522,14 @@ mod tests {
             ordered_sources(std::slice::from_ref(&legacy)).unwrap(),
             vec![&legacy]
         );
-        assert!(
-            ordered_sources(&[legacy.clone(), legacy.clone()])
-                .unwrap_err()
-                .contains("duplicate plugin")
-        );
+        assert!(ordered_sources(&[legacy.clone(), legacy.clone()])
+            .unwrap_err()
+            .contains("duplicate plugin"));
         let mut source = legacy;
         source.dependencies.push("missing".into());
-        assert!(
-            ordered_sources(std::slice::from_ref(&source))
-                .unwrap_err()
-                .contains("missing plugin")
-        );
+        assert!(ordered_sources(std::slice::from_ref(&source))
+            .unwrap_err()
+            .contains("missing plugin"));
         source.dependencies = vec![source.name.clone()];
         assert!(ordered_sources(&[source]).unwrap_err().contains("itself"));
     }
@@ -563,11 +659,18 @@ mod tests {
         ];
         let errors = load_all(&host, &sources).await;
         assert_eq!(
-            errors.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(),
+            errors
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
             ["base", "app", "leaf"]
         );
-        assert!(errors[1].1.contains("dependency base failed or was skipped in this batch"));
-        assert!(errors[2].1.contains("dependency app failed or was skipped in this batch"));
+        assert!(errors[1]
+            .1
+            .contains("dependency base failed or was skipped in this batch"));
+        assert!(errors[2]
+            .1
+            .contains("dependency app failed or was skipped in this batch"));
         host.load(
             "verify",
             "assert(base_version == 'old'); assert(app_ran == nil); assert(leaf_ran == nil); assert(unrelated_ran)",
@@ -578,7 +681,11 @@ mod tests {
     async fn broken_plugin_is_skipped_others_load() {
         let host = crate::plugin_host::LuaHost::spawn().unwrap();
         let sources = vec![
-            PluginSource { name: "bad.lua".into(), source: "not lua at all".into(), dependencies: Vec::new() },
+            PluginSource {
+                name: "bad.lua".into(),
+                source: "not lua at all".into(),
+                dependencies: Vec::new(),
+            },
             PluginSource {
                 name: "good.lua".into(),
                 dependencies: Vec::new(),

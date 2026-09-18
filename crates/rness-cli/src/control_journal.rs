@@ -1,6 +1,6 @@
 //! Durable admission journal. Its append-only records survive lost acknowledgments
 //! and restart; engine provenance closes the journal/log two-phase crash window.
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use rness_engine::service::SessionService;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -221,15 +221,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut journal = Journal::open(dir.path()).unwrap();
         journal.file.set_len(MAX_JOURNAL_BYTES - 4096).unwrap();
-        assert!(
-            journal
-                .accept(Request {
-                    id: "i".into(),
-                    session: "s".into(),
-                    text: "hello".into()
-                })
-                .is_err()
-        );
+        assert!(journal
+            .accept(Request {
+                id: "i".into(),
+                session: "s".into(),
+                text: "hello".into()
+            })
+            .is_err());
         assert!(journal.entries.is_empty());
         drop(journal);
         std::fs::write(dir.path().join("control/submissions.jsonl"), b"{invalid}\n").unwrap();
@@ -257,14 +255,12 @@ mod tests {
         let mut journal = Journal::open(dir.path()).unwrap();
         journal.accept(request.clone()).unwrap();
         assert_eq!(journal.entries.len(), 1);
-        assert!(
-            journal
-                .accept(Request {
-                    text: "changed".into(),
-                    ..request
-                })
-                .is_err()
-        );
+        assert!(journal
+            .accept(Request {
+                text: "changed".into(),
+                ..request
+            })
+            .is_err());
         assert!(!std::fs::read_to_string(path).unwrap().contains("torn"));
     }
 }

@@ -8,9 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use rness_engine::service::SessionService;
 use rness_engine::session::branch::SessionStore;
-use rness_engine::tools::{ToolRegistry, exposure::Exposure};
-use rness_engine::turn::TurnConfig;
+use rness_engine::tools::{exposure::Exposure, ToolRegistry};
 use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
+use rness_engine::turn::TurnConfig;
 use rness_kernel::EventBus;
 use rness_protocol::events::*;
 use tokio_util::sync::CancellationToken;
@@ -116,30 +116,24 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
 
     assert!(registry.get("mcp__fake__ping").is_some());
     let exposure = Exposure::default();
-    assert!(
-        exposure
-            .specs(&registry, &Default::default())
-            .iter()
-            .any(|tool| tool.name == "ToolSearch")
-    );
-    assert!(
-        !exposure
-            .specs(&registry, &Default::default())
-            .iter()
-            .any(|tool| tool.name == "mcp__fake__ping")
-    );
+    assert!(exposure
+        .specs(&registry, &Default::default())
+        .iter()
+        .any(|tool| tool.name == "ToolSearch"));
+    assert!(!exposure
+        .specs(&registry, &Default::default())
+        .iter()
+        .any(|tool| tool.name == "mcp__fake__ping"));
     let (_, names) = exposure
         .search(
             &registry,
             &serde_json::json!({"query":"select:mcp__fake__ping"}),
         )
         .unwrap();
-    assert!(
-        exposure
-            .specs(&registry, &names.into_iter().collect())
-            .iter()
-            .any(|tool| tool.name == "mcp__fake__ping")
-    );
+    assert!(exposure
+        .specs(&registry, &names.into_iter().collect())
+        .iter()
+        .any(|tool| tool.name == "mcp__fake__ping"));
 
     let calls = vec![rness_engine::tools::ToolCall {
         call: "permission".into(),
@@ -184,25 +178,58 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
     host.load("nested.lua", &format!(r#"
         rness.mcp.connect{{name="fake__nested", command="python3", args={{"{}"}}, defer_tools=false}}
     "#, script.display())).await.unwrap();
-    host.load("reconnect.lua", r#"
+    host.load(
+        "reconnect.lua",
+        r#"
         local names = rness.mcp.reconnect("fake")
         assert(#names == 1 and names[1] == "mcp__fake__ping")
-    "#).await.unwrap();
+    "#,
+    )
+    .await
+    .unwrap();
     assert!(!registry.is_deferred("mcp__fake__nested__ping"));
-    host.load("nested-bye.lua", r#"rness.mcp.disconnect("fake__nested")"#).await.unwrap();
+    host.load("nested-bye.lua", r#"rness.mcp.disconnect("fake__nested")"#)
+        .await
+        .unwrap();
     assert!(registry.is_deferred("mcp__fake__ping"));
-    assert_eq!(registry.get("mcp__fake__ping").unwrap().execute(serde_json::json!({})).await.unwrap(), "pong!");
+    assert_eq!(
+        registry
+            .get("mcp__fake__ping")
+            .unwrap()
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap(),
+        "pong!"
+    );
 
     let previous = registry.get("mcp__fake__ping").unwrap();
-    assert!(previous.execute(serde_json::json!({"crash":true})).await.is_err());
+    assert!(previous
+        .execute(serde_json::json!({"crash":true}))
+        .await
+        .is_err());
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
-            if registry.get("mcp__fake__ping").is_some_and(|fresh| !Arc::ptr_eq(&fresh, &previous)) { break; }
+            if registry
+                .get("mcp__fake__ping")
+                .is_some_and(|fresh| !Arc::ptr_eq(&fresh, &previous))
+            {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert!(registry.is_deferred("mcp__fake__ping"));
-    assert_eq!(registry.get("mcp__fake__ping").unwrap().execute(serde_json::json!({})).await.unwrap(), "pong!");
+    assert_eq!(
+        registry
+            .get("mcp__fake__ping")
+            .unwrap()
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap(),
+        "pong!"
+    );
 
     // Disconnect from Lua unregisters the bridged tools.
     host.load("bye.lua", r#"assert(rness.mcp.disconnect("fake") == true)"#)

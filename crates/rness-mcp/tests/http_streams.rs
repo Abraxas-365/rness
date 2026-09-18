@@ -1,7 +1,21 @@
-use axum::{extract::State, http::{HeaderMap, StatusCode}, response::{IntoResponse, Response}, Json};
-use rness_mcp::{http::{HttpServer, SsePolicy}, McpConnection};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    Json,
+};
+use rness_mcp::{
+    http::{HttpServer, SsePolicy},
+    McpConnection,
+};
 use serde_json::{json, Value};
-use std::{sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}}, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 #[derive(Default)]
 struct Fixture {
@@ -19,44 +33,78 @@ fn auth(headers: &HeaderMap) {
     assert_eq!(headers["mcp-session-id"], "session");
     assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
 }
-fn sse(text: String) -> Response { ([("content-type", "text/event-stream")], text).into_response() }
-async fn post(State(state): State<Arc<Fixture>>, headers: HeaderMap, Json(msg): Json<Value>) -> Response {
-    if msg["method"] != "initialize" { auth(&headers); }
+fn sse(text: String) -> Response {
+    ([("content-type", "text/event-stream")], text).into_response()
+}
+async fn post(
+    State(state): State<Arc<Fixture>>,
+    headers: HeaderMap,
+    Json(msg): Json<Value>,
+) -> Response {
+    if msg["method"] != "initialize" {
+        auth(&headers);
+    }
     let result = match msg["method"].as_str() {
-        Some("initialize") => json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{"listChanged":true}}}),
+        Some("initialize") => {
+            json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{"listChanged":true}}})
+        }
         Some("notifications/initialized") => return StatusCode::ACCEPTED.into_response(),
         Some("notifications/cancelled") => {
             *state.cancelled.lock().unwrap() = Some(msg["params"]["requestId"].clone());
             return StatusCode::ACCEPTED.into_response();
-        },
+        }
         Some("tools/list") => {
             state.lists.fetch_add(1, Ordering::SeqCst);
             json!({"tools":[{"name":"wait", "inputSchema":{"type":"object"}}]})
-        },
+        }
         Some("tools/call") => {
             state.calls.fetch_add(1, Ordering::SeqCst);
             *state.call_id.lock().unwrap() = msg["id"].clone();
-            if state.mode == 3 { return sse("data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n".into()); }
+            if state.mode == 3 {
+                return sse(
+                    "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n".into(),
+                );
+            }
             // Commit one event; interrupt a subsequent event mid-frame.
             return sse("id: call-1\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\nid: not-committed\ndata: {".into());
-        },
-        None => { state.replies.fetch_add(1, Ordering::SeqCst); return StatusCode::ACCEPTED.into_response(); },
+        }
+        None => {
+            state.replies.fetch_add(1, Ordering::SeqCst);
+            return StatusCode::ACCEPTED.into_response();
+        }
         _ => json!({}),
     };
-    ([("mcp-session-id", "session")], Json(json!({"jsonrpc":"2.0","id":msg["id"],"result":result}))).into_response()
+    (
+        [("mcp-session-id", "session")],
+        Json(json!({"jsonrpc":"2.0","id":msg["id"],"result":result})),
+    )
+        .into_response()
 }
 async fn get(State(state): State<Arc<Fixture>>, headers: HeaderMap) -> Response {
     auth(&headers);
     assert_eq!(headers["accept"], "text/event-stream");
-    let cursor = headers.get("last-event-id").map(|s| s.to_str().unwrap().to_owned());
+    let cursor = headers
+        .get("last-event-id")
+        .map(|s| s.to_str().unwrap().to_owned());
     state.gets.lock().unwrap().push(cursor.clone());
-    if state.mode == 4 { return sse("id: call-1\n\n".into()); }
-    if state.mode == 5 { return sse("id: bounded\n\n".into()); }
-    if state.mode == 1 { return StatusCode::METHOD_NOT_ALLOWED.into_response(); }
-    if state.mode == 2 { return StatusCode::NOT_FOUND.into_response(); }
+    if state.mode == 4 {
+        return sse("id: call-1\n\n".into());
+    }
+    if state.mode == 5 {
+        return sse("id: bounded\n\n".into());
+    }
+    if state.mode == 1 {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if state.mode == 2 {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     if cursor.as_deref() == Some("call-1") {
         let id = state.call_id.lock().unwrap().clone();
-        return sse(format!("id: call-2\ndata: {}\n\n", json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})));
+        return sse(format!(
+            "id: call-2\ndata: {}\n\n",
+            json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}})
+        ));
     }
     if cursor.is_none() {
         return sse("id: notice-1\rdata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\r\r".into());
@@ -71,25 +119,60 @@ async fn get(State(state): State<Arc<Fixture>>, headers: HeaderMap) -> Response 
     let body = axum::body::Body::from_stream(frames.chain(futures_util::stream::pending()));
     ([("content-type", "text/event-stream")], body).into_response()
 }
-async fn fixture(mode: u8, notifications: bool, resume: bool) -> (Arc<Fixture>, Arc<McpConnection>, tokio::task::JoinHandle<()>) {
-    let state = Arc::new(Fixture { mode, ..Default::default() });
+async fn fixture(
+    mode: u8,
+    notifications: bool,
+    resume: bool,
+) -> (
+    Arc<Fixture>,
+    Arc<McpConnection>,
+    tokio::task::JoinHandle<()>,
+) {
+    let state = Arc::new(Fixture {
+        mode,
+        ..Default::default()
+    });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
-    let router = axum::Router::new().route("/mcp", axum::routing::post(post).get(get).delete(|State(state): State<Arc<Fixture>>| async move {
-        state.deletes.fetch_add(1, Ordering::SeqCst); StatusCode::NO_CONTENT
-    })).with_state(state.clone());
-    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let router = axum::Router::new()
+        .route(
+            "/mcp",
+            axum::routing::post(post).get(get).delete(
+                |State(state): State<Arc<Fixture>>| async move {
+                    state.deletes.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NO_CONTENT
+                },
+            ),
+        )
+        .with_state(state.clone());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
     let conn = McpConnection::connect_http(HttpServer {
-        name: "stream".into(), url, headers: vec![("Authorization".into(), "Bearer secret".into())],
+        name: "stream".into(),
+        url,
+        headers: vec![("Authorization".into(), "Bearer secret".into())],
         timeout: Duration::from_millis(200),
-        sse: SsePolicy { notifications, resume, max_attempts: 2, retry_delay_ms: 5, idle_timeout_ms: 5000 },
-    }).await.unwrap();
+        sse: SsePolicy {
+            notifications,
+            resume,
+            max_attempts: 2,
+            retry_delay_ms: 5,
+            idle_timeout_ms: 5000,
+        },
+    })
+    .await
+    .unwrap();
     (state, conn, task)
 }
 async fn until(mut ready: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !ready() { tokio::time::sleep(Duration::from_millis(5)).await; }
-    }).await.unwrap();
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -110,10 +193,14 @@ async fn standalone_notifications_resume_refresh_catalog_and_stop_on_disconnect(
     let registry = Arc::new(rness_engine::tools::ToolRegistry::default());
     conn.bridge_tools(&registry).await.unwrap();
     conn.watch(&registry, false).await;
-    until(|| state.replies.load(Ordering::SeqCst) == 1 && state.lists.load(Ordering::SeqCst) >= 2).await;
+    until(|| state.replies.load(Ordering::SeqCst) == 1 && state.lists.load(Ordering::SeqCst) >= 2)
+        .await;
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(!conn.is_closed(), "GET must outlive normal POST timeout");
-    assert_eq!(*state.gets.lock().unwrap(), vec![None, Some("notice-1".into())]);
+    assert_eq!(
+        *state.gets.lock().unwrap(),
+        vec![None, Some("notice-1".into())]
+    );
     conn.disconnect(&registry).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert_eq!(state.gets.lock().unwrap().len(), 2);
@@ -163,11 +250,21 @@ async fn tool_cancellation_notifies_server_without_call_replay() {
     let tool = registry.get("mcp__stream__wait").unwrap();
     let cancel = tokio_util::sync::CancellationToken::new();
     let token = cancel.clone();
-    let task = tokio::spawn(async move { tool.execute_rich(&"session".into(), "call", json!({}), &token).await });
+    let task = tokio::spawn(async move {
+        tool.execute_rich(&"session".into(), "call", json!({}), &token)
+            .await
+    });
     until(|| state.calls.load(Ordering::SeqCst) == 1).await;
     cancel.cancel();
-    assert!(task.await.unwrap().unwrap_err().contains("remote termination is not confirmed"));
-    assert_eq!(*state.cancelled.lock().unwrap(), Some(state.call_id.lock().unwrap().clone()));
+    assert!(task
+        .await
+        .unwrap()
+        .unwrap_err()
+        .contains("remote termination is not confirmed"));
+    assert_eq!(
+        *state.cancelled.lock().unwrap(),
+        Some(state.call_id.lock().unwrap().clone())
+    );
     assert_eq!(state.calls.load(Ordering::SeqCst), 1);
     conn.disconnect(&registry).await;
     server.abort();

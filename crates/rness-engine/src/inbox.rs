@@ -69,10 +69,19 @@ impl Inbox {
     /// Classify an input. The caller commits the event to the log first
     /// (with the possibly-degraded intent returned here), then acts on
     /// the disposition.
-    pub fn submit(&mut self, intent: UserIntent, content: Vec<ContentPart>) -> (UserIntent, Disposition) {
+    pub fn submit(
+        &mut self,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+    ) -> (UserIntent, Disposition) {
         self.submit_sourced(intent, content, None)
     }
-    pub fn submit_sourced(&mut self, intent: UserIntent, content: Vec<ContentPart>, source: Option<rness_protocol::events::MessageSource>) -> (UserIntent, Disposition) {
+    pub fn submit_sourced(
+        &mut self,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+        source: Option<rness_protocol::events::MessageSource>,
+    ) -> (UserIntent, Disposition) {
         match (self.phase, intent) {
             (Phase::Idle, UserIntent::Followup | UserIntent::Steer) => {
                 // Steering an idle agent is just a prompt.
@@ -80,17 +89,29 @@ impl Inbox {
             }
             (Phase::Idle, UserIntent::Inject) => (UserIntent::Inject, Disposition::LogOnly),
             (Phase::Running, UserIntent::Followup) => {
-                self.followups.push_back(Pending { source, intent: UserIntent::Followup, content });
+                self.followups.push_back(Pending {
+                    source,
+                    intent: UserIntent::Followup,
+                    content,
+                });
                 (UserIntent::Followup, Disposition::Queued)
             }
             (Phase::Running, UserIntent::Steer) => {
-                self.steers.push_back(Pending { source, intent: UserIntent::Steer, content });
+                self.steers.push_back(Pending {
+                    source,
+                    intent: UserIntent::Steer,
+                    content,
+                });
                 (UserIntent::Steer, Disposition::Queued)
             }
             (Phase::Running, UserIntent::Inject) => {
                 // The running turn owns the log; deliver at the next
                 // boundary, intent preserved.
-                self.steers.push_back(Pending { source, intent: UserIntent::Inject, content });
+                self.steers.push_back(Pending {
+                    source,
+                    intent: UserIntent::Inject,
+                    content,
+                });
                 (UserIntent::Inject, Disposition::Queued)
             }
         }
@@ -148,10 +169,22 @@ mod tests {
         let mut inbox = Inbox::default();
         inbox.set_phase(Phase::Running);
 
-        assert_eq!(inbox.submit(UserIntent::Followup, text("next")).1, Disposition::Queued);
-        assert_eq!(inbox.submit(UserIntent::Steer, text("stop that")).1, Disposition::Queued);
-        assert_eq!(inbox.submit(UserIntent::Steer, text("also this")).1, Disposition::Queued);
-        assert_eq!(inbox.submit(UserIntent::Inject, text("fyi")).1, Disposition::Queued);
+        assert_eq!(
+            inbox.submit(UserIntent::Followup, text("next")).1,
+            Disposition::Queued
+        );
+        assert_eq!(
+            inbox.submit(UserIntent::Steer, text("stop that")).1,
+            Disposition::Queued
+        );
+        assert_eq!(
+            inbox.submit(UserIntent::Steer, text("also this")).1,
+            Disposition::Queued
+        );
+        assert_eq!(
+            inbox.submit(UserIntent::Inject, text("fyi")).1,
+            Disposition::Queued
+        );
 
         // Step boundary: steers + injects drain in order, once.
         let steers = inbox.drain_steers();

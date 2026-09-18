@@ -31,7 +31,7 @@ use crate::inbox::{Disposition, Inbox, Phase};
 use crate::session::branch::{BranchError, SessionStore};
 use crate::session::log::LogError;
 use crate::session::projection::{transcript, Transcript};
-use crate::session::replay::{replay, Replayed, ReplayError};
+use crate::session::replay::{replay, ReplayError, Replayed};
 use crate::tools::ToolRegistry;
 use crate::turn::provider::Provider;
 use crate::turn::{run_turn, TurnConfig};
@@ -53,7 +53,11 @@ pub enum ServiceError {
     #[error("no provider resolver configured for selection {route}/{model}")]
     NoProviderResolver { route: String, model: String },
     #[error("provider resolver failed for {route}/{model}: {message}")]
-    ProviderResolution { route: String, model: String, message: String },
+    ProviderResolution {
+        route: String,
+        model: String,
+        message: String,
+    },
     #[error("invalid request config: {0}")]
     InvalidConfig(String),
 }
@@ -147,31 +151,53 @@ pub struct PreparedCommand {
 
 impl PreparedCommand {
     pub fn complete(self, service: &SessionService) -> Result<Vec<String>, ServiceError> {
-        if self.cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("completion cancelled".into())); }
-        self.command.complete(service, crate::interaction::CommandInvocation {
-            session: &self.session, raw_input: &self.raw_input, cancel: self.cancel.clone(),
-            permit: CommandPermit(Arc::downgrade(&self.reservation)),
-        })
+        if self.cancel.is_cancelled() {
+            return Err(ServiceError::InvalidConfig("completion cancelled".into()));
+        }
+        self.command.complete(
+            service,
+            crate::interaction::CommandInvocation {
+                session: &self.session,
+                raw_input: &self.raw_input,
+                cancel: self.cancel.clone(),
+                permit: CommandPermit(Arc::downgrade(&self.reservation)),
+            },
+        )
     }
 
-    pub fn complete_items(self, service: &SessionService) -> Result<Vec<(String, String)>, ServiceError> {
-        if self.cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("completion cancelled".into())); }
-        self.command.complete_items(service, crate::interaction::CommandInvocation {
-            session: &self.session, raw_input: &self.raw_input, cancel: self.cancel.clone(),
-            permit: CommandPermit(Arc::downgrade(&self.reservation)),
-        })
+    pub fn complete_items(
+        self,
+        service: &SessionService,
+    ) -> Result<Vec<(String, String)>, ServiceError> {
+        if self.cancel.is_cancelled() {
+            return Err(ServiceError::InvalidConfig("completion cancelled".into()));
+        }
+        self.command.complete_items(
+            service,
+            crate::interaction::CommandInvocation {
+                session: &self.session,
+                raw_input: &self.raw_input,
+                cancel: self.cancel.clone(),
+                permit: CommandPermit(Arc::downgrade(&self.reservation)),
+            },
+        )
     }
 
     pub fn execute(self, service: &SessionService) -> Result<Disposition, ServiceError> {
         if self.cancel.is_cancelled() {
             return Err(ServiceError::InvalidConfig("command cancelled".into()));
         }
-        self.command.execute(service, crate::interaction::CommandInvocation {
-            session: &self.session,
-            raw_input: &self.raw_input,
-            cancel: self.cancel.clone(),
-            permit: CommandPermit(Arc::downgrade(&self.reservation)),
-        }).map(Disposition::Command)
+        self.command
+            .execute(
+                service,
+                crate::interaction::CommandInvocation {
+                    session: &self.session,
+                    raw_input: &self.raw_input,
+                    cancel: self.cancel.clone(),
+                    permit: CommandPermit(Arc::downgrade(&self.reservation)),
+                },
+            )
+            .map(Disposition::Command)
     }
 }
 
@@ -182,13 +208,20 @@ impl Drop for PreparedCommand {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Notice { None, Job, Subagent }
+enum Notice {
+    None,
+    Job,
+    Subagent,
+}
 
 // -- the service -----------------------------------------------------------
 
-pub type ProviderResolver = dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>, String> + Send + Sync;
+pub type ProviderResolver =
+    dyn Fn(&ModelSelection) -> Result<Arc<dyn Provider>, String> + Send + Sync;
 
-pub type InputResolver = dyn Fn(Option<&std::path::Path>, Vec<ContentPart>) -> Result<Vec<ContentPart>, String> + Send + Sync;
+pub type InputResolver = dyn Fn(Option<&std::path::Path>, Vec<ContentPart>) -> Result<Vec<ContentPart>, String>
+    + Send
+    + Sync;
 
 pub struct SessionService {
     images: Arc<std::sync::OnceLock<Arc<crate::images::ImageStore>>>,
@@ -217,33 +250,70 @@ pub struct SessionService {
 }
 
 impl SessionService {
-    pub fn plan(&self, session: &SessionId) -> Result<rness_protocol::events::PlanState, ServiceError> {
-        let mut state = rness_protocol::events::PlanState::from_history(&self.store.history(session)?);
-        if let Some(active) = self.tools.plan_selections.pending(session) { state.pending = Some(active); }
+    pub fn plan(
+        &self,
+        session: &SessionId,
+    ) -> Result<rness_protocol::events::PlanState, ServiceError> {
+        let mut state =
+            rness_protocol::events::PlanState::from_history(&self.store.history(session)?);
+        if let Some(active) = self.tools.plan_selections.pending(session) {
+            state.pending = Some(active);
+        }
         Ok(state)
     }
 
     pub fn select_plan(&self, session: &SessionId, active: bool) -> Result<(), ServiceError> {
-        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let _activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
         self.store.history(session)?;
-        if self.tools.get("exit_plan_mode").and_then(|tool| tool.plan_config()).is_none() {
-            return Err(ServiceError::InvalidConfig("plan plugin is not enabled".into()));
+        if self
+            .tools
+            .get("exit_plan_mode")
+            .and_then(|tool| tool.plan_config())
+            .is_none()
+        {
+            return Err(ServiceError::InvalidConfig(
+                "plan plugin is not enabled".into(),
+            ));
         }
         self.tools.plan_selections.select(session, active);
         Ok(())
     }
 
-    pub fn plan_store(&self) -> Arc<SessionStore> { self.store.clone() }
-
-    pub fn file_references(&self, session: &SessionId, query: &crate::file_references::Query, cancel: &CancellationToken) -> Result<Vec<crate::file_references::Candidate>, ServiceError> {
-        let workspace = self.store.workspace(session)?.ok_or_else(|| ServiceError::InvalidConfig("session has no workspace".into()))?;
-        self.tools.file_references.list(std::path::Path::new(&workspace), query, cancel).map_err(ServiceError::InvalidConfig)
+    pub fn plan_store(&self) -> Arc<SessionStore> {
+        self.store.clone()
     }
 
-    pub fn reference_service(&self) -> &Arc<crate::file_references::FileReferences> { &self.tools.file_references }
+    pub fn file_references(
+        &self,
+        session: &SessionId,
+        query: &crate::file_references::Query,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<crate::file_references::Candidate>, ServiceError> {
+        let workspace = self
+            .store
+            .workspace(session)?
+            .ok_or_else(|| ServiceError::InvalidConfig("session has no workspace".into()))?;
+        self.tools
+            .file_references
+            .list(std::path::Path::new(&workspace), query, cancel)
+            .map_err(ServiceError::InvalidConfig)
+    }
 
-    pub fn tasks(&self, session: &SessionId) -> Result<rness_protocol::events::TaskSnapshot, ServiceError> {
-        Ok(rness_protocol::events::TaskSnapshot::from_history(&self.store.history(session)?))
+    pub fn reference_service(&self) -> &Arc<crate::file_references::FileReferences> {
+        &self.tools.file_references
+    }
+
+    pub fn tasks(
+        &self,
+        session: &SessionId,
+    ) -> Result<rness_protocol::events::TaskSnapshot, ServiceError> {
+        Ok(rness_protocol::events::TaskSnapshot::from_history(
+            &self.store.history(session)?,
+        ))
     }
 
     pub fn commands(&self) -> &crate::interaction::CommandRegistry {
@@ -258,7 +328,11 @@ impl SessionService {
     pub fn set_input_resolver(&self, resolver: Arc<InputResolver>) {
         *self.input_resolver.lock().unwrap() = Some(resolver);
     }
-    pub fn with_agents(mut self, agents: std::collections::BTreeMap<String, crate::config::AgentDefinition>, models: crate::config::ModelRegistry) -> Self {
+    pub fn with_agents(
+        mut self,
+        agents: std::collections::BTreeMap<String, crate::config::AgentDefinition>,
+        models: crate::config::ModelRegistry,
+    ) -> Self {
         self.agents = agents;
         self.models = models;
         self
@@ -269,26 +343,44 @@ impl SessionService {
         self
     }
 
-    pub fn agents(&self) -> &std::collections::BTreeMap<String, crate::config::AgentDefinition> { &self.agents }
+    pub fn agents(&self) -> &std::collections::BTreeMap<String, crate::config::AgentDefinition> {
+        &self.agents
+    }
 
     pub fn select_agent(&self, session: &SessionId, name: &str) -> Result<(), ServiceError> {
-        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let _activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
-        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let _operation = live
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ServiceError::Busy)?;
         self.select_agent_reserved(session, name)
     }
 
-    pub(crate) fn select_agent_reserved(&self, session: &SessionId, name: &str) -> Result<(), ServiceError> {
+    pub(crate) fn select_agent_reserved(
+        &self,
+        session: &SessionId,
+        name: &str,
+    ) -> Result<(), ServiceError> {
         let live = self.live(session);
         let inbox = live.inbox.lock().unwrap();
-        if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
+        if inbox.phase() != Phase::Idle {
+            return Err(ServiceError::Busy);
+        }
         let config = self.agent_config(self.config(session)?, name)?;
         self.require_workspace_for_sandbox(
             &self.store.workspace(session)?,
             self.effective_sandbox(&config),
         )?;
         if self.config(session)? != config {
-            self.store.open(session)?.append(&SessionEvent::RequestConfig(config))?;
+            self.store
+                .open(session)?
+                .append(&SessionEvent::RequestConfig(config))?;
         }
         Ok(())
     }
@@ -305,16 +397,22 @@ impl SessionService {
         // Resolve before a profile replaces request options: neither a role
         // nor its profile may discard the session's (or parent's) restriction.
         let inherited_sandbox = config.sandbox;
-        let sandbox = self.effective_sandbox(&config)
+        let sandbox = self
+            .effective_sandbox(&config)
             .min(agent.sandbox.unwrap_or(self.sandbox.default));
         if let Some(profile) = &agent.profile {
             let ceiling = config.tool_ceiling;
-            config = self.models.resolve_profile_for(profile, config.selection.as_ref().map(|s| s.route.as_str())).map_err(ServiceError::InvalidConfig)?;
+            config = self
+                .models
+                .resolve_profile_for(profile, config.selection.as_ref().map(|s| s.route.as_str()))
+                .map_err(ServiceError::InvalidConfig)?;
             config.tool_ceiling = ceiling;
         }
         if let Some(names) = &agent.tools {
             for name in names {
-                if self.tools.get(name).is_none() { return Err(ServiceError::InvalidConfig(format!("unknown tool: {name}"))); }
+                if self.tools.get(name).is_none() {
+                    return Err(ServiceError::InvalidConfig(format!("unknown tool: {name}")));
+                }
             }
         }
         config.agent = Some(rness_protocol::events::AgentSnapshot {
@@ -327,14 +425,22 @@ impl SessionService {
             .then_some(sandbox);
         self.provider_for(&config)?;
         Self::validate_config(&config)?;
-        self.models.validate(&config).map_err(ServiceError::InvalidConfig)?;
+        self.models
+            .validate(&config)
+            .map_err(ServiceError::InvalidConfig)?;
         Ok(config)
     }
 
-    pub(crate) fn delegated_config(&self, parent: &SessionId, agent: Option<&str>) -> Result<CallConfig, ServiceError> {
+    pub(crate) fn delegated_config(
+        &self,
+        parent: &SessionId,
+        agent: Option<&str>,
+    ) -> Result<CallConfig, ServiceError> {
         let mut config = self.config(parent)?;
         let mut allowed = self.tools.names();
-        if let Some(ceiling) = &config.tool_ceiling { allowed.retain(|name| ceiling.contains(name)); }
+        if let Some(ceiling) = &config.tool_ceiling {
+            allowed.retain(|name| ceiling.contains(name));
+        }
         if let Some(tools) = config.agent.as_ref().and_then(|agent| agent.tools.as_ref()) {
             allowed.retain(|name| tools.contains(name));
         }
@@ -344,7 +450,9 @@ impl SessionService {
         config.agent = None;
         if let Some(name) = agent {
             if !self.agents.get(name).is_some_and(|agent| agent.subagent) {
-                return Err(ServiceError::InvalidConfig(format!("agent is not enabled for delegation: {name}")));
+                return Err(ServiceError::InvalidConfig(format!(
+                    "agent is not enabled for delegation: {name}"
+                )));
             }
             config = self.agent_config(config, name)?;
         }
@@ -374,8 +482,12 @@ impl SessionService {
             default_workspace: Mutex::new(None),
             commands: {
                 let commands = crate::interaction::CommandRegistry::default();
-                commands.register(Arc::new(crate::interaction::HelpCommand)).expect("built-in command");
-                commands.register(Arc::new(crate::interaction::AgentCommand)).expect("built-in command");
+                commands
+                    .register(Arc::new(crate::interaction::HelpCommand))
+                    .expect("built-in command");
+                commands
+                    .register(Arc::new(crate::interaction::AgentCommand))
+                    .expect("built-in command");
                 commands
             },
             input_resolver: Mutex::new(None),
@@ -386,42 +498,86 @@ impl SessionService {
     }
 
     pub fn set_images(&self, images: Arc<crate::images::ImageStore>) -> Result<(), ServiceError> {
-        self.images.set(images).map_err(|_| ServiceError::InvalidConfig("image store already configured".into()))
+        self.images
+            .set(images)
+            .map_err(|_| ServiceError::InvalidConfig("image store already configured".into()))
     }
 
-    pub fn set_image_processor(&self, processor: Option<(String, Arc<crate::images::ImageProcessor>)>) -> Result<(), ServiceError> {
-        self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
-            .set_processor(processor).map_err(ServiceError::InvalidConfig)
+    pub fn set_image_processor(
+        &self,
+        processor: Option<(String, Arc<crate::images::ImageProcessor>)>,
+    ) -> Result<(), ServiceError> {
+        self.images
+            .get()
+            .ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+            .set_processor(processor)
+            .map_err(ServiceError::InvalidConfig)
     }
 
-    pub fn image_policy(&self, update: Option<serde_json::Value>) -> Result<crate::images::ImagePolicy, ServiceError> {
-        let store = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?;
+    pub fn image_policy(
+        &self,
+        update: Option<serde_json::Value>,
+    ) -> Result<crate::images::ImagePolicy, ServiceError> {
+        let store = self
+            .images
+            .get()
+            .ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?;
         if let Some(update) = update {
-            let mut value = serde_json::to_value(store.effective_request_policy(store.policy())).map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
-            let fields = update.as_object().ok_or_else(|| ServiceError::InvalidConfig("image policy must be an object".into()))?;
-            for (key, field) in fields { value[key] = field.clone(); }
-            let policy = serde_json::from_value(value).map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
-            store.set_request_policy(Some(policy)).map_err(ServiceError::InvalidConfig)?;
+            let mut value = serde_json::to_value(store.effective_request_policy(store.policy()))
+                .map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
+            let fields = update.as_object().ok_or_else(|| {
+                ServiceError::InvalidConfig("image policy must be an object".into())
+            })?;
+            for (key, field) in fields {
+                value[key] = field.clone();
+            }
+            let policy = serde_json::from_value(value)
+                .map_err(|e| ServiceError::InvalidConfig(e.to_string()))?;
+            store
+                .set_request_policy(Some(policy))
+                .map_err(ServiceError::InvalidConfig)?;
         }
         Ok(store.effective_request_policy(store.policy()))
     }
 
-    pub fn admit_image(&self, session: &SessionId, data: &[u8], media_type: &str) -> Result<rness_protocol::events::ImageRef, ServiceError> {
+    pub fn admit_image(
+        &self,
+        session: &SessionId,
+        data: &[u8],
+        media_type: &str,
+    ) -> Result<rness_protocol::events::ImageRef, ServiceError> {
         self.store.history(session)?;
-        self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
-            .admit_for_session(session, data, media_type).map_err(ServiceError::InvalidConfig)
+        self.images
+            .get()
+            .ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
+            .admit_for_session(session, data, media_type)
+            .map_err(ServiceError::InvalidConfig)
     }
 
     /// Only session-referenced images may be retrieved through this boundary.
-    pub fn read_image(&self, session: &SessionId, id: &str) -> Result<(String, Vec<u8>), ServiceError> {
+    pub fn read_image(
+        &self,
+        session: &SessionId,
+        id: &str,
+    ) -> Result<(String, Vec<u8>), ServiceError> {
         let history = self.store.history(session)?;
         for envelope in history {
             if let SessionEvent::ToolResult(result) = &envelope.event {
                 for part in &result.content {
-                    if let rness_protocol::events::ToolResultContentPart::Image { attachment } = part {
+                    if let rness_protocol::events::ToolResultContentPart::Image { attachment } =
+                        part
+                    {
                         if attachment.id == id {
-                            let data = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
-                                .read(attachment).map_err(ServiceError::InvalidConfig)?;
+                            let data = self
+                                .images
+                                .get()
+                                .ok_or_else(|| {
+                                    ServiceError::InvalidConfig(
+                                        "image storage is not configured".into(),
+                                    )
+                                })?
+                                .read(attachment)
+                                .map_err(ServiceError::InvalidConfig)?;
                             return Ok((attachment.media_type.clone(), data));
                         }
                     }
@@ -435,14 +591,24 @@ impl SessionService {
             for part in content {
                 if let ContentPart::Image { attachment } = part {
                     if attachment.id == id {
-                        let data = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?
-                            .read(attachment).map_err(ServiceError::InvalidConfig)?;
+                        let data = self
+                            .images
+                            .get()
+                            .ok_or_else(|| {
+                                ServiceError::InvalidConfig(
+                                    "image storage is not configured".into(),
+                                )
+                            })?
+                            .read(attachment)
+                            .map_err(ServiceError::InvalidConfig)?;
                         return Ok((attachment.media_type.clone(), data));
                     }
                 }
             }
         }
-        Err(ServiceError::InvalidConfig("image is not referenced by this session".into()))
+        Err(ServiceError::InvalidConfig(
+            "image is not referenced by this session".into(),
+        ))
     }
 
     /// Configure the composition-root resolver for durable model selections.
@@ -461,59 +627,94 @@ impl SessionService {
         let Some(selection) = &config.selection else {
             return Ok(Arc::clone(&self.provider));
         };
-        let resolver = self.resolver.as_ref().ok_or_else(|| ServiceError::NoProviderResolver {
-            route: selection.route.clone(),
-            model: selection.model.clone(),
-        })?;
+        let resolver = self
+            .resolver
+            .as_ref()
+            .ok_or_else(|| ServiceError::NoProviderResolver {
+                route: selection.route.clone(),
+                model: selection.model.clone(),
+            })?;
         let provider = resolver(selection).map_err(|message| ServiceError::ProviderResolution {
             route: selection.route.clone(),
             model: selection.model.clone(),
             message,
         })?;
-        if self.models.capabilities(selection).is_some_and(|caps| caps.image_input == Some(false)) {
-            Ok(Arc::new(crate::turn::provider::ImageCapabilityProvider { inner: provider }))
-        } else { Ok(provider) }
+        if self
+            .models
+            .capabilities(selection)
+            .is_some_and(|caps| caps.image_input == Some(false))
+        {
+            Ok(Arc::new(crate::turn::provider::ImageCapabilityProvider {
+                inner: provider,
+            }))
+        } else {
+            Ok(provider)
+        }
     }
 
     /// Resolve once for both automatic and manual policy-based compaction.
-    fn compaction_provider(&self, current: &CallConfig, policy: &crate::turn::compaction::Policy)
-        -> Result<Arc<dyn Provider>, ServiceError>
-    {
+    fn compaction_provider(
+        &self,
+        current: &CallConfig,
+        policy: &crate::turn::compaction::Policy,
+    ) -> Result<Arc<dyn Provider>, ServiceError> {
         policy.validate().map_err(ServiceError::InvalidConfig)?;
         let main = self.provider_for(current)?;
         let mut config = match &policy.summary_profile {
-            Some(name) => self.models.resolve_profile_for(name, current.selection.as_ref().map(|s| s.route.as_str()))
+            Some(name) => self
+                .models
+                .resolve_profile_for(name, current.selection.as_ref().map(|s| s.route.as_str()))
                 .map_err(ServiceError::InvalidConfig)?,
             None => current.clone(),
         };
-        let summary = if policy.summary_profile.is_some() { self.provider_for(&config)? } else { main.clone() };
-        config.max_output_tokens = summary.supports_max_output_tokens().then_some(policy.summary_tokens);
+        let summary = if policy.summary_profile.is_some() {
+            self.provider_for(&config)?
+        } else {
+            main.clone()
+        };
+        config.max_output_tokens = summary
+            .supports_max_output_tokens()
+            .then_some(policy.summary_tokens);
         Self::validate_config(&config)?;
-        self.models.validate(&config).map_err(ServiceError::InvalidConfig)?;
+        self.models
+            .validate(&config)
+            .map_err(ServiceError::InvalidConfig)?;
         if let (Some(rness_protocol::events::Reasoning::BudgetTokens { tokens }), Some(limit)) =
             (&config.reasoning, config.max_output_tokens)
         {
             if *tokens >= limit {
-                return Err(ServiceError::InvalidConfig("compaction reasoning budget must be less than summary_tokens".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "compaction reasoning budget must be less than summary_tokens".into(),
+                ));
             }
         }
-        Ok(Arc::new(crate::turn::provider::SummaryProvider { main, summary, config }))
+        Ok(Arc::new(crate::turn::provider::SummaryProvider {
+            main,
+            summary,
+            config,
+        }))
     }
 
     fn validate_config(config: &CallConfig) -> Result<(), ServiceError> {
         if let Some(selection) = &config.selection {
             if selection.route.trim().is_empty() || selection.model.trim().is_empty() {
-                return Err(ServiceError::InvalidConfig("selection route and model must be non-empty".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "selection route and model must be non-empty".into(),
+                ));
             }
         }
         if let Some(rness_protocol::events::Reasoning::BudgetTokens { tokens }) = config.reasoning {
             if tokens < 1024 {
-                return Err(ServiceError::InvalidConfig("reasoning budget must be at least 1024 tokens".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "reasoning budget must be at least 1024 tokens".into(),
+                ));
             }
         }
         if let Some(temperature) = config.temperature {
             if !temperature.is_finite() {
-                return Err(ServiceError::InvalidConfig("temperature must be finite".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "temperature must be finite".into(),
+                ));
             }
         }
         Ok(())
@@ -545,8 +746,12 @@ impl SessionService {
         };
 
         let replayed = replay(&self.store, session)?;
-        let cited: std::collections::HashSet<&str> =
-            replayed.context.sources.iter().map(|s| s.as_str()).collect();
+        let cited: std::collections::HashSet<&str> = replayed
+            .context
+            .sources
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let visible_current = replayed.history.iter().any(|e| {
             cited.contains(e.id.as_str())
                 && matches!(
@@ -563,8 +768,12 @@ impl SessionService {
 
         log.append(&SessionEvent::UserMessage(UserMessage {
             intent: UserIntent::Inject,
-            content: vec![ContentPart::Text { text: baseline.text }],
-            source: Some(MessageSource::Instructions { identity: baseline.identity }),
+            content: vec![ContentPart::Text {
+                text: baseline.text,
+            }],
+            source: Some(MessageSource::Instructions {
+                identity: baseline.identity,
+            }),
         }))?;
         Ok(())
     }
@@ -598,15 +807,20 @@ impl SessionService {
     /// explicit composition-root seed is committed once, immediately after
     /// the header, so HTTP-created sessions carry the same selection.
     fn normalize_workspace(workspace: Option<String>) -> Result<Option<String>, ServiceError> {
-        workspace.map(|path| {
-            let root = std::fs::canonicalize(&path)
-                .map_err(|e| ServiceError::InvalidConfig(format!("workspace {path}: {e}")))?;
-            if !root.is_dir() {
-                return Err(ServiceError::InvalidConfig(format!("workspace {path} is not a directory")));
-            }
-            root.to_str().map(str::to_owned)
-                .ok_or_else(|| ServiceError::InvalidConfig("workspace must be valid UTF-8".into()))
-        }).transpose()
+        workspace
+            .map(|path| {
+                let root = std::fs::canonicalize(&path)
+                    .map_err(|e| ServiceError::InvalidConfig(format!("workspace {path}: {e}")))?;
+                if !root.is_dir() {
+                    return Err(ServiceError::InvalidConfig(format!(
+                        "workspace {path} is not a directory"
+                    )));
+                }
+                root.to_str().map(str::to_owned).ok_or_else(|| {
+                    ServiceError::InvalidConfig("workspace must be valid UTF-8".into())
+                })
+            })
+            .transpose()
     }
 
     fn require_workspace_for_sandbox(
@@ -663,9 +877,7 @@ impl SessionService {
         let mut seed = self.creation_seed.clone();
         let sandbox = self.effective_sandbox(&seed).min(self.sandbox.default);
         // Keep opt-in defaults absent, but always persist restricted policy.
-        if seed.sandbox.is_some()
-            || sandbox != crate::sandbox::SandboxMode::DangerFullAccess
-        {
+        if seed.sandbox.is_some() || sandbox != crate::sandbox::SandboxMode::DangerFullAccess {
             seed.sandbox = Some(sandbox);
         }
         Ok(seed)
@@ -673,11 +885,7 @@ impl SessionService {
 
     /// Fork `session` at `at` (or its tip). Prefix request options replay
     /// into the child, but sandbox authority cannot exceed the current parent.
-    pub fn fork(
-        &self,
-        session: &SessionId,
-        at: Option<String>,
-    ) -> Result<SessionId, ServiceError> {
+    pub fn fork(&self, session: &SessionId, at: Option<String>) -> Result<SessionId, ServiceError> {
         let mut log = self.store.fork(session, at)?;
         self.tighten_fork_sandbox(&mut log, session)?;
         Ok(log.session().clone())
@@ -739,8 +947,13 @@ impl SessionService {
     /// Reserve engine quiescence for extension lifecycle changes. Fails rather
     /// than waiting on a turn that may itself be waiting on the plugin host.
     /// Holding the returned guard rejects new sends and compactions.
-    pub fn try_extension_maintenance(&self) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ServiceError> {
-        self.lifecycle.clone().try_write_owned().map_err(|_| ServiceError::Busy)
+    pub fn try_extension_maintenance(
+        &self,
+    ) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, ServiceError> {
+        self.lifecycle
+            .clone()
+            .try_write_owned()
+            .map_err(|_| ServiceError::Busy)
     }
 
     /// Submit user input. Classification (docs §5):
@@ -758,35 +971,73 @@ impl SessionService {
     }
 
     /// Deliver a background completion at the next step, waking an idle owner.
-    pub fn notify_job(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, Notice::Job, None)
+    pub fn notify_job(
+        &self,
+        session: &SessionId,
+        text: String,
+    ) -> Result<Disposition, ServiceError> {
+        self.send_or_retry(
+            session,
+            UserIntent::Steer,
+            vec![ContentPart::Text { text }],
+            false,
+            Notice::Job,
+            None,
+        )
     }
 
     /// Await reservations and retain them through admission, avoiding a retry race.
-    pub async fn notify_job_wait(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+    pub async fn notify_job_wait(
+        &self,
+        session: &SessionId,
+        text: String,
+    ) -> Result<Disposition, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
-        self.send_or_retry(session, UserIntent::Steer, vec![ContentPart::Text { text }], false, Notice::Job, Some((activity, operation)))
+        self.send_or_retry(
+            session,
+            UserIntent::Steer,
+            vec![ContentPart::Text { text }],
+            false,
+            Notice::Job,
+            Some((activity, operation)),
+        )
     }
 
     /// Record user intervention without waking an idle principal. Await the
     /// invoking command's reservation and use the normal single-writer inbox.
-    pub(crate) async fn notify_user_intervention(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+    pub(crate) async fn notify_user_intervention(
+        &self,
+        session: &SessionId,
+        text: String,
+    ) -> Result<Disposition, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
-        self.send_or_retry(session, UserIntent::Inject, vec![ContentPart::Text { text }], false,
-            Notice::Subagent, Some((activity, operation)))
+        self.send_or_retry(
+            session,
+            UserIntent::Inject,
+            vec![ContentPart::Text { text }],
+            false,
+            Notice::Subagent,
+            Some((activity, operation)),
+        )
     }
 
     /// Deliver a continuable child's closing answer. Wait out command
     /// reservations instead of dropping busy notices.
-    pub async fn notify_subagent_settled(&self, session: &SessionId, text: String) -> Result<Disposition, ServiceError> {
+    pub async fn notify_subagent_settled(
+        &self,
+        session: &SessionId,
+        text: String,
+    ) -> Result<Disposition, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
         let mut lineage = vec![session.clone()];
         while let Some(delegation) = self.store.delegation(lineage.last().unwrap())? {
             if lineage.contains(&delegation.parent) {
-                return Err(ServiceError::InvalidConfig("cyclic subagent lineage".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "cyclic subagent lineage".into(),
+                ));
             }
             lineage.push(delegation.parent);
         }
@@ -796,9 +1047,19 @@ impl SessionService {
                 let closing = self.closing.lock().unwrap();
                 let teardown = lineage.iter().any(|id| closing.contains(id));
                 if !teardown || self.phase(session) == Phase::Idle {
-                    let intent = if teardown { UserIntent::Inject } else { UserIntent::Steer };
-                    return self.send_or_retry(session, intent, vec![ContentPart::Text { text }], false,
-                        Notice::Subagent, Some((activity, operation)));
+                    let intent = if teardown {
+                        UserIntent::Inject
+                    } else {
+                        UserIntent::Steer
+                    };
+                    return self.send_or_retry(
+                        session,
+                        intent,
+                        vec![ContentPart::Text { text }],
+                        false,
+                        Notice::Subagent,
+                        Some((activity, operation)),
+                    );
                 }
             }
             // Cancelled bursts park queued input. Let the writer retire before
@@ -821,48 +1082,119 @@ impl SessionService {
 
     /// Continue a failed turn from durable context without appending user content.
     pub fn retry(&self, session: &SessionId) -> Result<Disposition, ServiceError> {
-        self.send_or_retry(session, UserIntent::Followup, vec![], true, Notice::None, None)
+        self.send_or_retry(
+            session,
+            UserIntent::Followup,
+            vec![],
+            true,
+            Notice::None,
+            None,
+        )
     }
 
     /// Idle-only admission for a durable external queue. The ID is committed in
     /// the same fsynced envelope as the prompt; replay never submits it twice.
     /// false means busy: the caller must retain its durable pending record.
-    pub fn deliver_external_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
+    pub fn deliver_external_once(
+        &self,
+        session: &SessionId,
+        id: &str,
+        text: String,
+    ) -> Result<bool, ServiceError> {
         if text.trim().is_empty() || text.trim_start().starts_with('/') {
-            return Err(ServiceError::InvalidConfig("external prompts must be nonempty chat text, not commands".into()));
+            return Err(ServiceError::InvalidConfig(
+                "external prompts must be nonempty chat text, not commands".into(),
+            ));
         }
-        let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
-        let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let operation = live
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ServiceError::Busy)?;
         if self.store.history(session)?.iter().any(|e| matches!(&e.event,
             SessionEvent::UserMessage(m) if matches!(&m.source, Some(MessageSource::ExternalPrompt { id: key }) if key == id))) {
             return Ok(true);
         }
-        if self.closing.lock().unwrap().contains(session) || live.inbox.lock().unwrap().phase() != Phase::Idle {
+        if self.closing.lock().unwrap().contains(session)
+            || live.inbox.lock().unwrap().phase() != Phase::Idle
+        {
             return Ok(false);
         }
-        self.send_or_retry_sourced(session, UserIntent::Followup, vec![ContentPart::Text { text }], false,
-            Notice::None, Some((activity, operation)), Some(MessageSource::ExternalPrompt { id: id.into() }))?;
+        self.send_or_retry_sourced(
+            session,
+            UserIntent::Followup,
+            vec![ContentPart::Text { text }],
+            false,
+            Notice::None,
+            Some((activity, operation)),
+            Some(MessageSource::ExternalPrompt { id: id.into() }),
+        )?;
         Ok(true)
     }
 
-    pub async fn notify_job_once(&self, session: &SessionId, id: &str, text: String) -> Result<bool, ServiceError> {
+    pub async fn notify_job_once(
+        &self,
+        session: &SessionId,
+        id: &str,
+        text: String,
+    ) -> Result<bool, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let live = self.live(session);
         let operation = live.operation.clone().lock_owned().await;
         if self.store.history(session)?.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(message) if matches!(&message.source, Some(rness_protocol::events::MessageSource::JobCompletion { id: key }) if key == id))) { return Ok(true); }
         let mut pending = live.job_pending.lock().unwrap();
-        if live.inbox.lock().unwrap().phase() == Phase::Idle { pending.remove(id); }
-        if pending.contains(id) { return Ok(false); }
-        self.send_or_retry_sourced(session, UserIntent::Steer, vec![ContentPart::Text {text}], false, Notice::Job, Some((activity,operation)), Some(rness_protocol::events::MessageSource::JobCompletion {id:id.into()}))?;
+        if live.inbox.lock().unwrap().phase() == Phase::Idle {
+            pending.remove(id);
+        }
+        if pending.contains(id) {
+            return Ok(false);
+        }
+        self.send_or_retry_sourced(
+            session,
+            UserIntent::Steer,
+            vec![ContentPart::Text { text }],
+            false,
+            Notice::Job,
+            Some((activity, operation)),
+            Some(rness_protocol::events::MessageSource::JobCompletion { id: id.into() }),
+        )?;
         pending.insert(id.into());
         Ok(false)
     }
 
-    fn send_or_retry(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, notice: Notice, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>) -> Result<Disposition, ServiceError> {
-        self.send_or_retry_sourced(session,intent,content,retry,notice,reservation,None)
+    fn send_or_retry(
+        &self,
+        session: &SessionId,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+        retry: bool,
+        notice: Notice,
+        reservation: Option<(
+            tokio::sync::OwnedRwLockReadGuard<()>,
+            tokio::sync::OwnedMutexGuard<()>,
+        )>,
+    ) -> Result<Disposition, ServiceError> {
+        self.send_or_retry_sourced(session, intent, content, retry, notice, reservation, None)
     }
-    fn send_or_retry_sourced(&self, session: &SessionId, intent: UserIntent, content: Vec<ContentPart>, retry: bool, notice: Notice, reservation: Option<(tokio::sync::OwnedRwLockReadGuard<()>, tokio::sync::OwnedMutexGuard<()>)>, source: Option<rness_protocol::events::MessageSource>) -> Result<Disposition, ServiceError> {
+    fn send_or_retry_sourced(
+        &self,
+        session: &SessionId,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+        retry: bool,
+        notice: Notice,
+        reservation: Option<(
+            tokio::sync::OwnedRwLockReadGuard<()>,
+            tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        source: Option<rness_protocol::events::MessageSource>,
+    ) -> Result<Disposition, ServiceError> {
         if notice == Notice::None && !matches!(source, Some(MessageSource::ExternalPrompt { .. })) {
             if let [ContentPart::Text { text }] = content.as_slice() {
                 if let Some(command) = self.prepare_command(session, text)? {
@@ -873,56 +1205,112 @@ impl SessionService {
         let workspace = self.store.workspace(session)?.map(std::path::PathBuf::from);
         if let Some(path) = &workspace {
             if !path.is_absolute() || !path.is_dir() {
-                return Err(ServiceError::InvalidConfig(format!("session workspace is not an available absolute directory: {}", path.display())));
+                return Err(ServiceError::InvalidConfig(format!(
+                    "session workspace is not an available absolute directory: {}",
+                    path.display()
+                )));
             }
         }
         let resolver = self.input_resolver.lock().unwrap().clone();
         let content = match resolver {
-            Some(resolve) => resolve(workspace.as_deref(), content).map_err(ServiceError::InvalidConfig)?,
+            Some(resolve) => {
+                resolve(workspace.as_deref(), content).map_err(ServiceError::InvalidConfig)?
+            }
             None => content,
         };
         for part in &content {
             if let ContentPart::Image { attachment } = part {
-                let images = self.images.get().ok_or_else(|| ServiceError::InvalidConfig("image storage is not configured".into()))?;
-                if !images.admitted_for_session(session, &attachment.id) && self.read_image(session, &attachment.id).is_err() {
-                    return Err(ServiceError::InvalidConfig("image was not uploaded to this session".into()));
+                let images = self.images.get().ok_or_else(|| {
+                    ServiceError::InvalidConfig("image storage is not configured".into())
+                })?;
+                if !images.admitted_for_session(session, &attachment.id)
+                    && self.read_image(session, &attachment.id).is_err()
+                {
+                    return Err(ServiceError::InvalidConfig(
+                        "image was not uploaded to this session".into(),
+                    ));
                 }
-                images.read(attachment).map_err(ServiceError::InvalidConfig)?;
+                images
+                    .read(attachment)
+                    .map_err(ServiceError::InvalidConfig)?;
             }
         }
         let live = self.live(session);
         let (activity, _operation) = match reservation {
             Some(reservation) => reservation,
             None => {
-                let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
-                let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+                let activity = self
+                    .lifecycle
+                    .clone()
+                    .try_read_owned()
+                    .map_err(|_| ServiceError::Busy)?;
+                let operation = live
+                    .operation
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| ServiceError::Busy)?;
                 (activity, operation)
             }
         };
         let command = live.command.lock().unwrap();
-        if command.is_some() { return Err(ServiceError::Busy); }
+        if command.is_some() {
+            return Err(ServiceError::Busy);
+        }
         let request_config = self.config(session)?;
-        let images_forbidden = request_config.selection.as_ref()
+        let images_forbidden = request_config
+            .selection
+            .as_ref()
             .and_then(|selection| self.models.capabilities(selection))
             .is_some_and(|caps| caps.image_input == Some(false));
         if images_forbidden {
-            let contains_image = |parts: &[ContentPart]| parts.iter().any(|part| matches!(part, ContentPart::Image { .. }));
+            let contains_image = |parts: &[ContentPart]| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, ContentPart::Image { .. }))
+            };
             let context = crate::session::projection::model_context(&self.store.history(session)?);
             let history_has_images = context.turns.iter().any(|turn| match turn {
-                crate::session::projection::ModelTurn::User { content } | crate::session::projection::ModelTurn::Assistant { content } => contains_image(content),
-                crate::session::projection::ModelTurn::ToolResults { results } => results.iter().any(|r| r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. }))),
+                crate::session::projection::ModelTurn::User { content }
+                | crate::session::projection::ModelTurn::Assistant { content } => {
+                    contains_image(content)
+                }
+                crate::session::projection::ModelTurn::ToolResults { results } => {
+                    results.iter().any(|r| {
+                        r.content.iter().any(|p| {
+                            matches!(
+                                p,
+                                rness_protocol::events::ToolResultContentPart::Image { .. }
+                            )
+                        })
+                    })
+                }
             });
             if contains_image(&content) || history_has_images {
-                return Err(ServiceError::InvalidConfig("selected model explicitly disables image input".into()));
+                return Err(ServiceError::InvalidConfig(
+                    "selected model explicitly disables image input".into(),
+                ));
             }
         }
         let mut inbox = live.inbox.lock().unwrap();
         if retry {
-            if inbox.phase() != Phase::Idle { return Err(ServiceError::Busy); }
+            if inbox.phase() != Phase::Idle {
+                return Err(ServiceError::Busy);
+            }
             let history = self.store.history(session)?;
-            let tip = history.iter().rev().find(|e| !matches!(e.event, SessionEvent::RequestConfig(_)));
-            if !matches!(tip.map(|e| &e.event), Some(SessionEvent::TurnEnded { outcome: rness_protocol::events::TurnOutcome::Failed, .. })) {
-                return Err(ServiceError::InvalidConfig("retry requires a failed turn at the session tip".into()));
+            let tip = history
+                .iter()
+                .rev()
+                .find(|e| !matches!(e.event, SessionEvent::RequestConfig(_)));
+            if !matches!(
+                tip.map(|e| &e.event),
+                Some(SessionEvent::TurnEnded {
+                    outcome: rness_protocol::events::TurnOutcome::Failed,
+                    ..
+                })
+            ) {
+                return Err(ServiceError::InvalidConfig(
+                    "retry requires a failed turn at the session tip".into(),
+                ));
             }
         }
         // Job completions resume idle owners just like other followups. A
@@ -935,15 +1323,25 @@ impl SessionService {
             Disposition::LogOnly => {
                 drop(inbox);
                 let mut log = self.store.open(session)?;
-                log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
+                log.append(&SessionEvent::UserMessage(UserMessage {
+                    intent,
+                    content,
+                    source,
+                }))?;
             }
             Disposition::StartTurn => {
                 // Resolve before committing the prompt or flipping phase:
                 // an unavailable selected provider must not leave a session
                 // running with an input it cannot process.
                 let request_config = self.config(session)?;
-                let policy = request_config.selection.as_ref()
-                    .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
+                let policy = request_config
+                    .selection
+                    .as_ref()
+                    .and_then(|s| {
+                        self.config
+                            .compaction
+                            .get(&format!("{}/{}", s.route, s.model))
+                    })
                     .or_else(|| self.config.compaction.get("default"));
                 let provider = match policy {
                     Some(policy) => self.compaction_provider(&request_config, policy)?,
@@ -994,12 +1392,26 @@ impl SessionService {
 
     /// Resolve and reserve synchronously, before handing work to a scheduler.
     /// The lifecycle guard prevents unload between lookup and execution.
-    pub fn prepare_command(&self, session: &SessionId, text: &str) -> Result<Option<PreparedCommand>, ServiceError> {
-        let activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
-        let Some((command, offset)) = self.commands.resolve(text) else { return Ok(None); };
+    pub fn prepare_command(
+        &self,
+        session: &SessionId,
+        text: &str,
+    ) -> Result<Option<PreparedCommand>, ServiceError> {
+        let activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
+        let Some((command, offset)) = self.commands.resolve(text) else {
+            return Ok(None);
+        };
         self.store.workspace(session)?;
         let live = self.live(session);
-        let operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let operation = live
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ServiceError::Busy)?;
         let mut active = live.command.lock().unwrap();
         if active.is_some() || (!command.allow_busy() && self.phase(session) != Phase::Idle) {
             return Err(ServiceError::Busy);
@@ -1008,14 +1420,26 @@ impl SessionService {
         *active = Some(cancel.clone());
         drop(active);
         Ok(Some(PreparedCommand {
-            reservation: Arc::new(CommandReservation { live: live.clone(), _operation: operation, _activity: activity }),
-            live, command, session: session.clone(),
-            raw_input: text[offset..].to_owned(), cancel,
+            reservation: Arc::new(CommandReservation {
+                live: live.clone(),
+                _operation: operation,
+                _activity: activity,
+            }),
+            live,
+            command,
+            session: session.clone(),
+            raw_input: text[offset..].to_owned(),
+            cancel,
         }))
     }
 
     /// Admission happens when called, not when the returned future is polled.
-    pub fn send_async(self: &Arc<Self>, session: SessionId, intent: UserIntent, content: Vec<ContentPart>) -> impl std::future::Future<Output = Result<Disposition, ServiceError>> + Send + 'static {
+    pub fn send_async(
+        self: &Arc<Self>,
+        session: SessionId,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+    ) -> impl std::future::Future<Output = Result<Disposition, ServiceError>> + Send + 'static {
         let prepared = match content.as_slice() {
             [ContentPart::Text { text }] => self.prepare_command(&session, text),
             _ => Ok(None),
@@ -1026,7 +1450,9 @@ impl SessionService {
             tokio::task::spawn_blocking(move || match prepared {
                 Some(command) => command.execute(&service),
                 None => service.send(&session, intent, content),
-            }).await.map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?
+            })
+            .await
+            .map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?
         }
     }
 
@@ -1035,7 +1461,9 @@ impl SessionService {
     }
 
     pub fn cancel(&self, session: &SessionId) {
-        if let Some(token) = self.live(session).command.lock().unwrap().as_ref() { token.cancel(); }
+        if let Some(token) = self.live(session).command.lock().unwrap().as_ref() {
+            token.cancel();
+        }
         self.live(session).cancel.lock().unwrap().cancel();
     }
 
@@ -1053,15 +1481,31 @@ impl SessionService {
         session: &SessionId,
         keep_turns: usize,
     ) -> Result<CompactReport, ServiceError> {
-        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let _activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
-        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let _operation = live
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ServiceError::Busy)?;
         if self.phase(session) != Phase::Idle {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
-        let policy = replayed.context.config.selection.as_ref()
-            .and_then(|s| self.config.compaction.get(&format!("{}/{}", s.route, s.model)))
+        let policy = replayed
+            .context
+            .config
+            .selection
+            .as_ref()
+            .and_then(|s| {
+                self.config
+                    .compaction
+                    .get(&format!("{}/{}", s.route, s.model))
+            })
             .or_else(|| self.config.compaction.get("default"));
         let provider = match policy {
             Some(policy) => self.compaction_provider(&replayed.context.config, policy)?,
@@ -1093,8 +1537,12 @@ impl SessionService {
         // Fold span: model-visible events before the cut that the current
         // projection actually cites (already-shadowed ones are inert;
         // earlier checkpoints DO fold — their summary is model-visible).
-        let cited: std::collections::HashSet<&str> =
-            replayed.context.sources.iter().map(|s| s.as_str()).collect();
+        let cited: std::collections::HashSet<&str> = replayed
+            .context
+            .sources
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         // Transitive closure: folding a checkpoint also re-claims the
         // span it shadowed — otherwise those events would resurface once
         // their shadower is itself shadowed.
@@ -1120,14 +1568,20 @@ impl SessionService {
         // Summarize ONLY the folding region, projected exactly as the
         // model saw it (shadowing of prior checkpoints honored).
         let mut fold_ctx = crate::session::projection::model_context(&history[..cut]);
-        fold_ctx.config = provider.summary_config().cloned().unwrap_or_else(|| replayed.context.config.clone());
+        fold_ctx.config = provider
+            .summary_config()
+            .cloned()
+            .unwrap_or_else(|| replayed.context.config.clone());
         let estimated_tokens = crate::turn::compaction::measure(&fold_ctx, "", &[]);
         self.bus.emit::<FrameEv>(&Frame::CompactionStarted {
-            session: session.clone(), events: replaces.len(), estimated_tokens,
+            session: session.clone(),
+            events: replaces.len(),
+            estimated_tokens,
         });
         let summary = summarize(provider.as_ref(), fold_ctx, policy).await;
         self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
-            session: session.clone(), changed: summary.is_ok(),
+            session: session.clone(),
+            changed: summary.is_ok(),
         });
         let summary = summary?;
 
@@ -1140,43 +1594,86 @@ impl SessionService {
         }))?;
         drop(log);
 
-        self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() });
+        self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
+            session: session.clone(),
+        });
         Ok(CompactReport { shadowed, summary })
     }
 
     /// Compact a zero-based half-open model-message region, rejecting stale snapshots.
-    pub async fn compact_region(&self, session: &SessionId, start: usize, end: usize,
+    pub async fn compact_region(
+        &self,
+        session: &SessionId,
+        start: usize,
+        end: usize,
         expected_sources: Vec<rness_protocol::events::EventId>,
         policy: crate::turn::compaction::Policy,
     ) -> Result<bool, ServiceError> {
-        self.compact_region_with_permit(session, start, end, expected_sources, policy, None, CancellationToken::new()).await
+        self.compact_region_with_permit(
+            session,
+            start,
+            end,
+            expected_sources,
+            policy,
+            None,
+            CancellationToken::new(),
+        )
+        .await
     }
 
-    pub async fn compact_region_with_permit(&self, session: &SessionId, start: usize, end: usize,
-        expected_sources: Vec<rness_protocol::events::EventId>, policy: crate::turn::compaction::Policy,
-        permit: Option<CommandPermit>, cancel: CancellationToken,
+    pub async fn compact_region_with_permit(
+        &self,
+        session: &SessionId,
+        start: usize,
+        end: usize,
+        expected_sources: Vec<rness_protocol::events::EventId>,
+        policy: crate::turn::compaction::Policy,
+        permit: Option<CommandPermit>,
+        cancel: CancellationToken,
     ) -> Result<bool, ServiceError> {
         policy.validate().map_err(ServiceError::InvalidConfig)?;
         let live = self.live(session);
         let reservation = match permit {
             Some(permit) => {
                 let reservation = permit.0.upgrade().ok_or(ServiceError::Busy)?;
-                if !Arc::ptr_eq(&reservation.live, &live) { return Err(ServiceError::Busy); }
+                if !Arc::ptr_eq(&reservation.live, &live) {
+                    return Err(ServiceError::Busy);
+                }
                 Some(reservation)
             }
             None => None,
         };
         let _activity = if reservation.is_none() {
-            Some(self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?)
-        } else { None };
+            Some(
+                self.lifecycle
+                    .clone()
+                    .try_read_owned()
+                    .map_err(|_| ServiceError::Busy)?,
+            )
+        } else {
+            None
+        };
         let _operation = if reservation.is_none() {
-            Some(live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?)
-        } else { None };
-        if cancel.is_cancelled() { return Err(ServiceError::InvalidConfig("command cancelled".into())); }
-        if self.phase(session) != Phase::Idle { return Err(ServiceError::Busy); }
+            Some(
+                live.operation
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| ServiceError::Busy)?,
+            )
+        } else {
+            None
+        };
+        if cancel.is_cancelled() {
+            return Err(ServiceError::InvalidConfig("command cancelled".into()));
+        }
+        if self.phase(session) != Phase::Idle {
+            return Err(ServiceError::Busy);
+        }
         let replayed = replay(&self.store, session)?;
         if replayed.context.sources != expected_sources {
-            return Err(ServiceError::InvalidConfig("stale compaction region".into()));
+            return Err(ServiceError::InvalidConfig(
+                "stale compaction region".into(),
+            ));
         }
         let provider = self.compaction_provider(&replayed.context.config, &policy)?;
         let mut log = self.store.open(session)?;
@@ -1186,14 +1683,30 @@ impl SessionService {
         let on_compaction = move |progress: crate::turn::compaction::CompactionProgress| {
             progress_bus.emit::<FrameEv>(&progress.frame(progress_session.clone()));
         };
-        let changed = crate::turn::compaction::reduce_region_with_progress(&self.store, &mut log, provider.as_ref(),
-            "", &[], &policy, false, Some(start..end), &cancel, &on_compaction).await
-            .map_err(|e| ServiceError::Summarizer(e.to_string()));
+        let changed = crate::turn::compaction::reduce_region_with_progress(
+            &self.store,
+            &mut log,
+            provider.as_ref(),
+            "",
+            &[],
+            &policy,
+            false,
+            Some(start..end),
+            &cancel,
+            &on_compaction,
+        )
+        .await
+        .map_err(|e| ServiceError::Summarizer(e.to_string()));
         self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
-            session: session.clone(), changed: matches!(changed, Ok(true)),
+            session: session.clone(),
+            changed: matches!(changed, Ok(true)),
         });
         let changed = changed?;
-        if changed { self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() }); }
+        if changed {
+            self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
+                session: session.clone(),
+            });
+        }
         Ok(changed)
     }
 
@@ -1209,9 +1722,17 @@ impl SessionService {
         session: &SessionId,
         opts: PruneOptions,
     ) -> Result<usize, ServiceError> {
-        let _activity = self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?;
+        let _activity = self
+            .lifecycle
+            .clone()
+            .try_read_owned()
+            .map_err(|_| ServiceError::Busy)?;
         let live = self.live(session);
-        let _operation = live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?;
+        let _operation = live
+            .operation
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| ServiceError::Busy)?;
         if self.phase(session) != Phase::Idle {
             return Err(ServiceError::Busy);
         }
@@ -1239,17 +1760,30 @@ impl SessionService {
         // projection replays PRUNED results under the prune event's id,
         // so re-pruning an already-pruned result never triggers (its
         // replayed output is already short).
-        let cited: std::collections::HashSet<&str> =
-            replayed.context.sources.iter().map(|s| s.as_str()).collect();
+        let cited: std::collections::HashSet<&str> = replayed
+            .context
+            .sources
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         let mut pruned = 0usize;
         let mut log: Option<crate::session::log::SessionLog> = None;
         for env in &history[..cut] {
-            let SessionEvent::ToolResult(r) = &env.event else { continue };
+            let SessionEvent::ToolResult(r) = &env.event else {
+                continue;
+            };
             if !cited.contains(env.id.as_str()) {
                 continue;
             }
             // Do not reorder mixed text/image output using the text-only pruner.
-            if r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) { continue; }
+            if r.content.iter().any(|p| {
+                matches!(
+                    p,
+                    rness_protocol::events::ToolResultContentPart::Image { .. }
+                )
+            }) {
+                continue;
+            }
             let chars = r.output.chars().count();
             if chars <= opts.threshold_chars {
                 continue;
@@ -1276,7 +1810,9 @@ impl SessionService {
         drop(log);
 
         if pruned > 0 {
-            self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() });
+            self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
+                session: session.clone(),
+            });
         }
         Ok(pruned)
     }
@@ -1293,15 +1829,22 @@ impl SessionService {
     /// The session's effective request controls (latest `request/config`
     /// event; default when none was ever set).
     pub fn config(&self, session: &SessionId) -> Result<CallConfig, ServiceError> {
-        Ok(self.store.history(session)?.iter().rev().find_map(|entry| {
-            match &entry.event {
+        Ok(self
+            .store
+            .history(session)?
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.event {
                 SessionEvent::RequestConfig(config) => Some(config.clone()),
                 _ => None,
-            }
-        }).unwrap_or_default())
+            })
+            .unwrap_or_default())
     }
 
-    pub fn model_capabilities(&self, selection: &rness_protocol::events::ModelSelection) -> Option<&crate::config::ModelCapabilities> {
+    pub fn model_capabilities(
+        &self,
+        selection: &rness_protocol::events::ModelSelection,
+    ) -> Option<&crate::config::ModelCapabilities> {
         self.models.capabilities(selection)
     }
 
@@ -1313,14 +1856,22 @@ impl SessionService {
         self.models.profile_names()
     }
 
-    pub fn profile_config(&self, name: &str, provider: Option<&str>) -> Result<CallConfig, ServiceError> {
-        self.models.resolve_profile_for(name, provider).map_err(ServiceError::InvalidConfig)
+    pub fn profile_config(
+        &self,
+        name: &str,
+        provider: Option<&str>,
+    ) -> Result<CallConfig, ServiceError> {
+        self.models
+            .resolve_profile_for(name, provider)
+            .map_err(ServiceError::InvalidConfig)
     }
 
     fn effective_sandbox(&self, config: &CallConfig) -> crate::sandbox::SandboxMode {
         // Absence in durable config is the compatibility policy, not the
         // current startup default (which applies only to creation/role choice).
-        config.sandbox.unwrap_or(crate::sandbox::SandboxMode::DangerFullAccess)
+        config
+            .sandbox
+            .unwrap_or(crate::sandbox::SandboxMode::DangerFullAccess)
     }
 
     fn validate_sandbox_update(
@@ -1340,11 +1891,7 @@ impl SessionService {
     /// `request/config` event applied to every later model request.
     /// No-op when equal to the effective config — only real changes are
     /// logged (dsh: no silent per-call drift, no redundant snapshots).
-    pub fn set_config(
-        &self,
-        session: &SessionId,
-        config: CallConfig,
-    ) -> Result<(), ServiceError> {
+    pub fn set_config(&self, session: &SessionId, config: CallConfig) -> Result<(), ServiceError> {
         self.set_config_with_permit(session, config, None)
     }
 
@@ -1358,17 +1905,33 @@ impl SessionService {
         let reservation = match permit {
             Some(permit) => {
                 let reservation = permit.0.upgrade().ok_or(ServiceError::Busy)?;
-                if !Arc::ptr_eq(&reservation.live, &live) { return Err(ServiceError::Busy); }
+                if !Arc::ptr_eq(&reservation.live, &live) {
+                    return Err(ServiceError::Busy);
+                }
                 Some(reservation)
             }
             None => None,
         };
         let _activity = if reservation.is_none() {
-            Some(self.lifecycle.clone().try_read_owned().map_err(|_| ServiceError::Busy)?)
-        } else { None };
+            Some(
+                self.lifecycle
+                    .clone()
+                    .try_read_owned()
+                    .map_err(|_| ServiceError::Busy)?,
+            )
+        } else {
+            None
+        };
         let _operation = if reservation.is_none() {
-            Some(live.operation.clone().try_lock_owned().map_err(|_| ServiceError::Busy)?)
-        } else { None };
+            Some(
+                live.operation
+                    .clone()
+                    .try_lock_owned()
+                    .map_err(|_| ServiceError::Busy)?,
+            )
+        } else {
+            None
+        };
         let inbox = live.inbox.lock().unwrap();
         if inbox.phase() != Phase::Idle {
             return Err(ServiceError::Busy);
@@ -1382,7 +1945,10 @@ impl SessionService {
         }
         if let Some(ceiling) = previous.tool_ceiling.clone() {
             config.tool_ceiling = Some(match config.tool_ceiling {
-                Some(requested) => ceiling.into_iter().filter(|name| requested.contains(name)).collect(),
+                Some(requested) => ceiling
+                    .into_iter()
+                    .filter(|name| requested.contains(name))
+                    .collect(),
                 None => ceiling,
             });
         }
@@ -1403,7 +1969,9 @@ impl SessionService {
         log.append(&SessionEvent::RequestConfig(config))?;
         drop(log);
         drop(inbox);
-        self.bus.emit::<FrameEv>(&Frame::HistoryChanged { session: session.clone() });
+        self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
+            session: session.clone(),
+        });
         Ok(())
     }
 }
@@ -1448,7 +2016,12 @@ async fn summarize(
 ) -> Result<String, ServiceError> {
     ctx.turns.push(crate::session::projection::ModelTurn::User {
         content: vec![ContentPart::Text {
-            text: policy.map_or("Summarize the conversation above now, per the system instructions.", |p| p.prompt.as_str()).to_string(),
+            text: policy
+                .map_or(
+                    "Summarize the conversation above now, per the system instructions.",
+                    |p| p.prompt.as_str(),
+                )
+                .to_string(),
         }],
     });
     let request = crate::turn::provider::StepRequest {
@@ -1503,7 +2076,10 @@ async fn burst(
 
     loop {
         turn_no += 1;
-        bus.emit::<TurnStartedEv>(&TurnNotice { session: session.clone(), turn: turn_no });
+        bus.emit::<TurnStartedEv>(&TurnNotice {
+            session: session.clone(),
+            turn: turn_no,
+        });
 
         let steer_live = Arc::clone(&live);
         let mut steers = move || steer_live.inbox.lock().unwrap().drain_steers();
@@ -1549,14 +2125,14 @@ async fn burst(
         match next {
             Some(pending) => {
                 drop(inbox);
-                let append = log
-                    .as_mut()
-                    .expect("burst owns the log")
-                    .append(&SessionEvent::UserMessage(UserMessage {
-                        intent: UserIntent::Followup,
-                        content: pending.content,
-                        source: pending.source,
-                    }));
+                let append =
+                    log.as_mut()
+                        .expect("burst owns the log")
+                        .append(&SessionEvent::UserMessage(UserMessage {
+                            intent: UserIntent::Followup,
+                            content: pending.content,
+                            source: pending.source,
+                        }));
                 if let Err(e) = append {
                     tracing::error!(session = %session, error = %e, "followup commit failed");
                     let mut inbox = live.inbox.lock().unwrap();
@@ -1599,7 +2175,7 @@ async fn burst(
                             &SessionEvent::UserMessage(UserMessage {
                                 intent,
                                 content: pending.content,
-                        source: pending.source,
+                                source: pending.source,
                             }),
                         );
                         if let Err(e) = append {
@@ -1667,7 +2243,8 @@ impl Plugin for SessionsPlugin {
             Arc::clone(ctx.bus()),
         );
         if let Some(resolver) = &self.resolver {
-            service = service.with_provider_resolver(self.creation_seed.clone(), Arc::clone(resolver));
+            service =
+                service.with_provider_resolver(self.creation_seed.clone(), Arc::clone(resolver));
         }
         let service = Arc::new(
             service

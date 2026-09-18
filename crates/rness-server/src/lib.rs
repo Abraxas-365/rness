@@ -21,8 +21,8 @@
 //! The CLI requires bearer authentication for non-loopback binds; custom hosts
 //! install `auth::authorize` explicitly. TLS termination remains operator-owned.
 
-pub mod auth;
 pub mod approvals;
+pub mod auth;
 pub mod routes;
 pub mod sse;
 
@@ -52,7 +52,12 @@ impl ServerState {
     pub fn new(sessions: Arc<SessionService>) -> Self {
         let (frames, _) = broadcast::channel(1024);
         let approvals = Arc::new(approvals::RemoteApprovals::new(frames.clone()));
-        Self { sessions, frames, approvals, questions: Arc::new(Default::default()) }
+        Self {
+            sessions,
+            frames,
+            approvals,
+            questions: Arc::new(Default::default()),
+        }
     }
 
     /// The callback to hang on the kernel bus (`FrameEv`).

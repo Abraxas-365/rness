@@ -85,7 +85,9 @@ fn completion_hints_show_role_and_bounded_task_without_changing_values() {
 #[test]
 fn runtime_parses_mixed_completion_items_and_preserves_legacy_values() {
     let mut host = host();
-    let items = host.complete_command_items("agents", json!({"session":"main"})).unwrap();
+    let items = host
+        .complete_command_items("agents", json!({"session":"main"}))
+        .unwrap();
     assert!(items.contains(&("a1".into(), "subagent".into())));
     host.load("mixed", r#"
         assert(rness.commands.completion_descriptions)
@@ -94,14 +96,26 @@ fn runtime_parses_mixed_completion_items_and_preserves_legacy_values() {
           complete=function() return {'plain', {value='rich', description='hint'}, {value='bare'}} end,
         }
     "#).unwrap();
-    assert_eq!(host.complete_command_items("mixed", json!({})).unwrap(), vec![
-        ("plain".into(), "".into()), ("rich".into(), "hint".into()), ("bare".into(), "".into()),
-    ]);
-    assert_eq!(host.complete_command("mixed", json!({})).unwrap(), ["plain", "rich", "bare"]);
-    host.load("invalid", r#"
+    assert_eq!(
+        host.complete_command_items("mixed", json!({})).unwrap(),
+        vec![
+            ("plain".into(), "".into()),
+            ("rich".into(), "hint".into()),
+            ("bare".into(), "".into()),
+        ]
+    );
+    assert_eq!(
+        host.complete_command("mixed", json!({})).unwrap(),
+        ["plain", "rich", "bare"]
+    );
+    host.load(
+        "invalid",
+        r#"
         rness.commands.register {name='invalid', run=function() end,
           complete=function() return {{description='missing value'}} end}
-    "#).unwrap();
+    "#,
+    )
+    .unwrap();
     assert!(host.complete_command_items("invalid", json!({})).is_err());
 }
 
@@ -170,22 +184,30 @@ fn steering_requires_text_and_stop_retains_compatibility() {
         let result = host
             .call_command("agents", json!({"session":"main", "raw_input":input}))
             .unwrap();
-        assert!(
-            result
-                .message
-                .contains("Confirm: /agents grandchild-full stop confirm")
-        );
-        assert!(
-            result
-                .message
-                .contains("Queued messages are not cleared; descendants keep running.")
-        );
+        assert!(result
+            .message
+            .contains("Confirm: /agents grandchild-full stop confirm"));
+        assert!(result
+            .message
+            .contains("Queued messages are not cleared; descendants keep running."));
     }
     host.load("before-confirm", "assert(steered); assert(stopped == nil)")
         .unwrap();
-    for (index, input) in ["grandchild-full stop confirm", "stop grandchild-full confirm", "stop a2 confirm"].iter().enumerate() {
-        host.call_command("agents", json!({"session":"main", "raw_input":input})).unwrap();
-        host.load(&format!("check-{index}"), &format!("assert(stopped == {})", index + 1)).unwrap();
+    for (index, input) in [
+        "grandchild-full stop confirm",
+        "stop grandchild-full confirm",
+        "stop a2 confirm",
+    ]
+    .iter()
+    .enumerate()
+    {
+        host.call_command("agents", json!({"session":"main", "raw_input":input}))
+            .unwrap();
+        host.load(
+            &format!("check-{index}"),
+            &format!("assert(stopped == {})", index + 1),
+        )
+        .unwrap();
     }
     let choices = host
         .complete_command("agents", json!({"session":"main"}))
@@ -248,10 +270,9 @@ fn aliases_use_runtime_identity_not_list_position() {
     "#,
     )
     .unwrap();
-    assert!(
-        host.call_command("agents", json!({"session":"main", "raw_input":"a1"}))
-            .is_err()
-    );
+    assert!(host
+        .call_command("agents", json!({"session":"main", "raw_input":"a1"}))
+        .is_err());
     let result = host
         .call_command("agents", json!({"session":"main", "raw_input":"a2"}))
         .unwrap();

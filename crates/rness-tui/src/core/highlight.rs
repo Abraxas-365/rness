@@ -20,7 +20,10 @@ fn theme() -> &'static syntect::highlighting::Theme {
     static THEME: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
     THEME.get_or_init(|| {
         let mut themes = ThemeSet::load_defaults();
-        themes.themes.remove("base16-eighties.dark").expect("bundled syntect theme")
+        themes
+            .themes
+            .remove("base16-eighties.dark")
+            .expect("bundled syntect theme")
     })
 }
 
@@ -87,7 +90,12 @@ mod tests {
     fn plain(lines: &[Line<'_>]) -> Vec<String> {
         lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect()
     }
 
@@ -96,7 +104,10 @@ mod tests {
         let lines = highlight_code("fn main() {}\nlet x = 1;", "rust").expect("rust known");
         assert_eq!(plain(&lines), vec!["fn main() {}", "let x = 1;"]);
         // At least one span deviates from default (i.e. actually colored).
-        assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg.is_some()));
+        assert!(lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .any(|s| s.style.fg.is_some()));
     }
 
     #[test]
@@ -107,7 +118,10 @@ mod tests {
         ] {
             let lines = highlight_code(source, extension).expect("known file extension");
             assert_eq!(lines, highlight_code(source, language).unwrap());
-            assert!(lines.iter().flat_map(|l| &l.spans).any(|s| s.style.fg.is_some()));
+            assert!(lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg.is_some()));
         }
         assert!(highlight_code("plain text", "unknown_extension").is_none());
     }

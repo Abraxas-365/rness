@@ -44,10 +44,29 @@ impl Tool for SendMessageTool {
         })
     }
 
-    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let target = crate::required_str(&args, "agent_id")?.to_string();
         let output = self.execute_in(session, args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(json!({"version":1,"kind":"send_message","agent_id":target,"accepted":true}))))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(json!({"version":1,"kind":"send_message","agent_id":target,"accepted":true})),
+        ))
     }
 
     async fn execute(&self, _args: Value) -> Result<String, String> {
@@ -96,10 +115,29 @@ impl Tool for InterruptAgentTool {
         })
     }
 
-    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let target = crate::required_str(&args, "agent_id")?.to_string();
         let output = self.execute_in(session, args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(json!({"version":1,"kind":"interrupt_agent","agent_id":target,"accepted":true}))))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(json!({"version":1,"kind":"interrupt_agent","agent_id":target,"accepted":true})),
+        ))
     }
 
     async fn execute(&self, _args: Value) -> Result<String, String> {
@@ -158,9 +196,28 @@ impl Tool for ListAgentsTool {
         self.list_presented(session, args).map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, metadata) = self.list_presented(session, args)?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(metadata),
+        ))
     }
 }
 
@@ -176,19 +233,22 @@ impl ListAgentsTool {
         if children.is_empty() {
             return Ok(("No continuable child agents".into(), metadata));
         }
-        Ok((children
-            .iter()
-            .map(|c| {
-                format!(
-                    "{} depth={} {} parent={}",
-                    c.session,
-                    c.depth,
-                    if c.running { "running" } else { "idle" },
-                    c.parent
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"), metadata))
+        Ok((
+            children
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} depth={} {} parent={}",
+                        c.session,
+                        c.depth,
+                        if c.running { "running" } else { "idle" },
+                        c.parent
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            metadata,
+        ))
     }
 }
 
@@ -197,7 +257,11 @@ pub fn register_subagent_control(
     registry: &rness_engine::tools::ToolRegistry,
     runtime: Arc<SubagentRuntime>,
 ) {
-    registry.register(Arc::new(SendMessageTool { runtime: Arc::clone(&runtime) }));
-    registry.register(Arc::new(InterruptAgentTool { runtime: Arc::clone(&runtime) }));
+    registry.register(Arc::new(SendMessageTool {
+        runtime: Arc::clone(&runtime),
+    }));
+    registry.register(Arc::new(InterruptAgentTool {
+        runtime: Arc::clone(&runtime),
+    }));
     registry.register(Arc::new(ListAgentsTool { runtime }));
 }

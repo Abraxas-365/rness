@@ -71,9 +71,18 @@ pub enum SessionEvent {
     ToolsActivated { names: Vec<String> },
     /// Nested program calls are auditable, not standalone model messages.
     #[serde(rename = "tools/program_started")]
-    ProgramToolStarted { parent: ToolCallId, call: ToolCallId, name: String, args: serde_json::Value },
+    ProgramToolStarted {
+        parent: ToolCallId,
+        call: ToolCallId,
+        name: String,
+        args: serde_json::Value,
+    },
     #[serde(rename = "tools/program_result")]
-    ProgramToolResult { parent: ToolCallId, args: serde_json::Value, result: ToolResult },
+    ProgramToolResult {
+        parent: ToolCallId,
+        args: serde_json::Value,
+        result: ToolResult,
+    },
 
     /// A turn opened (one user intent -> agent until idle).
     #[serde(rename = "turn/started")]
@@ -100,7 +109,12 @@ pub enum SessionEvent {
 
     /// Audit only: never inserted into model-visible history.
     #[serde(rename = "compaction/started")]
-    CompactionStarted { model: String, sources: Vec<EventId>, estimated_input: u64, request: serde_json::Value },
+    CompactionStarted {
+        model: String,
+        sources: Vec<EventId>,
+        estimated_input: u64,
+        request: serde_json::Value,
+    },
     #[serde(rename = "compaction/request")]
     CompactionRequest { started: EventId, body: String },
     #[serde(rename = "compaction/finished")]
@@ -123,7 +137,11 @@ pub enum SessionEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PlanReview { Approved, KeepPlanning, Dismissed }
+pub enum PlanReview {
+    Approved,
+    KeepPlanning,
+    Dismissed,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanState {
@@ -135,8 +153,16 @@ impl PlanState {
         let mut state = Self::default();
         for env in history {
             match &env.event {
-                SessionEvent::PlanMode { active } => { state.active = *active; state.pending = None; }
-                SessionEvent::ToolResult(result) | SessionEvent::ProgramToolResult { result, .. } if !result.is_error && result.plan_review == Some(PlanReview::Approved) => state.pending = Some(false),
+                SessionEvent::PlanMode { active } => {
+                    state.active = *active;
+                    state.pending = None;
+                }
+                SessionEvent::ToolResult(result)
+                | SessionEvent::ProgramToolResult { result, .. }
+                    if !result.is_error && result.plan_review == Some(PlanReview::Approved) =>
+                {
+                    state.pending = Some(false)
+                }
                 _ => {}
             }
         }
@@ -146,7 +172,11 @@ impl PlanState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TaskStatus { Pending, InProgress, Completed }
+pub enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,10 +195,19 @@ pub struct TaskSnapshot {
 impl TaskSnapshot {
     /// Latest successful snapshot in full fork-resolved history, including compacted events.
     pub fn from_history(history: &[Envelope]) -> Self {
-        history.iter().rev().find_map(|env| match &env.event {
-            SessionEvent::ToolResult(result) | SessionEvent::ProgramToolResult { result, .. } if !result.is_error => result.tasks.clone(),
-            _ => None,
-        }).unwrap_or_default()
+        history
+            .iter()
+            .rev()
+            .find_map(|env| match &env.event {
+                SessionEvent::ToolResult(result)
+                | SessionEvent::ProgramToolResult { result, .. }
+                    if !result.is_error =>
+                {
+                    result.tasks.clone()
+                }
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -321,12 +360,18 @@ pub struct UserMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageSource {
-    ExternalPrompt { id: String },
-    JobCompletion { id: String },
+    ExternalPrompt {
+        id: String,
+    },
+    JobCompletion {
+        id: String,
+    },
     /// Workspace instruction baseline (AGENTS.md chain). `identity`
     /// fingerprints discovery inputs+content: a visible baseline with a
     /// matching identity is current; mismatch or absence → re-inject.
-    Instructions { identity: String },
+    Instructions {
+        identity: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -382,8 +427,12 @@ pub struct ImageRef {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ContentPart {
-    Image { attachment: ImageRef },
-    Text { text: String },
+    Image {
+        attachment: ImageRef,
+    },
+    Text {
+        text: String,
+    },
     /// Model-internal reasoning (persisted; provider adapters decide
     /// whether it is replayed).
     Thinking {
@@ -394,7 +443,12 @@ pub enum ContentPart {
         signature: Option<String>,
     },
     /// The model requested a tool call.
-    ToolUse { call: ToolCallId, name: String, #[serde(default)] args: serde_json::Value },
+    ToolUse {
+        call: ToolCallId,
+        name: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
 }
 
 pub type ToolCallId = String;
@@ -439,7 +493,9 @@ impl ToolResult {
     /// logs. Keeping fallback here makes replay migrations transparent.
     pub fn effective_content(&self) -> Vec<ToolResultContentPart> {
         if self.content.is_empty() && !self.output.is_empty() {
-            vec![ToolResultContentPart::Text { text: self.output.clone() }]
+            vec![ToolResultContentPart::Text {
+                text: self.output.clone(),
+            }]
         } else {
             self.content.clone()
         }
@@ -500,8 +556,15 @@ pub struct TimedChunk {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "d")]
 pub enum ChunkDelta {
-    Text { t: String },
-    Thinking { t: String },
+    Text {
+        t: String,
+    },
+    Thinking {
+        t: String,
+    },
     /// Incremental tool-call argument JSON.
-    ToolArgs { call: ToolCallId, t: String },
+    ToolArgs {
+        call: ToolCallId,
+        t: String,
+    },
 }

@@ -17,11 +17,17 @@ use rness_protocol::events::{
 /// One entry of the conversation as the model will see it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub enum ModelTurn {
-    User { content: Vec<ContentPart> },
-    Assistant { content: Vec<ContentPart> },
+    User {
+        content: Vec<ContentPart>,
+    },
+    Assistant {
+        content: Vec<ContentPart>,
+    },
     /// Results for the tool calls of the preceding assistant turn,
     /// in model (call) order.
-    ToolResults { results: Vec<ToolResult> },
+    ToolResults {
+        results: Vec<ToolResult>,
+    },
 }
 
 /// The derived model-request input: ordered turns plus bookkeeping.
@@ -46,13 +52,30 @@ pub struct Transcript {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptItem {
-    User { event: EventId, content: Vec<ContentPart> },
-    Assistant { event: EventId, model: String, content: Vec<ContentPart> },
-    Attempt { event: EventId, attempt: AssistantAttempt },
-    Tool { event: EventId, result: ToolResult },
+    User {
+        event: EventId,
+        content: Vec<ContentPart>,
+    },
+    Assistant {
+        event: EventId,
+        model: String,
+        content: Vec<ContentPart>,
+    },
+    Attempt {
+        event: EventId,
+        attempt: AssistantAttempt,
+    },
+    Tool {
+        event: EventId,
+        result: ToolResult,
+    },
     /// A compaction checkpoint: `shadowed` events before it are replayed
     /// to the model as `summary` instead.
-    Compaction { event: EventId, summary: String, shadowed: usize },
+    Compaction {
+        event: EventId,
+        summary: String,
+        shadowed: usize,
+    },
 }
 
 /// Compaction plan for a history: which events are shadowed, and where
@@ -98,7 +121,11 @@ fn compaction_plan(history: &[Envelope]) -> CompactionPlan {
             _ => {}
         }
     }
-    CompactionPlan { shadowed, anchors, pruned }
+    CompactionPlan {
+        shadowed,
+        anchors,
+        pruned,
+    }
 }
 
 /// Derive the model context from a history (as returned by
@@ -106,12 +133,20 @@ fn compaction_plan(history: &[Envelope]) -> CompactionPlan {
 pub fn search_surfaces(history: &[Envelope]) -> std::collections::HashMap<EventId, &'static str> {
     let plan = compaction_plan(history);
     let current: HashSet<_> = model_context(history).sources.into_iter().collect();
-    history.iter().map(|event| {
-        let surface = if plan.shadowed.contains(&event.id) || plan.pruned.contains_key(&event.id) {
-            "shadowed"
-        } else if current.contains(&event.id) { "current" } else { "log-only" };
-        (event.id.clone(), surface)
-    }).collect()
+    history
+        .iter()
+        .map(|event| {
+            let surface =
+                if plan.shadowed.contains(&event.id) || plan.pruned.contains_key(&event.id) {
+                    "shadowed"
+                } else if current.contains(&event.id) {
+                    "current"
+                } else {
+                    "log-only"
+                };
+            (event.id.clone(), surface)
+        })
+        .collect()
 }
 
 pub fn model_context(history: &[Envelope]) -> ModelContext {
@@ -148,12 +183,16 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
             SessionEvent::UserMessage(m) => {
                 flush_tools(&mut ctx, &mut pending_tools);
                 ctx.sources.push(env.id.clone());
-                ctx.turns.push(ModelTurn::User { content: m.content.clone() });
+                ctx.turns.push(ModelTurn::User {
+                    content: m.content.clone(),
+                });
             }
             SessionEvent::AssistantMessage(m) => {
                 flush_tools(&mut ctx, &mut pending_tools);
                 ctx.sources.push(env.id.clone());
-                ctx.turns.push(ModelTurn::Assistant { content: m.content.clone() });
+                ctx.turns.push(ModelTurn::Assistant {
+                    content: m.content.clone(),
+                });
                 ctx.usage.input_tokens += m.usage.input_tokens;
                 ctx.usage.output_tokens += m.usage.output_tokens;
                 ctx.usage.cache_read_tokens += m.usage.cache_read_tokens;
@@ -296,7 +335,7 @@ pub fn transcript(history: &[Envelope]) -> Transcript {
                 t.items.push(TranscriptItem::Tool { event, result });
             }
             SessionEvent::Compaction(_) => {} // replayed at its anchor
-            SessionEvent::Prune(_) => {} // replayed at its target
+            SessionEvent::Prune(_) => {}      // replayed at its target
             SessionEvent::Header(_)
             | SessionEvent::ToolsActivated { .. }
             | SessionEvent::ProgramToolStarted { .. }

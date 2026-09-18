@@ -5,9 +5,9 @@
 use std::fs;
 use std::io::Write;
 
+use proptest::prelude::*;
 use rness_engine::session::log::{read_session, SessionLog};
 use rness_protocol::events::{ContentPart, SessionEvent, UserIntent, UserMessage};
-use proptest::prelude::*;
 
 fn arb_event() -> impl Strategy<Value = SessionEvent> {
     // Text content exercising escaping: quotes, newlines, unicode, braces.
@@ -112,7 +112,11 @@ fn torn_tail_followed_by_append_yields_clean_log() {
     drop(f);
 
     let mut log = SessionLog::open(root.path(), &sid).unwrap();
-    log.append(&SessionEvent::TurnEnded { turn: 1, outcome: rness_protocol::events::TurnOutcome::Completed }).unwrap();
+    log.append(&SessionEvent::TurnEnded {
+        turn: 1,
+        outcome: rness_protocol::events::TurnOutcome::Completed,
+    })
+    .unwrap();
     let read = log.read_all().unwrap();
     assert_eq!(read.len(), 3);
 }

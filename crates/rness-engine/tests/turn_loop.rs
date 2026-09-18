@@ -21,41 +21,107 @@ async fn middle_region_preserves_neighbors_and_rejects_invalid_endpoints() {
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
     for text in ["before".into(), "middle ".repeat(3000), "after".into()] {
-        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text }], source: None })).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text }],
+            source: None,
+        }))
+        .unwrap();
     }
-    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("summary", StopReason::EndTurn, vec![]))]);
-    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
-        &compact_policy(100000), false, Some(1..2), &CancellationToken::new()).await.unwrap());
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+        "summary",
+        StopReason::EndTurn,
+        vec![],
+    ))]);
+    assert!(rness_engine::turn::compaction::reduce_region(
+        &store,
+        &mut log,
+        &provider,
+        "",
+        &[],
+        &compact_policy(100000),
+        false,
+        Some(1..2),
+        &CancellationToken::new()
+    )
+    .await
+    .unwrap());
     let context = replay(&store, log.session()).unwrap().context;
     assert_eq!(context.turns.len(), 3);
     let rendered = serde_json::to_value(&context.turns).unwrap();
     assert_eq!(rendered[0]["User"]["content"][0]["text"], "before");
-    assert!(rendered[1]["User"]["content"][0]["text"].as_str().unwrap().ends_with("summary"));
+    assert!(rendered[1]["User"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .ends_with("summary"));
     assert_eq!(rendered[2]["User"]["content"][0]["text"], "after");
     assert!(!rendered.to_string().contains("middle middle"));
-    let invalid = rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
-        &compact_policy(100000), false, Some(2..4), &CancellationToken::new()).await;
+    let invalid = rness_engine::turn::compaction::reduce_region(
+        &store,
+        &mut log,
+        &provider,
+        "",
+        &[],
+        &compact_policy(100000),
+        false,
+        Some(2..4),
+        &CancellationToken::new(),
+    )
+    .await;
     assert!(invalid.is_err());
 }
 
 #[tokio::test]
 async fn failed_empty_and_nonshrinking_summaries_preserve_region_after_reopen() {
     for (outcome, expected) in [
-        (StepOutcome::Failed { error: ProviderError { code: "TEST", message: "failed".into(), retryable: false, retry_after: None }, partial: vec![] }, "failed: TEST: failed"),
-        (StepOutcome::Committed(assistant("", StopReason::EndTurn, vec![])), "empty"),
-        (StepOutcome::Committed(assistant(&"long".repeat(5000), StopReason::EndTurn, vec![])), "non_shrinking"),
+        (
+            StepOutcome::Failed {
+                error: ProviderError {
+                    code: "TEST",
+                    message: "failed".into(),
+                    retryable: false,
+                    retry_after: None,
+                },
+                partial: vec![],
+            },
+            "failed: TEST: failed",
+        ),
+        (
+            StepOutcome::Committed(assistant("", StopReason::EndTurn, vec![])),
+            "empty",
+        ),
+        (
+            StepOutcome::Committed(assistant(&"long".repeat(5000), StopReason::EndTurn, vec![])),
+            "non_shrinking",
+        ),
     ] {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
-        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text: "original".repeat(1000) }], source: None })).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text {
+                text: "original".repeat(1000),
+            }],
+            source: None,
+        }))
+        .unwrap();
         let session = log.session().clone();
         let original = replay(&store, &session).unwrap().context;
         let provider = Scripted::new(vec![outcome]);
-        assert!(!rness_engine::turn::compaction::reduce_region(&store, &mut log, &provider, "", &[],
-            &compact_policy(100000), false, Some(0..1), &CancellationToken::new()).await.unwrap());
+        assert!(!rness_engine::turn::compaction::reduce_region(
+            &store,
+            &mut log,
+            &provider,
+            "",
+            &[],
+            &compact_policy(100000),
+            false,
+            Some(0..1),
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap());
         drop(log);
         let mut log = store.open(&session).unwrap();
         let size = log.read_all().unwrap().len();
@@ -72,24 +138,45 @@ async fn compaction_uses_configured_prompts() {
     struct CapturesPrompts;
     #[async_trait]
     impl Provider for CapturesPrompts {
-        fn model(&self) -> &str { "test" }
+        fn model(&self) -> &str {
+            "test"
+        }
         async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
             assert_eq!(request.system, "Configured system prompt");
-            assert!(matches!(&request.context.turns.last().unwrap(), rness_engine::session::projection::ModelTurn::User { content }
-                if matches!(&content[0], ContentPart::Text { text } if text == "Configured user prompt")));
+            assert!(
+                matches!(&request.context.turns.last().unwrap(), rness_engine::session::projection::ModelTurn::User { content }
+                if matches!(&content[0], ContentPart::Text { text } if text == "Configured user prompt"))
+            );
             StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))
         }
     }
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "original ".repeat(1000) }], source: None })).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Followup,
+        content: vec![ContentPart::Text {
+            text: "original ".repeat(1000),
+        }],
+        source: None,
+    }))
+    .unwrap();
     let mut policy = compact_policy(100000);
     policy.system_prompt = "Configured system prompt".into();
     policy.prompt = "Configured user prompt".into();
-    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &CapturesPrompts,
-        "", &[], &policy, false, Some(0..1), &CancellationToken::new()).await.unwrap());
+    assert!(rness_engine::turn::compaction::reduce_region(
+        &store,
+        &mut log,
+        &CapturesPrompts,
+        "",
+        &[],
+        &policy,
+        false,
+        Some(0..1),
+        &CancellationToken::new()
+    )
+    .await
+    .unwrap());
 }
 
 #[tokio::test]
@@ -97,8 +184,12 @@ async fn compaction_omits_unsupported_output_limit() {
     struct RejectsOutputLimit;
     #[async_trait]
     impl Provider for RejectsOutputLimit {
-        fn model(&self) -> &str { "subscription" }
-        fn supports_max_output_tokens(&self) -> bool { false }
+        fn model(&self) -> &str {
+            "subscription"
+        }
+        fn supports_max_output_tokens(&self) -> bool {
+            false
+        }
         async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
             assert_eq!(request.context.config.max_output_tokens, None);
             StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))
@@ -107,10 +198,27 @@ async fn compaction_omits_unsupported_output_limit() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "original ".repeat(1000) }], source: None })).unwrap();
-    assert!(rness_engine::turn::compaction::reduce_region(&store, &mut log, &RejectsOutputLimit,
-        "", &[], &compact_policy(100000), false, Some(0..1), &CancellationToken::new()).await.unwrap());
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Followup,
+        content: vec![ContentPart::Text {
+            text: "original ".repeat(1000),
+        }],
+        source: None,
+    }))
+    .unwrap();
+    assert!(rness_engine::turn::compaction::reduce_region(
+        &store,
+        &mut log,
+        &RejectsOutputLimit,
+        "",
+        &[],
+        &compact_policy(100000),
+        false,
+        Some(0..1),
+        &CancellationToken::new()
+    )
+    .await
+    .unwrap());
 }
 
 #[test]
@@ -119,10 +227,21 @@ fn interrupted_compaction_recovery_is_idempotent_and_preserves_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
-        let start = log.append(&SessionEvent::CompactionStarted { model: "test".into(),
-            sources: vec![], estimated_input: 10, request: serde_json::json!({"system":"summary", "turns":[]}) }).unwrap();
+        let start = log
+            .append(&SessionEvent::CompactionStarted {
+                model: "test".into(),
+                sources: vec![],
+                estimated_input: 10,
+                request: serde_json::json!({"system":"summary", "turns":[]}),
+            })
+            .unwrap();
         if committed {
-            log.append(&SessionEvent::Compaction(Compaction { replaces: vec![], summary: "retained".into(), model: "test".into() })).unwrap();
+            log.append(&SessionEvent::Compaction(Compaction {
+                replaces: vec![],
+                summary: "retained".into(),
+                model: "test".into(),
+            }))
+            .unwrap();
         }
         let session = log.session().clone();
         drop(log);
@@ -134,11 +253,33 @@ fn interrupted_compaction_recovery_is_idempotent_and_preserves_checkpoint() {
         rness_engine::turn::compaction::recover(&mut log).unwrap();
         assert_eq!(log.read_all().unwrap().len(), recovered_len);
         let history = log.read_all().unwrap();
-        let finishes: Vec<_> = history.iter().filter_map(|e| match &e.event {
-            SessionEvent::CompactionFinished { started, outcome, .. } => Some((started, outcome.as_str())), _ => None,
-        }).collect();
-        assert_eq!(finishes, vec![(&start.id, if committed { "committed_before_interruption" } else { "interrupted" })]);
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::Compaction(_))).count(), usize::from(committed));
+        let finishes: Vec<_> = history
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::CompactionFinished {
+                    started, outcome, ..
+                } => Some((started, outcome.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finishes,
+            vec![(
+                &start.id,
+                if committed {
+                    "committed_before_interruption"
+                } else {
+                    "interrupted"
+                }
+            )]
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::Compaction(_)))
+                .count(),
+            usize::from(committed)
+        );
     }
 }
 
@@ -146,12 +287,18 @@ fn interrupted_compaction_recovery_is_idempotent_and_preserves_checkpoint() {
 fn route_meter_changes_estimate_without_changing_context() {
     let context = rness_engine::session::projection::ModelContext {
         turns: vec![rness_engine::session::projection::ModelTurn::User {
-            content: vec![ContentPart::Text { text: "test".repeat(200) }],
-        }], ..Default::default()
+            content: vec![ContentPart::Text {
+                text: "test".repeat(200),
+            }],
+        }],
+        ..Default::default()
     };
     let original = context.clone();
     let default = rness_engine::turn::compaction::Meter::default();
-    let dense = rness_engine::turn::compaction::Meter { bytes_per_token: 2, ..default.clone() };
+    let dense = rness_engine::turn::compaction::Meter {
+        bytes_per_token: 2,
+        ..default.clone()
+    };
     assert!(dense.measure(&context, "system", &[]) > default.measure(&context, "system", &[]));
     assert_eq!(context, original);
     let mut invalid = compact_policy(1000);
@@ -166,53 +313,115 @@ fn compact_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
     rness_engine::turn::compaction::Policy {
         meter: Default::default(),
         summary_profile: None,
-        threshold_tokens: threshold, retain_tokens: 40, summary_tokens: 100,
+        threshold_tokens: threshold,
+        retain_tokens: 40,
+        summary_tokens: 100,
         system_prompt: "Summarize without tools.".into(),
         prompt: "Create a continuation briefing.".into(),
-        max_overflow_retries: 1, max_compactions: 2,
-        prune_threshold: 8192, prune_head: 4096, prune_tail: 1024,
+        max_overflow_retries: 1,
+        max_compactions: 2,
+        prune_threshold: 8192,
+        prune_head: 4096,
+        prune_tail: 1024,
     }
 }
 
 #[tokio::test]
 async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
-    for (overflow, policy_key) in [(false, "test/fake-1"), (true, "test/fake-1"), (false, "default"), (true, "default")] {
+    for (overflow, policy_key) in [
+        (false, "test/fake-1"),
+        (true, "test/fake-1"),
+        (false, "default"),
+        (true, "default"),
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
         log.append(&SessionEvent::RequestConfig(CallConfig {
-            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            selection: Some(ModelSelection {
+                route: "test".into(),
+                model: "fake-1".into(),
+            }),
             ..Default::default()
-        })).unwrap();
+        }))
+        .unwrap();
         for text in ["old ".repeat(3000), "recent".into()] {
-            log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-                content: vec![ContentPart::Text { text }], source: None })).unwrap();
+            log.append(&SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text { text }],
+                source: None,
+            }))
+            .unwrap();
         }
         let mut steps = vec![];
-        if overflow { steps.push(StepOutcome::Failed { error: ProviderError {
-            code: "CONTEXT_OVERFLOW", retryable: false, retry_after: None, message: "too long".into(),
-        }, partial: vec![] }); }
-        steps.push(StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![])));
-        steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+        if overflow {
+            steps.push(StepOutcome::Failed {
+                error: ProviderError {
+                    code: "CONTEXT_OVERFLOW",
+                    retryable: false,
+                    retry_after: None,
+                    message: "too long".into(),
+                },
+                partial: vec![],
+            });
+        }
+        steps.push(StepOutcome::Committed(assistant(
+            "brief",
+            StopReason::EndTurn,
+            vec![],
+        )));
+        steps.push(StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        )));
         let provider = Scripted::new(steps);
-        let config = TurnConfig { compaction: [(policy_key.into(), compact_policy(if overflow { 100000 } else { 1000 }))].into(), ..Default::default() };
+        let config = TurnConfig {
+            compaction: [(
+                policy_key.into(),
+                compact_policy(if overflow { 100000 } else { 1000 }),
+            )]
+            .into(),
+            ..Default::default()
+        };
         // Keep only the latest message in this fixture.
         let mut config = config;
         config.compaction.get_mut(policy_key).unwrap().retain_tokens = 1;
         let frames = Mutex::new(Vec::new());
-        let outcome = run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
-            &CancellationToken::new(), &mut Vec::new, 1, &|frame| frames.lock().unwrap().push(frame)).await.unwrap();
+        let outcome = run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &ToolRegistry::default(),
+            &config,
+            &CancellationToken::new(),
+            &mut Vec::new,
+            1,
+            &|frame| frames.lock().unwrap().push(frame),
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome, TurnOutcome::Completed);
         let frames = frames.into_inner().unwrap();
         use rness_protocol::frames::Frame;
-        let estimates: Vec<_> = frames.iter().filter_map(|f| match f {
-            Frame::ContextUsage { session, estimated_tokens, threshold_tokens } => {
-                assert_eq!(session, log.session());
-                assert_eq!(*threshold_tokens, Some(config.compaction[policy_key].threshold_tokens));
-                Some(*estimated_tokens)
-            }
-            _ => None,
-        }).collect();
+        let estimates: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ContextUsage {
+                    session,
+                    estimated_tokens,
+                    threshold_tokens,
+                } => {
+                    assert_eq!(session, log.session());
+                    assert_eq!(
+                        *threshold_tokens,
+                        Some(config.compaction[policy_key].threshold_tokens)
+                    );
+                    Some(*estimated_tokens)
+                }
+                _ => None,
+            })
+            .collect();
         assert!(estimates.first().unwrap() > estimates.last().unwrap());
         for (index, frame) in frames.iter().enumerate() {
             if matches!(frame, Frame::StepStarted { .. }) {
@@ -220,13 +429,27 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
             }
         }
         if !overflow {
-            let start = frames.iter().position(|f| matches!(f, Frame::CompactionStarted { .. })).unwrap();
-            assert!(matches!(frames[start - 1], Frame::ContextUsage { estimated_tokens, threshold_tokens: Some(threshold), .. } if estimated_tokens >= threshold));
+            let start = frames
+                .iter()
+                .position(|f| matches!(f, Frame::CompactionStarted { .. }))
+                .unwrap();
+            assert!(
+                matches!(frames[start - 1], Frame::ContextUsage { estimated_tokens, threshold_tokens: Some(threshold), .. } if estimated_tokens >= threshold)
+            );
             assert!(estimates.last().unwrap() < &config.compaction[policy_key].threshold_tokens);
         }
         let history = store.history(log.session()).unwrap();
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::Compaction(_))).count(), 1);
-        let started = history.iter().find(|e| matches!(e.event, SessionEvent::CompactionStarted { .. })).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::Compaction(_)))
+                .count(),
+            1
+        );
+        let started = history
+            .iter()
+            .find(|e| matches!(e.event, SessionEvent::CompactionStarted { .. }))
+            .unwrap();
         assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::CompactionFinished { started: id, outcome, usage, chunks }
             if id == &started.id && outcome == "committed" && usage.input_tokens == 1 && !chunks.is_empty())));
         let context = replay(&store, log.session()).unwrap().context;
@@ -241,53 +464,103 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
 
 #[tokio::test]
 async fn context_usage_matches_request_meter_not_reported_usage() {
-    use rness_protocol::frames::Frame;
     use rness_engine::turn::compaction::Meter;
+    use rness_protocol::frames::Frame;
     for policy_key in [None, Some("default"), Some("test/fake-1")] {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
         log.append(&SessionEvent::RequestConfig(CallConfig {
-            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            selection: Some(ModelSelection {
+                route: "test".into(),
+                model: "fake-1".into(),
+            }),
             max_output_tokens: Some(200),
             ..Default::default()
-        })).unwrap();
+        }))
+        .unwrap();
         let mut previous = assistant("previous", StopReason::EndTurn, vec![]);
         previous.usage.input_tokens = 179300;
-        log.append(&SessionEvent::AssistantMessage(previous)).unwrap();
+        log.append(&SessionEvent::AssistantMessage(previous))
+            .unwrap();
         log.append(&SessionEvent::UserMessage(UserMessage {
             intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text: "small context".into() }], source: None,
-        })).unwrap();
-        let mut config = TurnConfig { system: "system overhead".into(), ..Default::default() };
+            content: vec![ContentPart::Text {
+                text: "small context".into(),
+            }],
+            source: None,
+        }))
+        .unwrap();
+        let mut config = TurnConfig {
+            system: "system overhead".into(),
+            ..Default::default()
+        };
         let mut meter = Meter::default();
         if let Some(key) = policy_key {
             let mut policy = compact_policy(165000);
-            policy.meter = Meter { bytes_per_token: 2, output_reserve: 300, ..Default::default() };
+            policy.meter = Meter {
+                bytes_per_token: 2,
+                output_reserve: 300,
+                ..Default::default()
+            };
             meter = policy.meter.clone();
             config.compaction.insert(key.into(), policy);
             if key != "default" {
-                config.compaction.insert("default".into(), compact_policy(100000));
+                config
+                    .compaction
+                    .insert("default".into(), compact_policy(100000));
             }
         }
         let context = replay(&store, log.session()).unwrap().context;
         let expected = meter.pressure(&context, &config.system, &[]);
-        assert_eq!(expected, meter.measure(&context, &config.system, &[]) + meter.output_reserve.max(200));
-        let provider = Scripted::new(vec![StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
+        assert_eq!(
+            expected,
+            meter.measure(&context, &config.system, &[]) + meter.output_reserve.max(200)
+        );
+        let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        ))]);
         let observed = Mutex::new(Vec::new());
-        run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
-            &CancellationToken::new(), &mut Vec::new, 1, &|f| observed.lock().unwrap().push(f)).await.unwrap();
+        run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &ToolRegistry::default(),
+            &config,
+            &CancellationToken::new(),
+            &mut Vec::new,
+            1,
+            &|f| observed.lock().unwrap().push(f),
+        )
+        .await
+        .unwrap();
         let frames = observed.into_inner().unwrap();
-        let usage = frames.iter().filter_map(|f| match f {
-            Frame::ContextUsage { estimated_tokens, threshold_tokens, .. } => Some((*estimated_tokens, *threshold_tokens)),
-            _ => None,
-        }).collect::<Vec<_>>();
+        let usage = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::ContextUsage {
+                    estimated_tokens,
+                    threshold_tokens,
+                    ..
+                } => Some((*estimated_tokens, *threshold_tokens)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert!(!usage.is_empty());
-        assert!(usage.iter().all(|v| *v == (expected, policy_key.map(|_| 165000))));
+        assert!(usage
+            .iter()
+            .all(|v| *v == (expected, policy_key.map(|_| 165000))));
         assert_ne!(expected, 179300);
-        assert!(!frames.iter().any(|f| matches!(f, Frame::CompactionStarted { .. })));
+        assert!(!frames
+            .iter()
+            .any(|f| matches!(f, Frame::CompactionStarted { .. })));
         // The new metadata remains ephemeral and has a stable wire shape.
-        let frame = frames.iter().find(|f| matches!(f, Frame::ContextUsage { .. })).unwrap();
+        let frame = frames
+            .iter()
+            .find(|f| matches!(f, Frame::ContextUsage { .. }))
+            .unwrap();
         let wire = serde_json::to_value(frame).unwrap();
         assert_eq!(wire["type"], "context_usage");
         assert_eq!(serde_json::from_value::<Frame>(wire).unwrap(), *frame);
@@ -307,43 +580,93 @@ async fn calibration_scales_pressure_and_commit_records_estimate() {
         let store = SessionStore::new(dir.path());
         let mut log = store.create(None).unwrap();
         log.append(&SessionEvent::RequestConfig(CallConfig {
-            selection: Some(ModelSelection { route: "test".into(), model: "fake-1".into() }),
+            selection: Some(ModelSelection {
+                route: "test".into(),
+                model: "fake-1".into(),
+            }),
             ..Default::default()
-        })).unwrap();
+        }))
+        .unwrap();
         let mut previous = assistant(&"old ".repeat(3000), StopReason::EndTurn, vec![]);
         previous.usage.input_tokens = 150;
         previous.usage.cache_read_tokens = 50;
         previous.estimated_input = if seeded { 100 } else { 0 }; // real/est = 2.0
-        log.append(&SessionEvent::AssistantMessage(previous)).unwrap();
-        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text: "recent ".repeat(50) }], source: None })).unwrap();
+        log.append(&SessionEvent::AssistantMessage(previous))
+            .unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text {
+                text: "recent ".repeat(50),
+            }],
+            source: None,
+        }))
+        .unwrap();
         let replayed = replay(&store, log.session()).unwrap();
         let ratio = calibration(&replayed.history);
         assert_eq!(ratio, seeded.then_some(2.0));
         let raw = Meter::default().pressure(&replayed.context, "", &[]);
         let threshold = raw + raw / 2; // raw < threshold < 2*raw
-        let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(threshold))].into(), ..Default::default() };
+        let config = TurnConfig {
+            compaction: [("test/fake-1".into(), compact_policy(threshold))].into(),
+            ..Default::default()
+        };
         let mut steps = vec![];
-        if expect_compaction { steps.push(StepOutcome::Committed(assistant("brief", StopReason::EndTurn, vec![]))); }
-        steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+        if expect_compaction {
+            steps.push(StepOutcome::Committed(assistant(
+                "brief",
+                StopReason::EndTurn,
+                vec![],
+            )));
+        }
+        steps.push(StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        )));
         let provider = Scripted::new(steps);
         let frames = Mutex::new(Vec::new());
-        run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
-            &CancellationToken::new(), &mut Vec::new, 1, &|f| frames.lock().unwrap().push(f)).await.unwrap();
+        run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &ToolRegistry::default(),
+            &config,
+            &CancellationToken::new(),
+            &mut Vec::new,
+            1,
+            &|f| frames.lock().unwrap().push(f),
+        )
+        .await
+        .unwrap();
         let frames = frames.into_inner().unwrap();
-        let compacted = frames.iter().any(|f| matches!(f, Frame::CompactionStarted { .. }));
+        let compacted = frames
+            .iter()
+            .any(|f| matches!(f, Frame::CompactionStarted { .. }));
         assert_eq!(compacted, expect_compaction, "seeded={seeded}");
         if seeded {
             // Published estimates are calibrated: the first Measuring frame
             // reports roughly twice the raw estimate.
-            let first = frames.iter().find_map(|f| match f {
-                Frame::ContextUsage { estimated_tokens, .. } => Some(*estimated_tokens), _ => None }).unwrap();
+            let first = frames
+                .iter()
+                .find_map(|f| match f {
+                    Frame::ContextUsage {
+                        estimated_tokens, ..
+                    } => Some(*estimated_tokens),
+                    _ => None,
+                })
+                .unwrap();
             assert!(first > raw, "calibrated {first} should exceed raw {raw}");
         }
         // The committed step recorded its own estimate for future calibration.
         let history = store.history(log.session()).unwrap();
-        let last = history.iter().rev().find_map(|e| match &e.event {
-            SessionEvent::AssistantMessage(m) => Some(m), _ => None }).unwrap();
+        let last = history
+            .iter()
+            .rev()
+            .find_map(|e| match &e.event {
+                SessionEvent::AssistantMessage(m) => Some(m),
+                _ => None,
+            })
+            .unwrap();
         assert!(last.estimated_input > 0);
         // Post-compaction the ratio derives from the newest step's own
         // estimate — bounded, not the stale pre-compaction provider count.
@@ -365,20 +688,29 @@ async fn calibration_clamps_degenerate_ratios_and_skips_missing_data() {
     over.usage.input_tokens = 10;
     over.estimated_input = 1000;
     log.append(&SessionEvent::AssistantMessage(over)).unwrap();
-    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(0.25));
+    assert_eq!(
+        calibration(&store.history(log.session()).unwrap()),
+        Some(0.25)
+    );
     // Degenerate provider report (zero real tokens) is skipped, keeping
     // the previous usable ratio.
     let mut zero = assistant("m", StopReason::EndTurn, vec![]);
     zero.usage = Usage::default();
     zero.estimated_input = 500;
     log.append(&SessionEvent::AssistantMessage(zero)).unwrap();
-    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(0.25));
+    assert_eq!(
+        calibration(&store.history(log.session()).unwrap()),
+        Some(0.25)
+    );
     // Wildly under-estimating meter clamps at 4.0.
     let mut under = assistant("m", StopReason::EndTurn, vec![]);
     under.usage.input_tokens = 100_000;
     under.estimated_input = 100;
     log.append(&SessionEvent::AssistantMessage(under)).unwrap();
-    assert_eq!(calibration(&store.history(log.session()).unwrap()), Some(4.0));
+    assert_eq!(
+        calibration(&store.history(log.session()).unwrap()),
+        Some(4.0)
+    );
 }
 
 #[tokio::test]
@@ -386,17 +718,48 @@ async fn overflowing_indivisible_request_does_not_retry() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    log.append(&SessionEvent::RequestConfig(CallConfig { selection: Some(ModelSelection {
-        route: "test".into(), model: "fake-1".into(),
-    }), ..Default::default() })).unwrap();
-    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "huge".repeat(10000) }], source: None })).unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Failed { error: ProviderError {
-        code: "CONTEXT_OVERFLOW", retryable: false, retry_after: None, message: "too long".into(),
-    }, partial: vec![] }]);
-    let config = TurnConfig { compaction: [("test/fake-1".into(), compact_policy(1000))].into(), ..Default::default() };
-    assert!(run_turn(&store, &mut log, &provider, &ToolRegistry::default(), &config,
-        &CancellationToken::new(), &mut Vec::new, 1, &|_| {}).await.is_err());
+    log.append(&SessionEvent::RequestConfig(CallConfig {
+        selection: Some(ModelSelection {
+            route: "test".into(),
+            model: "fake-1".into(),
+        }),
+        ..Default::default()
+    }))
+    .unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Followup,
+        content: vec![ContentPart::Text {
+            text: "huge".repeat(10000),
+        }],
+        source: None,
+    }))
+    .unwrap();
+    let provider = Scripted::new(vec![StepOutcome::Failed {
+        error: ProviderError {
+            code: "CONTEXT_OVERFLOW",
+            retryable: false,
+            retry_after: None,
+            message: "too long".into(),
+        },
+        partial: vec![],
+    }]);
+    let config = TurnConfig {
+        compaction: [("test/fake-1".into(), compact_policy(1000))].into(),
+        ..Default::default()
+    };
+    assert!(run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &ToolRegistry::default(),
+        &config,
+        &CancellationToken::new(),
+        &mut Vec::new,
+        1,
+        &|_| {}
+    )
+    .await
+    .is_err());
     assert_eq!(provider.seen_contexts.lock().unwrap().len(), 1);
 }
 
@@ -406,38 +769,99 @@ async fn boundary_pruning_remeasures_without_summarizing_or_splitting_tools() {
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
     log.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
-    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "work".into() }], source: None })).unwrap();
-    log.append(&SessionEvent::AssistantMessage(assistant("", StopReason::ToolUse, vec![("c", "Echo")]))).unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Followup,
+        content: vec![ContentPart::Text {
+            text: "work".into(),
+        }],
+        source: None,
+    }))
+    .unwrap();
+    log.append(&SessionEvent::AssistantMessage(assistant(
+        "",
+        StopReason::ToolUse,
+        vec![("c", "Echo")],
+    )))
+    .unwrap();
     let output = "x".repeat(16000);
-    log.append(&SessionEvent::ToolResult(ToolResult { call: "c".into(), name: "Echo".into(),
-        output: output.clone(), content: vec![ToolResultContentPart::Text { text: output }],
-        is_error: false, duration_ms: 0, tasks: None, plan_review: None, presentation: None,
-    })).unwrap();
-    log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Steer,
-        content: vec![ContentPart::Text { text: "continue".into() }], source: None })).unwrap();
+    log.append(&SessionEvent::ToolResult(ToolResult {
+        call: "c".into(),
+        name: "Echo".into(),
+        output: output.clone(),
+        content: vec![ToolResultContentPart::Text { text: output }],
+        is_error: false,
+        duration_ms: 0,
+        tasks: None,
+        plan_review: None,
+        presentation: None,
+    }))
+    .unwrap();
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Steer,
+        content: vec![ContentPart::Text {
+            text: "continue".into(),
+        }],
+        source: None,
+    }))
+    .unwrap();
     let provider = Scripted::new(vec![]); // Pruning alone must avoid any model call.
     let mut policy = compact_policy(165000);
-    assert!(rness_engine::turn::compaction::measure(&replay(&store, log.session()).unwrap().context, "", &[]) < policy.threshold_tokens);
+    assert!(
+        rness_engine::turn::compaction::measure(
+            &replay(&store, log.session()).unwrap().context,
+            "",
+            &[]
+        ) < policy.threshold_tokens
+    );
     policy.retain_tokens = 1;
     let estimates = Mutex::new(Vec::new());
-    assert!(rness_engine::turn::compaction::reduce_with_progress(&store, &mut log, &provider, "", &[], &policy,
-        false, &CancellationToken::new(), &|progress| {
+    assert!(rness_engine::turn::compaction::reduce_with_progress(
+        &store,
+        &mut log,
+        &provider,
+        "",
+        &[],
+        &policy,
+        false,
+        &CancellationToken::new(),
+        &|progress| {
             match progress {
-                rness_engine::turn::compaction::CompactionProgress::Measuring { estimated_tokens, threshold_tokens } => {
+                rness_engine::turn::compaction::CompactionProgress::Measuring {
+                    estimated_tokens,
+                    threshold_tokens,
+                } => {
                     assert_eq!(threshold_tokens, policy.threshold_tokens);
                     estimates.lock().unwrap().push(estimated_tokens);
                 }
                 _ => panic!("pruning alone should suffice"),
             }
-        }).await.unwrap());
+        }
+    )
+    .await
+    .unwrap());
     let replayed = replay(&store, log.session()).unwrap();
-    assert_eq!(*estimates.lock().unwrap(), vec![policy.meter.pressure(&replayed.context, "", &[])]);
+    assert_eq!(
+        *estimates.lock().unwrap(),
+        vec![policy.meter.pressure(&replayed.context, "", &[])]
+    );
     assert!(rness_engine::turn::compaction::measure(&replayed.context, "", &[]) < 2000);
-    assert_eq!(replayed.history.iter().filter(|e| matches!(e.event, SessionEvent::Prune(_))).count(), 1);
-    assert!(!replayed.history.iter().any(|e| matches!(e.event, SessionEvent::Compaction(_))));
+    assert_eq!(
+        replayed
+            .history
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::Prune(_)))
+            .count(),
+        1
+    );
+    assert!(!replayed
+        .history
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::Compaction(_))));
     // No TurnEnded was required: the existing writer reduced a closed step mid-turn.
-    assert!(!replayed.history.iter().any(|e| matches!(e.event, SessionEvent::TurnEnded { .. })));
+    assert!(!replayed
+        .history
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnEnded { .. })));
 }
 
 #[tokio::test]
@@ -445,7 +869,9 @@ async fn cancelled_summary_does_not_write_a_checkpoint() {
     struct Cancels;
     #[async_trait]
     impl Provider for Cancels {
-        fn model(&self) -> &str { "test" }
+        fn model(&self) -> &str {
+            "test"
+        }
         async fn step(&self, _: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
             cancel.cancel();
             StepOutcome::Committed(assistant("short", StopReason::EndTurn, vec![]))
@@ -455,15 +881,34 @@ async fn cancelled_summary_does_not_write_a_checkpoint() {
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
     for text in ["old".repeat(3000), "keep".into()] {
-        log.append(&SessionEvent::UserMessage(UserMessage { intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text }], source: None })).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text }],
+            source: None,
+        }))
+        .unwrap();
     }
     let mut policy = compact_policy(1000);
     policy.retain_tokens = 1;
     let cancel = CancellationToken::new();
-    assert!(!rness_engine::turn::compaction::reduce(&store, &mut log, &Cancels, "", &[], &policy, false, &cancel).await.unwrap());
+    assert!(!rness_engine::turn::compaction::reduce(
+        &store,
+        &mut log,
+        &Cancels,
+        "",
+        &[],
+        &policy,
+        false,
+        &cancel
+    )
+    .await
+    .unwrap());
     assert!(cancel.is_cancelled());
-    assert!(!store.history(log.session()).unwrap().iter().any(|e| matches!(e.event, SessionEvent::Compaction(_))));
+    assert!(!store
+        .history(log.session())
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::Compaction(_))));
 }
 
 // -- scripted provider -----------------------------------------------------
@@ -524,9 +969,16 @@ fn assistant(text: &str, stop: StopReason, tool_calls: Vec<(&str, &str)>) -> Ass
         model: "fake-1".into(),
         content,
         stop,
-        usage: Usage { input_tokens: 1, output_tokens: 1, ..Default::default() },
+        usage: Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+            ..Default::default()
+        },
         estimated_input: 0,
-        chunks: vec![TimedChunk { ms: 1, delta: ChunkDelta::Text { t: text.into() } }],
+        chunks: vec![TimedChunk {
+            ms: 1,
+            delta: ChunkDelta::Text { t: text.into() },
+        }],
     }
 }
 
@@ -556,13 +1008,28 @@ async fn max_tokens_stop_with_tool_use_dispatches_and_continues() {
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(assistant("truncated", StopReason::MaxTokens, vec![("cut-off", "Echo")])),
+        StepOutcome::Committed(assistant(
+            "truncated",
+            StopReason::MaxTokens,
+            vec![("cut-off", "Echo")],
+        )),
         StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
     ]);
     let tools = ToolRegistry::default();
     tools.register(Arc::new(Echo));
-    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
-        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    let outcome = run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &tools,
+        &TurnConfig::default(),
+        &CancellationToken::new(),
+        &mut no_steers(),
+        1,
+        &|_| {},
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, TurnOutcome::Completed);
     let history = store.history(log.session()).unwrap();
     assert!(history.iter().any(|event| matches!(&event.event,
@@ -572,8 +1039,12 @@ async fn max_tokens_stop_with_tool_use_dispatches_and_continues() {
     // The tool_use turn must be immediately followed by its tool_result
     // turn — no terminal-stop short-circuit in between.
     assert!(rendered.as_array().unwrap().windows(2).any(|pair| {
-        pair[0]["Assistant"]["content"].as_array().is_some_and(|c| c.iter().any(|p| p["call"] == "cut-off" && p["kind"] == "tool_use"))
-            && pair[1]["ToolResults"]["results"].as_array().is_some_and(|r| r.iter().any(|res| res["call"] == "cut-off"))
+        pair[0]["Assistant"]["content"].as_array().is_some_and(|c| {
+            c.iter()
+                .any(|p| p["call"] == "cut-off" && p["kind"] == "tool_use")
+        }) && pair[1]["ToolResults"]["results"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|res| res["call"] == "cut-off"))
     }));
 }
 
@@ -582,10 +1053,25 @@ async fn max_tokens_stop_without_tool_use_completes_the_turn() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("truncated text", StopReason::MaxTokens, vec![]))]);
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+        "truncated text",
+        StopReason::MaxTokens,
+        vec![],
+    ))]);
     let tools = ToolRegistry::default();
-    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
-        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    let outcome = run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &tools,
+        &TurnConfig::default(),
+        &CancellationToken::new(),
+        &mut no_steers(),
+        1,
+        &|_| {},
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, TurnOutcome::Completed);
 }
 
@@ -595,14 +1081,20 @@ struct RestrictedRequest(AtomicUsize);
 
 #[async_trait]
 impl Provider for RestrictedRequest {
-    fn model(&self) -> &str { "restricted-test" }
+    fn model(&self) -> &str {
+        "restricted-test"
+    }
     async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
         assert!(request.system.ends_with("Only review"));
         assert!(request.tools.is_empty());
         if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
             return StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]));
         }
-        StepOutcome::Committed(assistant("try forbidden", StopReason::ToolUse, vec![("denied", "Echo")]))
+        StepOutcome::Committed(assistant(
+            "try forbidden",
+            StopReason::ToolUse,
+            vec![("denied", "Echo")],
+        ))
     }
 }
 
@@ -615,21 +1107,40 @@ async fn agent_instructions_and_ceiling_apply_to_schema_and_dispatch() {
         log.append(&SessionEvent::RequestConfig(CallConfig {
             tool_ceiling: ceiling.then(Vec::new),
             agent: Some(AgentSnapshot {
-                name: "reviewer".into(), instructions: "Only review".into(),
+                name: "reviewer".into(),
+                instructions: "Only review".into(),
                 tools: if ceiling { None } else { Some(vec![]) },
             }),
             ..Default::default()
-        })).unwrap();
+        }))
+        .unwrap();
         log.append(&SessionEvent::UserMessage(UserMessage {
-            intent: UserIntent::Followup, content: vec![ContentPart::Text { text: "review".into() }], source: None,
-        })).unwrap();
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text {
+                text: "review".into(),
+            }],
+            source: None,
+        }))
+        .unwrap();
         let tools = ToolRegistry::default();
         tools.register(Arc::new(Echo));
-        run_turn(&store, &mut log, &RestrictedRequest(AtomicUsize::new(0)), &tools,
+        run_turn(
+            &store,
+            &mut log,
+            &RestrictedRequest(AtomicUsize::new(0)),
+            &tools,
             &TurnConfig::default(),
-            &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+            &CancellationToken::new(),
+            &mut no_steers(),
+            1,
+            &|_| {},
+        )
+        .await
+        .unwrap();
         let history = store.history(log.session()).unwrap();
-        assert!(history.iter().any(|event| matches!(&event.event, SessionEvent::ToolResult(result) if result.is_error)));
+        assert!(history.iter().any(
+            |event| matches!(&event.event, SessionEvent::ToolResult(result) if result.is_error)
+        ));
     }
 }
 
@@ -642,26 +1153,74 @@ async fn tasks_commit_in_model_order_and_survive_compaction_and_resume() {
     let tasks = |content: &str| serde_json::json!({"tasks":[{"id":"one","content":content,"status":"in_progress"}]});
     let mut message = assistant("tracking", StopReason::ToolUse, vec![]);
     for (call, content) in [("a", "first"), ("b", "second")] {
-        message.content.push(ContentPart::ToolUse { call: call.into(), name: "TaskWrite".into(), args: tasks(content) });
+        message.content.push(ContentPart::ToolUse {
+            call: call.into(),
+            name: "TaskWrite".into(),
+            args: tasks(content),
+        });
     }
-    let provider = Scripted::new(vec![StepOutcome::Committed(message), StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))]);
+    let provider = Scripted::new(vec![
+        StepOutcome::Committed(message),
+        StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
+    ]);
     let tools = ToolRegistry::default();
     tools.register(Arc::new(rness_engine::tasks::TaskWrite(Default::default())));
-    run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(), &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &tools,
+        &TurnConfig::default(),
+        &CancellationToken::new(),
+        &mut no_steers(),
+        1,
+        &|_| {},
+    )
+    .await
+    .unwrap();
     let history = store.history(&sid).unwrap();
-    let results: Vec<_> = history.iter().filter_map(|env| match &env.event { SessionEvent::ToolResult(result) => Some(result), _ => None }).collect();
+    let results: Vec<_> = history
+        .iter()
+        .filter_map(|env| match &env.event {
+            SessionEvent::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect();
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].tasks.as_ref().unwrap().tasks[0].content, "first");
-    assert_eq!(TaskSnapshot::from_history(&history).tasks[0].content, "second");
-    log.append(&SessionEvent::Compaction(Compaction { replaces: history.iter().skip(1).map(|env| env.id.clone()).collect(), summary: "compacted".into(), model: "test".into() })).unwrap();
-    let fork_at = history.iter().find(|env| matches!(&env.event, SessionEvent::ToolResult(result) if result.call == "a")).unwrap().id.clone();
+    assert_eq!(
+        TaskSnapshot::from_history(&history).tasks[0].content,
+        "second"
+    );
+    log.append(&SessionEvent::Compaction(Compaction {
+        replaces: history.iter().skip(1).map(|env| env.id.clone()).collect(),
+        summary: "compacted".into(),
+        model: "test".into(),
+    }))
+    .unwrap();
+    let fork_at = history
+        .iter()
+        .find(|env| matches!(&env.event, SessionEvent::ToolResult(result) if result.call == "a"))
+        .unwrap()
+        .id
+        .clone();
     drop(log);
     let reopened = SessionStore::new(dir.path());
     let child = reopened.fork(&sid, Some(fork_at)).unwrap();
-    assert_eq!(TaskSnapshot::from_history(&reopened.history(child.session()).unwrap()).tasks[0].content, "first");
-    assert_eq!(TaskSnapshot::from_history(&replay(&reopened, &sid).unwrap().history).tasks[0].content, "second");
+    assert_eq!(
+        TaskSnapshot::from_history(&reopened.history(child.session()).unwrap()).tasks[0].content,
+        "first"
+    );
+    assert_eq!(
+        TaskSnapshot::from_history(&replay(&reopened, &sid).unwrap().history).tasks[0].content,
+        "second"
+    );
     let other = reopened.create(None).unwrap();
-    assert!(TaskSnapshot::from_history(&reopened.history(other.session()).unwrap()).tasks.is_empty());
+    assert!(
+        TaskSnapshot::from_history(&reopened.history(other.session()).unwrap())
+            .tasks
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -670,7 +1229,11 @@ async fn final_tool_result_notifies_after_persistence_without_another_model_step
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    let provider = Scripted::new(vec![StepOutcome::Committed(assistant("calling", StopReason::ToolUse, vec![("last", "Echo")]))]);
+    let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+        "calling",
+        StopReason::ToolUse,
+        vec![("last", "Echo")],
+    ))]);
     let tools = ToolRegistry::default();
     tools.register(Arc::new(Echo));
     let observed = Mutex::new(false);
@@ -683,11 +1246,24 @@ async fn final_tool_result_notifies_after_persistence_without_another_model_step
             cancel.cancel();
         }
     };
-    let outcome = run_turn(&store, &mut log, &provider, &tools,
+    let outcome = run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &tools,
         &TurnConfig::default(),
-        &cancel, &mut no_steers(), 1, &frames).await.unwrap();
+        &cancel,
+        &mut no_steers(),
+        1,
+        &frames,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, TurnOutcome::Cancelled);
-    assert!(*observed.lock().unwrap(), "final tool result did not trigger history/card refresh");
+    assert!(
+        *observed.lock().unwrap(),
+        "final tool result did not trigger history/card refresh"
+    );
 }
 
 #[tokio::test]
@@ -695,24 +1271,56 @@ async fn tool_roundtrips_continue_beyond_fifty_model_requests() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut log = store.create(None).unwrap();
-    let mut steps: Vec<_> = (0..60).map(|index| {
-        StepOutcome::Committed(assistant("calling", StopReason::ToolUse, vec![(&format!("call-{index}"), "Echo")]))
-    }).collect();
-    steps.push(StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])));
+    let mut steps: Vec<_> = (0..60)
+        .map(|index| {
+            StepOutcome::Committed(assistant(
+                "calling",
+                StopReason::ToolUse,
+                vec![(&format!("call-{index}"), "Echo")],
+            ))
+        })
+        .collect();
+    steps.push(StepOutcome::Committed(assistant(
+        "done",
+        StopReason::EndTurn,
+        vec![],
+    )));
     let provider = Scripted::new(steps);
     let tools = ToolRegistry::default();
     tools.register(Arc::new(Echo));
-    let outcome = run_turn(&store, &mut log, &provider, &tools, &TurnConfig::default(),
-        &CancellationToken::new(), &mut no_steers(), 1, &|_| {}).await.unwrap();
+    let outcome = run_turn(
+        &store,
+        &mut log,
+        &provider,
+        &tools,
+        &TurnConfig::default(),
+        &CancellationToken::new(),
+        &mut no_steers(),
+        1,
+        &|_| {},
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome, TurnOutcome::Completed);
     assert_eq!(provider.seen_contexts.lock().unwrap().len(), 61);
     assert!(provider.steps.lock().unwrap().is_empty());
     let history = store.history(log.session()).unwrap();
-    assert_eq!(history.iter().filter(|event| matches!(event.event, SessionEvent::ToolResult(_))).count(), 60);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.event, SessionEvent::ToolResult(_)))
+            .count(),
+        60
+    );
     assert!(matches!(&history[history.len() - 2].event,
         SessionEvent::AssistantMessage(message) if message.stop == StopReason::EndTurn));
-    assert!(matches!(history.last().unwrap().event,
-        SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }));
+    assert!(matches!(
+        history.last().unwrap().event,
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
+    ));
 }
 
 #[tokio::test]
@@ -723,13 +1331,19 @@ async fn tool_roundtrip_turn_commits_and_replays() {
     let sid = log.session().clone();
     log.append(&SessionEvent::UserMessage(UserMessage {
         intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "run the tool".into() }],
+        content: vec![ContentPart::Text {
+            text: "run the tool".into(),
+        }],
         source: None,
     }))
     .unwrap();
 
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(assistant("calling", StopReason::ToolUse, vec![("c1", "Echo")])),
+        StepOutcome::Committed(assistant(
+            "calling",
+            StopReason::ToolUse,
+            vec![("c1", "Echo")],
+        )),
         StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
     ]);
     let mut tools = ToolRegistry::default();
@@ -779,7 +1393,15 @@ async fn tool_roundtrip_turn_commits_and_replays() {
         .collect();
     assert_eq!(
         kinds,
-        vec!["header", "user", "turn+", "assistant", "tool", "assistant", "turn-"]
+        vec![
+            "header",
+            "user",
+            "turn+",
+            "assistant",
+            "tool",
+            "assistant",
+            "turn-"
+        ]
     );
     // Second request saw: user, assistant, tool_results (3 turns).
     assert_eq!(*provider.seen_contexts.lock().unwrap(), vec![1, 3]);
@@ -794,13 +1416,19 @@ async fn steer_lands_before_next_step() {
     let mut log = store.create(None).unwrap();
     log.append(&SessionEvent::UserMessage(UserMessage {
         intent: UserIntent::Followup,
-        content: vec![ContentPart::Text { text: "start".into() }],
+        content: vec![ContentPart::Text {
+            text: "start".into(),
+        }],
         source: None,
     }))
     .unwrap();
 
     let provider = Scripted::new(vec![
-        StepOutcome::Committed(assistant("step1", StopReason::ToolUse, vec![("c1", "Echo")])),
+        StepOutcome::Committed(assistant(
+            "step1",
+            StopReason::ToolUse,
+            vec![("c1", "Echo")],
+        )),
         StepOutcome::Committed(assistant("step2", StopReason::EndTurn, vec![])),
     ]);
     let mut tools = ToolRegistry::default();
@@ -813,7 +1441,9 @@ async fn steer_lands_before_next_step() {
             vec![Pending {
                 source: None,
                 intent: UserIntent::Steer,
-                content: vec![ContentPart::Text { text: "actually stop".into() }],
+                content: vec![ContentPart::Text {
+                    text: "actually stop".into(),
+                }],
             }]
         } else {
             vec![]
@@ -855,8 +1485,16 @@ async fn retryable_failure_becomes_attempt_then_succeeds() {
 
     let provider = Scripted::new(vec![
         StepOutcome::Failed {
-            error: ProviderError { code: "PROVIDER", retry_after: None, message: "overloaded".into(), retryable: true },
-            partial: vec![TimedChunk { ms: 5, delta: ChunkDelta::Text { t: "par".into() } }],
+            error: ProviderError {
+                code: "PROVIDER",
+                retry_after: None,
+                message: "overloaded".into(),
+                retryable: true,
+            },
+            partial: vec![TimedChunk {
+                ms: 5,
+                delta: ChunkDelta::Text { t: "par".into() },
+            }],
         },
         StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![])),
     ]);
@@ -900,7 +1538,12 @@ async fn non_retryable_failure_fails_turn_but_commits_trace() {
     .unwrap();
 
     let provider = Scripted::new(vec![StepOutcome::Failed {
-        error: ProviderError { code: "PROVIDER", retry_after: None, message: "invalid api key".into(), retryable: false },
+        error: ProviderError {
+            code: "PROVIDER",
+            retry_after: None,
+            message: "invalid api key".into(),
+            retryable: false,
+        },
         partial: vec![],
     }]);
     let mut steers = no_steers();
@@ -916,14 +1559,20 @@ async fn non_retryable_failure_fails_turn_but_commits_trace() {
         &|_| {},
     )
     .await;
-    assert!(matches!(result, Err(TurnError::ModelExhausted { attempts: 1, .. })));
+    assert!(matches!(
+        result,
+        Err(TurnError::ModelExhausted { attempts: 1, .. })
+    ));
     drop(log);
 
     // turn/ended(failed) + the attempt are in the log.
     let history = replay(&store, &sid).unwrap().history;
     assert!(history.iter().any(|e| matches!(
         e.event,
-        SessionEvent::TurnEnded { outcome: TurnOutcome::Failed, .. }
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Failed,
+            ..
+        }
     )));
 }
 
@@ -941,7 +1590,12 @@ async fn cancellation_mid_stream_preserves_partial() {
     .unwrap();
 
     let provider = Scripted::new(vec![StepOutcome::Cancelled {
-        partial: vec![TimedChunk { ms: 9, delta: ChunkDelta::Text { t: "half a tho".into() } }],
+        partial: vec![TimedChunk {
+            ms: 9,
+            delta: ChunkDelta::Text {
+                t: "half a tho".into(),
+            },
+        }],
     }]);
     let mut steers = no_steers();
     let outcome = run_turn(

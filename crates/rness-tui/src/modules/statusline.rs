@@ -28,7 +28,11 @@ impl Component for Statusline {
         let model = ctx.model;
         let theme = ctx.theme;
         let phase = match &model.compaction {
-            Some(compaction) => format!("compacting {} events · ~{}k tok", compaction.events, compaction.estimated_tokens / 1000),
+            Some(compaction) => format!(
+                "compacting {} events · ~{}k tok",
+                compaction.events,
+                compaction.estimated_tokens / 1000
+            ),
             None if model.busy => "streaming".into(),
             None => "idle".into(),
         };
@@ -45,7 +49,10 @@ impl Component for Statusline {
             Span::styled(format!(" {} ", model.model_name), theme.statusline_accent),
             Span::styled(format!("· {phase}{scroll}"), theme.statusline),
             Span::styled(
-                format!("  ({})", &model.session.as_str()[..8.min(model.session.as_str().len())]),
+                format!(
+                    "  ({})",
+                    &model.session.as_str()[..8.min(model.session.as_str().len())]
+                ),
                 theme.statusline,
             ),
         ])

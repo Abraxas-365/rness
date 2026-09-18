@@ -302,7 +302,10 @@ impl ToolRegistry {
             .is_some_and(|entry| Arc::ptr_eq(entry, expected))
         {
             tools.remove(expected.name());
-            self.deferred.write().expect("registry lock").remove(expected.name());
+            self.deferred
+                .write()
+                .expect("registry lock")
+                .remove(expected.name());
             true
         } else {
             false
@@ -392,7 +395,8 @@ impl ToolRegistry {
         max_concurrency: usize,
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
-        self.dispatch_exposed(session, calls, max_concurrency, cancel, None).await
+        self.dispatch_exposed(session, calls, max_concurrency, cancel, None)
+            .await
     }
 
     /// Exposure limits which tools may be called, not the session's permissions
@@ -415,9 +419,20 @@ impl ToolRegistry {
             };
             let mut end = start + 1;
             if safe(&calls[start]) {
-                while end < calls.len() && safe(&calls[end]) { end += 1; }
+                while end < calls.len() && safe(&calls[end]) {
+                    end += 1;
+                }
             }
-            results.extend(self.dispatch_batch(session, &calls[start..end], max_concurrency, cancel, exposed).await);
+            results.extend(
+                self.dispatch_batch(
+                    session,
+                    &calls[start..end],
+                    max_concurrency,
+                    cancel,
+                    exposed,
+                )
+                .await,
+            );
             start = end;
         }
         results
@@ -441,7 +456,8 @@ impl ToolRegistry {
             .collect();
         for call in calls {
             let sem = Arc::clone(&sem);
-            let tool = self.get(&call.name)
+            let tool = self
+                .get(&call.name)
                 .filter(|_| exposed.is_none_or(|names| names.contains(&call.name)));
             let background_error = tool.as_ref()
                 .filter(|tool| tool.starts_background_job(&call.args) && !missing_job_controls.is_empty())
@@ -584,7 +600,9 @@ mod tests {
     struct SleepEcho;
     #[async_trait]
     impl Tool for SleepEcho {
-        fn concurrency_safe(&self, _: &serde_json::Value) -> bool { true }
+        fn concurrency_safe(&self, _: &serde_json::Value) -> bool {
+            true
+        }
         fn name(&self) -> &str {
             "sleep_echo"
         }

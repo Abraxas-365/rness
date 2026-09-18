@@ -35,7 +35,10 @@ pub fn install(
 ) -> Result<(), mlua::Error> {
     let subagents = lua.create_table()?;
     let r = Arc::clone(&runtime);
-    subagents.set("roster", lua.create_function(move |lua, ()| lua.to_value(&r.roster()))?)?;
+    subagents.set(
+        "roster",
+        lua.create_function(move |lua, ()| lua.to_value(&r.roster()))?,
+    )?;
 
     let r = Arc::clone(&runtime);
     subagents.set(
@@ -165,36 +168,44 @@ pub fn install(
     // Retain bounded hints, not histories, for the currently detailed tree.
     // Keeping every member avoids cache thrashing on large descendant lists.
     let hints = std::sync::Mutex::new(std::collections::HashMap::<
-        String, rness_engine::session::hints::AgentHintReader,
+        String,
+        rness_engine::session::hints::AgentHintReader,
     >::new());
-    subagents.set("list", lua.create_function(move |lua, (root, details): (String, Option<bool>)| {
-        let children = r.list_agents(&root).map_err(err)?;
-        let mut cache = if details.unwrap_or(false) {
-            let mut cache = hints.lock().expect("agent hints lock");
-            let ids: std::collections::HashSet<_> = children.iter().map(|child| &child.session).collect();
-            cache.retain(|id, _| ids.contains(id));
-            Some(cache)
-        } else {
-            None
-        };
-        let out = lua.create_table()?;
-        for (i, child) in children.into_iter().enumerate() {
-            let t = lua.create_table()?;
-            t.set("alias", child.alias)?;
-            t.set("session", child.session.clone())?;
-            t.set("parent", child.parent)?;
-            t.set("depth", child.depth)?;
-            t.set("running", child.running)?;
-            if let Some(cache) = cache.as_mut() {
-                let (name, task) = cache.entry(child.session.clone()).or_default()
-                    .read(hint_sessions.store(), &child.session).map_err(err)?;
-                t.set("name", name)?;
-                t.set("task", task)?;
+    subagents.set(
+        "list",
+        lua.create_function(move |lua, (root, details): (String, Option<bool>)| {
+            let children = r.list_agents(&root).map_err(err)?;
+            let mut cache = if details.unwrap_or(false) {
+                let mut cache = hints.lock().expect("agent hints lock");
+                let ids: std::collections::HashSet<_> =
+                    children.iter().map(|child| &child.session).collect();
+                cache.retain(|id, _| ids.contains(id));
+                Some(cache)
+            } else {
+                None
+            };
+            let out = lua.create_table()?;
+            for (i, child) in children.into_iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("alias", child.alias)?;
+                t.set("session", child.session.clone())?;
+                t.set("parent", child.parent)?;
+                t.set("depth", child.depth)?;
+                t.set("running", child.running)?;
+                if let Some(cache) = cache.as_mut() {
+                    let (name, task) = cache
+                        .entry(child.session.clone())
+                        .or_default()
+                        .read(hint_sessions.store(), &child.session)
+                        .map_err(err)?;
+                    t.set("name", name)?;
+                    t.set("task", task)?;
+                }
+                out.set(i + 1, t)?;
             }
-            out.set(i + 1, t)?;
-        }
-        Ok(out)
-    })?)?;
+            Ok(out)
+        })?,
+    )?;
 
     rness.set("subagents", subagents)?;
     Ok(())
@@ -212,8 +223,14 @@ mod tests {
     struct UnusedProvider;
     #[async_trait::async_trait]
     impl Provider for UnusedProvider {
-        fn model(&self) -> &str { "unused" }
-        async fn step(&self, _: StepRequest<'_>, _: &tokio_util::sync::CancellationToken) -> StepOutcome {
+        fn model(&self) -> &str {
+            "unused"
+        }
+        async fn step(
+            &self,
+            _: StepRequest<'_>,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> StepOutcome {
             panic!("listing must not run a turn")
         }
     }
@@ -224,16 +241,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new(dir.path());
         let root = store.create(None).unwrap();
-        let mut child = store.create_delegated(None, Delegation {
-            parent: root.session().clone(), call: None, depth: 1, mode: DelegationMode::OneShot,
-        }).unwrap();
-        child.append(&SessionEvent::UserMessage(UserMessage {
-            intent: UserIntent::Followup,
-            content: vec![ContentPart::Text { text: "original task".into() }], source: None,
-        })).unwrap();
+        let mut child = store
+            .create_delegated(
+                None,
+                Delegation {
+                    parent: root.session().clone(),
+                    call: None,
+                    depth: 1,
+                    mode: DelegationMode::OneShot,
+                },
+            )
+            .unwrap();
+        child
+            .append(&SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text {
+                    text: "original task".into(),
+                }],
+                source: None,
+            }))
+            .unwrap();
         let sessions = Arc::new(rness_engine::service::SessionService::new(
-            store, Arc::new(UnusedProvider), Arc::new(ToolRegistry::default()),
-            Default::default(), Arc::new(rness_kernel::EventBus::default()),
+            store,
+            Arc::new(UnusedProvider),
+            Arc::new(ToolRegistry::default()),
+            Default::default(),
+            Arc::new(rness_kernel::EventBus::default()),
         ));
         let runtime = Arc::new(SubagentRuntime::new(sessions.clone(), 3));
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -243,7 +276,8 @@ mod tests {
         lua.globals().set("rness", rness).unwrap();
         lua.globals().set("root", root.session().clone()).unwrap();
         lua.globals().set("child", child.session().clone()).unwrap();
-        lua.load(r#"
+        lua.load(
+            r#"
             local plain = rness.subagents.list(root)
             local explicit = rness.subagents.list(root, false)
             local detailed = rness.subagents.list(root, true)
@@ -256,9 +290,15 @@ mod tests {
             assert(plain[1].name == nil and plain[1].task == nil)
             assert(explicit[1].name == nil and explicit[1].task == nil)
             assert(detailed[1].name == 'subagent' and detailed[1].task == 'original task')
-        "#).exec().unwrap();
+        "#,
+        )
+        .exec()
+        .unwrap();
         // A corrupt non-header event must not affect the cheap statusline path.
-        let mut writer = std::fs::OpenOptions::new().append(true).open(child.path()).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(child.path())
+            .unwrap();
         writer.write_all(b"not json\n").unwrap();
         lua.load("assert(#rness.subagents.list(root) == 1); assert(#rness.subagents.list(root, false) == 1)").exec().unwrap();
         assert!(lua.load("rness.subagents.list(root, true)").exec().is_err());

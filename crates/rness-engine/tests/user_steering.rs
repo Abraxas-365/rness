@@ -6,8 +6,8 @@ use rness_engine::{
     subagent::{SubagentError, SubagentRuntime},
     tools::ToolRegistry,
     turn::{
-        TurnConfig,
         provider::{Provider, StepOutcome, StepRequest},
+        TurnConfig,
     },
 };
 use rness_kernel::EventBus;
@@ -97,16 +97,12 @@ async fn user_steering_records_origin_notifies_caller_and_preserves_agent_author
             Err(SubagentError::NotAuthorized(_))
         ));
     }
-    assert!(
-        runtime
-            .steer_user(&main, &grandchild, " \n ".into())
-            .is_err()
-    );
-    assert!(
-        runtime
-            .send_message(&main, &grandchild, "no".into())
-            .is_err()
-    );
+    assert!(runtime
+        .steer_user(&main, &grandchild, " \n ".into())
+        .is_err());
+    assert!(runtime
+        .send_message(&main, &grandchild, "no".into())
+        .is_err());
     assert!(messages(&sessions, &grandchild).is_empty());
     runtime
         .steer_user(&main, &grandchild, "Do this instead".into())
@@ -125,34 +121,37 @@ async fn user_steering_records_origin_notifies_caller_and_preserves_agent_author
     );
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if messages(&sessions, &main).iter().any(|m| m.content == vec![ContentPart::Text {
-                text: format!("User intervened in subagent {grandchild} with steering:\nDo this instead"),
-            }]) { break; }
+            if messages(&sessions, &main).iter().any(|m| {
+                m.content
+                    == vec![ContentPart::Text {
+                        text: format!(
+                        "User intervened in subagent {grandchild} with steering:\nDo this instead"
+                    ),
+                    }]
+            }) {
+                break;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     sessions.join(&main).await;
-    assert!(
-        sessions
-            .store()
-            .history(&main)
-            .unwrap()
-            .iter()
-            .all(|e| !matches!(e.event, SessionEvent::TurnStarted { .. }))
-    );
-    assert!(
-        messages(&sessions, &main)
-            .iter()
-            .all(|m| m.intent == UserIntent::Inject)
-    );
+    assert!(sessions
+        .store()
+        .history(&main)
+        .unwrap()
+        .iter()
+        .all(|e| !matches!(e.event, SessionEvent::TurnStarted { .. })));
+    assert!(messages(&sessions, &main)
+        .iter()
+        .all(|m| m.intent == UserIntent::Inject));
     // Reopening the store retains the distinct text, not a transient UI label.
-    assert!(
-        SessionStore::new(dir.path())
-            .history(&grandchild)
-            .unwrap()
-            .iter()
-            .any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m == &user[0]))
-    );
+    assert!(SessionStore::new(dir.path())
+        .history(&grandchild)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m == &user[0])));
     assert!(messages(&sessions, &other).is_empty());
 }
 

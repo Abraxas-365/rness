@@ -17,15 +17,15 @@ pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
-pub mod lsp;
 pub mod jobs;
+pub mod lsp;
 pub mod read;
 pub mod read_image;
 pub mod skills;
 pub mod subagent;
 pub mod subagent_control;
-pub mod write;
 pub mod web;
+pub mod write;
 
 /// The observed version of a file: mtime plus length. Comparing both
 /// catches same-mtime rewrites that a timestamp alone would miss
@@ -38,7 +38,10 @@ struct FileVersion {
 
 impl FileVersion {
     fn of(meta: &std::fs::Metadata) -> Option<FileVersion> {
-        Some(FileVersion { mtime: meta.modified().ok()?, len: meta.len() })
+        Some(FileVersion {
+            mtime: meta.modified().ok()?,
+            len: meta.len(),
+        })
     }
 }
 
@@ -56,12 +59,20 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(root: impl Into<PathBuf>) -> Arc<Self> {
-        Arc::new(Self { root: root.into(), read_at: Mutex::new(HashMap::new()), sessions: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            root: root.into(),
+            read_at: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashMap::new()),
+        })
     }
 
     fn for_session(&self, session: &str, root: &Path) -> Arc<Self> {
         let mut sessions = self.sessions.lock().expect("workspace sessions lock");
-        Arc::clone(sessions.entry(session.to_owned()).or_insert_with(|| Self::new(root)))
+        Arc::clone(
+            sessions
+                .entry(session.to_owned())
+                .or_insert_with(|| Self::new(root)),
+        )
     }
 
     pub fn root(&self) -> &Path {
@@ -80,8 +91,15 @@ impl Workspace {
 
     /// Record that the current content of `path` has been seen.
     fn mark_seen(&self, path: &Path) {
-        if let Some(version) = std::fs::metadata(path).ok().as_ref().and_then(FileVersion::of) {
-            self.read_at.lock().expect("freshness lock").insert(path.to_path_buf(), version);
+        if let Some(version) = std::fs::metadata(path)
+            .ok()
+            .as_ref()
+            .and_then(FileVersion::of)
+        {
+            self.read_at
+                .lock()
+                .expect("freshness lock")
+                .insert(path.to_path_buf(), version);
         }
     }
 
@@ -113,14 +131,20 @@ pub fn register_all(registry: &ToolRegistry, workspace: Arc<Workspace>) -> jobs:
     register_all_configured(registry, workspace, Default::default())
 }
 
-pub fn register_all_configured(registry: &ToolRegistry, workspace: Arc<Workspace>, process: rness_engine::sandbox::ProcessConfig) -> jobs::JobRegistry {
+pub fn register_all_configured(
+    registry: &ToolRegistry,
+    workspace: Arc<Workspace>,
+    process: rness_engine::sandbox::ProcessConfig,
+) -> jobs::JobRegistry {
     let jobs = jobs::JobRegistry::new();
     registry.register(Arc::new(read::ReadTool::new(workspace.clone())));
     registry.register(Arc::new(write::WriteTool::new(workspace.clone())));
     registry.register(Arc::new(edit::EditTool::new(workspace.clone())));
     registry.register(Arc::new(glob::GlobTool::new(workspace.clone())));
     registry.register(Arc::new(grep::GrepTool::new(workspace.clone())));
-    registry.register(Arc::new(bash::BashTool::new(workspace, jobs.clone()).with_process_config(process)));
+    registry.register(Arc::new(
+        bash::BashTool::new(workspace, jobs.clone()).with_process_config(process),
+    ));
     registry.register(Arc::new(jobs::JobOutputTool::new(jobs.clone())));
     registry.register(Arc::new(jobs::JobListTool::new(jobs.clone())));
     registry.register(Arc::new(jobs::JobKillTool::new(jobs.clone())));

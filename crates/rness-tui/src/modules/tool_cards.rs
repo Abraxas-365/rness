@@ -46,11 +46,23 @@ mod tests {
     #[test]
     fn reads_share_immutable_card_storage() {
         let cache = CardCache::default();
-        cache.insert("call".into(), vec![CardLine { text:"old".into(), ..Default::default() }]);
+        cache.insert(
+            "call".into(),
+            vec![CardLine {
+                text: "old".into(),
+                ..Default::default()
+            }],
+        );
         let first = cache.get(&"call".into()).unwrap();
         let second = cache.get(&"call".into()).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        cache.insert("call".into(), vec![CardLine {text:"new".into(), ..Default::default() }]);
+        cache.insert(
+            "call".into(),
+            vec![CardLine {
+                text: "new".into(),
+                ..Default::default()
+            }],
+        );
         assert_eq!(first[0].text, "old");
         assert_eq!(cache.get(&"call".into()).unwrap()[0].text, "new");
     }
@@ -70,15 +82,38 @@ mod tests {
 impl CardCache {
     pub fn changes_since(&self, revision: u64) -> Option<Vec<ToolCallId>> {
         let inner = self.inner.read().expect("card cache lock");
-        if revision == inner.revision { return Some(Vec::new()); }
-        if inner.changes.front().is_none_or(|(first, _)| revision.saturating_add(1) < *first) { return None; }
-        Some(inner.changes.iter().filter(|(r, _)| *r > revision).map(|(_, call)| call.clone()).collect())
+        if revision == inner.revision {
+            return Some(Vec::new());
+        }
+        if inner
+            .changes
+            .front()
+            .is_none_or(|(first, _)| revision.saturating_add(1) < *first)
+        {
+            return None;
+        }
+        Some(
+            inner
+                .changes
+                .iter()
+                .filter(|(r, _)| *r > revision)
+                .map(|(_, call)| call.clone())
+                .collect(),
+        )
     }
 
-    pub fn revision(&self) -> u64 { self.inner.read().expect("card cache lock").revision }
+    pub fn revision(&self) -> u64 {
+        self.inner.read().expect("card cache lock").revision
+    }
 
     pub fn call_revision(&self, call: &ToolCallId) -> u64 {
-        self.inner.read().expect("card cache lock").revisions.get(call).copied().unwrap_or(0)
+        self.inner
+            .read()
+            .expect("card cache lock")
+            .revisions
+            .get(call)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn generation(&self) -> u64 {
@@ -87,21 +122,33 @@ impl CardCache {
 
     pub fn invalidate(&self) {
         let mut inner = self.inner.write().expect("card cache lock");
-        inner.generation = inner.generation.checked_add(1).expect("card generation exhausted");
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("card generation exhausted");
         inner.cards.clear();
         inner.revisions.clear();
         inner.changes.clear();
         inner.revision += 1;
     }
 
-    pub fn insert_if_current(&self, generation: u64, call: ToolCallId, lines: Vec<CardLine>) -> bool {
+    pub fn insert_if_current(
+        &self,
+        generation: u64,
+        call: ToolCallId,
+        lines: Vec<CardLine>,
+    ) -> bool {
         let mut inner = self.inner.write().expect("card cache lock");
-        if inner.generation != generation { return false; }
+        if inner.generation != generation {
+            return false;
+        }
         inner.revision += 1;
         let revision = inner.revision;
         inner.revisions.insert(call.clone(), revision);
         inner.changes.push_back((revision, call.clone()));
-        if inner.changes.len() > 1024 { inner.changes.pop_front(); }
+        if inner.changes.len() > 1024 {
+            inner.changes.pop_front();
+        }
         inner.cards.insert(call, Arc::new(lines));
         true
     }
@@ -110,13 +157,17 @@ impl CardCache {
     /// must invalidate cached rows and use the built-in completed-result card.
     pub fn remove_if_current(&self, generation: u64, call: &ToolCallId) -> bool {
         let mut inner = self.inner.write().expect("card cache lock");
-        if inner.generation != generation { return false; }
+        if inner.generation != generation {
+            return false;
+        }
         if inner.cards.remove(call).is_some() {
             inner.revision += 1;
             let revision = inner.revision;
             inner.revisions.insert(call.clone(), revision);
             inner.changes.push_back((revision, call.clone()));
-            if inner.changes.len() > 1024 { inner.changes.pop_front(); }
+            if inner.changes.len() > 1024 {
+                inner.changes.pop_front();
+            }
         }
         true
     }
@@ -127,15 +178,26 @@ impl CardCache {
         let revision = inner.revision;
         inner.revisions.insert(call.clone(), revision);
         inner.changes.push_back((revision, call.clone()));
-        if inner.changes.len() > 1024 { inner.changes.pop_front(); }
+        if inner.changes.len() > 1024 {
+            inner.changes.pop_front();
+        }
         inner.cards.insert(call, Arc::new(lines));
     }
 
     pub fn get(&self, call: &ToolCallId) -> Option<Arc<Vec<CardLine>>> {
-        self.inner.read().expect("card cache lock").cards.get(call).cloned()
+        self.inner
+            .read()
+            .expect("card cache lock")
+            .cards
+            .get(call)
+            .cloned()
     }
 
     pub fn contains(&self, call: &ToolCallId) -> bool {
-        self.inner.read().expect("card cache lock").cards.contains_key(call)
+        self.inner
+            .read()
+            .expect("card cache lock")
+            .cards
+            .contains_key(call)
     }
 }

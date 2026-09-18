@@ -47,10 +47,14 @@ pub struct ProcessConfig {
 impl Default for ProcessConfig {
     fn default() -> Self {
         Self {
-            unix_shell: "/bin/sh".into(), macos_runner: "/usr/bin/sandbox-exec".into(),
-            linux_runner: "/usr/bin/bwrap".into(), windows_shell: "powershell.exe".into(),
-            windows_container_runner: "docker.exe".into(), windows_container_image: None,
-            windows_container_shell: "/bin/sh".into(), windows_container_pids: 256,
+            unix_shell: "/bin/sh".into(),
+            macos_runner: "/usr/bin/sandbox-exec".into(),
+            linux_runner: "/usr/bin/bwrap".into(),
+            windows_shell: "powershell.exe".into(),
+            windows_container_runner: "docker.exe".into(),
+            windows_container_image: None,
+            windows_container_shell: "/bin/sh".into(),
+            windows_container_pids: 256,
             temp_parent: None,
         }
     }
@@ -58,18 +62,31 @@ impl Default for ProcessConfig {
 
 impl ProcessConfig {
     pub fn validate(&self) -> Result<(), String> {
-        for path in [&self.unix_shell, &self.macos_runner, &self.linux_runner,
-            &self.windows_shell, &self.windows_container_runner] {
+        for path in [
+            &self.unix_shell,
+            &self.macos_runner,
+            &self.linux_runner,
+            &self.windows_shell,
+            &self.windows_container_runner,
+        ] {
             if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
-                return Err("sandbox process executable must be nonempty and contain no NUL".into());
+                return Err(
+                    "sandbox process executable must be nonempty and contain no NUL".into(),
+                );
             }
         }
-        if self.windows_container_pids == 0 || self.windows_container_shell.is_empty()
-            || self.windows_container_shell.contains('\0') {
+        if self.windows_container_pids == 0
+            || self.windows_container_shell.is_empty()
+            || self.windows_container_shell.contains('\0')
+        {
             return Err("sandbox container requires a shell and positive process limit".into());
         }
-        if self.windows_container_image.as_ref().is_some_and(|image|
-            image.is_empty() || image.starts_with('-') || image.chars().any(char::is_whitespace) || image.contains('\0')) {
+        if self.windows_container_image.as_ref().is_some_and(|image| {
+            image.is_empty()
+                || image.starts_with('-')
+                || image.chars().any(char::is_whitespace)
+                || image.contains('\0')
+        }) {
             return Err("sandbox container image must be a nonempty image reference".into());
         }
         Ok(())

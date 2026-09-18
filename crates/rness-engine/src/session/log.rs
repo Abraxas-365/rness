@@ -14,9 +14,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use rness_protocol::branch::{Delegation, ForkRef};
-use rness_protocol::events::{
-    Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION,
-};
+use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
@@ -61,7 +59,11 @@ impl SessionLog {
         }
         fs::create_dir_all(&dir)?;
         let path = log_file(&dir);
-        let file = OpenOptions::new().create_new(true).append(true).read(true).open(&path)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .read(true)
+            .open(&path)?;
         let mut log = Self::lock(session, file, path)?;
         let header = SessionEvent::Header(Header {
             version: FORMAT_VERSION,
@@ -89,7 +91,11 @@ impl SessionLog {
 
     fn lock(session: &SessionId, file: File, path: PathBuf) -> Result<Self, LogError> {
         match file.try_lock() {
-            Ok(()) => Ok(Self { session: session.clone(), file, path }),
+            Ok(()) => Ok(Self {
+                session: session.clone(),
+                file,
+                path,
+            }),
             Err(_) => Err(LogError::Locked(session.clone())),
         }
     }
@@ -130,7 +136,11 @@ impl SessionLog {
         if content.is_empty() || content.ends_with(b"\n") {
             return Ok(());
         }
-        let keep = content.iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+        let keep = content
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         tracing::warn!(
             session = %self.session,
             dropped = content.len() - keep,
@@ -188,9 +198,18 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
     }
     // First line must be a header.
     match out.first() {
-        Some(Envelope { event: SessionEvent::Header(_), .. }) => Ok(out),
-        Some(_) => Err(LogError::Corrupt { line: 1, reason: "first event is not session/header".into() }),
-        None => Err(LogError::Corrupt { line: 0, reason: "empty log".into() }),
+        Some(Envelope {
+            event: SessionEvent::Header(_),
+            ..
+        }) => Ok(out),
+        Some(_) => Err(LogError::Corrupt {
+            line: 1,
+            reason: "first event is not session/header".into(),
+        }),
+        None => Err(LogError::Corrupt {
+            line: 0,
+            reason: "empty log".into(),
+        }),
     }
 }
 
@@ -205,21 +224,36 @@ pub(super) struct SessionReader {
 }
 
 impl SessionReader {
-    pub(super) fn read(&mut self, root: &Path, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
+    pub(super) fn read(
+        &mut self,
+        root: &Path,
+        session: &SessionId,
+    ) -> Result<Vec<Envelope>, LogError> {
         self.refresh(root, session)?;
         Ok(self.events.clone())
     }
 
-    pub(super) fn read_after(&mut self, root: &Path, session: &SessionId, after: &str) -> Result<Option<Vec<Envelope>>, LogError> {
+    pub(super) fn read_after(
+        &mut self,
+        root: &Path,
+        session: &SessionId,
+        after: &str,
+    ) -> Result<Option<Vec<Envelope>>, LogError> {
         self.refresh(root, session)?;
-        Ok(self.positions.get(after).map(|index| self.events[index + 1..].to_vec()))
+        Ok(self
+            .positions
+            .get(after)
+            .map(|index| self.events[index + 1..].to_vec()))
     }
 
     fn refresh(&mut self, root: &Path, session: &SessionId) -> Result<(), LogError> {
         let path = log_file(&root.join(session));
         let mut file = File::open(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound { LogError::NotFound(session.clone()) }
-            else { LogError::Io(error) }
+            if error.kind() == std::io::ErrorKind::NotFound {
+                LogError::NotFound(session.clone())
+            } else {
+                LogError::Io(error)
+            }
         })?;
         if file.metadata()?.len() < self.offset {
             *self = Self::default();
@@ -230,13 +264,20 @@ impl SessionReader {
         loop {
             bytes.clear();
             let n = reader.read_until(b'\n', &mut bytes)?;
-            if n == 0 || !bytes.ends_with(b"\n") { break; }
+            if n == 0 || !bytes.ends_with(b"\n") {
+                break;
+            }
             if !bytes.iter().all(u8::is_ascii_whitespace) {
-                let event: Envelope = serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
-                    line: self.line + 1, reason: error.to_string(),
-                })?;
+                let event: Envelope =
+                    serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
+                        line: self.line + 1,
+                        reason: error.to_string(),
+                    })?;
                 if self.events.is_empty() && !matches!(event.event, SessionEvent::Header(_)) {
-                    return Err(LogError::Corrupt { line: 1, reason: "first event is not session/header".into() });
+                    return Err(LogError::Corrupt {
+                        line: 1,
+                        reason: "first event is not session/header".into(),
+                    });
                 }
                 self.positions.insert(event.id.clone(), self.events.len());
                 self.events.push(event);
@@ -245,7 +286,10 @@ impl SessionReader {
             self.line += 1;
         }
         if self.events.is_empty() {
-            return Err(LogError::Corrupt { line: 0, reason: "empty log".into() });
+            return Err(LogError::Corrupt {
+                line: 0,
+                reason: "empty log".into(),
+            });
         }
         Ok(())
     }
@@ -253,13 +297,19 @@ impl SessionReader {
 
 /// Commit timestamp (RFC 3339, ms precision, UTC).
 fn now_rfc3339() -> String {
-    jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    jiff::Timestamp::now()
+        .strftime("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// Last event id of a session — the default fork point.
 pub fn tip(root: &Path, session: &SessionId) -> Result<EventId, LogError> {
     let events = read_session(root, session)?;
-    Ok(events.last().expect("read_session guarantees header").id.clone())
+    Ok(events
+        .last()
+        .expect("read_session guarantees header")
+        .id
+        .clone())
 }
 
 #[cfg(test)]
@@ -284,17 +334,41 @@ mod tests {
         log.append(&user_msg("original 日本語")).unwrap();
         let prefix = fs::read(log.path()).unwrap();
         let events = [
-            SessionEvent::CompactionStarted { model: "test".into(), sources: vec![], estimated_input: 100,
-                request: serde_json::json!({"text":"日本語"}) },
-            SessionEvent::CompactionRequest { started: "start".into(), body: "{\"text\":\"日本語\"}".into() },
-            SessionEvent::Compaction(Compaction { replaces: vec![], summary: "summary".into(), model: "test".into() }),
-            SessionEvent::CompactionFinished { started: "start".into(), outcome: "committed".into(), usage: Usage::default(), chunks: vec![] },
+            SessionEvent::CompactionStarted {
+                model: "test".into(),
+                sources: vec![],
+                estimated_input: 100,
+                request: serde_json::json!({"text":"日本語"}),
+            },
+            SessionEvent::CompactionRequest {
+                started: "start".into(),
+                body: "{\"text\":\"日本語\"}".into(),
+            },
+            SessionEvent::Compaction(Compaction {
+                replaces: vec![],
+                summary: "summary".into(),
+                model: "test".into(),
+            }),
+            SessionEvent::CompactionFinished {
+                started: "start".into(),
+                outcome: "committed".into(),
+                usage: Usage::default(),
+                chunks: vec![],
+            },
         ];
         let mut durable = prefix;
         let path = log.path().to_path_buf();
         drop(log);
         for (stage, event) in events.into_iter().enumerate() {
-            let envelope = Envelope { id: if stage == 0 { "start".into() } else { format!("event-{stage}") }, at: now_rfc3339(), event };
+            let envelope = Envelope {
+                id: if stage == 0 {
+                    "start".into()
+                } else {
+                    format!("event-{stage}")
+                },
+                at: now_rfc3339(),
+                event,
+            };
             let mut bytes = serde_json::to_vec(&envelope).unwrap();
             bytes.push(b'\n');
             for cut in 0..=bytes.len() {
@@ -302,18 +376,44 @@ mod tests {
                 crash.extend_from_slice(&bytes[..cut]);
                 fs::write(&path, &crash).unwrap();
                 let mut reopened = SessionLog::open(root.path(), &sid).unwrap();
-                assert_eq!(fs::read(&path).unwrap(), if cut == bytes.len() { crash } else { durable.clone() });
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    if cut == bytes.len() {
+                        crash
+                    } else {
+                        durable.clone()
+                    }
+                );
                 crate::turn::compaction::recover(&mut reopened).unwrap();
                 let history = reopened.read_all().unwrap();
                 let has_start = stage > 0 || cut == bytes.len();
                 let has_checkpoint = stage > 2 || (stage == 2 && cut == bytes.len());
-                let finishes: Vec<_> = history.iter().filter_map(|e| match &e.event {
-                    SessionEvent::CompactionFinished { started, outcome, .. } => Some((started.as_str(), outcome.as_str())), _ => None,
-                }).collect();
+                let finishes: Vec<_> = history
+                    .iter()
+                    .filter_map(|e| match &e.event {
+                        SessionEvent::CompactionFinished {
+                            started, outcome, ..
+                        } => Some((started.as_str(), outcome.as_str())),
+                        _ => None,
+                    })
+                    .collect();
                 if has_start {
-                    assert_eq!(finishes, vec![("start", if stage == 3 && cut == bytes.len() { "committed" }
-                        else if has_checkpoint { "committed_before_interruption" } else { "interrupted" })]);
-                } else { assert!(finishes.is_empty()); }
+                    assert_eq!(
+                        finishes,
+                        vec![(
+                            "start",
+                            if stage == 3 && cut == bytes.len() {
+                                "committed"
+                            } else if has_checkpoint {
+                                "committed_before_interruption"
+                            } else {
+                                "interrupted"
+                            }
+                        )]
+                    );
+                } else {
+                    assert!(finishes.is_empty());
+                }
                 drop(reopened);
                 let mut reopened = SessionLog::open(root.path(), &sid).unwrap();
                 crate::turn::compaction::recover(&mut reopened).unwrap();
@@ -331,11 +431,20 @@ mod tests {
         let before = log.read_all().unwrap();
         // A real OS write error, independent of permissions or running as root.
         log.file = File::open(log.path()).unwrap();
-        let result = log.append(&SessionEvent::CompactionRequest { started: "start".into(), body: "{}".into() });
+        let result = log.append(&SessionEvent::CompactionRequest {
+            started: "start".into(),
+            body: "{}".into(),
+        });
         assert!(matches!(result, Err(LogError::Io(_))));
         assert_eq!(log.read_all().unwrap(), before);
         drop(log);
-        assert_eq!(SessionLog::open(root.path(), &sid).unwrap().read_all().unwrap(), before);
+        assert_eq!(
+            SessionLog::open(root.path(), &sid)
+                .unwrap()
+                .read_all()
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -351,7 +460,11 @@ mod tests {
         log.append(&user_msg("hello")).unwrap();
         assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 2);
         let offset = reader.offset;
-        let event = Envelope { id: "tail".into(), at: now_rfc3339(), event: user_msg("é") };
+        let event = Envelope {
+            id: "tail".into(),
+            at: now_rfc3339(),
+            event: user_msg("é"),
+        };
         let mut bytes = serde_json::to_vec(&event).unwrap();
         bytes.push(b'\n');
         let split = bytes.iter().position(|b| *b == 0xc3).unwrap() + 1;
@@ -360,7 +473,10 @@ mod tests {
         assert_eq!(reader.offset, offset);
         log.file.write_all(&bytes[split..]).unwrap();
         assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 3);
-        assert_eq!(reader.read(root.path(), &sid).unwrap(), log.read_all().unwrap());
+        assert_eq!(
+            reader.read(root.path(), &sid).unwrap(),
+            log.read_all().unwrap()
+        );
     }
 
     #[test]
@@ -424,7 +540,8 @@ mod tests {
 
         // Simulate a crash mid-write: garbage without trailing newline.
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        f.write_all(b"{\"id\":\"01X\",\"at\":\"t\",\"type\":\"user/mess").unwrap();
+        f.write_all(b"{\"id\":\"01X\",\"at\":\"t\",\"type\":\"user/mess")
+            .unwrap();
         drop(f);
 
         // Lockless read tolerates the torn tail (prefix only).
@@ -481,8 +598,12 @@ mod tests {
         drop(parent);
 
         let child_sid: SessionId = "01CHILD".into();
-        let fork = ForkRef { session: parent_sid.clone(), at: committed.id.clone() };
-        let child = SessionLog::create(root.path(), &child_sid, None, Some(fork.clone()), None).unwrap();
+        let fork = ForkRef {
+            session: parent_sid.clone(),
+            at: committed.id.clone(),
+        };
+        let child =
+            SessionLog::create(root.path(), &child_sid, None, Some(fork.clone()), None).unwrap();
         let events = child.read_all().unwrap();
         match &events[0].event {
             SessionEvent::Header(h) => assert_eq!(h.parent.as_ref(), Some(&fork)),

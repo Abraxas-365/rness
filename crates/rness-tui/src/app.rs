@@ -206,8 +206,7 @@ impl Model {
         // checkpoints become cards at their recorded log position, so a newly
         // completed summary is visible beside the newest conversation.
         let mut shadowed: std::collections::HashSet<&str> = Default::default();
-        let mut checkpoints: std::collections::HashMap<&str, (usize, String)> =
-            Default::default();
+        let mut checkpoints: std::collections::HashMap<&str, (usize, String)> = Default::default();
         for env in history.envelopes.iter().rev() {
             if let SessionEvent::Compaction(c) = &env.event {
                 if shadowed.contains(env.id.as_str()) {
@@ -245,7 +244,12 @@ impl Model {
         self.entries.truncate(self.projected_entries);
         let mut names = std::mem::take(&mut self.projected_names);
         let mut failed_attempts = self.projected_failed_attempts;
-        self.project_events(events, &Default::default(), &mut names, &mut failed_attempts);
+        self.project_events(
+            events,
+            &Default::default(),
+            &mut names,
+            &mut failed_attempts,
+        );
         self.projected_names = names;
         self.projected_failed_attempts = failed_attempts;
         if removed_local || self.entries.len() != self.projected_entries {
@@ -711,18 +715,29 @@ impl App {
                     _ => None,
                 };
                 if let Some(up) = direction {
-                    let ctx = Ctx { model: &self.model, theme: &self.theme };
+                    let ctx = Ctx {
+                        model: &self.model,
+                        theme: &self.theme,
+                    };
                     if self.slots.overlay_active(&ctx) {
                         // A read-only monitor owns scrolling while open. Never
                         // move the hidden principal transcript under an overlay.
                         if let Some(component) = self.slots.focused_mut(&ctx) {
-                            component.on_action(&ctx, "viewport:wheel", &serde_json::json!({"up":up}));
+                            component.on_action(
+                                &ctx,
+                                "viewport:wheel",
+                                &serde_json::json!({"up":up}),
+                            );
                         }
                     } else {
-                        self.apply(if up { Action::ScrollUp(3) } else { Action::ScrollDown(3) });
+                        self.apply(if up {
+                            Action::ScrollUp(3)
+                        } else {
+                            Action::ScrollDown(3)
+                        });
                     }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -1025,7 +1040,9 @@ impl App {
         }
         let intent = if matches!(&action, Action::Steer(_) | Action::SteerImages(_, _)) {
             UserIntent::Steer
-        } else { UserIntent::Followup };
+        } else {
+            UserIntent::Followup
+        };
         match action {
             Action::PluginBatch {
                 request,
@@ -1061,7 +1078,16 @@ impl App {
                 }
                 // Validate the entire batch before changing either app or prompt state.
                 if operations.iter().any(|op| matches!(op, PluginOperation::CloseApp(name) if request.app.as_ref().is_none_or(|(owner, _)| owner != name))) { return; }
-                if request.app.is_some() && operations.iter().any(|op| matches!(op, PluginOperation::QueuePrompt | PluginOperation::SteerPrompt)) { return; }
+                if request.app.is_some()
+                    && operations.iter().any(|op| {
+                        matches!(
+                            op,
+                            PluginOperation::QueuePrompt | PluginOperation::SteerPrompt
+                        )
+                    })
+                {
+                    return;
+                }
                 let mut submissions = Vec::new();
                 let apply_operations = || {
                     let mut close = false;
@@ -1073,7 +1099,11 @@ impl App {
                                 &serde_json::json!(text),
                             ),
                             PluginOperation::QueuePrompt | PluginOperation::SteerPrompt => {
-                                let binding = if matches!(operation, PluginOperation::SteerPrompt) { "steer" } else { "queue" };
+                                let binding = if matches!(operation, PluginOperation::SteerPrompt) {
+                                    "steer"
+                                } else {
+                                    "queue"
+                                };
                                 if let Some(component) = self.slots.focused_mut(&ctx) {
                                     submissions.extend(component.on_binding(&ctx, binding).actions);
                                 }
@@ -1093,7 +1123,9 @@ impl App {
                     let mut apply_operations = apply_operations;
                     apply_operations();
                 }
-                for submission in submissions { self.apply(submission); }
+                for submission in submissions {
+                    self.apply(submission);
+                }
             }
             Action::PluginAppClose {
                 input_epoch,
@@ -1401,7 +1433,8 @@ impl App {
                 self.model.scroll_from_bottom = 0;
             }
             Action::Cancel => {
-                self.input_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.input_epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.backend.request(ClientRequest::Cancel {
                     session: self.model.session.clone(),
                 });
@@ -1434,12 +1467,21 @@ impl App {
             }
             Action::CommandCompletionResult(session, text, items) => {
                 if session == self.model.session {
-                    let ctx = Ctx { model: &self.model, theme: &self.theme };
-                    self.slots.broadcast(&ctx, "input:completion", &serde_json::json!({"text":text,"items":items}));
+                    let ctx = Ctx {
+                        model: &self.model,
+                        theme: &self.theme,
+                    };
+                    self.slots.broadcast(
+                        &ctx,
+                        "input:completion",
+                        &serde_json::json!({"text":text,"items":items}),
+                    );
                 }
             }
             Action::CommandResult(session, message) => {
-                if message.is_empty() { return; }
+                if message.is_empty() {
+                    return;
+                }
                 self.command_results
                     .entry(session.clone())
                     .or_default()
@@ -1451,10 +1493,14 @@ impl App {
             Action::Notice(text) => self.model.entries.push(Entry::Notice(text)),
             Action::Custom(name, payload) => {
                 if name == "app:open" {
-                    if payload["session"].as_str() != Some(self.model.session.as_str()) { return; }
+                    if payload["session"].as_str() != Some(self.model.session.as_str()) {
+                        return;
+                    }
                     if let Some(name) = payload["app"].as_str() {
                         if !self.apps.as_ref().is_some_and(|apps| apps.open(name)) {
-                            self.model.entries.push(Entry::Notice(format!("App is not registered: {name}")));
+                            self.model
+                                .entries
+                                .push(Entry::Notice(format!("App is not registered: {name}")));
                         }
                     }
                     return;
@@ -1483,7 +1529,9 @@ impl App {
                 if name == "terminal:edit-plan" {
                     let mut payload = payload;
                     payload["plan_edit"] = serde_json::json!(true);
-                    payload["input_epoch"] = serde_json::json!(self.input_epoch.load(std::sync::atomic::Ordering::SeqCst));
+                    payload["input_epoch"] = serde_json::json!(self
+                        .input_epoch
+                        .load(std::sync::atomic::Ordering::SeqCst));
                     self.edit_prompt = Some(payload);
                     return;
                 }
@@ -1503,13 +1551,17 @@ impl App {
                 if session == self.model.session {
                     return;
                 }
-                if let Some(apps) = &self.apps { apps.set_session(session.clone()); }
+                if let Some(apps) = &self.apps {
+                    apps.set_session(session.clone());
+                }
                 let next = self
                     .background_models
                     .remove(&session)
                     .unwrap_or_else(|| Model::new(session, self.model.model_name.clone()));
                 let previous = std::mem::replace(&mut self.model, next);
-                if let Some(ref mut displayed) = displayed { **displayed = self.model.session.clone(); }
+                if let Some(ref mut displayed) = displayed {
+                    **displayed = self.model.session.clone();
+                }
                 if previous.busy || previous.live.is_some() {
                     self.background_models
                         .insert(previous.session.clone(), previous);
@@ -1545,12 +1597,18 @@ fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
         .ok_or("Editor command is empty")?;
     let snapshot = payload["snapshot"] == true;
     let mut file = tempfile::Builder::new()
-        .prefix(if payload["plan_edit"] == true { "rness-plan-" } else if snapshot {
+        .prefix(if payload["plan_edit"] == true {
+            "rness-plan-"
+        } else if snapshot {
             "rness-message-"
         } else {
             "rness-prompt-"
         })
-        .suffix(if snapshot || payload["plan_edit"] == true { ".md" } else { ".txt" })
+        .suffix(if snapshot || payload["plan_edit"] == true {
+            ".md"
+        } else {
+            ".txt"
+        })
         .tempfile()
         .map_err(|e| e.to_string())?;
     file.write_all(
@@ -1602,28 +1660,26 @@ pub async fn run(
     let reader_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_stop = reader_done.clone();
     let reader_lock = terminal_input.clone();
-    std::thread::spawn(move || {
-        loop {
-            if reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            let _guard = reader_lock.blocking_lock();
-            if reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            match crossterm::event::poll(Duration::from_millis(20)) {
-                Ok(false) => continue,
-                Err(_) => return,
-                Ok(true) => {}
-            }
-            match crossterm::event::read() {
-                Ok(ev) => {
-                    if tx.send(ev).is_err() {
-                        return;
-                    }
+    std::thread::spawn(move || loop {
+        if reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let _guard = reader_lock.blocking_lock();
+        if reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        match crossterm::event::poll(Duration::from_millis(20)) {
+            Ok(false) => continue,
+            Err(_) => return,
+            Ok(true) => {}
+        }
+        match crossterm::event::read() {
+            Ok(ev) => {
+                if tx.send(ev).is_err() {
+                    return;
                 }
-                Err(_) => return,
             }
+            Err(_) => return,
         }
     });
 
@@ -1668,12 +1724,20 @@ pub async fn run(
             // The reader must relinquish stdin before handing it to an editor.
             let _guard = terminal_input.lock().await;
             if payload["plan_edit"] == true {
-                while let Ok(event) = term_events.try_recv() { app.on_term_event(event); }
-                while let Ok(action) = host_actions.try_recv() { app.apply(action); }
-                if app.model.should_quit || payload["session"] != app.model.session
-                    || payload["input_epoch"].as_u64() != Some(app.input_epoch.load(std::sync::atomic::Ordering::SeqCst)) {
+                while let Ok(event) = term_events.try_recv() {
+                    app.on_term_event(event);
+                }
+                while let Ok(action) = host_actions.try_recv() {
+                    app.apply(action);
+                }
+                if app.model.should_quit
+                    || payload["session"] != app.model.session
+                    || payload["input_epoch"].as_u64()
+                        != Some(app.input_epoch.load(std::sync::atomic::Ordering::SeqCst))
+                {
                     let mut response = payload.clone();
-                    response["error"] = serde_json::json!("review interrupted before editor launch");
+                    response["error"] =
+                        serde_json::json!("review interrupted before editor launch");
                     app.apply(Action::Custom("questions:plan-edited".into(), response));
                     continue;
                 }
@@ -1694,9 +1758,13 @@ pub async fn run(
             );
             if payload["plan_edit"] == true {
                 // Apply queued host cancellation/session changes before auto-approval.
-                while let Ok(action) = host_actions.try_recv() { app.apply(action); }
-                if app.model.should_quit || payload["session"] != app.model.session
-                    || editor_epoch != app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) {
+                while let Ok(action) = host_actions.try_recv() {
+                    app.apply(action);
+                }
+                if app.model.should_quit
+                    || payload["session"] != app.model.session
+                    || editor_epoch != app.input_epoch.load(std::sync::atomic::Ordering::SeqCst)
+                {
                     edited = Err("review interrupted while editor was open".into());
                 }
             }
@@ -1746,8 +1814,8 @@ pub async fn run(
 mod tests {
     use super::*;
     use rness_protocol::events::{
-        AssistantMessage, Envelope, FORMAT_VERSION, Header, StopReason, ToolResult, Usage,
-        UserMessage,
+        AssistantMessage, Envelope, Header, StopReason, ToolResult, Usage, UserMessage,
+        FORMAT_VERSION,
     };
 
     /// Backend that serves a canned history — the `-s` reopen case.
@@ -1810,10 +1878,9 @@ mod tests {
         assert!(
             matches!(&actions[..], [Action::Custom(name, payload)] if name == "terminal:view-message" && payload["text"] == "**original**\nsecond line")
         );
-        assert!(
-            app.route_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
-                .is_empty()
-        );
+        assert!(app
+            .route_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .is_empty());
         app.route_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         let actions = app.route_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(
@@ -1866,8 +1933,13 @@ mod tests {
 
     #[test]
     fn displayed_session_observer_tracks_actual_switch() {
-        let mut app = App::new(Model::new("s1".into(), "m".into()), Slots::default(),
-            Arc::new(FakeBackend { history: prior_history("s1") }));
+        let mut app = App::new(
+            Model::new("s1".into(), "m".into()),
+            Slots::default(),
+            Arc::new(FakeBackend {
+                history: prior_history("s1"),
+            }),
+        );
         let displayed = Arc::new(std::sync::RwLock::new("s1".to_string()));
         app.displayed_session = Some(displayed.clone());
         app.apply(Action::SwitchSession("s2".into()));
@@ -1881,14 +1953,25 @@ mod tests {
         let mut slots = Slots::default();
         let apps = crate::modules::ext_apps::install(&mut slots);
         apps.set_apps(vec![crate::modules::ext_apps::AppInfo {
-            name: "jobs".into(), slot: "overlay".into(), ..Default::default()
+            name: "jobs".into(),
+            slot: "overlay".into(),
+            ..Default::default()
         }]);
         apps.set_session("s1".into());
-        let mut app = App::new(Model::new("s1".into(), "m".into()), slots,
-            Arc::new(FakeBackend { history: prior_history("s1") }));
+        let mut app = App::new(
+            Model::new("s1".into(), "m".into()),
+            slots,
+            Arc::new(FakeBackend {
+                history: prior_history("s1"),
+            }),
+        );
         app.apps = Some(apps.clone());
-        let open = |session: &str, name: &str| Action::Custom("app:open".into(),
-            serde_json::json!({"session":session,"app":name}));
+        let open = |session: &str, name: &str| {
+            Action::Custom(
+                "app:open".into(),
+                serde_json::json!({"session":session,"app":name}),
+            )
+        };
         app.apply(open("other", "jobs"));
         assert_eq!(apps.active(), None);
         app.apply(open("s1", "jobs"));
@@ -1908,13 +1991,24 @@ mod tests {
     fn completed_card_is_not_live_and_selection_works_during_compaction() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        struct CompletingBackend { history: History, incremental: bool }
+        struct CompletingBackend {
+            history: History,
+            incremental: bool,
+        }
         impl Backend for CompletingBackend {
             fn request(&self, _: ClientRequest) {}
-            fn history(&self, _: &SessionId) -> History { self.history.clone() }
+            fn history(&self, _: &SessionId) -> History {
+                self.history.clone()
+            }
             fn history_after(&self, _: &SessionId, after: &str) -> Option<Vec<Envelope>> {
-                if !self.incremental { return None; }
-                let index = self.history.envelopes.iter().position(|env| env.id == after)?;
+                if !self.incremental {
+                    return None;
+                }
+                let index = self
+                    .history
+                    .envelopes
+                    .iter()
+                    .position(|env| env.id == after)?;
                 Some(self.history.envelopes[index + 1..].to_vec())
             }
         }
@@ -1932,7 +2026,8 @@ mod tests {
             }
             let mut model = Model::new("s".into(), "m".into());
             model.load_history(&History {
-                session: "s".into(), envelopes: history.envelopes[..3].to_vec(),
+                session: "s".into(),
+                envelopes: history.envelopes[..3].to_vec(),
             });
             model.busy = true;
             model.live = Some(LiveStep {
@@ -1942,12 +2037,25 @@ mod tests {
             });
             let mut slots = Slots::default();
             crate::modules::chat::install(&mut slots);
-            let mut app = App::new(model, slots, Arc::new(CompletingBackend { history, incremental }));
-            app.apply(Action::Custom("chat:messagebox-config".into(),
-                serde_json::json!({"keys":{"select_message":"ctrl+n"}})));
-            app.apply_frame(&Frame::HistoryChanged { session: "s".into() });
+            let mut app = App::new(
+                model,
+                slots,
+                Arc::new(CompletingBackend {
+                    history,
+                    incremental,
+                }),
+            );
+            app.apply(Action::Custom(
+                "chat:messagebox-config".into(),
+                serde_json::json!({"keys":{"select_message":"ctrl+n"}}),
+            ));
+            app.apply_frame(&Frame::HistoryChanged {
+                session: "s".into(),
+            });
             app.apply_frame(&Frame::CompactionStarted {
-                session: "s".into(), events: 42, estimated_tokens: 183_000,
+                session: "s".into(),
+                events: 42,
+                estimated_tokens: 183_000,
             });
             assert!(app.model.busy);
             assert!(app.model.compaction.is_some());
@@ -1970,7 +2078,13 @@ mod tests {
             assert!(matches!(copy.as_slice(), [Action::Custom(name, payload)]
                 if name == "terminal:copy-text" && payload["text"] == "crea foo.txt"));
             app.route_key(KeyEvent::from(KeyCode::Esc));
-            assert!(app.slots.focused_mut(&Ctx { model: &app.model, theme: &app.theme }).is_none());
+            assert!(app
+                .slots
+                .focused_mut(&Ctx {
+                    model: &app.model,
+                    theme: &app.theme
+                })
+                .is_none());
         }
     }
 
@@ -1986,7 +2100,9 @@ mod tests {
             ..Default::default()
         });
         model.apply_frame(&Frame::ToolOutput {
-            session: "s".into(), call: "c1".into(), output: "partial output".into(),
+            session: "s".into(),
+            call: "c1".into(),
+            output: "partial output".into(),
         });
         assert_eq!(model.live.as_ref().unwrap().running_tools.len(), 2);
         model.load_history(&history);
@@ -2060,11 +2176,10 @@ mod tests {
         app.apply(Action::CommandResult("s".into(), "old help".into()));
         app.apply(Action::CommandResult("other".into(), "other help".into()));
         app.reconcile();
-        assert!(
-            app.model
-                .entries
-                .contains(&Entry::Notice("old help".into()))
-        );
+        assert!(app
+            .model
+            .entries
+            .contains(&Entry::Notice("old help".into())));
         app.apply_frame(&Frame::StepStarted {
             session: "s".into(),
             turn: 2,
@@ -2079,11 +2194,10 @@ mod tests {
         });
         assert!(!app.command_results.contains_key("other"));
         app.apply(Action::SwitchSession("other".into()));
-        assert!(
-            !app.model
-                .entries
-                .contains(&Entry::Notice("other help".into()))
-        );
+        assert!(!app
+            .model
+            .entries
+            .contains(&Entry::Notice("other help".into())));
     }
 
     #[test]
@@ -2091,13 +2205,23 @@ mod tests {
         let mut slots = Slots::default();
         let cards = crate::modules::chat::install(&mut slots);
         let monitor = crate::modules::agents::install(&mut slots, cards);
-        let mut app = App::new(Model::new("s".into(), "m".into()), slots,
-            Arc::new(FakeBackend { history: prior_history("s") }));
+        let mut app = App::new(
+            Model::new("s".into(), "m".into()),
+            slots,
+            Arc::new(FakeBackend {
+                history: prior_history("s"),
+            }),
+        );
         app.model.scroll_from_bottom = 17;
-        app.apply(Action::Custom("agents:open".into(), serde_json::json!({"session":"s"})));
+        app.apply(Action::Custom(
+            "agents:open".into(),
+            serde_json::json!({"session":"s"}),
+        ));
         assert!(monitor.requested().is_some());
         app.on_term_event(TermEvent::Mouse(crossterm::event::MouseEvent {
-            kind: crossterm::event::MouseEventKind::ScrollUp, column: 2, row: 2,
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 2,
+            row: 2,
             modifiers: crossterm::event::KeyModifiers::NONE,
         }));
         assert_eq!(app.model.scroll_from_bottom, 17);
@@ -2127,22 +2251,29 @@ mod tests {
             1
         );
         app.apply(Action::SwitchSession("s".into()));
-        assert!(
-            !app.model
-                .entries
-                .contains(&Entry::Notice("saved result".into()))
-        );
+        assert!(!app
+            .model
+            .entries
+            .contains(&Entry::Notice("saved result".into())));
     }
 
     #[test]
     fn queue_and_steer_send_distinct_intents_for_text_and_images() {
         struct Capture(std::sync::Mutex<Vec<ClientRequest>>);
         impl Backend for Capture {
-            fn request(&self, request: ClientRequest) { self.0.lock().unwrap().push(request); }
-            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+            fn request(&self, request: ClientRequest) {
+                self.0.lock().unwrap().push(request);
+            }
+            fn history(&self, _: &SessionId) -> History {
+                prior_history("s")
+            }
         }
         let backend = Arc::new(Capture(Default::default()));
-        let mut app = App::new(Model::new("s".into(), "m".into()), Slots::default(), backend.clone());
+        let mut app = App::new(
+            Model::new("s".into(), "m".into()),
+            Slots::default(),
+            backend.clone(),
+        );
         for busy in [false, true] {
             app.model.busy = busy;
             app.apply(Action::Submit("later".into()));
@@ -2461,7 +2592,10 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         crate::component::Component::render(
             &mut crate::modules::chat::Chat::default(),
-            &crate::component::Ctx { model: &model, theme: &theme },
+            &crate::component::Ctx {
+                model: &model,
+                theme: &theme,
+            },
             area,
             &mut buffer,
         );
@@ -2740,10 +2874,9 @@ mod tests {
         assert!(rx.try_recv().is_err());
         binding.layer = BindingLayer::User;
         *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[binding]).unwrap();
-        assert!(
-            app.route_key(KeyEvent::from(crossterm::event::KeyCode::F(6)))
-                .is_empty()
-        );
+        assert!(app
+            .route_key(KeyEvent::from(crossterm::event::KeyCode::F(6)))
+            .is_empty());
         assert_eq!(rx.try_recv().unwrap().name, "review.inspect");
         *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[
             ScopedBinding {
@@ -2762,10 +2895,9 @@ mod tests {
             },
         ])
         .unwrap();
-        assert!(
-            app.route_key(KeyEvent::from(crossterm::event::KeyCode::F(6)))
-                .is_empty()
-        );
+        assert!(app
+            .route_key(KeyEvent::from(crossterm::event::KeyCode::F(6)))
+            .is_empty());
         assert_eq!(rx.try_recv().unwrap().name, "prompt.inspect");
     }
 
@@ -2815,7 +2947,9 @@ mod tests {
             app.route_key(KeyEvent::from(KeyCode::Char(c)));
         }
         assert!(app.route_key(KeyEvent::from(KeyCode::Enter)).is_empty());
-        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Complete(text)] if text == "/unload "));
+        assert!(
+            matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Complete(text)] if text == "/unload ")
+        );
         app.route_key(KeyEvent::from(KeyCode::F(6)));
         assert_eq!(apps.active().as_deref(), Some("review"));
         app.route_key(KeyEvent::from(KeyCode::Esc));
@@ -2858,12 +2992,16 @@ mod tests {
 
     #[test]
     fn queue_and_steer_core_remaps_and_plugin_batches_submit_drafts() {
-        use crossterm::event::KeyCode;
         use crate::keymaps::{BindingLayer, Scope, ScopedBinding, ScopedKeymap};
+        use crossterm::event::KeyCode;
         struct Capture(std::sync::Mutex<Vec<ClientRequest>>);
         impl Backend for Capture {
-            fn request(&self, request: ClientRequest) { self.0.lock().unwrap().push(request); }
-            fn history(&self, _: &SessionId) -> History { prior_history("s") }
+            fn request(&self, request: ClientRequest) {
+                self.0.lock().unwrap().push(request);
+            }
+            fn history(&self, _: &SessionId) -> History {
+                prior_history("s")
+            }
         }
         let backend = Arc::new(Capture(Default::default()));
         let mut slots = Slots::default();
@@ -2871,32 +3009,70 @@ mod tests {
         let mut app = App::new(Model::new("s".into(), "m".into()), slots, backend.clone());
         let (tx, _rx) = mpsc::unbounded_channel();
         app.plugin_actions = Some(tx);
-        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(&[
-            ("enter", "core.promptbox.steer"), ("f8", "core.promptbox.queue"),
-        ].into_iter().map(|(key, action)| ScopedBinding {
-            owner: "core".into(), scope: Scope::Promptbox,
-            chord: crate::keys::Chord::parse(key).unwrap(), action: action.into(), layer: BindingLayer::User,
-        }).collect::<Vec<_>>()).unwrap();
+        *app.plugin_keymap.write().unwrap() = ScopedKeymap::resolve(
+            &[
+                ("enter", "core.promptbox.steer"),
+                ("f8", "core.promptbox.queue"),
+            ]
+            .into_iter()
+            .map(|(key, action)| ScopedBinding {
+                owner: "core".into(),
+                scope: Scope::Promptbox,
+                chord: crate::keys::Chord::parse(key).unwrap(),
+                action: action.into(),
+                layer: BindingLayer::User,
+            })
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
         app.route_key(KeyEvent::from(KeyCode::Char('s')));
-        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::Enter)).as_slice(), [Action::Steer(text)] if text == "s"));
+        assert!(
+            matches!(app.route_key(KeyEvent::from(KeyCode::Enter)).as_slice(), [Action::Steer(text)] if text == "s")
+        );
         app.route_key(KeyEvent::from(KeyCode::Char('q')));
-        assert!(matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Submit(text)] if text == "q"));
-        for (operation, intent) in [(PluginOperation::QueuePrompt, UserIntent::Followup), (PluginOperation::SteerPrompt, UserIntent::Steer)] {
+        assert!(
+            matches!(app.route_key(KeyEvent::from(KeyCode::F(8))).as_slice(), [Action::Submit(text)] if text == "q")
+        );
+        for (operation, intent) in [
+            (PluginOperation::QueuePrompt, UserIntent::Followup),
+            (PluginOperation::SteerPrompt, UserIntent::Steer),
+        ] {
             let request = PluginActionRequest {
-                input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst), app: None,
-                generation: app.plugin_generation.load(std::sync::atomic::Ordering::SeqCst),
-                name: "delivery".into(), session: "s".into(), epoch: app.model.history_epoch,
+                input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst),
+                app: None,
+                generation: app
+                    .plugin_generation
+                    .load(std::sync::atomic::Ordering::SeqCst),
+                name: "delivery".into(),
+                session: "s".into(),
+                epoch: app.model.history_epoch,
             };
-            app.apply(Action::PluginBatch { request, operations: vec![PluginOperation::InsertPrompt("draft".into()), operation] });
-            assert!(matches!(backend.0.lock().unwrap().last(), Some(ClientRequest::Send { intent: actual, content, .. })
-                if *actual == intent && matches!(content.as_slice(), [ContentPart::Text { text }] if text == "draft")));
+            app.apply(Action::PluginBatch {
+                request,
+                operations: vec![PluginOperation::InsertPrompt("draft".into()), operation],
+            });
+            assert!(
+                matches!(backend.0.lock().unwrap().last(), Some(ClientRequest::Send { intent: actual, content, .. })
+                if *actual == intent && matches!(content.as_slice(), [ContentPart::Text { text }] if text == "draft"))
+            );
         }
         let request = PluginActionRequest {
-            input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) + 1, app: None,
-            generation: app.plugin_generation.load(std::sync::atomic::Ordering::SeqCst),
-            name: "delivery".into(), session: "s".into(), epoch: app.model.history_epoch,
+            input_epoch: app.input_epoch.load(std::sync::atomic::Ordering::SeqCst) + 1,
+            app: None,
+            generation: app
+                .plugin_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            name: "delivery".into(),
+            session: "s".into(),
+            epoch: app.model.history_epoch,
         };
-        app.apply(Action::PluginBatch { request, operations: vec![PluginOperation::InsertPrompt("stale".into()), PluginOperation::SteerPrompt] });
+        app.apply(Action::PluginBatch {
+            request,
+            operations: vec![
+                PluginOperation::InsertPrompt("stale".into()),
+                PluginOperation::SteerPrompt,
+            ],
+        });
         assert_eq!(backend.0.lock().unwrap().len(), 2);
     }
 
@@ -2984,7 +3160,19 @@ mod tests {
         use crate::modules::ext_apps::{AppEvent, AppInfo};
         use std::sync::atomic::Ordering;
 
-        for case in ["empty", "insert", "close", "invalid", "input", "runtime", "session", "history", "activation", "reopened", "closed"] {
+        for case in [
+            "empty",
+            "insert",
+            "close",
+            "invalid",
+            "input",
+            "runtime",
+            "session",
+            "history",
+            "activation",
+            "reopened",
+            "closed",
+        ] {
             let mut slots = Slots::default();
             crate::modules::input::install(&mut slots);
             let apps = crate::modules::ext_apps::install(&mut slots);
@@ -2997,7 +3185,9 @@ mod tests {
             let mut app = App::new(
                 Model::new("s1".into(), "m".into()),
                 slots,
-                Arc::new(FakeBackend { history: prior_history("s1") }),
+                Arc::new(FakeBackend {
+                    history: prior_history("s1"),
+                }),
             );
             app.apps = Some(apps.clone());
             apps.track_input_epoch(app.input_epoch.clone());
@@ -3017,22 +3207,47 @@ mod tests {
                 "insert" => vec![PluginOperation::InsertPrompt("updated".into())],
                 "close" => vec![PluginOperation::CloseApp("review".into())],
                 "invalid" => vec![PluginOperation::CloseApp("other".into())],
-                "input" => { request.input_epoch += 1; vec![] }
-                "runtime" => { request.generation += 1; vec![] }
-                "session" => { request.session = "s2".into(); vec![] }
-                "history" => { request.epoch += 1; vec![] }
-                "activation" => { request.app.as_mut().unwrap().1 += 1; vec![] }
+                "input" => {
+                    request.input_epoch += 1;
+                    vec![]
+                }
+                "runtime" => {
+                    request.generation += 1;
+                    vec![]
+                }
+                "session" => {
+                    request.session = "s2".into();
+                    vec![]
+                }
+                "history" => {
+                    request.epoch += 1;
+                    vec![]
+                }
+                "activation" => {
+                    request.app.as_mut().unwrap().1 += 1;
+                    vec![]
+                }
                 "reopened" => {
                     assert!(apps.open("review"));
                     assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("review".into()));
                     vec![]
                 }
-                "closed" => { apps.close(); vec![] }
+                "closed" => {
+                    apps.close();
+                    vec![]
+                }
                 _ => vec![],
             };
-            app.apply(Action::PluginBatch { request, operations });
+            app.apply(Action::PluginBatch {
+                request,
+                operations,
+            });
             if matches!(case, "empty" | "insert") {
-                assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("review".into()), "{case}");
+                assert_eq!(
+                    rx.try_recv().unwrap(),
+                    AppEvent::Shown("review".into()),
+                    "{case}"
+                );
             }
             assert!(rx.try_recv().is_err(), "unexpected refresh for {case}");
             if case == "close" {
@@ -3094,11 +3309,9 @@ mod tests {
             }
             let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
             if invalid {
-                assert!(
-                    !actions
-                        .iter()
-                        .any(|a| matches!(a, Action::Submit(text) if text.contains("one")))
-                );
+                assert!(!actions
+                    .iter()
+                    .any(|a| matches!(a, Action::Submit(text) if text.contains("one"))));
             } else {
                 assert!(
                     matches!(actions.as_slice(), [Action::Submit(text)] if text == "onetwo"),
@@ -3276,11 +3489,9 @@ mod tests {
                 text: "stale".into(),
             });
             let actions = app.route_key(KeyEvent::from(KeyCode::Enter));
-            assert!(
-                !actions
-                    .iter()
-                    .any(|a| matches!(a, Action::Submit(text) if text.contains("stale")))
-            );
+            assert!(!actions
+                .iter()
+                .any(|a| matches!(a, Action::Submit(text) if text.contains("stale"))));
         }
     }
 

@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::jobs::{JobRegistry, JobStatus};
 use crate::sandbox::{self, Policy as SandboxPolicy};
-use crate::{Workspace, required_str};
+use crate::{required_str, Workspace};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -32,7 +32,11 @@ pub struct BashTool {
 
 impl BashTool {
     pub fn new(ws: Arc<Workspace>, jobs: JobRegistry) -> Self {
-        Self::with_sandbox(ws, jobs, rness_protocol::sandbox::SandboxMode::DangerFullAccess)
+        Self::with_sandbox(
+            ws,
+            jobs,
+            rness_protocol::sandbox::SandboxMode::DangerFullAccess,
+        )
     }
 
     fn with_sandbox(
@@ -41,7 +45,13 @@ impl BashTool {
         sandbox: rness_protocol::sandbox::SandboxMode,
     ) -> Self {
         let sandbox_policy = SandboxPolicy::new(sandbox, ws.root());
-        Self { ws, jobs, sandbox, sandbox_policy, process: Default::default() }
+        Self {
+            ws,
+            jobs,
+            sandbox,
+            sandbox_policy,
+            process: Default::default(),
+        }
     }
 
     pub fn with_process_config(mut self, process: rness_engine::sandbox::ProcessConfig) -> Self {
@@ -65,8 +75,15 @@ fn tail_truncate(mut text: String) -> String {
     format!("… {cut} bytes truncated …\n{text}")
 }
 
-fn publish_stream(pending: &mut Vec<u8>, bytes: &[u8], eof: bool, stream: &Option<(JobRegistry, String, String)>) {
-    let Some((jobs, session, call)) = stream else { return };
+fn publish_stream(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    eof: bool,
+    stream: &Option<(JobRegistry, String, String)>,
+) {
+    let Some((jobs, session, call)) = stream else {
+        return;
+    };
     pending.extend_from_slice(bytes);
     let complete = match std::str::from_utf8(pending) {
         Ok(_) => pending.len(),
@@ -74,7 +91,11 @@ fn publish_stream(pending: &mut Vec<u8>, bytes: &[u8], eof: bool, stream: &Optio
         Err(_) => pending.len(),
     };
     if complete > 0 {
-        jobs.stream_output(session, call, String::from_utf8_lossy(&pending[..complete]).into_owned());
+        jobs.stream_output(
+            session,
+            call,
+            String::from_utf8_lossy(&pending[..complete]).into_owned(),
+        );
         pending.drain(..complete);
     }
 }
@@ -93,9 +114,13 @@ async fn drain_stream(
         total += n;
         crate::jobs::retain_tail(&mut output, &buffer[..n], MAX_OUTPUT_BYTES);
         artifact.append(&buffer[..n]);
-        if artifact.cancelled().is_cancelled() { return Err(std::io::Error::other("output persistence failed")); }
+        if artifact.cancelled().is_cancelled() {
+            return Err(std::io::Error::other("output persistence failed"));
+        }
         publish_stream(&mut pending, &buffer[..n], n == 0, stream);
-        if n == 0 { return Ok((output, total)); }
+        if n == 0 {
+            return Ok((output, total));
+        }
     }
 }
 
@@ -107,20 +132,26 @@ struct ShellGroup {
 impl ShellGroup {
     fn disarm(&mut self) {
         #[cfg(unix)]
-        { self.pid = None; }
+        {
+            self.pid = None;
+        }
     }
 
     fn kill(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self.pid.take() {
             // The child starts its own session, so this targets only its process group.
-            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
         }
     }
 }
 
 impl Drop for ShellGroup {
-    fn drop(&mut self) { self.kill(); }
+    fn drop(&mut self) {
+        self.kill();
+    }
 }
 
 fn spawn_shell(
@@ -129,14 +160,17 @@ fn spawn_shell(
     sandbox_policy: &SandboxPolicy,
     config: &rness_engine::sandbox::ProcessConfig,
 ) -> Result<(tokio::process::Child, ShellGroup, sandbox::Lease), String> {
-    let (mut process, lease) = sandbox::prepare_configured(command, workdir, sandbox_policy, config)?;
+    let (mut process, lease) =
+        sandbox::prepare_configured(command, workdir, sandbox_policy, config)?;
     sandbox::standard_io(&mut process, workdir);
     #[cfg(unix)]
     // Closing stdin alone does not prevent sudo/getpass from opening /dev/tty.
     // setsid detaches the controlling terminal and creates a cleanup process group.
     unsafe {
         process.pre_exec(|| {
-            if libc::setsid() == -1 { return Err(std::io::Error::last_os_error()); }
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -163,7 +197,10 @@ impl Tool for BashTool {
             jobs: self.jobs.clone(),
             sandbox,
             process: self.process.clone(),
-            sandbox_policy: SandboxPolicy { mode: sandbox, workspace: workspace.to_path_buf() },
+            sandbox_policy: SandboxPolicy {
+                mode: sandbox,
+                workspace: workspace.to_path_buf(),
+            },
         }))
     }
     fn name(&self) -> &str {
@@ -207,7 +244,9 @@ impl Tool for BashTool {
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
-        self.run_presented(args, None, None).await.map(|(output, _)| output)
+        self.run_presented(args, None, None)
+            .await
+            .map(|(output, _)| output)
     }
 
     async fn execute_presented(
@@ -259,7 +298,12 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    async fn run_presented(&self, args: Value, owner: Option<&String>, call: Option<&String>) -> Result<(String, Value), String> {
+    async fn run_presented(
+        &self,
+        args: Value,
+        owner: Option<&String>,
+        call: Option<&String>,
+    ) -> Result<(String, Value), String> {
         let command = required_str(&args, "command")?;
         required_str(&args, "description")?;
         let workdir = self.ws.resolve(args["workdir"].as_str().unwrap_or("."));
@@ -270,9 +314,12 @@ impl BashTool {
             .map_err(|e| format!("canonicalize workdir {}: {e}", workdir.display()))?;
         let sandbox_policy = &self.sandbox_policy;
 
-        let stream = owner.zip(call).map(|(owner, call)| (self.jobs.clone(), owner.clone(), call.clone()));
+        let stream = owner
+            .zip(call)
+            .map(|(owner, call)| (self.jobs.clone(), owner.clone(), call.clone()));
         if args["run_in_background"].as_bool().unwrap_or(false) {
-            let (mut child, mut group, lease) = spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
+            let (mut child, mut group, lease) =
+                spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
             let (id, writer) = self.jobs.start_owned("bash", command.to_string(), owner);
             let mut stdout_pipe = child.stdout.take().expect("piped stdout");
             let mut stderr_pipe = child.stderr.take().expect("piped stderr");
@@ -317,10 +364,13 @@ impl BashTool {
                     }
                 }
             });
-            return Ok((format!("started background job {id}"), json!({
-                "version":1,"kind":"bash","command":command,"cwd":workdir,
-                "job_id":id,"status":"running",
-            })));
+            return Ok((
+                format!("started background job {id}"),
+                json!({
+                    "version":1,"kind":"bash","command":command,"cwd":workdir,
+                    "job_id":id,"status":"running",
+                }),
+            ));
         }
 
         let timeout = Duration::from_millis(
@@ -330,11 +380,14 @@ impl BashTool {
                 .min(MAX_TIMEOUT_MS),
         );
 
-        let (mut child, mut group, _lease) = spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
+        let (mut child, mut group, _lease) =
+            spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
         let (artifact_id, artifact) = self.jobs.capture(command.into(), owner);
         struct CaptureGuard(crate::jobs::JobWriter);
         impl Drop for CaptureGuard {
-            fn drop(&mut self) { self.0.settle(JobStatus::Interrupted); }
+            fn drop(&mut self) {
+                self.0.settle(JobStatus::Interrupted);
+            }
         }
         let _capture_guard = CaptureGuard(artifact.clone());
 
@@ -347,7 +400,8 @@ impl BashTool {
                 drain_stream(&mut stdout_pipe, &stream, &artifact),
                 drain_stream(&mut stderr_pipe, &stream, &artifact),
                 child.wait(),
-            ).map_err(|e| format!("capture command output: {e}"))?;
+            )
+            .map_err(|e| format!("capture command output: {e}"))?;
             Ok::<_, String>((out, err, status))
         };
 
@@ -365,7 +419,9 @@ impl BashTool {
             Err(error) => {
                 group.kill();
                 let _ = child.kill().await;
-                return Err(format!("{error}; retained output: job_output(job_id=\"{artifact_id}\", offset=0)"));
+                return Err(format!(
+                    "{error}; retained output: job_output(job_id=\"{artifact_id}\", offset=0)"
+                ));
             }
         };
 
@@ -401,7 +457,14 @@ impl BashTool {
             Some(code) => format!("[exit code: {code}]"),
             None => "[killed by signal]".to_string(),
         };
-        Ok((if text.is_empty() { marker } else { format!("{text}{marker}") }, presentation))
+        Ok((
+            if text.is_empty() {
+                marker
+            } else {
+                format!("{text}{marker}")
+            },
+            presentation,
+        ))
     }
 }
 
@@ -442,9 +505,15 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let tool = BashTool::new(Workspace::new(workspace.path()), JobRegistry::new());
-        let output = tool.execute(args("printf allowed > outside.txt", outside.path())).await.unwrap();
+        let output = tool
+            .execute(args("printf allowed > outside.txt", outside.path()))
+            .await
+            .unwrap();
         assert!(output.contains("[exit code: 0]"), "{output}");
-        assert_eq!(std::fs::read_to_string(outside.path().join("outside.txt")).unwrap(), "allowed");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("outside.txt")).unwrap(),
+            "allowed"
+        );
     }
 
     #[cfg(unix)]
@@ -457,7 +526,10 @@ mod tests {
         for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
             let tool = BashTool::with_sandbox(Workspace::new(&workspace), JobRegistry::new(), mode);
             for workdir in [workspace.join("escape"), workspace.join("..")] {
-                let error = tool.execute(args("touch should-not-run", &workdir)).await.unwrap_err();
+                let error = tool
+                    .execute(args("touch should-not-run", &workdir))
+                    .await
+                    .unwrap_err();
                 assert!(error.contains("outside session workspace"), "{error}");
             }
         }
@@ -474,17 +546,31 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let base = BashTool::new(Workspace::new(&workspace), JobRegistry::new());
-        let tool = base.for_workspace_with_policy(
-            &"session".to_string(), &workspace, SandboxMode::WorkspaceWrite,
-        ).unwrap();
+        let tool = base
+            .for_workspace_with_policy(
+                &"session".to_string(),
+                &workspace,
+                SandboxMode::WorkspaceWrite,
+            )
+            .unwrap();
         std::fs::rename(&workspace, root.path().join("original")).unwrap();
         std::os::unix::fs::symlink(&outside, &workspace).unwrap();
-        let error = tool.execute(args("touch should-not-run", &workspace)).await.unwrap_err();
+        let error = tool
+            .execute(args("touch should-not-run", &workspace))
+            .await
+            .unwrap_err();
         assert!(error.contains("no longer a canonical directory"), "{error}");
-        let rebound = base.for_workspace_with_policy(
-            &"session".to_string(), &workspace, SandboxMode::WorkspaceWrite,
-        ).unwrap();
-        let error = rebound.execute(args("touch should-not-run", &workspace)).await.unwrap_err();
+        let rebound = base
+            .for_workspace_with_policy(
+                &"session".to_string(),
+                &workspace,
+                SandboxMode::WorkspaceWrite,
+            )
+            .unwrap();
+        let error = rebound
+            .execute(args("touch should-not-run", &workspace))
+            .await
+            .unwrap_err();
         assert!(error.contains("no longer a canonical directory"), "{error}");
         assert!(!outside.join("should-not-run").exists());
     }
@@ -499,12 +585,7 @@ mod tests {
         let command = format!("sleep 30 && touch {}", marker.display());
         let session = "session".to_string();
         let call = "call".to_string();
-        let run = tool.execute_presented(
-            &session,
-            &call,
-            args(&command, dir.path()),
-            &cancel,
-        );
+        let run = tool.execute_presented(&session, &call, args(&command, dir.path()), &cancel);
         tokio::pin!(run);
         // Let the shell start, then cancel mid-flight.
         tokio::select! {
@@ -527,8 +608,14 @@ mod tests {
     async fn unsupported_modes_never_execute_command() {
         let dir = tempfile::tempdir().unwrap();
         for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
-            let error = run(mode, dir.path(), "touch should-not-run").await.unwrap_err();
-            assert!(error.contains("no backend has been implemented") || error.contains("windows_container_image"), "{error}");
+            let error = run(mode, dir.path(), "touch should-not-run")
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains("no backend has been implemented")
+                    || error.contains("windows_container_image"),
+                "{error}"
+            );
             assert!(error.contains("refusing to run"), "{error}");
         }
         assert!(!dir.path().join("should-not-run").exists());
@@ -558,15 +645,31 @@ mod tests {
         std::fs::write(root.path().join("outside"), "readable").unwrap();
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let base = BashTool::new(Workspace::new(root.path()), JobRegistry::new());
-        let tool = base.for_workspace_with_policy(
-            &"readonly-session".to_string(), &workspace, SandboxMode::ReadOnly,
-        ).unwrap();
-        let output = tool.execute(args("cat ../outside && printf discarded > /dev/null", &workspace)).await.unwrap();
+        let tool = base
+            .for_workspace_with_policy(
+                &"readonly-session".to_string(),
+                &workspace,
+                SandboxMode::ReadOnly,
+            )
+            .unwrap();
+        let output = tool
+            .execute(args(
+                "cat ../outside && printf discarded > /dev/null",
+                &workspace,
+            ))
+            .await
+            .unwrap();
         assert!(output.contains("readable"), "{output}");
         assert!(output.contains("[exit code: 0]"), "{output}");
-        let output = tool.execute(args("printf blocked > ../outside", &workspace)).await.unwrap();
+        let output = tool
+            .execute(args("printf blocked > ../outside", &workspace))
+            .await
+            .unwrap();
         assert!(!output.contains("[exit code: 0]"), "{output}");
-        assert_eq!(std::fs::read_to_string(root.path().join("outside")).unwrap(), "readable");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("outside")).unwrap(),
+            "readable"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -618,9 +721,15 @@ mod tests {
             "rm ../outside",
             "chmod 777 ../outside",
         ] {
-            let output = run(SandboxMode::WorkspaceWrite, &workspace, command).await.unwrap();
+            let output = run(SandboxMode::WorkspaceWrite, &workspace, command)
+                .await
+                .unwrap();
             assert!(!output.contains("[exit code: 0]"), "{command}: {output}");
-            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged", "{command}");
+            assert_eq!(
+                std::fs::read_to_string(&outside).unwrap(),
+                "unchanged",
+                "{command}"
+            );
             assert!(!root.path().join("new-file").exists());
         }
     }
@@ -635,9 +744,17 @@ mod tests {
             ).await.unwrap();
             let path = std::path::Path::new(output.lines().next().unwrap());
             assert!(path.is_absolute(), "{output}");
-            assert!(path.file_name().unwrap().to_string_lossy().starts_with("rness-sandbox-"));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("rness-sandbox-"));
             assert!(!path.exists(), "temporary directory leaked: {output}");
-            assert_eq!(output.contains("[exit code: 0]"), mode == SandboxMode::WorkspaceWrite, "{output}");
+            assert_eq!(
+                output.contains("[exit code: 0]"),
+                mode == SandboxMode::WorkspaceWrite,
+                "{output}"
+            );
         }
     }
 
@@ -647,10 +764,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("quote\"back\\slash\nλ");
         std::fs::create_dir(&workspace).unwrap();
-        let tool = BashTool::with_sandbox(Workspace::new(&workspace), JobRegistry::new(), SandboxMode::WorkspaceWrite);
+        let tool = BashTool::with_sandbox(
+            Workspace::new(&workspace),
+            JobRegistry::new(),
+            SandboxMode::WorkspaceWrite,
+        );
         let output = tool.execute(json!({"command": "printf allowed > inside", "description": "test literal profile path"})).await.unwrap();
         assert!(output.contains("[exit code: 0]"), "{output}");
-        assert_eq!(std::fs::read_to_string(workspace.join("inside")).unwrap(), "allowed");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("inside")).unwrap(),
+            "allowed"
+        );
         let output = tool.execute(json!({"command": "printf blocked > ../outside", "description": "test literal profile confinement"})).await.unwrap();
         assert!(!output.contains("[exit code: 0]"), "{output}");
         assert!(!root.path().join("outside").exists());

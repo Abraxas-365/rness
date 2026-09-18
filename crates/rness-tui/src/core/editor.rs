@@ -17,7 +17,9 @@ pub struct Editor {
 }
 
 impl Default for Editor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Clone)]
@@ -30,7 +32,12 @@ struct Paste {
 
 impl Editor {
     pub fn new() -> Self {
-        Self { pastes: Vec::new(), next_paste: 1, lines: vec![String::new()], cursor: (0, 0) }
+        Self {
+            pastes: Vec::new(),
+            next_paste: 1,
+            lines: vec![String::new()],
+            cursor: (0, 0),
+        }
     }
 
     pub fn paste(&mut self, text: &str, lines: usize, chars: usize) {
@@ -40,27 +47,55 @@ impl Editor {
         }
         let id = self.next_paste;
         self.next_paste += 1;
-        let label = format!("[Paste #{id} · {} lines · {} bytes]", text.split('\n').count(), text.len());
+        let label = format!(
+            "[Paste #{id} · {} lines · {} bytes]",
+            text.split('\n').count(),
+            text.len()
+        );
         let start = self.before_cursor().len();
         self.insert_str(&label);
-        self.pastes.push(Paste { id, start, end: start + label.len(), content: text.into() });
+        self.pastes.push(Paste {
+            id,
+            start,
+            end: start + label.len(),
+            content: text.into(),
+        });
         self.pastes.sort_by_key(|p| p.start);
     }
 
-    pub fn has_pastes(&self) -> bool { !self.pastes.is_empty() }
+    pub fn has_pastes(&self) -> bool {
+        !self.pastes.is_empty()
+    }
 
     pub fn selected_paste(&self) -> Option<(usize, &str)> {
         let pos = self.before_cursor().len();
-        self.pastes.iter().find(|p| pos >= p.start && pos <= p.end)
+        self.pastes
+            .iter()
+            .find(|p| pos >= p.start && pos <= p.end)
             .map(|p| (p.id, p.content.as_str()))
     }
 
     pub fn replace_paste(&mut self, id: usize, text: Option<&str>) {
-        let Some(index) = self.pastes.iter().position(|p| p.id == id) else { return };
+        let Some(index) = self.pastes.iter().position(|p| p.id == id) else {
+            return;
+        };
         let paste = self.pastes.remove(index);
         let raw = self.lines.join("\n");
-        let replacement = text.map(|s| format!("[Paste #{id} · {} lines · {} bytes]", s.split('\n').count(), s.len())).unwrap_or_default();
-        let updated = format!("{}{}{}", &raw[..paste.start], replacement, &raw[paste.end..]);
+        let replacement = text
+            .map(|s| {
+                format!(
+                    "[Paste #{id} · {} lines · {} bytes]",
+                    s.split('\n').count(),
+                    s.len()
+                )
+            })
+            .unwrap_or_default();
+        let updated = format!(
+            "{}{}{}",
+            &raw[..paste.start],
+            replacement,
+            &raw[paste.end..]
+        );
         for p in &mut self.pastes {
             if p.start >= paste.end {
                 p.start = p.start - (paste.end - paste.start) + replacement.len();
@@ -70,14 +105,22 @@ impl Editor {
         self.lines = updated.split('\n').map(str::to_owned).collect();
         self.set_offset(paste.start + replacement.len());
         if let Some(content) = text {
-            self.pastes.push(Paste { id, start: paste.start, end: paste.start + replacement.len(), content: content.into() });
+            self.pastes.push(Paste {
+                id,
+                start: paste.start,
+                end: paste.start + replacement.len(),
+                content: content.into(),
+            });
             self.pastes.sort_by_key(|p| p.start);
         }
     }
 
     fn set_offset(&mut self, mut offset: usize) {
         for (row, line) in self.lines.iter().enumerate() {
-            if offset <= line.len() { self.cursor = (row, offset); return; }
+            if offset <= line.len() {
+                self.cursor = (row, offset);
+                return;
+            }
             offset -= line.len() + 1;
         }
     }
@@ -118,8 +161,12 @@ impl Editor {
     }
 
     pub fn replace_before_cursor(&mut self, bytes: usize, replacement: &str) {
-        let chars = self.before_cursor()[self.before_cursor().len() - bytes..].chars().count();
-        for _ in 0..chars { self.backspace(); }
+        let chars = self.before_cursor()[self.before_cursor().len() - bytes..]
+            .chars()
+            .count();
+        for _ in 0..chars {
+            self.backspace();
+        }
         self.insert_str(replacement);
     }
 
@@ -170,7 +217,12 @@ impl Editor {
 
     pub fn backspace(&mut self) {
         let pos = self.before_cursor().len();
-        if let Some(id) = self.pastes.iter().find(|p| pos > p.start && pos <= p.end).map(|p| p.id) {
+        if let Some(id) = self
+            .pastes
+            .iter()
+            .find(|p| pos > p.start && pos <= p.end)
+            .map(|p| p.id)
+        {
             self.replace_paste(id, None);
             return;
         }
@@ -252,7 +304,10 @@ impl Editor {
     /// Cursor position for display: (row, column cells).
     pub fn cursor_cells(&self) -> (usize, usize) {
         let (row, col) = self.cursor;
-        let cells = self.lines[row][..col].chars().map(|c| c.width().unwrap_or(0)).sum();
+        let cells = self.lines[row][..col]
+            .chars()
+            .map(|c| c.width().unwrap_or(0))
+            .sum();
         (row, cells)
     }
 
@@ -269,13 +324,21 @@ impl Editor {
             for (bi, c) in line.char_indices() {
                 let w = c.width().unwrap_or(0);
                 if cells + w > width {
-                    rows.push(WrapRow { line: li, start, end: bi });
+                    rows.push(WrapRow {
+                        line: li,
+                        start,
+                        end: bi,
+                    });
                     start = bi;
                     cells = 0;
                 }
                 cells += w;
             }
-            rows.push(WrapRow { line: li, start, end: line.len() });
+            rows.push(WrapRow {
+                line: li,
+                start,
+                end: line.len(),
+            });
         }
         rows
     }
@@ -337,7 +400,9 @@ mod paste_tests {
         e.move_home();
         e.insert_str("prefix ");
         e.move_end();
-        for _ in 0..6 { e.move_left(); }
+        for _ in 0..6 {
+            e.move_left();
+        }
         let id = e.selected_paste().unwrap().0;
         e.replace_paste(id, Some("edited\n"));
         assert_eq!(e.text(), "prefix before edited\n after");
@@ -450,8 +515,8 @@ mod tests {
     fn cursor_wrapped_at_exact_boundary() {
         let mut e = Editor::new();
         e.insert_str("abcd"); // width 4: cursor at byte 4 = end
-        // End-of-line at an exact wrap boundary stays on the line's
-        // last row (col == width), not a phantom next row.
+                              // End-of-line at an exact wrap boundary stays on the line's
+                              // last row (col == width), not a phantom next row.
         assert_eq!(e.cursor_wrapped(4), (0, 4));
         e.insert_char('e'); // now 2 rows, cursor after 'e'
         assert_eq!(e.cursor_wrapped(4), (1, 1));

@@ -21,11 +21,27 @@ impl rness_kernel::presentation::TextProvider for LuaHost {
 
 #[async_trait::async_trait]
 impl rness_tools::web::WebHooks for LuaHost {
-    async fn transform(&self, operation: &str, phase: &str, value: serde_json::Value, context: serde_json::Value, cancel: &tokio_util::sync::CancellationToken) -> Result<serde_json::Value, String> {
+    async fn transform(
+        &self,
+        operation: &str,
+        phase: &str,
+        value: serde_json::Value,
+        context: serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<serde_json::Value, String> {
         let token = cancel.child_token();
         let _guard = token.clone().drop_guard();
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::WebTransform { operation: operation.into(), phase: phase.into(), value, context, cancel: token.clone(), reply }).map_err(|_| "lua vm gone")?;
+        self.tx
+            .send(Cmd::WebTransform {
+                operation: operation.into(),
+                phase: phase.into(),
+                value,
+                context,
+                cancel: token.clone(),
+                reply,
+            })
+            .map_err(|_| "lua vm gone")?;
         tokio::select! {
             biased;
             _ = token.cancelled() => Err("web hook cancelled".into()),
@@ -35,29 +51,49 @@ impl rness_tools::web::WebHooks for LuaHost {
 }
 
 impl rness_kernel::presentation::HookSink for LuaHost {
-    fn fire_hook(&self, event: &str, payload: serde_json::Value) { LuaHost::fire_hook(self, event, payload); }
+    fn fire_hook(&self, event: &str, payload: serde_json::Value) {
+        LuaHost::fire_hook(self, event, payload);
+    }
 }
 
 #[async_trait::async_trait]
 impl rness_kernel::presentation::Applications for LuaHost {
-    async fn app_specs(&self) -> Vec<LuaAppSpec> { LuaHost::app_specs(self).await }
+    async fn app_specs(&self) -> Vec<LuaAppSpec> {
+        LuaHost::app_specs(self).await
+    }
     async fn app_view(&self, name: &str, ctx: serde_json::Value) -> Result<Vec<String>, String> {
         LuaHost::app_view(self, name, ctx).await
     }
-    async fn app_key(&self, name: &str, key: &str, ctx: serde_json::Value) -> Result<AppKeyOutcome, String> {
+    async fn app_key(
+        &self,
+        name: &str,
+        key: &str,
+        ctx: serde_json::Value,
+    ) -> Result<AppKeyOutcome, String> {
         LuaHost::app_key(self, name, key, ctx).await
     }
 }
 
 #[async_trait::async_trait]
 impl rness_engine::presentation::ToolCards for LuaHost {
-    async fn tool_card(&self, name: &str, args: serde_json::Value, output: &str, is_error: bool)
-        -> Option<Vec<crate::runtime::StyledLine>> {
+    async fn tool_card(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        output: &str,
+        is_error: bool,
+    ) -> Option<Vec<crate::runtime::StyledLine>> {
         LuaHost::tool_card(self, name, args, output, is_error).await
     }
 
-    async fn tool_card_presented(&self, name: &str, args: serde_json::Value, output: &str, is_error: bool, presentation: Option<serde_json::Value>)
-        -> Option<Vec<crate::runtime::StyledLine>> {
+    async fn tool_card_presented(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        output: &str,
+        is_error: bool,
+        presentation: Option<serde_json::Value>,
+    ) -> Option<Vec<crate::runtime::StyledLine>> {
         LuaHost::tool_card_presented(self, name, args, output, is_error, presentation).await
     }
 }
@@ -94,15 +130,51 @@ pub(crate) enum ReloadError {
 }
 
 enum Cmd {
-    WebTransform { operation: String, phase: String, value: serde_json::Value, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>> },
-    ValidateBindings { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
-    ActionSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaActionSpec>> },
-    BindingSpecs { reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>> },
-    Action { guard: Box<dyn FnOnce() -> bool + Send>, generation: u64, name: String, scope: String, context: serde_json::Value, reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>> },
-    Complete { name: String, context: serde_json::Value, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<Vec<(String, String)>, String>> },
-    Command { name: String, context: serde_json::Value, permit: rness_engine::service::CommandPermit, cancel: tokio_util::sync::CancellationToken, reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>> },
-    ResumeCommand { id: u64, result: Result<bool, String> },
-    PluginNames { reply: tokio::sync::oneshot::Sender<Vec<String>> },
+    WebTransform {
+        operation: String,
+        phase: String,
+        value: serde_json::Value,
+        context: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+        reply: tokio::sync::oneshot::Sender<Result<serde_json::Value, String>>,
+    },
+    ValidateBindings {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    ActionSpecs {
+        reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaActionSpec>>,
+    },
+    BindingSpecs {
+        reply: tokio::sync::oneshot::Sender<Vec<crate::runtime::LuaBindingSpec>>,
+    },
+    Action {
+        guard: Box<dyn FnOnce() -> bool + Send>,
+        generation: u64,
+        name: String,
+        scope: String,
+        context: serde_json::Value,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<crate::runtime::UiActionOperation>, String>>,
+    },
+    Complete {
+        name: String,
+        context: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
+        reply: mpsc::Sender<Result<Vec<(String, String)>, String>>,
+    },
+    Command {
+        name: String,
+        context: serde_json::Value,
+        permit: rness_engine::service::CommandPermit,
+        cancel: tokio_util::sync::CancellationToken,
+        reply: mpsc::Sender<Result<rness_engine::interaction::CommandResult, String>>,
+    },
+    ResumeCommand {
+        id: u64,
+        result: Result<bool, String>,
+    },
+    PluginNames {
+        reply: tokio::sync::oneshot::Sender<Vec<String>>,
+    },
     CoordinatedUnload {
         name: String,
         installed: crate::api::tools::InstalledTools,
@@ -122,7 +194,10 @@ enum Cmd {
     ToolSpecs {
         reply: tokio::sync::oneshot::Sender<Vec<LuaToolSpec>>,
     },
-    ResumeTool { id: u64, result: Result<serde_json::Value, String> },
+    ResumeTool {
+        id: u64,
+        result: Result<serde_json::Value, String>,
+    },
     CallTool {
         context: serde_json::Value,
         name: String,
@@ -212,49 +287,100 @@ struct LuaCommand {
 }
 
 impl rness_engine::interaction::Command for LuaCommand {
-    fn name(&self) -> &str { &self.name }
-    fn usage(&self) -> &str { &self.usage }
-    fn allow_busy(&self) -> bool { self.allow_busy }
-    fn arguments(&self) -> Vec<(String, String)> { self.arguments.clone() }
-    fn description(&self) -> &str { &self.description }
-    fn complete(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<String>, rness_engine::service::ServiceError> {
-        self.complete_items(service, input).map(|items| items.into_iter().map(|(value, _)| value).collect())
+    fn name(&self) -> &str {
+        &self.name
     }
-    fn complete_items(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<Vec<(String, String)>, rness_engine::service::ServiceError> {
+    fn usage(&self) -> &str {
+        &self.usage
+    }
+    fn allow_busy(&self) -> bool {
+        self.allow_busy
+    }
+    fn arguments(&self) -> Vec<(String, String)> {
+        self.arguments.clone()
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn complete(
+        &self,
+        service: &rness_engine::service::SessionService,
+        input: rness_engine::interaction::CommandInvocation<'_>,
+    ) -> Result<Vec<String>, rness_engine::service::ServiceError> {
+        self.complete_items(service, input)
+            .map(|items| items.into_iter().map(|(value, _)| value).collect())
+    }
+    fn complete_items(
+        &self,
+        service: &rness_engine::service::SessionService,
+        input: rness_engine::interaction::CommandInvocation<'_>,
+    ) -> Result<Vec<(String, String)>, rness_engine::service::ServiceError> {
         use rness_engine::service::ServiceError;
-        if std::thread::current().name() == Some("lua-vm") { return Err(ServiceError::InvalidConfig("recursive Lua completion".into())); }
+        if std::thread::current().name() == Some("lua-vm") {
+            return Err(ServiceError::InvalidConfig(
+                "recursive Lua completion".into(),
+            ));
+        }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
         self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Complete {
             name: self.name.clone(), context: serde_json::json!({"session":input.session,"workspace":workspace,"raw_input":input.raw_input}), cancel: input.cancel, reply,
         }).map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
-        receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?.map_err(ServiceError::InvalidConfig)
+        receive
+            .recv()
+            .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
+            .map_err(ServiceError::InvalidConfig)
     }
-    fn execute(&self, service: &rness_engine::service::SessionService, input: rness_engine::interaction::CommandInvocation<'_>) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
+    fn execute(
+        &self,
+        service: &rness_engine::service::SessionService,
+        input: rness_engine::interaction::CommandInvocation<'_>,
+    ) -> Result<rness_engine::interaction::CommandResult, rness_engine::service::ServiceError> {
         use rness_engine::service::ServiceError;
         if std::thread::current().name() == Some("lua-vm") {
-            return Err(ServiceError::InvalidConfig("Lua commands cannot recursively invoke Lua commands".into()));
+            return Err(ServiceError::InvalidConfig(
+                "Lua commands cannot recursively invoke Lua commands".into(),
+            ));
         }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
         self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), permit: input.permit, cancel: input.cancel, reply })
             .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
-        receive.recv().map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
+        receive
+            .recv()
+            .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
             .map_err(ServiceError::InvalidConfig)
     }
 }
 
-fn sync_commands(rt: &LuaRuntime, binding: &SessionBinding, tx: &std::sync::Weak<mpsc::Sender<Cmd>>, installed: &mut Vec<std::sync::Arc<dyn rness_engine::interaction::Command>>) -> Result<(), String> {
+fn sync_commands(
+    rt: &LuaRuntime,
+    binding: &SessionBinding,
+    tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
+    installed: &mut Vec<std::sync::Arc<dyn rness_engine::interaction::Command>>,
+) -> Result<(), String> {
     let specs = rt.command_specs();
     installed.retain(|command| {
-        if specs.iter().any(|(name, _)| name == command.name()) { return true; }
+        if specs.iter().any(|(name, _)| name == command.name()) {
+            return true;
+        }
         binding.sessions.commands().unregister_if_current(command);
         false
     });
     for (name, description) in specs {
-        if installed.iter().any(|c| c.name() == name) { continue; }
+        if installed.iter().any(|c| c.name() == name) {
+            continue;
+        }
         let (usage, arguments, allow_busy) = rt.command_metadata(&name);
-        let command: std::sync::Arc<dyn rness_engine::interaction::Command> = std::sync::Arc::new(LuaCommand { name, usage, arguments, allow_busy, description, tx: tx.clone() });
+        let command: std::sync::Arc<dyn rness_engine::interaction::Command> =
+            std::sync::Arc::new(LuaCommand {
+                name,
+                usage,
+                arguments,
+                allow_busy,
+                description,
+                tx: tx.clone(),
+            });
         binding.sessions.commands().register(command.clone())?;
         installed.push(command);
     }
@@ -273,33 +399,57 @@ struct ToolCompletion {
 }
 impl Drop for ToolCompletion {
     fn drop(&mut self) {
-        let result = self.result.take().unwrap_or_else(|| Err("session query task stopped".into()));
-        let _ = self.tx.send(Cmd::ResumeTool { id: self.id, result });
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err("session query task stopped".into()));
+        let _ = self.tx.send(Cmd::ResumeTool {
+            id: self.id,
+            result,
+        });
     }
 }
 fn tool_step(
-    id: u64, tool: PendingTool, step: Result<crate::runtime::ToolStep, String>,
+    id: u64,
+    tool: PendingTool,
+    step: Result<crate::runtime::ToolStep, String>,
     pending: &mut std::collections::HashMap<u64, PendingTool>,
-    runtime: Option<&tokio::runtime::Handle>, tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
+    runtime: Option<&tokio::runtime::Handle>,
+    tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
 ) {
     match step {
         Ok(crate::runtime::ToolStep::Pending(request)) => {
             let Some((runtime, tx)) = runtime.zip(tx.upgrade()) else {
-                let _ = tool.reply.send(Err("session query runtime unavailable".into()));
+                let _ = tool
+                    .reply
+                    .send(Err("session query runtime unavailable".into()));
                 return;
             };
             pending.insert(id, tool);
-            let mut completion = ToolCompletion { tx, id, result: None };
+            let mut completion = ToolCompletion {
+                tx,
+                id,
+                result: None,
+            };
             runtime.spawn(async move {
-                completion.result = Some(match tokio::time::timeout(std::time::Duration::from_secs(60), request.0).await {
-                    Ok(result) => result,
-                    Err(_) => Err("session query timed out; index worker may still finish".into()),
-                });
+                completion.result = Some(
+                    match tokio::time::timeout(std::time::Duration::from_secs(60), request.0).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            Err("session query timed out; index worker may still finish".into())
+                        }
+                    },
+                );
                 drop(completion);
             });
         }
-        Ok(crate::runtime::ToolStep::Complete(result)) => { let _ = tool.reply.send(Ok(result)); }
-        Err(error) => { let _ = tool.reply.send(Err(error)); }
+        Ok(crate::runtime::ToolStep::Complete(result)) => {
+            let _ = tool.reply.send(Ok(result));
+        }
+        Err(error) => {
+            let _ = tool.reply.send(Err(error));
+        }
     }
 }
 
@@ -319,25 +469,40 @@ struct CompactionCompletion {
 
 impl Drop for CompactionCompletion {
     fn drop(&mut self) {
-        let result = self.result.take().unwrap_or_else(|| Err("compaction task stopped".into()));
-        let _ = self.tx.send(Cmd::ResumeCommand { id: self.id, result });
+        let result = self
+            .result
+            .take()
+            .unwrap_or_else(|| Err("compaction task stopped".into()));
+        let _ = self.tx.send(Cmd::ResumeCommand {
+            id: self.id,
+            result,
+        });
     }
 }
 
 fn command_step(
-    id: u64, command: PendingCommand, step: Result<crate::runtime::CommandStep, String>,
+    id: u64,
+    command: PendingCommand,
+    step: Result<crate::runtime::CommandStep, String>,
     pending: &mut std::collections::HashMap<u64, PendingCommand>,
-    runtime: Option<&tokio::runtime::Handle>, tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
+    runtime: Option<&tokio::runtime::Handle>,
+    tx: &std::sync::Weak<mpsc::Sender<Cmd>>,
 ) {
     match step {
         Ok(crate::runtime::CommandStep::Pending(future)) => {
             let Some((runtime, tx)) = runtime.zip(tx.upgrade()) else {
-                let _ = command.reply.send(Err("compaction runtime unavailable".into()));
+                let _ = command
+                    .reply
+                    .send(Err("compaction runtime unavailable".into()));
                 return;
             };
             pending.insert(id, command);
             // A dropped/panicking runtime task must also release the parked command.
-            let mut completion = CompactionCompletion { tx, id, result: None };
+            let mut completion = CompactionCompletion {
+                tx,
+                id,
+                result: None,
+            };
             runtime.spawn(async move {
                 completion.result = Some(future.await);
                 drop(completion);
@@ -363,11 +528,16 @@ impl LuaHost {
         Self::spawn_inner(config, None).map(|(host, _)| host)
     }
 
-    pub fn spawn_from_init(path: std::path::PathBuf) -> Result<(Self, crate::api::config::StartupConfig), String> {
+    pub fn spawn_from_init(
+        path: std::path::PathBuf,
+    ) -> Result<(Self, crate::api::config::StartupConfig), String> {
         Self::spawn_inner(crate::api::config::StartupConfig::default(), Some(path))
     }
 
-    fn spawn_inner(mut config: crate::api::config::StartupConfig, init: Option<std::path::PathBuf>) -> Result<(Self, crate::api::config::StartupConfig), String> {
+    fn spawn_inner(
+        mut config: crate::api::config::StartupConfig,
+        init: Option<std::path::PathBuf>,
+    ) -> Result<(Self, crate::api::config::StartupConfig), String> {
         let (tx, rx) = mpsc::channel::<Cmd>();
         let tx = std::sync::Arc::new(tx);
         let command_tx = std::sync::Arc::downgrade(&tx);
@@ -698,7 +868,9 @@ impl LuaHost {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let config = ready_rx.recv().map_err(|_| "lua vm thread died".to_string())??;
+        let config = ready_rx
+            .recv()
+            .map_err(|_| "lua vm thread died".to_string())??;
         Ok((Self { tx, generation }, config))
     }
 
@@ -706,10 +878,20 @@ impl LuaHost {
         self.load_with_dependencies(name, source, &[]).await
     }
 
-    pub async fn load_with_dependencies(&self, name: &str, source: &str, dependencies: &[String]) -> Result<(), String> {
+    pub async fn load_with_dependencies(
+        &self,
+        name: &str,
+        source: &str,
+        dependencies: &[String],
+    ) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::Load { name: name.into(), source: source.into(), dependencies: dependencies.to_vec(), reply })
+            .send(Cmd::Load {
+                name: name.into(),
+                source: source.into(),
+                dependencies: dependencies.to_vec(),
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
@@ -718,7 +900,12 @@ impl LuaHost {
     /// until engine and frontend teardown can be coordinated.
     pub async fn unload(&self, name: &str) -> Result<bool, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::Unload { name: name.into(), reply }).map_err(|_| "lua vm gone")?;
+        self.tx
+            .send(Cmd::Unload {
+                name: name.into(),
+                reply,
+            })
+            .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
@@ -734,15 +921,22 @@ impl LuaHost {
         apply_ui: impl FnOnce(UnloadSnapshot) + Send + 'static,
     ) -> Result<bool, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::CoordinatedUnload {
-            name: name.into(), installed, apply_ui: Box::new(apply_ui), reply,
-        }).map_err(|_| "lua vm gone")?;
+        self.tx
+            .send(Cmd::CoordinatedUnload {
+                name: name.into(),
+                installed,
+                apply_ui: Box::new(apply_ui),
+                reply,
+            })
+            .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     pub async fn plugin_names(&self) -> Vec<String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(Cmd::PluginNames { reply }).is_err() { return Vec::new(); }
+        if self.tx.send(Cmd::PluginNames { reply }).is_err() {
+            return Vec::new();
+        }
         rx.await.unwrap_or_default()
     }
 
@@ -755,24 +949,45 @@ impl LuaHost {
     }
 
     pub async fn call_tool(&self, name: &str, args: serde_json::Value) -> Result<String, String> {
-        self.call_tool_context(name, args, serde_json::json!({})).await
+        self.call_tool_context(name, args, serde_json::json!({}))
+            .await
     }
 
-    pub async fn call_tool_context(&self, name: &str, args: serde_json::Value, context: serde_json::Value) -> Result<String, String> {
-        self.call_tool_presented(name, args, context).await.map(|(output, _)| output)
+    pub async fn call_tool_context(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context: serde_json::Value,
+    ) -> Result<String, String> {
+        self.call_tool_presented(name, args, context)
+            .await
+            .map(|(output, _)| output)
     }
 
-    pub async fn call_tool_presented(&self, name: &str, args: serde_json::Value, context: serde_json::Value) -> Result<(String, Option<serde_json::Value>), String> {
+    pub async fn call_tool_presented(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context: serde_json::Value,
+    ) -> Result<(String, Option<serde_json::Value>), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::CallTool { name: name.into(), args, context, reply })
+            .send(Cmd::CallTool {
+                name: name.into(),
+                args,
+                context,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// Fire-and-forget: never blocks the caller on Lua execution.
     pub fn fire_hook(&self, event: &str, payload: serde_json::Value) {
-        let _ = self.tx.send(Cmd::FireHook { event: event.into(), payload });
+        let _ = self.tx.send(Cmd::FireHook {
+            event: event.into(),
+            payload,
+        });
     }
 
     pub async fn statusline(&self) -> Option<String> {
@@ -790,7 +1005,8 @@ impl LuaHost {
         output: &str,
         is_error: bool,
     ) -> Option<Vec<crate::runtime::StyledLine>> {
-        self.tool_card_presented(name, args, output, is_error, None).await
+        self.tool_card_presented(name, args, output, is_error, None)
+            .await
     }
 
     pub async fn tool_card_presented(
@@ -817,35 +1033,76 @@ impl LuaHost {
 
     pub async fn action_specs(&self) -> Vec<crate::runtime::LuaActionSpec> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(Cmd::ActionSpecs { reply }).is_err() { return Vec::new(); }
+        if self.tx.send(Cmd::ActionSpecs { reply }).is_err() {
+            return Vec::new();
+        }
         rx.await.unwrap_or_default()
     }
 
     pub async fn binding_specs(&self) -> Vec<crate::runtime::LuaBindingSpec> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        if self.tx.send(Cmd::BindingSpecs { reply }).is_err() { return Vec::new(); }
+        if self.tx.send(Cmd::BindingSpecs { reply }).is_err() {
+            return Vec::new();
+        }
         rx.await.unwrap_or_default()
     }
 
     pub async fn validate_bindings(&self) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::ValidateBindings { reply }).map_err(|_| "Lua host stopped".to_owned())?;
+        self.tx
+            .send(Cmd::ValidateBindings { reply })
+            .map_err(|_| "Lua host stopped".to_owned())?;
         rx.await.map_err(|_| "Lua host stopped".to_owned())?
     }
 
-    pub fn action_generation(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> { self.generation.clone() }
-
-    pub async fn call_action(&self, name: &str, scope: &str, context: serde_json::Value) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
-        self.call_action_at(self.generation.load(std::sync::atomic::Ordering::SeqCst), name, scope, context).await
+    pub fn action_generation(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        self.generation.clone()
     }
 
-    pub async fn call_action_at(&self, generation: u64, name: &str, scope: &str, context: serde_json::Value) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
-        self.call_action_guarded(generation, name, scope, context, || true).await
+    pub async fn call_action(
+        &self,
+        name: &str,
+        scope: &str,
+        context: serde_json::Value,
+    ) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+        self.call_action_at(
+            self.generation.load(std::sync::atomic::Ordering::SeqCst),
+            name,
+            scope,
+            context,
+        )
+        .await
     }
 
-    pub async fn call_action_guarded(&self, generation: u64, name: &str, scope: &str, context: serde_json::Value, guard: impl FnOnce() -> bool + Send + 'static) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+    pub async fn call_action_at(
+        &self,
+        generation: u64,
+        name: &str,
+        scope: &str,
+        context: serde_json::Value,
+    ) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
+        self.call_action_guarded(generation, name, scope, context, || true)
+            .await
+    }
+
+    pub async fn call_action_guarded(
+        &self,
+        generation: u64,
+        name: &str,
+        scope: &str,
+        context: serde_json::Value,
+        guard: impl FnOnce() -> bool + Send + 'static,
+    ) -> Result<Vec<crate::runtime::UiActionOperation>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::Action { guard: Box::new(guard), generation, name: name.into(), scope: scope.into(), context, reply })
+        self.tx
+            .send(Cmd::Action {
+                guard: Box::new(guard),
+                generation,
+                name: name.into(),
+                scope: scope.into(),
+                context,
+                reply,
+            })
             .map_err(|_| "Lua host stopped".to_owned())?;
         rx.await.map_err(|_| "Lua host stopped".to_owned())?
     }
@@ -874,7 +1131,12 @@ impl LuaHost {
     ) -> Result<Vec<String>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::AppView { guard: None, name: name.into(), ctx, reply })
+            .send(Cmd::AppView {
+                guard: None,
+                name: name.into(),
+                ctx,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
@@ -887,62 +1149,111 @@ impl LuaHost {
     ) -> Result<AppKeyOutcome, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::AppKey { guard: None, name: name.into(), key: key.into(), ctx, reply })
+            .send(Cmd::AppKey {
+                guard: None,
+                name: name.into(),
+                key: key.into(),
+                ctx,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// Check activation/context on the VM thread immediately before calling Lua.
     pub async fn app_view_guarded(
-        &self, name: &str, ctx: serde_json::Value,
+        &self,
+        name: &str,
+        ctx: serde_json::Value,
         guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<Vec<String>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::AppView { guard: Some(guard), name: name.into(), ctx, reply })
+        self.tx
+            .send(Cmd::AppView {
+                guard: Some(guard),
+                name: name.into(),
+                ctx,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// A queued key must not run side effects after its activation expires.
     pub async fn app_key_guarded(
-        &self, name: &str, key: &str, ctx: serde_json::Value,
+        &self,
+        name: &str,
+        key: &str,
+        ctx: serde_json::Value,
         guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<AppKeyOutcome, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::AppKey { guard: Some(guard), name: name.into(), key: key.into(), ctx, reply })
+        self.tx
+            .send(Cmd::AppKey {
+                guard: Some(guard),
+                name: name.into(),
+                key: key.into(),
+                ctx,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// Replace runtime registrations from `sources`, preserving startup state.
     /// Any load failure leaves the old registrations live.
-    pub async fn reload(&self,
+    pub async fn reload(
+        &self,
         sources: Vec<crate::loader::PluginSource>,
     ) -> Result<Vec<(String, String)>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::Reload { sources, reconcile: None, reply })
+            .send(Cmd::Reload {
+                sources,
+                reconcile: None,
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?.map_err(|error| error.to_string())
+        rx.await
+            .map_err(|_| "lua vm gone")?
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) async fn reload_reconciled(&self, sources: Vec<crate::loader::PluginSource>, reconcile: impl FnOnce(Vec<LuaToolSpec>) + Send + 'static) -> Result<Vec<(String, String)>, ReloadError> {
+    pub(crate) async fn reload_reconciled(
+        &self,
+        sources: Vec<crate::loader::PluginSource>,
+        reconcile: impl FnOnce(Vec<LuaToolSpec>) + Send + 'static,
+    ) -> Result<Vec<(String, String)>, ReloadError> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::Reload { sources, reconcile: Some(Box::new(reconcile)), reply }).map_err(|_| ReloadError::Failed("lua vm gone".into()))?;
-        rx.await.map_err(|_| ReloadError::Failed("lua vm gone".into()))?
+        self.tx
+            .send(Cmd::Reload {
+                sources,
+                reconcile: Some(Box::new(reconcile)),
+                reply,
+            })
+            .map_err(|_| ReloadError::Failed("lua vm gone".into()))?;
+        rx.await
+            .map_err(|_| ReloadError::Failed("lua vm gone".into()))?
     }
 
     /// Inject shared background jobs. Sticky across retained-VM hot reloads.
     pub async fn install_jobs(&self, jobs: rness_tools::jobs::JobRegistry) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::InstallJobs { jobs, reply }).map_err(|_| "lua vm gone")?;
+        self.tx
+            .send(Cmd::InstallJobs { jobs, reply })
+            .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
     /// Inject the shared questions broker. Sticky across hot reloads.
-    pub async fn install_questions(&self, questions: std::sync::Arc<rness_engine::questions::Questions>) -> Result<(), String> {
+    pub async fn install_questions(
+        &self,
+        questions: std::sync::Arc<rness_engine::questions::Questions>,
+    ) -> Result<(), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.tx.send(Cmd::InstallQuestions { questions, reply }).map_err(|_| "lua vm gone")?;
+        self.tx
+            .send(Cmd::InstallQuestions { questions, reply })
+            .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }
 
@@ -959,7 +1270,14 @@ impl LuaHost {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::InstallSession {
-                binding: SessionBinding { sessions, subagents, registry, mcp, rt, model },
+                binding: SessionBinding {
+                    sessions,
+                    subagents,
+                    registry,
+                    mcp,
+                    rt,
+                    model,
+                },
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
@@ -975,22 +1293,44 @@ mod tests {
     #[tokio::test]
     async fn guarded_app_callbacks_reject_stale_requests_before_lua_side_effects() {
         let host = LuaHost::spawn().unwrap();
-        host.load("probe", r#"
+        host.load(
+            "probe",
+            r#"
             local calls = 0
             rness.ui.app { name = 'probe', slot = 'overlay',
                 view = function() calls = calls + 1; return {tostring(calls)} end,
                 on_key = function() calls = calls + 1; return true end }
-        "#).await.unwrap();
+        "#,
+        )
+        .await
+        .unwrap();
         let guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(|| false);
-        assert_eq!(host.app_key_guarded("probe", "enter", json!({}), guard.clone()).await.unwrap_err(), "stale app request");
-        assert_eq!(host.app_view_guarded("probe", json!({}), guard).await.unwrap_err(), "stale app request");
+        assert_eq!(
+            host.app_key_guarded("probe", "enter", json!({}), guard.clone())
+                .await
+                .unwrap_err(),
+            "stale app request"
+        );
+        assert_eq!(
+            host.app_view_guarded("probe", json!({}), guard)
+                .await
+                .unwrap_err(),
+            "stale app request"
+        );
         // Both rejected callbacks must leave Lua state untouched.
         assert_eq!(host.app_view("probe", json!({})).await.unwrap(), vec!["1"]);
         let generation = host.action_generation();
         let captured = generation.load(std::sync::atomic::Ordering::SeqCst);
-        let guard = std::sync::Arc::new(move || generation.load(std::sync::atomic::Ordering::SeqCst) == captured);
+        let guard = std::sync::Arc::new(move || {
+            generation.load(std::sync::atomic::Ordering::SeqCst) == captured
+        });
         host.load("other", "").await.unwrap();
-        assert_eq!(host.app_key_guarded("probe", "enter", json!({}), guard).await.unwrap_err(), "stale app request");
+        assert_eq!(
+            host.app_key_guarded("probe", "enter", json!({}), guard)
+                .await
+                .unwrap_err(),
+            "stale app request"
+        );
         assert_eq!(host.app_view("probe", json!({})).await.unwrap(), vec!["2"]);
     }
 
@@ -999,13 +1339,43 @@ mod tests {
         let host = LuaHost::spawn().unwrap();
         let source = "local p = __rness_plugin_context(); p.action('run', {scope='promptbox', description='Run', run=function(ctx) ctx.promptbox.insert('new') end})";
         host.load("review", source).await.unwrap();
-        let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
-        host.reload(vec![crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: source.into() }]).await.unwrap();
-        assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.unwrap_err().contains("generation expired"));
-        assert_eq!(host.call_action("review.run", "promptbox", json!({})).await.unwrap().len(), 1);
-        let generation = host.action_generation().load(std::sync::atomic::Ordering::SeqCst);
-        assert!(host.reload(vec![crate::loader::PluginSource { dependencies: vec![], name: "review".into(), source: "error('failed')".into() }]).await.is_err());
-        assert!(host.call_action_at(generation, "review.run", "promptbox", json!({})).await.is_ok());
+        let generation = host
+            .action_generation()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        host.reload(vec![crate::loader::PluginSource {
+            dependencies: vec![],
+            name: "review".into(),
+            source: source.into(),
+        }])
+        .await
+        .unwrap();
+        assert!(host
+            .call_action_at(generation, "review.run", "promptbox", json!({}))
+            .await
+            .unwrap_err()
+            .contains("generation expired"));
+        assert_eq!(
+            host.call_action("review.run", "promptbox", json!({}))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let generation = host
+            .action_generation()
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(host
+            .reload(vec![crate::loader::PluginSource {
+                dependencies: vec![],
+                name: "review".into(),
+                source: "error('failed')".into()
+            }])
+            .await
+            .is_err());
+        assert!(host
+            .call_action_at(generation, "review.run", "promptbox", json!({}))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1026,12 +1396,22 @@ mod tests {
     #[tokio::test]
     async fn unmounted_host_unloads_across_cloned_handles() {
         let host = LuaHost::spawn().unwrap();
-        host.load("plugin", "rness.tool.register{name='owned', run=function() return 'ok' end}").await.unwrap();
+        host.load(
+            "plugin",
+            "rness.tool.register{name='owned', run=function() return 'ok' end}",
+        )
+        .await
+        .unwrap();
         assert!(host.clone().unload("plugin").await.unwrap());
         assert!(host.tool_specs().await.is_empty());
         assert!(host.call_tool("owned", json!({})).await.is_err());
         assert!(!host.unload("plugin").await.unwrap());
-        host.load("plugin", "rness.tool.register{name='owned', run=function() return 'new' end}").await.unwrap();
+        host.load(
+            "plugin",
+            "rness.tool.register{name='owned', run=function() return 'new' end}",
+        )
+        .await
+        .unwrap();
         assert_eq!(host.call_tool("owned", json!({})).await.unwrap(), "new");
     }
 
@@ -1047,11 +1427,17 @@ mod tests {
 
         let specs = host.tool_specs().await;
         assert_eq!(specs[0].name, "add");
-        assert_eq!(host.call_tool("add", json!({"x": 2, "y": 3})).await, Ok("5".into()));
+        assert_eq!(
+            host.call_tool("add", json!({"x": 2, "y": 3})).await,
+            Ok("5".into())
+        );
 
         // Cloned handles talk to the same VM.
         let clone = host.clone();
-        assert_eq!(clone.call_tool("add", json!({"x": 1, "y": 1})).await, Ok("2".into()));
+        assert_eq!(
+            clone.call_tool("add", json!({"x": 1, "y": 1})).await,
+            Ok("2".into())
+        );
     }
 
     #[tokio::test]
@@ -1077,7 +1463,10 @@ mod tests {
     #[tokio::test]
     async fn load_error_reports_source_name() {
         let host = LuaHost::spawn().unwrap();
-        let err = host.load("broken.lua", "this is not lua").await.unwrap_err();
+        let err = host
+            .load("broken.lua", "this is not lua")
+            .await
+            .unwrap_err();
         assert!(err.contains("broken.lua"), "{err}");
     }
 
@@ -1088,7 +1477,12 @@ mod tests {
         host.install_questions(qs.clone()).await.unwrap();
 
         // Plugin enables questions.
-        host.load("q-plugin", "rness.questions.enable { height = 25, title = 'Decisions' }").await.unwrap();
+        host.load(
+            "q-plugin",
+            "rness.questions.enable { height = 25, title = 'Decisions' }",
+        )
+        .await
+        .unwrap();
         assert!(qs.is_available());
         assert_eq!(qs.owner().as_deref(), Some("q-plugin"));
         assert_eq!(qs.overlay_config().height, 25);
@@ -1100,7 +1494,9 @@ mod tests {
         assert!(qs.owner().is_none());
 
         // Re-enable works after unload.
-        host.load("q-plugin", "rness.questions.enable()").await.unwrap();
+        host.load("q-plugin", "rness.questions.enable()")
+            .await
+            .unwrap();
         assert!(qs.is_available());
 
         // Explicit disable from Lua.

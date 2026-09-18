@@ -66,7 +66,13 @@ pub fn public_tool_name(server: &str, raw: &str) -> String {
     let joined = format!("mcp__{server}__{raw}");
     let normalized: String = joined
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if normalized == joined && normalized.len() <= MAX {
         return normalized;
@@ -74,7 +80,12 @@ pub fn public_tool_name(server: &str, raw: &str) -> String {
     // Stable identity hash (FNV-1a over server\0raw) — no crypto needed,
     // just collision resistance across a tool list.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in server.as_bytes().iter().chain([0u8].iter()).chain(raw.as_bytes()) {
+    for b in server
+        .as_bytes()
+        .iter()
+        .chain([0u8].iter())
+        .chain(raw.as_bytes())
+    {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -85,51 +96,92 @@ pub fn public_tool_name(server: &str, raw: &str) -> String {
 
 fn valid_server_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-struct PendingRequest { pending: Pending, id: u64 }
+struct PendingRequest {
+    pending: Pending,
+    id: u64,
+}
 impl Drop for PendingRequest {
-    fn drop(&mut self) { self.pending.lock().expect("pending lock").remove(&self.id); }
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending lock").remove(&self.id);
+    }
 }
 
-struct IncompleteWrite<'a> { connection: &'a McpConnection, complete: bool }
+struct IncompleteWrite<'a> {
+    connection: &'a McpConnection,
+    complete: bool,
+}
 impl Drop for IncompleteWrite<'_> {
     fn drop(&mut self) {
-        if self.complete { return; }
+        if self.complete {
+            return;
+        }
         let conn = self.connection;
         conn.closed.store(true, Ordering::Release);
-        if let Some(reader) = &conn.reader { reader.abort(); }
+        if let Some(reader) = &conn.reader {
+            reader.abort();
+        }
         conn.pending.lock().expect("pending lock").clear();
-        if let Some(child) = conn.child.lock().expect("child lock").as_mut() { let _ = child.start_kill(); }
+        if let Some(child) = conn.child.lock().expect("child lock").as_mut() {
+            let _ = child.start_kill();
+        }
         conn.changed.notify_one();
     }
 }
 
 /// A small launch-environment allowlist; credentials must be passed explicitly.
 fn child_env() -> Vec<(String, std::ffi::OsString)> {
-    ["PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "WINDIR", "PATHEXT", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL"]
-        .into_iter().filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value))).collect()
+    [
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)))
+    .collect()
 }
 
-async fn read_frame(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> std::io::Result<Option<Vec<u8>>> {
+async fn read_frame(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+) -> std::io::Result<Option<Vec<u8>>> {
     let mut frame = Vec::new();
     loop {
         let bytes = reader.fill_buf().await?;
         if bytes.is_empty() {
-            return if frame.is_empty() { Ok(None) } else { Err(std::io::ErrorKind::UnexpectedEof.into()) };
+            return if frame.is_empty() {
+                Ok(None)
+            } else {
+                Err(std::io::ErrorKind::UnexpectedEof.into())
+            };
         }
         let end = bytes.iter().position(|b| *b == b'\n').map(|i| i + 1);
         let count = end.unwrap_or(bytes.len());
         if frame.len().saturating_add(count) > MAX_FRAME_BYTES {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "MCP frame exceeds 16 MiB"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "MCP frame exceeds 16 MiB",
+            ));
         }
         frame.extend_from_slice(&bytes[..count]);
         reader.consume(count);
-        if end.is_some() { return Ok(Some(frame)); }
+        if end.is_some() {
+            return Ok(Some(frame));
+        }
     }
 }
 
@@ -158,8 +210,12 @@ pub struct McpConnection {
 impl Drop for McpConnection {
     fn drop(&mut self) {
         self.cancel.cancel();
-        if let Some(reader) = &self.reader { reader.abort(); }
-        if let Some(reader) = self.http_reader.get_mut().unwrap().take() { reader.abort(); }
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+        if let Some(reader) = self.http_reader.get_mut().unwrap().take() {
+            reader.abort();
+        }
     }
 }
 
@@ -180,9 +236,10 @@ impl McpConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|source| McpError::Spawn { server: spec.name.clone(), source })?;
+        let mut child = cmd.spawn().map_err(|source| McpError::Spawn {
+            server: spec.name.clone(),
+            source,
+        })?;
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -204,12 +261,17 @@ impl McpConnection {
                     reader_changed.notify_one();
                     continue;
                 }
-                let Some(id) = msg["id"].as_u64() else { continue };
+                let Some(id) = msg["id"].as_u64() else {
+                    continue;
+                };
                 let Some(tx) = route.lock().expect("pending lock").remove(&id) else {
                     continue;
                 };
                 let result = if msg["error"].is_object() {
-                    Err(msg["error"]["message"].as_str().unwrap_or("unknown error").to_string())
+                    Err(msg["error"]["message"]
+                        .as_str()
+                        .unwrap_or("unknown error")
+                        .to_string())
                 } else {
                     Ok(msg["result"].clone())
                 };
@@ -237,7 +299,8 @@ impl McpConnection {
             changed,
             deferred: AtomicBool::new(false),
             reader: Some(reader.abort_handle()),
-            http_reader: Default::default(), cancel: Default::default(),
+            http_reader: Default::default(),
+            cancel: Default::default(),
             sync: tokio::sync::Mutex::new(()),
         });
 
@@ -256,19 +319,34 @@ impl McpConnection {
     }
 
     pub async fn connect_http(spec: http::HttpServer) -> Result<Arc<Self>, McpError> {
-        if !valid_server_name(&spec.name) { return Err(McpError::BadServerName { server: spec.name }); }
+        if !valid_server_name(&spec.name) {
+            return Err(McpError::BadServerName { server: spec.name });
+        }
         let transport = http::HttpTransport::new(spec.clone())?;
         let conn = Arc::new(Self {
-            server: spec.name, spec: None, http: Some(transport.clone()), stdin: None,
-            pending: Default::default(), next_id: AtomicU64::new(1), timeout: spec.timeout,
-            child: Mutex::new(None), registered: Default::default(), closed: Arc::new(AtomicBool::new(false)),
-            reader: None, http_reader: Default::default(), cancel: Default::default(), sync: Default::default(), changed: Default::default(), deferred: AtomicBool::new(false),
+            server: spec.name,
+            spec: None,
+            http: Some(transport.clone()),
+            stdin: None,
+            pending: Default::default(),
+            next_id: AtomicU64::new(1),
+            timeout: spec.timeout,
+            child: Mutex::new(None),
+            registered: Default::default(),
+            closed: Arc::new(AtomicBool::new(false)),
+            reader: None,
+            http_reader: Default::default(),
+            cancel: Default::default(),
+            sync: Default::default(),
+            changed: Default::default(),
+            deferred: AtomicBool::new(false),
         });
         let result = match conn.request("initialize", json!({"protocolVersion":"2025-03-26", "capabilities":{}, "clientInfo":{"name":"rness", "version":env!("CARGO_PKG_VERSION")}})).await {
             Ok(result) => result,
             Err(error) => { transport.close().await; return Err(error); },
         };
-        if let Err(error) = transport.set_version(result["protocolVersion"].as_str().unwrap_or("")) {
+        if let Err(error) = transport.set_version(result["protocolVersion"].as_str().unwrap_or(""))
+        {
             transport.close().await;
             return Err(error);
         }
@@ -296,9 +374,12 @@ impl McpConnection {
         self.disconnect(registry).await;
         let conn = match &self.spec {
             Some(spec) => Self::connect(spec.clone()).await?,
-            None => Self::connect_http(self.http.as_ref().expect("HTTP transport").spec.clone()).await?,
+            None => {
+                Self::connect_http(self.http.as_ref().expect("HTTP transport").spec.clone()).await?
+            }
         };
-        conn.deferred.store(self.deferred.load(Ordering::Acquire), Ordering::Release);
+        conn.deferred
+            .store(self.deferred.load(Ordering::Acquire), Ordering::Release);
         if let Err(error) = conn.bridge_tools(registry).await {
             conn.disconnect(registry).await;
             return Err(error);
@@ -306,7 +387,9 @@ impl McpConnection {
         Ok(conn)
     }
 
-    pub fn is_closed(&self) -> bool { self.closed.load(Ordering::Acquire) }
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
 
     pub fn server(&self) -> &str {
         &self.server
@@ -316,16 +399,30 @@ impl McpConnection {
         let mut line = serde_json::to_string(payload).expect("serializable");
         line.push('\n');
         if line.len() > MAX_FRAME_BYTES {
-            return Err(McpError::Protocol { server: self.server.clone(), message: "outgoing MCP frame exceeds 16 MiB".into() });
+            return Err(McpError::Protocol {
+                server: self.server.clone(),
+                message: "outgoing MCP frame exceeds 16 MiB".into(),
+            });
         }
         let mut stdin = self.stdin.as_ref().expect("stdio transport").lock().await;
-        if self.closed.load(Ordering::Acquire) { return Err(McpError::Closed { server: self.server.clone() }); }
-        let mut guard = IncompleteWrite { connection: self, complete: false };
+        if self.closed.load(Ordering::Acquire) {
+            return Err(McpError::Closed {
+                server: self.server.clone(),
+            });
+        }
+        let mut guard = IncompleteWrite {
+            connection: self,
+            complete: false,
+        };
         stdin
             .write_all(line.as_bytes())
             .await
-            .map_err(|_| McpError::Closed { server: self.server.clone() })?;
-        stdin.flush().await.map_err(|_| McpError::Closed { server: self.server.clone() })?;
+            .map_err(|_| McpError::Closed {
+                server: self.server.clone(),
+            })?;
+        stdin.flush().await.map_err(|_| McpError::Closed {
+            server: self.server.clone(),
+        })?;
         guard.complete = true;
         Ok(())
     }
@@ -340,21 +437,31 @@ impl McpConnection {
             }
             return Ok(());
         }
-        self.send_raw(&json!({ "jsonrpc": "2.0", "method": method, "params": params })).await
+        self.send_raw(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+            .await
     }
 
     /// One JSON-RPC request with the connection's timeout.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, McpError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(McpError::Closed { server: self.server.clone() });
+            return Err(McpError::Closed {
+                server: self.server.clone(),
+            });
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.request_with_id(id, method, params).await
     }
 
-    async fn request_with_id(&self, id: u64, method: &str, params: Value) -> Result<Value, McpError> {
+    async fn request_with_id(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, McpError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(McpError::Closed { server: self.server.clone() });
+            return Err(McpError::Closed {
+                server: self.server.clone(),
+            });
         }
         if let Some(http) = &self.http {
             let payload = json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params});
@@ -365,23 +472,49 @@ impl McpConnection {
                 result = tokio::time::timeout(self.timeout, work) => result
                     .unwrap_or_else(|_| Err(McpError::Timeout { server:self.server.clone(), timeout_ms:self.timeout.as_millis() as u64 })),
             };
-            if result.as_ref().is_err_and(|error| !matches!(error, McpError::Rpc { .. })) { self.closed.store(true, Ordering::Release); self.changed.notify_one(); }
-            return result?.ok_or_else(|| McpError::Protocol { server:self.server.clone(), message:"missing HTTP response".into() });
+            if result
+                .as_ref()
+                .is_err_and(|error| !matches!(error, McpError::Rpc { .. }))
+            {
+                self.closed.store(true, Ordering::Release);
+                self.changed.notify_one();
+            }
+            return result?.ok_or_else(|| McpError::Protocol {
+                server: self.server.clone(),
+                message: "missing HTTP response".into(),
+            });
         }
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
-        let _cleanup = PendingRequest { pending: self.pending.clone(), id };
+        let _cleanup = PendingRequest {
+            pending: self.pending.clone(),
+            id,
+        };
         let timeout_ms = self.timeout.as_millis() as u64;
         let work = async {
-            self.send_raw(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })).await?;
+            self.send_raw(
+                &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }),
+            )
+            .await?;
             match rx.await {
-                Err(_) => Err(McpError::Closed { server: self.server.clone() }),
-                Ok(Err(message)) => Err(McpError::Protocol { server: self.server.clone(), message }),
+                Err(_) => Err(McpError::Closed {
+                    server: self.server.clone(),
+                }),
+                Ok(Err(message)) => Err(McpError::Protocol {
+                    server: self.server.clone(),
+                    message,
+                }),
                 Ok(Ok(result)) => Ok(result),
             }
         };
-        tokio::time::timeout(self.timeout, work).await
-            .unwrap_or_else(|_| Err(McpError::Timeout { server: self.server.clone(), timeout_ms }))
+        tokio::time::timeout(self.timeout, work)
+            .await
+            .unwrap_or_else(|_| {
+                Err(McpError::Timeout {
+                    server: self.server.clone(),
+                    timeout_ms,
+                })
+            })
     }
 
     /// Discover the server's tools and register each on `registry`
@@ -402,10 +535,15 @@ impl McpConnection {
             let result = self.request("tools/list", params).await?;
             let tools = result["tools"].as_array().cloned().unwrap_or_default();
             for t in tools {
-                let Some(raw) = t["name"].as_str() else { continue };
+                let Some(raw) = t["name"].as_str() else {
+                    continue;
+                };
                 let public = public_tool_name(&self.server, raw);
                 if discovered.len() >= 4096 || discovered.iter().any(|tool| tool.name() == public) {
-                    return Err(McpError::Protocol { server: self.server.clone(), message: "duplicate tool or catalog exceeds 4096 tools".into() });
+                    return Err(McpError::Protocol {
+                        server: self.server.clone(),
+                        message: "duplicate tool or catalog exceeds 4096 tools".into(),
+                    });
                 }
                 discovered.push(Arc::new(McpTool {
                     images: registry.images.clone(),
@@ -421,8 +559,15 @@ impl McpConnection {
                 }));
             }
             match result["nextCursor"].as_str() {
-                Some(c) if cursors.len() < 128 && cursors.insert(c.to_owned()) => cursor = Some(c.to_string()),
-                Some(_) => return Err(McpError::Protocol { server: self.server.clone(), message: "repeated cursor or too many catalog pages".into() }),
+                Some(c) if cursors.len() < 128 && cursors.insert(c.to_owned()) => {
+                    cursor = Some(c.to_string())
+                }
+                Some(_) => {
+                    return Err(McpError::Protocol {
+                        server: self.server.clone(),
+                        message: "repeated cursor or too many catalog pages".into(),
+                    })
+                }
                 None => break,
             }
         }
@@ -432,7 +577,10 @@ impl McpConnection {
         for tool in &discovered {
             if let Some(current) = registry.get(tool.name()) {
                 if !previous.iter().any(|old| Arc::ptr_eq(old, &current)) {
-                    return Err(McpError::Protocol { server: self.server.clone(), message: format!("tool registration conflict: {}", tool.name()) });
+                    return Err(McpError::Protocol {
+                        server: self.server.clone(),
+                        message: format!("tool registration conflict: {}", tool.name()),
+                    });
                 }
             }
         }
@@ -440,29 +588,55 @@ impl McpConnection {
         for tool in discovered {
             let result = if let Some(old) = previous.iter().find(|old| old.name() == tool.name()) {
                 registry.replace_if_current(old, tool.clone())
-            } else { registry.try_register(tool.clone()) };
-            result.map_err(|message| McpError::Protocol { server: self.server.clone(), message })?;
+            } else {
+                registry.try_register(tool.clone())
+            };
+            result.map_err(|message| McpError::Protocol {
+                server: self.server.clone(),
+                message,
+            })?;
             names.push(tool.name().to_owned());
             owned.push(Arc::downgrade(&tool));
         }
         for old in previous {
-            if !names.iter().any(|name| name == old.name()) { registry.unregister_if_current(&old); }
+            if !names.iter().any(|name| name == old.name()) {
+                registry.unregister_if_current(&old);
+            }
         }
-        owned.retain(|tool| tool.upgrade().is_some_and(|tool| registry.get(tool.name()).is_some_and(|current| Arc::ptr_eq(&tool, &current))));
-        if self.deferred.load(Ordering::Acquire) { registry.defer(names.iter().cloned()); }
+        owned.retain(|tool| {
+            tool.upgrade().is_some_and(|tool| {
+                registry
+                    .get(tool.name())
+                    .is_some_and(|current| Arc::ptr_eq(&tool, &current))
+            })
+        });
+        if self.deferred.load(Ordering::Acquire) {
+            registry.defer(names.iter().cloned());
+        }
         Ok(names)
     }
 
     /// Watch catalog changes. EOF removes stale tools; reconnect is explicit so
     /// a crashed server cannot silently restart side-effecting startup code.
-    pub fn tools_deferred(&self) -> bool { self.deferred.load(Ordering::Acquire) }
+    pub fn tools_deferred(&self) -> bool {
+        self.deferred.load(Ordering::Acquire)
+    }
 
     /// Exact currently owned registrations, never inferred from a namespace prefix.
     pub fn tool_names(&self, registry: &ToolRegistry) -> Vec<String> {
-        let mut names: Vec<_> = self.registered.lock().expect("registered lock").iter()
+        let mut names: Vec<_> = self
+            .registered
+            .lock()
+            .expect("registered lock")
+            .iter()
             .filter_map(|tool| tool.upgrade())
-            .filter(|tool| registry.get(tool.name()).is_some_and(|current| Arc::ptr_eq(tool, &current)))
-            .map(|tool| tool.name().to_owned()).collect();
+            .filter(|tool| {
+                registry
+                    .get(tool.name())
+                    .is_some_and(|current| Arc::ptr_eq(tool, &current))
+            })
+            .map(|tool| tool.name().to_owned())
+            .collect();
         names.sort();
         names.dedup();
         names
@@ -471,20 +645,25 @@ impl McpConnection {
     pub async fn watch(self: &Arc<Self>, registry: &Arc<ToolRegistry>, deferred: bool) {
         let _sync = self.sync.lock().await;
         self.deferred.store(deferred, Ordering::Release);
-        if deferred { registry.defer(self.tool_names(registry)); }
+        if deferred {
+            registry.defer(self.tool_names(registry));
+        }
         let connection = Arc::downgrade(self);
         let registry = Arc::downgrade(registry);
         let changed = self.changed.clone();
         tokio::spawn(async move {
             loop {
                 changed.notified().await;
-                let (Some(conn), Some(registry)) = (connection.upgrade(), registry.upgrade()) else { break };
+                let (Some(conn), Some(registry)) = (connection.upgrade(), registry.upgrade())
+                else {
+                    break;
+                };
                 if conn.closed.load(Ordering::Acquire) {
                     conn.disconnect(&registry).await;
                     break;
                 }
                 match conn.bridge_tools(&registry).await {
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "MCP catalog refresh failed"),
                 }
             }
@@ -495,16 +674,30 @@ impl McpConnection {
     pub async fn disconnect(&self, registry: &ToolRegistry) {
         self.closed.store(true, Ordering::Release);
         self.cancel.cancel();
-        if let Some(reader) = self.http_reader.lock().unwrap().take() { reader.abort(); }
+        if let Some(reader) = self.http_reader.lock().unwrap().take() {
+            reader.abort();
+        }
         let _sync = self.sync.lock().await;
-        if let Some(reader) = &self.reader { reader.abort(); }
-        if let Some(reader) = self.http_reader.lock().unwrap().take() { reader.abort(); }
+        if let Some(reader) = &self.reader {
+            reader.abort();
+        }
+        if let Some(reader) = self.http_reader.lock().unwrap().take() {
+            reader.abort();
+        }
         self.changed.notify_one();
-        for tool in self.registered.lock().expect("registered lock").drain(..).filter_map(|tool| tool.upgrade()) {
+        for tool in self
+            .registered
+            .lock()
+            .expect("registered lock")
+            .drain(..)
+            .filter_map(|tool| tool.upgrade())
+        {
             registry.unregister_if_current(&tool);
         }
         self.pending.lock().expect("pending lock").clear();
-        if let Some(http) = &self.http { http.close().await; }
+        if let Some(http) = &self.http {
+            http.close().await;
+        }
         let child = self.child.lock().expect("child lock").take();
         if let Some(mut child) = child {
             let _ = child.kill().await;
@@ -543,15 +736,37 @@ impl Tool for McpTool {
         _call: &str,
         args: Value,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
-        self.execute_presented(session, &_call.to_owned(), args, cancel).await.map(|(content, tasks, error, _)| (content, tasks, error))
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+        ),
+        String,
+    > {
+        self.execute_presented(session, &_call.to_owned(), args, cancel)
+            .await
+            .map(|(content, tasks, error, _)| (content, tasks, error))
     }
 
     async fn execute_presented(
-        &self, session: &rness_protocol::events::SessionId, _call: &String, args: Value,
+        &self,
+        session: &rness_protocol::events::SessionId,
+        _call: &String,
+        args: Value,
         cancel: &tokio_util::sync::CancellationToken,
-    ) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
-        if cancel.is_cancelled() { return Err("MCP call cancelled before dispatch".into()); }
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
+        if cancel.is_cancelled() {
+            return Err("MCP call cancelled before dispatch".into());
+        }
         let id = self.conn.next_id.fetch_add(1, Ordering::Relaxed);
         let result = tokio::select! {
             _ = cancel.cancelled() => {
@@ -575,9 +790,12 @@ impl Tool for McpTool {
         let images = self.images.get().cloned();
         let session = session.clone();
         let token = cancel.clone();
-        tokio::task::spawn_blocking(move || decode_content(result, images.as_deref(), &session, &token))
-            .await.map_err(|e| e.to_string())?
-            .map(|(content, tasks, error)| (content, tasks, error, Some(metadata)))
+        tokio::task::spawn_blocking(move || {
+            decode_content(result, images.as_deref(), &session, &token)
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|(content, tasks, error)| (content, tasks, error, Some(metadata)))
     }
 
     async fn execute(&self, args: Value) -> Result<String, String> {
@@ -591,18 +809,23 @@ impl Tool for McpTool {
             .map(|blocks| {
                 blocks
                     .iter()
-                    .filter_map(|b| {
-                        (b["type"] == "text").then(|| b["text"].as_str().unwrap_or(""))
-                    })
+                    .filter_map(|b| (b["type"] == "text").then(|| b["text"].as_str().unwrap_or("")))
                     .collect::<Vec<_>>()
                     .join("\n")
             })
             .unwrap_or_default();
-        if result["content"].as_array().is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image")) {
+        if result["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "image"))
+        {
             return Err(format!("MCP returned image content, but rich tool-image delivery is not configured. Images were not forwarded.\n{text}"));
         }
         if result["isError"].as_bool() == Some(true) {
-            Err(if text.is_empty() { "tool reported an error".into() } else { text })
+            Err(if text.is_empty() {
+                "tool reported an error".into()
+            } else {
+                text
+            })
         } else {
             Ok(text)
         }
@@ -614,31 +837,59 @@ fn decode_content(
     images: Option<&rness_engine::images::ImageStore>,
     session: &str,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool), String> {
+) -> Result<
+    (
+        Vec<rness_protocol::events::ToolResultContentPart>,
+        Option<rness_protocol::events::TaskSnapshot>,
+        bool,
+    ),
+    String,
+> {
     use base64::Engine;
     use rness_protocol::events::ToolResultContentPart;
-    let blocks = result["content"].as_array().ok_or("MCP result has no content array")?;
+    let blocks = result["content"]
+        .as_array()
+        .ok_or("MCP result has no content array")?;
     let mut content = Vec::new();
     for block in blocks {
-        if cancel.is_cancelled() { return Err("MCP call cancelled".into()); }
+        if cancel.is_cancelled() {
+            return Err("MCP call cancelled".into());
+        }
         match block["type"].as_str() {
             Some("text") => content.push(ToolResultContentPart::Text {
-                text: block["text"].as_str().ok_or("MCP text block has no text")?.into(),
+                text: block["text"]
+                    .as_str()
+                    .ok_or("MCP text block has no text")?
+                    .into(),
             }),
             Some("image") => {
                 let store = images.ok_or("MCP image storage is not configured")?;
                 let encoded = block["data"].as_str().ok_or("MCP image has no data")?;
-                if encoded.len() > store.policy().max_input_bytes.saturating_add(2).saturating_div(3).saturating_mul(4) { return Err("MCP encoded image exceeds input limit".into()); }
-                let data = base64::engine::general_purpose::STANDARD.decode(encoded)
+                if encoded.len()
+                    > store
+                        .policy()
+                        .max_input_bytes
+                        .saturating_add(2)
+                        .saturating_div(3)
+                        .saturating_mul(4)
+                {
+                    return Err("MCP encoded image exceeds input limit".into());
+                }
+                let data = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
                     .map_err(|e| format!("invalid MCP image base64: {e}"))?;
-                let mime = block["mimeType"].as_str().ok_or("MCP image has no mimeType")?;
+                let mime = block["mimeType"]
+                    .as_str()
+                    .ok_or("MCP image has no mimeType")?;
                 let attachment = store.admit_for_session(session, &data, mime)?;
                 content.push(ToolResultContentPart::Image { attachment });
             }
             other => return Err(format!("unsupported MCP content type: {other:?}")),
         }
     }
-    if cancel.is_cancelled() { return Err("MCP call cancelled".into()); }
+    if cancel.is_cancelled() {
+        return Err("MCP call cancelled".into());
+    }
     Ok((content, None, result["isError"].as_bool().unwrap_or(false)))
 }
 
@@ -651,35 +902,56 @@ mod tests {
         use base64::Engine;
         use rness_protocol::events::ToolResultContentPart;
         let dir = tempfile::tempdir().unwrap();
-        let store = rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
+        let store =
+            rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
         let image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
         let result = json!({"isError":true, "content":[{"type":"text","text":"before"},{"type":"image","mimeType":"image/png","data":image},{"type":"text","text":"after"}]});
         let cancel = tokio_util::sync::CancellationToken::new();
-        let (parts, _, error) = decode_content(result.clone(), Some(&store), "session", &cancel).unwrap();
+        let (parts, _, error) =
+            decode_content(result.clone(), Some(&store), "session", &cancel).unwrap();
         assert!(error);
         assert!(matches!(&parts[0], ToolResultContentPart::Text { text } if text == "before"));
-        let ToolResultContentPart::Image { attachment } = &parts[1] else { panic!("missing image") };
-        assert_eq!(store.read(attachment).unwrap(), base64::engine::general_purpose::STANDARD.decode(image).unwrap());
+        let ToolResultContentPart::Image { attachment } = &parts[1] else {
+            panic!("missing image")
+        };
+        assert_eq!(
+            store.read(attachment).unwrap(),
+            base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .unwrap()
+        );
         assert!(store.admitted_for_session("session", &attachment.id));
         assert!(matches!(&parts[2], ToolResultContentPart::Text { text } if text == "after"));
         assert!(decode_content(result.clone(), None, "session", &cancel).is_err());
         cancel.cancel();
-        assert!(decode_content(result, Some(&store), "session", &cancel).unwrap_err().contains("cancelled"));
+        assert!(decode_content(result, Some(&store), "session", &cancel)
+            .unwrap_err()
+            .contains("cancelled"));
     }
 
     #[test]
     fn rich_results_reject_invalid_images() {
         let dir = tempfile::tempdir().unwrap();
-        let store = rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
+        let store =
+            rness_engine::images::ImageStore::new(dir.path().into(), Default::default()).unwrap();
         let cancel = tokio_util::sync::CancellationToken::new();
         for data in ["%%%", "bm90IGFuIGltYWdl"] {
-            assert!(decode_content(json!({"content":[{"type":"image","mimeType":"image/png","data":data}]}), Some(&store), "s", &cancel).is_err());
+            assert!(decode_content(
+                json!({"content":[{"type":"image","mimeType":"image/png","data":data}]}),
+                Some(&store),
+                "s",
+                &cancel
+            )
+            .is_err());
         }
     }
 
     #[test]
     fn public_names_are_verbatim_when_clean() {
-        assert_eq!(public_tool_name("github", "create_issue"), "mcp__github__create_issue");
+        assert_eq!(
+            public_tool_name("github", "create_issue"),
+            "mcp__github__create_issue"
+        );
     }
 
     #[test]
@@ -689,7 +961,10 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("mcp__srv__weird_name_"));
         // Distinct identities never collapse.
-        assert_ne!(public_tool_name("srv", "weird.name"), public_tool_name("srv", "weird_name"));
+        assert_ne!(
+            public_tool_name("srv", "weird.name"),
+            public_tool_name("srv", "weird_name")
+        );
     }
 
     #[test]

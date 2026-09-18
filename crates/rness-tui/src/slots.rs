@@ -44,12 +44,20 @@ impl Slots {
         let list = self.slots.entry(slot.to_string()).or_default();
         // Stable position: after existing entries of >= priority.
         let at = list.partition_point(|m| m.priority >= priority);
-        list.insert(at, Mounted { priority, component });
+        list.insert(
+            at,
+            Mounted {
+                priority,
+                component,
+            },
+        );
     }
 
     /// Remove a component by name; returns whether anything was removed.
     pub fn unmount(&mut self, slot: &str, name: &str) -> bool {
-        let Some(list) = self.slots.get_mut(slot) else { return false };
+        let Some(list) = self.slots.get_mut(slot) else {
+            return false;
+        };
         let before = list.len();
         list.retain(|m| m.component.name() != name);
         list.len() != before
@@ -62,7 +70,12 @@ impl Slots {
             .iter_mut()
             .filter(|m| m.component.wants(ctx))
             .enumerate()
-            .max_by_key(|(index, m)| (m.component.priority().unwrap_or(m.priority), std::cmp::Reverse(*index)))
+            .max_by_key(|(index, m)| {
+                (
+                    m.component.priority().unwrap_or(m.priority),
+                    std::cmp::Reverse(*index),
+                )
+            })
             .map(|(_, m)| m)
             .map(|m| &mut m.component)
     }
@@ -73,7 +86,12 @@ impl Slots {
             .iter()
             .filter(|m| m.component.wants(ctx))
             .enumerate()
-            .max_by_key(|(index, m)| (m.component.priority().unwrap_or(m.priority), std::cmp::Reverse(*index)))
+            .max_by_key(|(index, m)| {
+                (
+                    m.component.priority().unwrap_or(m.priority),
+                    std::cmp::Reverse(*index),
+                )
+            })
             .map(|(_, m)| m)
             .map(|m| m.component.as_ref())
     }
@@ -88,7 +106,9 @@ impl Slots {
             if let Some(component) = self.winner(slot, ctx) {
                 let mut lines = vec![format!("Focus: {} ({slot})", component.name())];
                 let help = component.binding_help();
-                if help.is_empty() { lines.push("This component does not publish binding descriptions.".into()); }
+                if help.is_empty() {
+                    lines.push("This component does not publish binding descriptions.".into());
+                }
                 lines.extend(help);
                 return lines;
             }
@@ -96,29 +116,66 @@ impl Slots {
         vec!["No focused component".into()]
     }
 
-    pub fn resolved_binding_help(&self, ctx: &Ctx<'_>, map: &crate::keymaps::ScopedKeymap) -> Vec<String> {
-        use crate::keymaps::{Scope, BindingLayer};
+    pub fn resolved_binding_help(
+        &self,
+        ctx: &Ctx<'_>,
+        map: &crate::keymaps::ScopedKeymap,
+    ) -> Vec<String> {
+        use crate::keymaps::{BindingLayer, Scope};
         let mut lines = Vec::new();
-        for (slot, scope) in [(INPUT_FOOTER, Scope::Promptbox), (MESSAGE_BODY, Scope::Messagebox)] {
-            let Some(component) = self.winner(slot, ctx) else { continue; };
-            lines.push(format!("{} controls (when focused/applicable):", component.name()));
+        for (slot, scope) in [
+            (INPUT_FOOTER, Scope::Promptbox),
+            (MESSAGE_BODY, Scope::Messagebox),
+        ] {
+            let Some(component) = self.winner(slot, ctx) else {
+                continue;
+            };
+            lines.push(format!(
+                "{} controls (when focused/applicable):",
+                component.name()
+            ));
             let bindings = component.bindings();
             for line in component.binding_help() {
                 let shadowed = bindings.iter().find_map(|binding| {
-                    if !line.contains(&format!("{:?} → {} (when applicable)", binding.chord, binding.action)) { return None; }
-                    let key = crossterm::event::KeyEvent::new(binding.chord.code, binding.chord.mods);
-                    if map.layer(&scope, &key) != Some(BindingLayer::User) { return None; }
-                    map.lookup_exact(&scope, &key).filter(|action| {
-                        !component.captures_input() || action.strip_prefix("core.promptbox.").is_some_and(|action| {
-                            action == "noop" || ((action.starts_with("completion_") || action.starts_with("preview_") || action == "close_preview")
-                                && bindings.iter().any(|binding| binding.action == action))
+                    if !line.contains(&format!(
+                        "{:?} → {} (when applicable)",
+                        binding.chord, binding.action
+                    )) {
+                        return None;
+                    }
+                    let key =
+                        crossterm::event::KeyEvent::new(binding.chord.code, binding.chord.mods);
+                    if map.layer(&scope, &key) != Some(BindingLayer::User) {
+                        return None;
+                    }
+                    map.lookup_exact(&scope, &key)
+                        .filter(|action| {
+                            !component.captures_input()
+                                || action
+                                    .strip_prefix("core.promptbox.")
+                                    .is_some_and(|action| {
+                                        action == "noop"
+                                            || ((action.starts_with("completion_")
+                                                || action.starts_with("preview_")
+                                                || action == "close_preview")
+                                                && bindings
+                                                    .iter()
+                                                    .any(|binding| binding.action == action))
+                                    })
                         })
-                    }).map(|action| format!("{:?} → {action} (replaces {})", binding.chord, binding.action))
+                        .map(|action| {
+                            format!(
+                                "{:?} → {action} (replaces {})",
+                                binding.chord, binding.action
+                            )
+                        })
                 });
                 lines.push(shadowed.unwrap_or(line));
             }
         }
-        if self.modal_active(ctx) { lines.extend(self.focused_binding_help(ctx)); }
+        if self.modal_active(ctx) {
+            lines.extend(self.focused_binding_help(ctx));
+        }
         lines
     }
 
@@ -139,8 +196,11 @@ impl Slots {
     }
 
     pub fn prompt_focused(&self, ctx: &Ctx<'_>) -> bool {
-        self.winner(OVERLAY, ctx).is_none() && self.winner(SIDEBAR, ctx).is_none()
-            && !self.winner(MESSAGE_BODY, ctx).is_some_and(|component| component.captures_input())
+        self.winner(OVERLAY, ctx).is_none()
+            && self.winner(SIDEBAR, ctx).is_none()
+            && !self
+                .winner(MESSAGE_BODY, ctx)
+                .is_some_and(|component| component.captures_input())
             && self.winner(INPUT_FOOTER, ctx).is_some()
     }
 
@@ -153,22 +213,35 @@ impl Slots {
         if self.winner(SIDEBAR, ctx).is_some() {
             return self.winner_mut(SIDEBAR, ctx);
         }
-        if self.winner(MESSAGE_BODY, ctx).is_some_and(|component| component.captures_input()) {
+        if self
+            .winner(MESSAGE_BODY, ctx)
+            .is_some_and(|component| component.captures_input())
+        {
             return self.winner_mut(MESSAGE_BODY, ctx);
         }
         self.winner_mut(INPUT_FOOTER, ctx)
     }
 
     pub fn message_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> crate::component::KeyOutcome {
-        if self.modal_active(ctx) { return crate::component::KeyOutcome::pass(); }
-        self.winner_mut(MESSAGE_BODY, ctx).map(|c| c.on_binding(ctx, action)).unwrap_or_else(crate::component::KeyOutcome::pass)
+        if self.modal_active(ctx) {
+            return crate::component::KeyOutcome::pass();
+        }
+        self.winner_mut(MESSAGE_BODY, ctx)
+            .map(|c| c.on_binding(ctx, action))
+            .unwrap_or_else(crate::component::KeyOutcome::pass)
     }
 
-    pub fn message_key(&mut self, ctx: &Ctx<'_>, key: crossterm::event::KeyEvent) -> crate::component::KeyOutcome {
+    pub fn message_key(
+        &mut self,
+        ctx: &Ctx<'_>,
+        key: crossterm::event::KeyEvent,
+    ) -> crate::component::KeyOutcome {
         if self.overlay_active(ctx) || self.winner(SIDEBAR, ctx).is_some() {
             return crate::component::KeyOutcome::pass();
         }
-        self.winner_mut(MESSAGE_BODY, ctx).map(|c| c.on_key(ctx, key)).unwrap_or_else(crate::component::KeyOutcome::pass)
+        self.winner_mut(MESSAGE_BODY, ctx)
+            .map(|c| c.on_key(ctx, key))
+            .unwrap_or_else(crate::component::KeyOutcome::pass)
     }
 
     /// Deliver a custom action to every mounted component.
@@ -222,8 +295,15 @@ impl Slots {
             use ratatui::widgets::{Clear, Widget};
             Clear.render(area, buf);
             buf.set_style(area, ctx.theme.overlay);
-            let h = c.height(ctx, area.width).unwrap_or(area.height / 2).min(area.height);
-            let w = if area.width < 60 { area.width } else { area.width.saturating_sub(8) };
+            let h = c
+                .height(ctx, area.width)
+                .unwrap_or(area.height / 2)
+                .min(area.height);
+            let w = if area.width < 60 {
+                area.width
+            } else {
+                area.width.saturating_sub(8)
+            };
             let rect = Rect::new(
                 area.x + (area.width - w) / 2,
                 area.y + (area.height.saturating_sub(h)) / 2,
@@ -266,32 +346,66 @@ mod tests {
     #[test]
     fn overlay_clears_clipped_conversation_from_centered_panel_margins() {
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let area = Rect::new(0, 0, 80, 24);
         let mut buf = Buffer::empty(area);
-        for cell in &mut buf.content { cell.set_symbol("X").set_bg(ratatui::style::Color::Red); }
+        for cell in &mut buf.content {
+            cell.set_symbol("X").set_bg(ratatui::style::Color::Red);
+        }
         let mut slots = Slots::default();
-        slots.mount(OVERLAY, 1, Box::new(Probe { name: "modal", wants: true }));
+        slots.mount(
+            OVERLAY,
+            1,
+            Box::new(Probe {
+                name: "modal",
+                wants: true,
+            }),
+        );
         slots.render(&ctx, area, &mut buf);
         assert!(buf.content.iter().all(|cell| cell.symbol() == " "));
-        assert_eq!(buf[(0, 0)].bg, theme.overlay.bg.unwrap_or(ratatui::style::Color::Reset));
+        assert_eq!(
+            buf[(0, 0)].bg,
+            theme.overlay.bg.unwrap_or(ratatui::style::Color::Reset)
+        );
     }
 
     #[test]
     fn dynamic_priority_changes_render_and_focus_winner() {
-        use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
+        use std::sync::{
+            atomic::{AtomicI32, Ordering},
+            Arc,
+        };
         struct Dynamic(Arc<AtomicI32>);
         impl Component for Dynamic {
-            fn name(&self) -> &str { "dynamic" }
-            fn priority(&self) -> Option<i32> { Some(self.0.load(Ordering::SeqCst)) }
-            fn height(&self, _: &Ctx<'_>, _: u16) -> Option<u16> { Some(1) }
+            fn name(&self) -> &str {
+                "dynamic"
+            }
+            fn priority(&self) -> Option<i32> {
+                Some(self.0.load(Ordering::SeqCst))
+            }
+            fn height(&self, _: &Ctx<'_>, _: u16) -> Option<u16> {
+                Some(1)
+            }
             fn render(&mut self, _: &Ctx<'_>, _: Rect, _: &mut Buffer) {}
         }
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let priority = Arc::new(AtomicI32::new(20));
         let mut slots = Slots::default();
-        slots.mount(OVERLAY, 10, Box::new(Probe { name: "base", wants: true }));
+        slots.mount(
+            OVERLAY,
+            10,
+            Box::new(Probe {
+                name: "base",
+                wants: true,
+            }),
+        );
         slots.mount(OVERLAY, 0, Box::new(Dynamic(priority.clone())));
         assert_eq!(slots.winner(OVERLAY, &ctx).unwrap().name(), "dynamic");
         assert_eq!(slots.focused_mut(&ctx).unwrap().name(), "dynamic");
@@ -303,29 +417,73 @@ mod tests {
     #[test]
     fn higher_priority_shadows_lower() {
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut slots = Slots::default();
-        slots.mount(STATUSLINE, 0, Box::new(Probe { name: "base", wants: true }));
-        slots.mount(STATUSLINE, 10, Box::new(Probe { name: "fancy", wants: true }));
+        slots.mount(
+            STATUSLINE,
+            0,
+            Box::new(Probe {
+                name: "base",
+                wants: true,
+            }),
+        );
+        slots.mount(
+            STATUSLINE,
+            10,
+            Box::new(Probe {
+                name: "fancy",
+                wants: true,
+            }),
+        );
         assert_eq!(slots.winner_mut(STATUSLINE, &ctx).unwrap().name(), "fancy");
     }
 
     #[test]
     fn wants_false_falls_through_to_next() {
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut slots = Slots::default();
-        slots.mount(OVERLAY, 0, Box::new(Probe { name: "base", wants: true }));
-        slots.mount(OVERLAY, 10, Box::new(Probe { name: "modal", wants: false }));
+        slots.mount(
+            OVERLAY,
+            0,
+            Box::new(Probe {
+                name: "base",
+                wants: true,
+            }),
+        );
+        slots.mount(
+            OVERLAY,
+            10,
+            Box::new(Probe {
+                name: "modal",
+                wants: false,
+            }),
+        );
         assert_eq!(slots.winner_mut(OVERLAY, &ctx).unwrap().name(), "base");
     }
 
     #[test]
     fn no_willing_component_means_inactive() {
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut slots = Slots::default();
-        slots.mount(OVERLAY, 0, Box::new(Probe { name: "modal", wants: false }));
+        slots.mount(
+            OVERLAY,
+            0,
+            Box::new(Probe {
+                name: "modal",
+                wants: false,
+            }),
+        );
         assert!(!slots.overlay_active(&ctx));
         assert!(slots.winner_mut(OVERLAY, &ctx).is_none());
     }
@@ -333,9 +491,19 @@ mod tests {
     #[test]
     fn unmount_removes_by_name() {
         let (model, theme) = ctx_fixture();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let mut slots = Slots::default();
-        slots.mount(STATUSLINE, 5, Box::new(Probe { name: "a", wants: true }));
+        slots.mount(
+            STATUSLINE,
+            5,
+            Box::new(Probe {
+                name: "a",
+                wants: true,
+            }),
+        );
         assert!(slots.unmount(STATUSLINE, "a"));
         assert!(!slots.unmount(STATUSLINE, "a"));
         assert!(slots.winner_mut(STATUSLINE, &ctx).is_none());

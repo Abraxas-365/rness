@@ -34,14 +34,20 @@ impl std::str::FromStr for Policy {
             "allow" => Ok(Policy::Allow),
             "ask" => Ok(Policy::Ask),
             "never" => Ok(Policy::Never),
-            other => Err(format!("unknown approval policy '{other}' (allow|ask|never)")),
+            other => Err(format!(
+                "unknown approval policy '{other}' (allow|ask|never)"
+            )),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum ToolPolicy { Allow, Ask, Deny }
+pub enum ToolPolicy {
+    Allow,
+    Ask,
+    Deny,
+}
 
 /// The one-shot verdict on a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +79,10 @@ pub struct Approvals {
 
 impl Approvals {
     pub fn with_policy(policy: Policy) -> Self {
-        Self { policy: RwLock::new(policy), ..Default::default() }
+        Self {
+            policy: RwLock::new(policy),
+            ..Default::default()
+        }
     }
 
     pub fn policy(&self) -> Policy {
@@ -95,7 +104,12 @@ impl Approvals {
     }
 
     pub async fn check_tool(&self, request: &ApprovalRequest, sensitive: bool) -> Decision {
-        let rule = self.rules.read().expect("rules lock").get(&request.tool).copied();
+        let rule = self
+            .rules
+            .read()
+            .expect("rules lock")
+            .get(&request.tool)
+            .copied();
         let policy = match rule {
             Some(ToolPolicy::Allow) => Policy::Allow,
             Some(ToolPolicy::Ask) => Policy::Ask,
@@ -150,15 +164,29 @@ mod tests {
     #[tokio::test]
     async fn explicit_rules_override_sensitivity_and_global_policy() {
         let approvals = Approvals::default();
-        for sensitive in [false, true] { assert_eq!(approvals.check_tool(&req(), sensitive).await, Decision::Allowed); }
+        for sensitive in [false, true] {
+            assert_eq!(
+                approvals.check_tool(&req(), sensitive).await,
+                Decision::Allowed
+            );
+        }
         approvals.set_rules([("Bash".into(), ToolPolicy::Deny)].into());
-        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Rejected);
+        assert_eq!(
+            approvals.check_tool(&req(), false).await,
+            Decision::Rejected
+        );
         approvals.set_rules([("Bash".into(), ToolPolicy::Ask)].into());
-        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Unavailable);
+        assert_eq!(
+            approvals.check_tool(&req(), false).await,
+            Decision::Unavailable
+        );
         approvals.set_answerer(Arc::new(Always(Decision::Allowed)));
         assert_eq!(approvals.check_tool(&req(), false).await, Decision::Allowed);
         approvals.set_answerer(Arc::new(Always(Decision::Rejected)));
-        assert_eq!(approvals.check_tool(&req(), false).await, Decision::Rejected);
+        assert_eq!(
+            approvals.check_tool(&req(), false).await,
+            Decision::Rejected
+        );
         approvals.set_policy(Policy::Never);
         approvals.set_rules([("Bash".into(), ToolPolicy::Allow)].into());
         assert_eq!(approvals.check_tool(&req(), true).await, Decision::Allowed);

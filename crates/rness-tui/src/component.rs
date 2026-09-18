@@ -23,15 +23,24 @@ pub trait Component: Send {
     fn name(&self) -> &str;
 
     /// Internal menus/previews own input before user mappings.
-    fn captures_input(&self) -> bool { false }
-
-    fn bindings(&self) -> Vec<crate::keymaps::ComponentBinding> { Vec::new() }
-
-    fn binding_help(&self) -> Vec<String> {
-        self.bindings().iter().map(|binding| binding.help(self.name())).collect()
+    fn captures_input(&self) -> bool {
+        false
     }
 
-    fn priority(&self) -> Option<i32> { None }
+    fn bindings(&self) -> Vec<crate::keymaps::ComponentBinding> {
+        Vec::new()
+    }
+
+    fn binding_help(&self) -> Vec<String> {
+        self.bindings()
+            .iter()
+            .map(|binding| binding.help(self.name()))
+            .collect()
+    }
+
+    fn priority(&self) -> Option<i32> {
+        None
+    }
 
     /// Chain select (dsh pattern): whether this component wants to render
     /// given the current model. The highest-priority willing component in
@@ -56,9 +65,17 @@ pub trait Component: Send {
     }
 
     fn on_binding(&mut self, ctx: &Ctx<'_>, action: &str) -> KeyOutcome {
-        if action == "noop" { return KeyOutcome::consumed(); }
-        match self.bindings().into_iter().find(|binding| binding.action == action) {
-            Some(binding) => self.on_key(ctx, KeyEvent::new(binding.chord.code, binding.chord.mods)),
+        if action == "noop" {
+            return KeyOutcome::consumed();
+        }
+        match self
+            .bindings()
+            .into_iter()
+            .find(|binding| binding.action == action)
+        {
+            Some(binding) => {
+                self.on_key(ctx, KeyEvent::new(binding.chord.code, binding.chord.mods))
+            }
             None => KeyOutcome::pass(),
         }
     }
@@ -79,12 +96,21 @@ pub struct KeyOutcome {
 
 impl KeyOutcome {
     pub fn pass() -> Self {
-        Self { handled: false, actions: vec![] }
+        Self {
+            handled: false,
+            actions: vec![],
+        }
     }
     pub fn consumed() -> Self {
-        Self { handled: true, actions: vec![] }
+        Self {
+            handled: true,
+            actions: vec![],
+        }
     }
     pub fn act(actions: Vec<Action>) -> Self {
-        Self { handled: true, actions }
+        Self {
+            handled: true,
+            actions,
+        }
     }
 }

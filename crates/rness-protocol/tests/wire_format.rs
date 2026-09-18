@@ -7,7 +7,11 @@ use rness_protocol::branch::ForkRef;
 use rness_protocol::events::*;
 
 fn roundtrip(ev: &SessionEvent) -> SessionEvent {
-    let env = Envelope { id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(), at: "2026-09-06T12:00:00.000Z".into(), event: ev.clone() };
+    let env = Envelope {
+        id: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+        at: "2026-09-06T12:00:00.000Z".into(),
+        event: ev.clone(),
+    };
     let json = serde_json::to_string(&env).unwrap();
     let back: Envelope = serde_json::from_str(&json).unwrap();
     back.event
@@ -15,9 +19,15 @@ fn roundtrip(ev: &SessionEvent) -> SessionEvent {
 
 #[test]
 fn image_content_roundtrips_without_inline_bytes() {
-    let part = ContentPart::Image { attachment: ImageRef {
-        id: "a".repeat(64), media_type: "image/png".into(), bytes: 100, width: 20, height: 10,
-    }};
+    let part = ContentPart::Image {
+        attachment: ImageRef {
+            id: "a".repeat(64),
+            media_type: "image/png".into(),
+            bytes: 100,
+            width: 20,
+            height: 10,
+        },
+    };
     let value = serde_json::to_value(&part).unwrap();
     assert_eq!(value["kind"], "image");
     assert!(value["attachment"].get("data").is_none());
@@ -30,7 +40,10 @@ fn all_event_kinds_roundtrip() {
         SessionEvent::Header(Header {
             version: FORMAT_VERSION,
             session: "01S".into(),
-            parent: Some(ForkRef { session: "01P".into(), at: "01E".into() }),
+            parent: Some(ForkRef {
+                session: "01P".into(),
+                at: "01E".into(),
+            }),
             delegation: None,
             workspace: Some("/w".into()),
         }),
@@ -42,8 +55,13 @@ fn all_event_kinds_roundtrip() {
         SessionEvent::AssistantMessage(AssistantMessage {
             model: "test-model".into(),
             content: vec![
-                ContentPart::Thinking { text: "hmm".into(), signature: None },
-                ContentPart::Text { text: "hello".into() },
+                ContentPart::Thinking {
+                    text: "hmm".into(),
+                    signature: None,
+                },
+                ContentPart::Text {
+                    text: "hello".into(),
+                },
                 ContentPart::ToolUse {
                     call: "c1".into(),
                     name: "Read".into(),
@@ -51,18 +69,42 @@ fn all_event_kinds_roundtrip() {
                 },
             ],
             stop: StopReason::ToolUse,
-            usage: Usage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+                ..Default::default()
+            },
             estimated_input: 12,
             chunks: vec![
-                TimedChunk { ms: 100, delta: ChunkDelta::Thinking { t: "hmm".into() } },
-                TimedChunk { ms: 250, delta: ChunkDelta::Text { t: "hello".into() } },
-                TimedChunk { ms: 300, delta: ChunkDelta::ToolArgs { call: "c1".into(), t: "{\"path\"".into() } },
+                TimedChunk {
+                    ms: 100,
+                    delta: ChunkDelta::Thinking { t: "hmm".into() },
+                },
+                TimedChunk {
+                    ms: 250,
+                    delta: ChunkDelta::Text { t: "hello".into() },
+                },
+                TimedChunk {
+                    ms: 300,
+                    delta: ChunkDelta::ToolArgs {
+                        call: "c1".into(),
+                        t: "{\"path\"".into(),
+                    },
+                },
             ],
         }),
         SessionEvent::AssistantAttempt(AssistantAttempt {
             model: "test-model".into(),
-            outcome: AttemptOutcome::Error { code: None, retry_in_ms: None, message: "overloaded".into(), retryable: true },
-            chunks: vec![TimedChunk { ms: 50, delta: ChunkDelta::Text { t: "par".into() } }],
+            outcome: AttemptOutcome::Error {
+                code: None,
+                retry_in_ms: None,
+                message: "overloaded".into(),
+                retryable: true,
+            },
+            chunks: vec![TimedChunk {
+                ms: 50,
+                delta: ChunkDelta::Text { t: "par".into() },
+            }],
         }),
         SessionEvent::AssistantAttempt(AssistantAttempt {
             model: "test-model".into(),
@@ -70,7 +112,10 @@ fn all_event_kinds_roundtrip() {
             chunks: vec![],
         }),
         SessionEvent::ToolResult(ToolResult {
-            content: vec![], tasks: None, plan_review: None, presentation: None,
+            content: vec![],
+            tasks: None,
+            plan_review: None,
+            presentation: None,
             call: "c1".into(),
             name: "Read".into(),
             output: "contents".into(),
@@ -78,7 +123,10 @@ fn all_event_kinds_roundtrip() {
             duration_ms: 12,
         }),
         SessionEvent::TurnStarted { turn: 1 },
-        SessionEvent::TurnEnded { turn: 1, outcome: TurnOutcome::Completed },
+        SessionEvent::TurnEnded {
+            turn: 1,
+            outcome: TurnOutcome::Completed,
+        },
         SessionEvent::RequestConfig(CallConfig {
             reasoning: Some(Reasoning::BudgetTokens { tokens: 8192 }),
             ..Default::default()

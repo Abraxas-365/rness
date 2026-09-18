@@ -47,7 +47,10 @@ impl StatusText {
             let state = self.0.read().expect("status text lock");
             let mut context = state.context.clone();
             if let Some(object) = context.as_object_mut() {
-                let millis = state.busy_since.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                let millis = state
+                    .busy_since
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
                 object.insert("elapsed_ms".into(), millis.into());
                 object.insert("elapsed".into(), format!("{}s", millis / 1000).into());
             }
@@ -67,7 +70,10 @@ impl StatusText {
 
     pub fn set(&self, text: Option<String>) {
         let mut state = self.0.write().expect("status text lock");
-        state.generation = state.generation.checked_add(1).expect("status generation exhausted");
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("status generation exhausted");
         state.view = text.clone().map(serde_json::Value::String);
         state.text = text;
     }
@@ -86,8 +92,9 @@ impl StatusText {
     fn update_context(&self, context: serde_json::Value) {
         let mut state = self.0.write().expect("status text lock");
         if state.context != context {
-            if !context["busy"].as_bool().unwrap_or(false) { state.busy_since = None; }
-            else if state.busy_since.is_none() || state.context["session"] != context["session"] {
+            if !context["busy"].as_bool().unwrap_or(false) {
+                state.busy_since = None;
+            } else if state.busy_since.is_none() || state.context["session"] != context["session"] {
                 state.busy_since = Some(std::time::Instant::now());
             }
             state.context = context;
@@ -108,7 +115,11 @@ pub struct ExtStatusline {
 /// handle the host uses to publish text.
 pub fn install(slots: &mut Slots) -> StatusText {
     let text = StatusText::default();
-    slots.mount(STATUSLINE, 10, Box::new(ExtStatusline { text: text.clone() }));
+    slots.mount(
+        STATUSLINE,
+        10,
+        Box::new(ExtStatusline { text: text.clone() }),
+    );
     text
 }
 
@@ -124,39 +135,87 @@ impl Component for ExtStatusline {
 
     fn height(&self, _ctx: &Ctx<'_>, _width: u16) -> Option<u16> {
         let state = self.text.0.read().expect("status text lock");
-        if state.view.as_ref().and_then(|v| v.get("visible")).and_then(|v| v.as_bool()) == Some(false) { Some(0) } else { Some(1) }
+        if state
+            .view
+            .as_ref()
+            .and_then(|v| v.get("visible"))
+            .and_then(|v| v.as_bool())
+            == Some(false)
+        {
+            Some(0)
+        } else {
+            Some(1)
+        }
     }
 
     fn render(&mut self, ctx: &Ctx<'_>, area: Rect, buf: &mut Buffer) {
         let theme = ctx.theme;
         let model = ctx.model;
-        if area.width == 0 || area.height == 0 { return; }
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
         let view = self.text.0.read().expect("status text lock").view.clone();
         if let Some(view) = view.filter(|v| v.is_object()) {
-            let base = theme.resolve_style(&view["style"], theme.statusline).unwrap_or(theme.statusline);
-            for x in area.left()..area.right() { buf[(x, area.y)].set_style(base).set_symbol(" "); }
-            let pad = |side| view["padding"][side].as_u64().unwrap_or(0).min(u16::MAX as u64) as u16;
+            let base = theme
+                .resolve_style(&view["style"], theme.statusline)
+                .unwrap_or(theme.statusline);
+            for x in area.left()..area.right() {
+                buf[(x, area.y)].set_style(base).set_symbol(" ");
+            }
+            let pad = |side| {
+                view["padding"][side]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .min(u16::MAX as u64) as u16
+            };
             let left_pad = pad("left").min(area.width);
-            let width = area.width.saturating_sub(left_pad).saturating_sub(pad("right"));
+            let width = area
+                .width
+                .saturating_sub(left_pad)
+                .saturating_sub(pad("right"));
             let inner = Rect::new(area.x + left_pad, area.y, width, 1);
             let section = |value: &serde_json::Value| -> Line<'static> {
-                let values = value.as_array().cloned().unwrap_or_else(|| vec![value.clone()]);
+                let values = value
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![value.clone()]);
                 let mut spans = Vec::new();
                 for value in values {
-                    let text = value.as_str().or_else(|| value["text"].as_str()).unwrap_or("");
-                    if text.is_empty() { continue; }
-                    if !spans.is_empty() { spans.push(Span::styled(view["separator"].as_str().unwrap_or(" · ").to_owned(), base)); }
-                    let text: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-                    spans.push(Span::styled(text, theme.resolve_style(&value["style"], base).unwrap_or(base)));
+                    let text = value
+                        .as_str()
+                        .or_else(|| value["text"].as_str())
+                        .unwrap_or("");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if !spans.is_empty() {
+                        spans.push(Span::styled(
+                            view["separator"].as_str().unwrap_or(" · ").to_owned(),
+                            base,
+                        ));
+                    }
+                    let text: String = text
+                        .chars()
+                        .map(|c| if c.is_control() { ' ' } else { c })
+                        .collect();
+                    spans.push(Span::styled(
+                        text,
+                        theme.resolve_style(&value["style"], base).unwrap_or(base),
+                    ));
                 }
                 Line::from(spans)
             };
             let left = section(&view["left"]);
             let right = section(&view["right"]);
             let right_width = right.width().min(width as usize) as u16;
-            let left_width = width.saturating_sub(right_width).saturating_sub(u16::from(right_width > 0));
+            let left_width = width
+                .saturating_sub(right_width)
+                .saturating_sub(u16::from(right_width > 0));
             left.render(Rect::new(inner.x, inner.y, left_width, 1), buf);
-            right.render(Rect::new(inner.right() - right_width, inner.y, right_width, 1), buf);
+            right.render(
+                Rect::new(inner.right() - right_width, inner.y, right_width, 1),
+                buf,
+            );
             return;
         }
         let Some(text) = self.text.get() else { return };
@@ -190,16 +249,19 @@ mod tests {
         let mut component = ExtStatusline { text: cell.clone() };
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         for width in 0..32 {
             let area = Rect::new(0, 0, width, 1);
             let mut buf = Buffer::empty(area);
             component.render(&ctx, area, &mut buf);
             if width == 25 {
-                let text: String = (0..width).map(|x| buf[(x,0)].symbol()).collect();
+                let text: String = (0..width).map(|x| buf[(x, 0)].symbol()).collect();
                 assert!(text.starts_with(" working"));
                 assert!(text.ends_with("model "));
-                assert_eq!(buf[(1,0)].fg, ratatui::style::Color::Rgb(131,165,152));
+                assert_eq!(buf[(1, 0)].fg, ratatui::style::Color::Rgb(131, 165, 152));
             }
         }
         cell.0.write().unwrap().view = Some(serde_json::json!({"visible":false}));
@@ -213,7 +275,10 @@ mod tests {
         model.profile_name = Some("fast".into());
         model.agent_name = Some("coder".into());
         let theme = Theme::default();
-        cell.context(&Ctx { model: &model, theme: &theme });
+        cell.context(&Ctx {
+            model: &model,
+            theme: &theme,
+        });
 
         let state = cell.0.read().unwrap();
         assert_eq!(state.context["model"], "provider/model");
@@ -226,11 +291,17 @@ mod tests {
         let cell = StatusText::default();
         let mut model = Model::new("s".into(), "provider/model".into());
         let theme = Theme::default();
-        cell.context(&Ctx { model: &model, theme: &theme });
+        cell.context(&Ctx {
+            model: &model,
+            theme: &theme,
+        });
         cell.set(Some("published".into()));
 
         model.busy = true;
-        cell.context(&Ctx { model: &model, theme: &theme });
+        cell.context(&Ctx {
+            model: &model,
+            theme: &theme,
+        });
 
         assert_eq!(cell.get().as_deref(), Some("published"));
     }
@@ -240,11 +311,14 @@ mod tests {
         struct Initial;
         #[async_trait::async_trait]
         impl rness_kernel::presentation::TextProvider for Initial {
-            async fn text(&self) -> Option<String> { Some("initial".into()) }
+            async fn text(&self) -> Option<String> {
+                Some("initial".into())
+            }
         }
 
         let cell = StatusText::default();
-        cell.prime(&Initial, serde_json::json!({"session":"s", "busy":false})).await;
+        cell.prime(&Initial, serde_json::json!({"session":"s", "busy":false}))
+            .await;
 
         assert_eq!(cell.get().as_deref(), Some("initial"));
     }
@@ -292,13 +366,24 @@ mod tests {
         let mut model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
         model.apply_frame(&Frame::CompactionStarted {
-            session: "s".into(), events: 42, estimated_tokens: 73000,
+            session: "s".into(),
+            events: 42,
+            estimated_tokens: 73000,
         });
         let render = |slots: &mut Slots| {
             let area = Rect::new(0, 0, 80, 1);
             let mut buf = Buffer::empty(area);
-            slots.render(&Ctx { model: &model, theme: &theme }, area, &mut buf);
-            (0..area.width).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+            slots.render(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            (0..area.width)
+                .map(|x| buf[(x, 0)].symbol())
+                .collect::<String>()
         };
         for frame in ["⠋", "⠙"] {
             let text = format!("{frame} compacting context");
@@ -317,7 +402,10 @@ mod tests {
 
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
 
         let render_winner = |slots: &mut Slots, ctx: &Ctx<'_>| -> String {
             let mut buf = Buffer::empty(Rect::new(0, 0, 40, 1));

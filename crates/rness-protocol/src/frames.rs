@@ -17,13 +17,28 @@ pub enum Frame {
     StepStarted { session: SessionId, turn: u32 },
     /// Boundary snapshot from the compaction meter, including reserved output.
     /// Not provider usage or a live token counter. No threshold means no policy.
-    ContextUsage { session: SessionId, estimated_tokens: u64, threshold_tokens: Option<u64> },
+    ContextUsage {
+        session: SessionId,
+        estimated_tokens: u64,
+        threshold_tokens: Option<u64>,
+    },
     /// Streaming delta from the model (text/thinking/tool args).
-    Delta { session: SessionId, chunk: ChunkDelta },
+    Delta {
+        session: SessionId,
+        chunk: ChunkDelta,
+    },
     /// A tool started executing.
-    ToolStarted { session: SessionId, call: ToolCallId, name: String },
+    ToolStarted {
+        session: SessionId,
+        call: ToolCallId,
+        name: String,
+    },
     /// Incremental tool output (e.g. bash streaming).
-    ToolOutput { session: SessionId, call: ToolCallId, output: String },
+    ToolOutput {
+        session: SessionId,
+        call: ToolCallId,
+        output: String,
+    },
     /// The step committed; `event` is the durable assistant/message id —
     /// the frontend's reconcile point.
     StepCommitted { session: SessionId, event: EventId },
@@ -31,7 +46,11 @@ pub enum Frame {
     TurnIdle { session: SessionId },
     /// A compaction summary is running; its source event count and estimated
     /// input tokens let frontends show progress before the durable checkpoint.
-    CompactionStarted { session: SessionId, events: usize, estimated_tokens: u64 },
+    CompactionStarted {
+        session: SessionId,
+        events: usize,
+        estimated_tokens: u64,
+    },
     /// A compaction summary ended, whether it wrote a checkpoint or failed.
     CompactionFinished { session: SessionId, changed: bool },
     /// Durable history changed outside a turn (compaction): reload.
@@ -47,5 +66,8 @@ pub enum Frame {
     },
     /// The question is gone (answered, or withdrawn by cancellation);
     /// every attached client drops its prompt.
-    ApprovalResolved { session: SessionId, call: ToolCallId },
+    ApprovalResolved {
+        session: SessionId,
+        call: ToolCallId,
+    },
 }

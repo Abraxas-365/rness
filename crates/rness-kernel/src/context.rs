@@ -37,7 +37,8 @@ impl<'k> Context<'k> {
         name: &str,
         value: Arc<T>,
     ) -> Result<(), KernelError> {
-        self.services.set(name, value as Arc<dyn Any + Send + Sync>)?;
+        self.services
+            .set(name, value as Arc<dyn Any + Send + Sync>)?;
         let services = Arc::clone(self.services);
         let owned = name.to_string();
         self.provided.push(owned.clone());

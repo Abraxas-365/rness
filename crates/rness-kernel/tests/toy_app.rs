@@ -33,8 +33,13 @@ impl Plugin for GreeterPlugin {
         "greeter"
     }
     fn apply(&self, ctx: &mut Context<'_>) -> Result<(), String> {
-        ctx.provide("greeter", Arc::new(Greeter { calls: AtomicU32::new(0) }))
-            .map_err(|e| e.to_string())
+        ctx.provide(
+            "greeter",
+            Arc::new(Greeter {
+                calls: AtomicU32::new(0),
+            }),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -76,7 +81,11 @@ fn toy_app_boot_cascade_and_reload() {
 
     // Mount in "wrong" order on purpose: consumer first, provider last.
     // Boot order is derived, not written.
-    kernel.mount(AppPlugin { log: Arc::clone(&log) }).unwrap();
+    kernel
+        .mount(AppPlugin {
+            log: Arc::clone(&log),
+        })
+        .unwrap();
     assert_eq!(kernel.status("app"), Some(PluginStatus::Waiting));
 
     kernel.mount(ShoutPolicy).unwrap();
@@ -124,7 +133,8 @@ fn failed_apply_unwinds_partial_effects_and_can_retry() {
         fn apply(&self, ctx: &mut Context<'_>) -> Result<(), String> {
             // Registers a service, THEN fails on the first attempt — the
             // partial registration must be unwound.
-            ctx.provide("flaky-svc", Arc::new(1u8)).map_err(|e| e.to_string())?;
+            ctx.provide("flaky-svc", Arc::new(1u8))
+                .map_err(|e| e.to_string())?;
             if self.attempts.fetch_add(1, Ordering::Relaxed) == 0 {
                 return Err("first attempt fails".into());
             }
@@ -134,7 +144,11 @@ fn failed_apply_unwinds_partial_effects_and_can_retry() {
 
     let attempts = Arc::new(AtomicU32::new(0));
     let mut kernel = Kernel::new();
-    kernel.mount(Flaky { attempts: Arc::clone(&attempts) }).unwrap();
+    kernel
+        .mount(Flaky {
+            attempts: Arc::clone(&attempts),
+        })
+        .unwrap();
 
     assert_eq!(kernel.status("flaky"), Some(PluginStatus::Failed));
     assert!(
@@ -156,7 +170,8 @@ fn duplicate_service_fails_second_provider_not_first() {
             self.0
         }
         fn apply(&self, ctx: &mut Context<'_>) -> Result<(), String> {
-            ctx.provide("the-service", Arc::new(0u8)).map_err(|e| e.to_string())
+            ctx.provide("the-service", Arc::new(0u8))
+                .map_err(|e| e.to_string())
         }
     }
 

@@ -26,7 +26,11 @@ impl Drop for ReloadWatcher {
 #[derive(Debug, Clone)]
 pub enum ReloadReport {
     /// VM swapped. Per-plugin load errors (skipped files) included.
-    Reloaded { plugins: usize, tools: Vec<String>, errors: Vec<(String, String)> },
+    Reloaded {
+        plugins: usize,
+        tools: Vec<String>,
+        errors: Vec<(String, String)>,
+    },
     /// Reload failed outright; the previous VM is still live.
     Failed(String),
 }
@@ -43,7 +47,15 @@ pub fn watch(
     initial_tools: crate::api::tools::InstalledTools,
     on_reload: impl Fn(ReloadReport) + Send + 'static,
 ) -> Result<ReloadWatcher, String> {
-    watch_selected(root, plugin_names, Vec::new(), host, registry, initial_tools, on_reload)
+    watch_selected(
+        root,
+        plugin_names,
+        Vec::new(),
+        host,
+        registry,
+        initial_tools,
+        on_reload,
+    )
 }
 
 /// Select the watcher matching the startup declaration format.
@@ -55,7 +67,15 @@ pub fn watch_startup(
     initial_tools: crate::api::tools::InstalledTools,
     on_reload: impl Fn(ReloadReport) + Send + 'static,
 ) -> Result<ReloadWatcher, String> {
-    watch_selected(root, startup.plugins.clone(), startup.plugin_specs.clone(), host, registry, initial_tools, on_reload)
+    watch_selected(
+        root,
+        startup.plugins.clone(),
+        startup.plugin_specs.clone(),
+        host,
+        registry,
+        initial_tools,
+        on_reload,
+    )
 }
 
 /// Watch explicit development sources; retain non-watched source snapshots.
@@ -67,7 +87,15 @@ pub fn watch_specs(
     initial_tools: crate::api::tools::InstalledTools,
     on_reload: impl Fn(ReloadReport) + Send + 'static,
 ) -> Result<ReloadWatcher, String> {
-    watch_selected(root, Vec::new(), specs, host, registry, initial_tools, on_reload)
+    watch_selected(
+        root,
+        Vec::new(),
+        specs,
+        host,
+        registry,
+        initial_tools,
+        on_reload,
+    )
 }
 
 fn watch_selected(
@@ -94,8 +122,15 @@ fn watch_selected(
             }
             crate::loader::PluginLocation::Package(name) => {
                 let inventory = crate::packages::inventory(&root).map_err(|e| e.to_string())?;
-                let package = inventory.get(name).ok_or_else(|| format!("missing package {name}"))?;
-                watched_directories.push(package.directory.canonicalize().map_err(|e| e.to_string())?);
+                let package = inventory
+                    .get(name)
+                    .ok_or_else(|| format!("missing package {name}"))?;
+                watched_directories.push(
+                    package
+                        .directory
+                        .canonicalize()
+                        .map_err(|e| e.to_string())?,
+                );
             }
             crate::loader::PluginLocation::Inline => {}
         }
@@ -103,10 +138,17 @@ fn watch_selected(
     let mut watch_roots = vec![root.clone()];
     for path in &watched_files {
         if let Some(parent) = path.parent() {
-            if !parent.starts_with(&root) { watch_roots.push(parent.to_path_buf()); }
+            if !parent.starts_with(&root) {
+                watch_roots.push(parent.to_path_buf());
+            }
         }
     }
-    watch_roots.extend(watched_directories.iter().filter(|p| !p.starts_with(&root)).cloned());
+    watch_roots.extend(
+        watched_directories
+            .iter()
+            .filter(|p| !p.starts_with(&root))
+            .cloned(),
+    );
     watch_roots.sort();
     watch_roots.dedup();
     let startup_file = root.join("init.lua");
@@ -116,18 +158,32 @@ fn watch_selected(
         let Ok(event) = event else { return };
         let source_change = event.paths.iter().any(|p| {
             p.extension().is_some_and(|x| x == "lua")
-                || (explicit && (watched_files.contains(p)
-                    || (p.file_name().is_some_and(|name| name == "rness-plugin.json")
-                        && watched_directories.iter().any(|dir| p.starts_with(dir)))))
+                || (explicit
+                    && (watched_files.contains(p)
+                        || (p
+                            .file_name()
+                            .is_some_and(|name| name == "rness-plugin.json")
+                            && watched_directories.iter().any(|dir| p.starts_with(dir)))))
         });
         if source_change && !event.kind.is_access() {
             let startup = if explicit {
-                event.paths.iter().any(|p| p == &startup_file || p.starts_with(&startup_modules))
+                event
+                    .paths
+                    .iter()
+                    .any(|p| p == &startup_file || p.starts_with(&startup_modules))
             } else {
-                event.paths.iter().any(|p| p.extension().is_some_and(|x| x == "lua") && !p.starts_with(&runtime_root))
+                event.paths.iter().any(|p| {
+                    p.extension().is_some_and(|x| x == "lua") && !p.starts_with(&runtime_root)
+                })
             };
-            let selected = !explicit || event.paths.iter().any(|p| watched_files.contains(p) || watched_directories.iter().any(|dir| p.starts_with(dir)));
-            if startup || selected { let _ = tx.send(startup); }
+            let selected = !explicit
+                || event.paths.iter().any(|p| {
+                    watched_files.contains(p)
+                        || watched_directories.iter().any(|dir| p.starts_with(dir))
+                });
+            if startup || selected {
+                let _ = tx.send(startup);
+            }
         }
     };
     // notify's fsevents backend blocks inside watch(): FSEventStreamStart's
@@ -143,9 +199,12 @@ fn watch_selected(
         .name("rness-lua watch init".into())
         .spawn(move || {
             let build = (|| {
-                let mut watcher = notify::recommended_watcher(handler).map_err(|e| e.to_string())?;
+                let mut watcher =
+                    notify::recommended_watcher(handler).map_err(|e| e.to_string())?;
                 for path in &init_roots {
-                    watcher.watch(path, notify::RecursiveMode::Recursive).map_err(|e| e.to_string())?;
+                    watcher
+                        .watch(path, notify::RecursiveMode::Recursive)
+                        .map_err(|e| e.to_string())?;
                 }
                 Ok::<_, String>(watcher)
             })();
@@ -166,14 +225,21 @@ fn watch_selected(
                     _ = tokio::time::sleep(Duration::from_millis(150)) => false,
                 }
             } else {
-                match rx.recv().await { Some(startup) => startup, None => break }
+                match rx.recv().await {
+                    Some(startup) => startup,
+                    None => break,
+                }
             };
             // Debounce: editors fire bursts (write + rename + chmod).
             tokio::time::sleep(Duration::from_millis(150)).await;
-            while let Ok(startup) = rx.try_recv() { startup_changed |= startup; }
+            while let Ok(startup) = rx.try_recv() {
+                startup_changed |= startup;
+            }
             if startup_changed {
                 retry_pending = false;
-                on_reload(ReloadReport::Failed("startup Lua changed; restart rness to apply init.lua or module changes".into()));
+                on_reload(ReloadReport::Failed(
+                    "startup Lua changed; restart rness to apply init.lua or module changes".into(),
+                ));
                 continue;
             }
 
@@ -182,18 +248,27 @@ fn watch_selected(
                 let mut sources = snapshots.clone();
                 // Startup discovery validated the full graph. Refresh only watched
                 // sources without requiring their unwatched dependencies in this subset.
-                let watched: Vec<_> = specs.iter().filter(|s| s.watch).cloned().map(|mut spec| {
-                    spec.dependencies.clear();
-                    spec
-                }).collect();
+                let watched: Vec<_> = specs
+                    .iter()
+                    .filter(|s| s.watch)
+                    .cloned()
+                    .map(|mut spec| {
+                        spec.dependencies.clear();
+                        spec
+                    })
+                    .collect();
                 let refreshed = crate::loader::discover_specs(&root, &watched);
                 refreshed.map(|refreshed| {
                     for source in refreshed {
-                        if let Some(slot) = sources.iter_mut().find(|s| s.name == source.name) { slot.source = source.source; }
+                        if let Some(slot) = sources.iter_mut().find(|s| s.name == source.name) {
+                            slot.source = source.source;
+                        }
                     }
                     sources
                 })
-            } else { crate::loader::discover(&root, &plugin_names) };
+            } else {
+                crate::loader::discover(&root, &plugin_names)
+            };
             let sources = match discovered {
                 Ok(s) => s,
                 Err(e) => {
@@ -206,15 +281,23 @@ fn watch_selected(
             let registry = registry.clone();
             let previous = lua_tools.clone();
             let adapter = host.clone();
-            match host.reload_reconciled(sources, move |specs| {
-                let tools = crate::api::tools::sync_lua_tool_specs(&registry, &adapter, &previous, specs);
-                let _ = synced.send(tools);
-            }).await {
+            match host
+                .reload_reconciled(sources, move |specs| {
+                    let tools = crate::api::tools::sync_lua_tool_specs(
+                        &registry, &adapter, &previous, specs,
+                    );
+                    let _ = synced.send(tools);
+                })
+                .await
+            {
                 Ok(errors) => {
                     lua_tools = receive.await.expect("reload reconciliation completed");
                     on_reload(ReloadReport::Reloaded {
                         plugins,
-                        tools: lua_tools.iter().map(|tool| tool.name().to_owned()).collect(),
+                        tools: lua_tools
+                            .iter()
+                            .map(|tool| tool.name().to_owned())
+                            .collect(),
                         errors,
                     });
                 }
@@ -224,7 +307,10 @@ fn watch_selected(
         }
     });
 
-    Ok(ReloadWatcher { _watcher: watcher, task })
+    Ok(ReloadWatcher {
+        _watcher: watcher,
+        task,
+    })
 }
 
 #[cfg(test)]
@@ -237,13 +323,25 @@ mod tests {
         let config = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let live = external.path().join("live.lua");
-        std::fs::write(&live, "rness.tool.register{name='live', run=function() return 'old' end}").unwrap();
+        std::fs::write(
+            &live,
+            "rness.tool.register{name='live', run=function() return 'old' end}",
+        )
+        .unwrap();
         let fixed = config.path().join("fixed.lua");
-        std::fs::write(&fixed, "rness.tool.register{name='fixed', run=function() return 'fixed' end}").unwrap();
+        std::fs::write(
+            &fixed,
+            "rness.tool.register{name='fixed', run=function() return 'fixed' end}",
+        )
+        .unwrap();
         let spec = |name: &str, path: PathBuf, watch| crate::loader::PluginSpec {
             dependencies: vec![],
-            name: name.into(), source: crate::loader::PluginLocation::File(path), enabled: true,
-            watch, opts: serde_json::json!({}), keys: serde_json::json!({}),
+            name: name.into(),
+            source: crate::loader::PluginLocation::File(path),
+            enabled: true,
+            watch,
+            opts: serde_json::json!({}),
+            keys: serde_json::json!({}),
         };
         let mut live_spec = spec("live", live.clone(), true);
         live_spec.dependencies = vec!["fixed".into()];
@@ -254,13 +352,33 @@ mod tests {
         let registry = Arc::new(rness_engine::tools::ToolRegistry::default());
         let installed = crate::api::tools::sync_lua_tools(&registry, &host, &[]).await;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let _watch = watch_specs(config.path().into(), specs, host.clone(), registry.clone(), installed, move |report| { let _ = tx.send(report); }).unwrap();
+        let _watch = watch_specs(
+            config.path().into(),
+            specs,
+            host.clone(),
+            registry.clone(),
+            installed,
+            move |report| {
+                let _ = tx.send(report);
+            },
+        )
+        .unwrap();
         std::fs::write(&fixed, "error('unwatched source must not be re-read')").unwrap();
         let replacement = external.path().join("replacement.lua");
-        std::fs::write(&replacement, "rness.tool.register{name='replacement', run=function() return 'new' end}").unwrap();
+        std::fs::write(
+            &replacement,
+            "rness.tool.register{name='replacement', run=function() return 'new' end}",
+        )
+        .unwrap();
         std::fs::rename(replacement, live).unwrap();
-        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
-        assert!(matches!(report, ReloadReport::Reloaded { ref errors, .. } if errors.is_empty()), "{report:?}");
+        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(report, ReloadReport::Reloaded { ref errors, .. } if errors.is_empty()),
+            "{report:?}"
+        );
         assert!(registry.get("replacement").is_some());
         assert!(registry.get("live").is_none());
         assert!(registry.get("fixed").is_some());

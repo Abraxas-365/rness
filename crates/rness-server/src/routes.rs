@@ -16,7 +16,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/sessions", get(list_sessions).post(create_session))
         .route("/api/sessions/:id", get(history))
         .route("/api/sessions/:id/file-references", post(file_references))
-        .route("/api/sessions/:id/images", post(upload_image).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)))
+        .route(
+            "/api/sessions/:id/images",
+            post(upload_image).layer(axum::extract::DefaultBodyLimit::max(20 * 1024 * 1024)),
+        )
         .route("/api/sessions/:id/images/:image", get(read_image))
         .route("/api/sessions/:id/tasks", get(tasks))
         .route("/api/sessions/:id/phase", get(phase))
@@ -24,7 +27,10 @@ pub fn router(state: ServerState) -> Router {
         .route("/api/sessions/:id/compact", post(compact))
         .route("/api/sessions/:id/prune", post(prune))
         .route("/api/questions", get(pending_questions))
-        .route("/api/questions/:session/:call", post(answer_questions).delete(dismiss_questions))
+        .route(
+            "/api/questions/:session/:call",
+            post(answer_questions).delete(dismiss_questions),
+        )
         .route("/api/request", post(request))
         .route("/api/approvals", get(pending_approvals))
         .route("/api/approvals/:call", post(resolve_approval))
@@ -33,32 +39,67 @@ pub fn router(state: ServerState) -> Router {
         .with_state(state)
 }
 
-async fn upload_image(State(s): State<ServerState>, Path(id): Path<String>, headers: axum::http::HeaderMap, body: axum::body::Bytes) -> Response {
-    let media_type = headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned();
-    match tokio::task::spawn_blocking(move || s.sessions.admit_image(&id, &body, &media_type)).await {
+async fn upload_image(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let media_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    match tokio::task::spawn_blocking(move || s.sessions.admit_image(&id, &body, &media_type)).await
+    {
         Ok(Ok(image)) => (StatusCode::CREATED, Json(image)).into_response(),
         Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         Err(error) => err_response(error),
     }
 }
 
-async fn read_image(State(s): State<ServerState>, Path((id, image)): Path<(String, String)>) -> Response {
+async fn read_image(
+    State(s): State<ServerState>,
+    Path((id, image)): Path<(String, String)>,
+) -> Response {
     match tokio::task::spawn_blocking(move || s.sessions.read_image(&id, &image)).await {
-        Ok(Ok((mime, data))) => ([("content-type", mime), ("x-content-type-options", "nosniff".into()), ("cache-control", "private, no-store".into())], data).into_response(),
+        Ok(Ok((mime, data))) => (
+            [
+                ("content-type", mime),
+                ("x-content-type-options", "nosniff".into()),
+                ("cache-control", "private, no-store".into()),
+            ],
+            data,
+        )
+            .into_response(),
         Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => err_response(error),
     }
 }
 
-async fn pending_questions(State(s): State<ServerState>) -> Response { Json(s.questions.pending()).into_response() }
-async fn answer_questions(State(s): State<ServerState>, Path((session, call)): Path<(String, String)>, Json(answers): Json<rness_engine::questions::Answers>) -> Response {
+async fn pending_questions(State(s): State<ServerState>) -> Response {
+    Json(s.questions.pending()).into_response()
+}
+async fn answer_questions(
+    State(s): State<ServerState>,
+    Path((session, call)): Path<(String, String)>,
+    Json(answers): Json<rness_engine::questions::Answers>,
+) -> Response {
     match s.questions.resolve(&session, &call, answers) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
-async fn dismiss_questions(State(s): State<ServerState>, Path((session, call)): Path<(String, String)>) -> Response {
-    if s.questions.dismiss(&session, &call) { StatusCode::NO_CONTENT } else { StatusCode::NOT_FOUND }.into_response()
+async fn dismiss_questions(
+    State(s): State<ServerState>,
+    Path((session, call)): Path<(String, String)>,
+) -> Response {
+    if s.questions.dismiss(&session, &call) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+    .into_response()
 }
 
 /// Service errors become plain-text 4xx/5xx. Unknown sessions are the
@@ -73,10 +114,16 @@ fn err_response(e: impl std::fmt::Display) -> Response {
     (status, msg).into_response()
 }
 
-async fn file_references(State(s): State<ServerState>, Path(id): Path<String>, Json(query): Json<rness_engine::file_references::Query>) -> Response {
+async fn file_references(
+    State(s): State<ServerState>,
+    Path(id): Path<String>,
+    Json(query): Json<rness_engine::file_references::Query>,
+) -> Response {
     let cancel = tokio_util::sync::CancellationToken::new();
     let _guard = cancel.clone().drop_guard();
-    match tokio::task::spawn_blocking(move || s.sessions.file_references(&id, &query, &cancel)).await {
+    match tokio::task::spawn_blocking(move || s.sessions.file_references(&id, &query, &cancel))
+        .await
+    {
         Ok(Ok(paths)) => Json(paths).into_response(),
         Ok(Err(error)) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
         Err(error) => err_response(error),
@@ -95,10 +142,7 @@ struct CreateBody {
     workspace: Option<String>,
 }
 
-async fn create_session(
-    State(s): State<ServerState>,
-    body: Option<Json<CreateBody>>,
-) -> Response {
+async fn create_session(State(s): State<ServerState>, body: Option<Json<CreateBody>>) -> Response {
     let workspace = body.and_then(|Json(b)| b.workspace);
     match s.sessions.create(workspace) {
         Ok(id) => Json(json!({ "session": id })).into_response(),
@@ -108,7 +152,11 @@ async fn create_session(
 
 async fn history(State(s): State<ServerState>, Path(id): Path<String>) -> Response {
     match s.sessions.store().history(&id) {
-        Ok(envelopes) => Json(History { session: id, envelopes }).into_response(),
+        Ok(envelopes) => Json(History {
+            session: id,
+            envelopes,
+        })
+        .into_response(),
         Err(e) => err_response(e),
     }
 }
@@ -216,20 +264,24 @@ async fn resolve_approval(
 /// TUI's Backend sends in-process.
 async fn request(State(s): State<ServerState>, Json(req): Json<ClientRequest>) -> Response {
     match req {
-        ClientRequest::Send { session, intent, content } => {
-            match s.sessions.send_async(session, intent, content).await {
-                Ok(outcome) => {
-                    let status = match outcome {
-                        rness_engine::inbox::Disposition::Command(result) => return Json(json!({"status":"command", "result":result})).into_response(),
-                        rness_engine::inbox::Disposition::StartTurn => "started",
-                        rness_engine::inbox::Disposition::Queued => "queued",
-                        rness_engine::inbox::Disposition::LogOnly => "logged",
-                    };
-                    Json(json!({ "status": status })).into_response()
-                }
-                Err(e) => err_response(e),
+        ClientRequest::Send {
+            session,
+            intent,
+            content,
+        } => match s.sessions.send_async(session, intent, content).await {
+            Ok(outcome) => {
+                let status = match outcome {
+                    rness_engine::inbox::Disposition::Command(result) => {
+                        return Json(json!({"status":"command", "result":result})).into_response()
+                    }
+                    rness_engine::inbox::Disposition::StartTurn => "started",
+                    rness_engine::inbox::Disposition::Queued => "queued",
+                    rness_engine::inbox::Disposition::LogOnly => "logged",
+                };
+                Json(json!({ "status": status })).into_response()
             }
-        }
+            Err(e) => err_response(e),
+        },
         ClientRequest::Retry { session } => match s.sessions.retry(&session) {
             Ok(_) => Json(json!({ "status": "started" })).into_response(),
             Err(e) => err_response(e),

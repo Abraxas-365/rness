@@ -26,7 +26,11 @@ pub async fn all_events(
         // Lagged: frames dropped for this client; it reconciles later.
         Err(BroadcastStreamRecvError::Lagged(_)) => None,
     });
-    let questions = BroadcastStream::new(s.questions.subscribe()).filter_map(|item| item.ok().map(|event| Ok(Event::default().data(serde_json::to_string(&event).expect("question serializes")))));
+    let questions = BroadcastStream::new(s.questions.subscribe()).filter_map(|item| {
+        item.ok().map(|event| {
+            Ok(Event::default().data(serde_json::to_string(&event).expect("question serializes")))
+        })
+    });
     Sse::new(stream.merge(questions)).keep_alive(KeepAlive::default())
 }
 
@@ -36,7 +40,14 @@ pub async fn session_events(
     Path(id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let question_id = id.clone();
-    let questions = BroadcastStream::new(s.questions.subscribe()).filter_map(move |item| item.ok().filter(|event| event.session() == question_id).map(|event| Ok(Event::default().data(serde_json::to_string(&event).expect("question serializes")))));
+    let questions = BroadcastStream::new(s.questions.subscribe()).filter_map(move |item| {
+        item.ok()
+            .filter(|event| event.session() == question_id)
+            .map(|event| {
+                Ok(Event::default()
+                    .data(serde_json::to_string(&event).expect("question serializes")))
+            })
+    });
     let stream = BroadcastStream::new(s.frames.subscribe()).filter_map(move |item| match item {
         Ok(frame) if frame_session(&frame) == id => Some(Ok(frame_event(&frame))),
         Ok(_) => None,

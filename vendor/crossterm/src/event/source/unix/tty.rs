@@ -247,9 +247,10 @@ impl Parser {
 
             // Preserve the next key's escape prefix after a standalone Escape.
             if self.buffer == [0x1b] && *byte == 0x1b {
-                self.internal_events.push_back(InternalEvent::Event(Event::Key(
-                    crate::event::KeyCode::Esc.into(),
-                )));
+                self.internal_events
+                    .push_back(InternalEvent::Event(Event::Key(
+                        crate::event::KeyCode::Esc.into(),
+                    )));
                 self.buffer.clear();
             }
             self.buffer.push(*byte);

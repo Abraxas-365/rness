@@ -12,7 +12,7 @@ use rness_protocol::api::History;
 use rness_protocol::branch::DelegationMode;
 use rness_protocol::events::{ContentPart, Envelope, SessionEvent, TurnOutcome};
 use rness_tui::modules::agents::{AgentInfo, AgentMonitorState};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 struct ChildRead {
     info: AgentInfo,
@@ -444,7 +444,10 @@ mod tests {
         assert_eq!(refreshed.info.name, "subagent");
         project(
             &mut refreshed,
-            &[event(3000, SessionEvent::RequestConfig(named_config("scout")))],
+            &[event(
+                3000,
+                SessionEvent::RequestConfig(named_config("scout")),
+            )],
             false,
         );
         assert_eq!(refreshed.info.name, "scout");

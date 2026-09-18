@@ -682,7 +682,13 @@ while True:
             connection.close().await;
             assert!(connection.child.try_wait().unwrap().is_some());
         }
-        assert_eq!(std::fs::read_to_string(&log).unwrap().matches("cancel-id-2").count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .matches("cancel-id-2")
+                .count(),
+            2
+        );
         let mut crashed = Connection::start(&server, dir.path(), "file:///workspace/")
             .await
             .unwrap();

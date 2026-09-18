@@ -81,7 +81,12 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    fn register(&self, name: &'static str, kind: Kind, handler: Arc<dyn Any + Send + Sync>) -> Disposer {
+    fn register(
+        &self,
+        name: &'static str,
+        kind: Kind,
+        handler: Arc<dyn Any + Send + Sync>,
+    ) -> Disposer {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.listeners
             .write()
@@ -115,28 +120,44 @@ impl EventBus {
     // -- registration ------------------------------------------------------
 
     pub fn on<E: Event>(&self, f: impl Fn(&E::Payload) + Send + Sync + 'static) -> Disposer {
-        self.register(E::NAME, Kind::Emit, Arc::new(EmitH::<E::Payload>(Box::new(f))))
+        self.register(
+            E::NAME,
+            Kind::Emit,
+            Arc::new(EmitH::<E::Payload>(Box::new(f))),
+        )
     }
 
     pub fn on_bail<E: BailEvent>(
         &self,
         f: impl Fn(&E::Payload) -> Option<E::Output> + Send + Sync + 'static,
     ) -> Disposer {
-        self.register(E::NAME, Kind::Bail, Arc::new(BailH::<E::Payload, E::Output>(Box::new(f))))
+        self.register(
+            E::NAME,
+            Kind::Bail,
+            Arc::new(BailH::<E::Payload, E::Output>(Box::new(f))),
+        )
     }
 
     pub fn on_waterfall<E: Event>(
         &self,
         f: impl Fn(E::Payload, Next<'_, E::Payload>) -> E::Payload + Send + Sync + 'static,
     ) -> Disposer {
-        self.register(E::NAME, Kind::Waterfall, Arc::new(WaterH::<E::Payload>(Box::new(f))))
+        self.register(
+            E::NAME,
+            Kind::Waterfall,
+            Arc::new(WaterH::<E::Payload>(Box::new(f))),
+        )
     }
 
     pub fn on_serial<E: Event>(
         &self,
         f: impl Fn(&E::Payload) -> Result<(), String> + Send + Sync + 'static,
     ) -> Disposer {
-        self.register(E::NAME, Kind::Serial, Arc::new(SerialH::<E::Payload>(Box::new(f))))
+        self.register(
+            E::NAME,
+            Kind::Serial,
+            Arc::new(SerialH::<E::Payload>(Box::new(f))),
+        )
     }
 
     // -- dispatch ----------------------------------------------------------

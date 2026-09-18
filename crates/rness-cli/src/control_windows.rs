@@ -1,14 +1,14 @@
 //! Windows local-only named pipe with an explicit current-user DACL.
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use std::{path::Path, ptr};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, LocalFree},
+    Foundation::{CloseHandle, LocalFree, HANDLE},
     Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         SDDL_REVISION_1,
     },
-    Security::{GetTokenInformation, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser},
+    Security::{GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER},
     System::Threading::{GetCurrentProcess, OpenProcessToken},
 };
 

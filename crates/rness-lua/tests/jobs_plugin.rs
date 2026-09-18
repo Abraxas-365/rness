@@ -31,36 +31,79 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
         rness.jobs = {count=function(session) return counts[session] or 0 end}
         rness.subagents = {list=function(session) return agents[session] or {} end}
     "#).await.unwrap();
-    host.load("statusline", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
+    host.load(
+        "statusline",
+        include_str!("../../../flavors/default/plugins/statusline.lua"),
+    )
+    .await
+    .unwrap();
     let one = json!({"session":"one","model":"test"});
     let text = host.status(one.clone()).await.unwrap().to_string();
-    assert!(text.contains("idle") && text.contains("2 bg jobs") && text.contains("2 bg agents"), "{text}");
-    let text = host.status(json!({"session":"two"})).await.unwrap().to_string();
-    assert!(text.contains("1 bg job") && text.contains("1 bg agent") && !text.contains("2 bg jobs"), "{text}");
-    host.fire_hook("frame", json!({"type":"compaction_started","session":"one"}));
+    assert!(
+        text.contains("idle") && text.contains("2 bg jobs") && text.contains("2 bg agents"),
+        "{text}"
+    );
+    let text = host
+        .status(json!({"session":"two"}))
+        .await
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("1 bg job") && text.contains("1 bg agent") && !text.contains("2 bg jobs"),
+        "{text}"
+    );
+    host.fire_hook(
+        "frame",
+        json!({"type":"compaction_started","session":"one"}),
+    );
     let text = host.status(one.clone()).await.unwrap().to_string();
-    assert!(text.contains("compacting context") && text.contains("2 bg jobs") && text.contains("2 bg agents"), "{text}");
-    host.load("settle", "counts.one = 0; agents.one = {}").await.unwrap();
+    assert!(
+        text.contains("compacting context")
+            && text.contains("2 bg jobs")
+            && text.contains("2 bg agents"),
+        "{text}"
+    );
+    host.load("settle", "counts.one = 0; agents.one = {}")
+        .await
+        .unwrap();
     let settled = host.status(one.clone()).await.unwrap().to_string();
-    assert!(!settled.contains("bg job") && !settled.contains("bg agent"), "{settled}");
-    host.load("unavailable", "rness.jobs = nil; rness.subagents = nil").await.unwrap();
+    assert!(
+        !settled.contains("bg job") && !settled.contains("bg agent"),
+        "{settled}"
+    );
+    host.load("unavailable", "rness.jobs = nil; rness.subagents = nil")
+        .await
+        .unwrap();
     assert!(host.status(one).await.is_some());
 }
 
 #[tokio::test]
 async fn statusline_shows_background_agents_without_total_running_agent_count() {
     let host = LuaHost::spawn().unwrap();
-    host.load("stub", r#"
+    host.load(
+        "stub",
+        r#"
         rness.session = {usage=function() return {input=0} end}
         rness.subagents = {list=function()
           return {{session='child',running=true}}
         end}
-    "#).await.unwrap();
-    host.load("statusline", include_str!("../../../flavors/default/plugins/statusline.lua")).await.unwrap();
+    "#,
+    )
+    .await
+    .unwrap();
+    host.load(
+        "statusline",
+        include_str!("../../../flavors/default/plugins/statusline.lua"),
+    )
+    .await
+    .unwrap();
     host.fire_hook("turn_start", json!({"session":"parent"}));
     host.fire_hook("turn_start", json!({"session":"child"}));
-    let text = host.status(json!({"session":"parent","model":"test"}))
-        .await.unwrap().to_string();
+    let text = host
+        .status(json!({"session":"parent","model":"test"}))
+        .await
+        .unwrap()
+        .to_string();
     assert!(text.contains("working"), "{text}");
     assert!(text.contains("1 bg agent"), "{text}");
     assert!(!text.contains("2 agents"), "{text}");
@@ -80,7 +123,12 @@ async fn jobs_command_lists_inspects_and_stops_only_explicit_ids() {
         }
         rness.commands.register = function(command) jobs_command = command end
     "#).await.unwrap();
-    host.load("jobs", include_str!("../../../flavors/default/plugins/jobs.lua")).await.unwrap();
+    host.load(
+        "jobs",
+        include_str!("../../../flavors/default/plugins/jobs.lua"),
+    )
+    .await
+    .unwrap();
     host.load("assertions", r#"
         assert(jobs_command.name=='jobs' and jobs_command.allow_busy)
         local function run(input) return jobs_command.run({session='one',raw_input=input}) end
@@ -146,9 +194,24 @@ async fn monitor_host_config(config: &str) -> LuaHost {
           return jobs_command.run({raw_input=input or '',session=session or 'one'})
         end
     "#).await.unwrap();
-    host.load("initial-options", &format!("rness.jobs.config = {config}; original_setup = rness.jobs.setup")).await.unwrap();
-    host.load("jobs", include_str!("../../../flavors/default/plugins/jobs.lua")).await.unwrap();
-    host.load("unchanged-api", "assert(rness.jobs.setup == original_setup)").await.unwrap();
+    host.load(
+        "initial-options",
+        &format!("rness.jobs.config = {config}; original_setup = rness.jobs.setup"),
+    )
+    .await
+    .unwrap();
+    host.load(
+        "jobs",
+        include_str!("../../../flavors/default/plugins/jobs.lua"),
+    )
+    .await
+    .unwrap();
+    host.load(
+        "unchanged-api",
+        "assert(rness.jobs.setup == original_setup)",
+    )
+    .await
+    .unwrap();
     host
 }
 
@@ -162,17 +225,36 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
     assert!(lines[1].starts_with("> j1") && lines[2].contains("stopping"));
     assert!(lines[3].contains("finished") && lines[3].contains("exited (code 7)"));
     assert_eq!(host.app_key("jobs", "z", ctx.clone()).await.unwrap(), Pass);
-    assert_eq!(host.app_key("jobs", "j", ctx.clone()).await.unwrap(), Consumed);
+    assert_eq!(
+        host.app_key("jobs", "j", ctx.clone()).await.unwrap(),
+        Consumed
+    );
     assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[2].starts_with("> j2"));
     host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
-    assert!(host.app_view("jobs", ctx.clone()).await.unwrap().join("\n").contains("second output"));
-    host.load("settle", "jobs[2].running=false; jobs[2].status='killed'; jobs[2].output='final output'").await.unwrap();
+    assert!(host
+        .app_view("jobs", ctx.clone())
+        .await
+        .unwrap()
+        .join("\n")
+        .contains("second output"));
+    host.load(
+        "settle",
+        "jobs[2].running=false; jobs[2].status='killed'; jobs[2].output='final output'",
+    )
+    .await
+    .unwrap();
     let finished = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(finished[0].contains("killed") && finished.join("\n").contains("final output"));
-    let other = host.app_view("jobs", json!({"session":"two","rows":8,"cols":100})).await.unwrap();
+    let other = host
+        .app_view("jobs", json!({"session":"two","rows":8,"cols":100}))
+        .await
+        .unwrap();
     assert!(other[1].contains("No background jobs"), "{other:?}");
     assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap(), finished);
-    assert_eq!(host.app_key("jobs", "esc", ctx.clone()).await.unwrap(), Consumed);
+    assert_eq!(
+        host.app_key("jobs", "esc", ctx.clone()).await.unwrap(),
+        Consumed
+    );
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(lines[0].contains("(3)") && lines[2].starts_with("> j2"));
     assert!(lines[2].contains("killed"));
@@ -181,7 +263,10 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
     let retained = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(retained[0].contains("exited (code 7)") && retained.join("\n").contains("retained"));
     host.app_key("jobs", "esc", ctx.clone()).await.unwrap();
-    assert_eq!(host.app_key("jobs", "esc", ctx.clone()).await.unwrap(), Pass);
+    assert_eq!(
+        host.app_key("jobs", "esc", ctx.clone()).await.unwrap(),
+        Pass
+    );
     host.load("exact", r#"
         assert(open_jobs('done').data.app=='jobs')
         assert(not pcall(open_jobs,'j1','two'))
@@ -197,29 +282,52 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
 
 #[tokio::test]
 async fn monitor_live_tail_pause_scroll_end_wrap_and_small_viewports() {
-    let host = monitor_host_config(r#"{ render=function(ctx,m,lines)
+    let host = monitor_host_config(
+        r#"{ render=function(ctx,m,lines)
       if m.mode=='detail' then assert(#m.output<=8192 and utf8.len(m.output)) end
       return lines
-    end }"#).await;
-    host.load("output", r#"
+    end }"#,
+    )
+    .await;
+    host.load(
+        "output",
+        r#"
         jobs[1].output=''
         for i=1,30 do jobs[1].output=jobs[1].output..'line '..i..'\n' end
         jobs[1].output=jobs[1].output..'LAST'
         open_jobs('j1')
-    "#).await.unwrap();
+    "#,
+    )
+    .await
+    .unwrap();
     let ctx = json!({"session":"one","rows":9,"cols":100});
-    assert!(host.app_view("jobs", ctx.clone()).await.unwrap().join("\n").contains("LAST"));
-    host.load("between-frame-and-key", "jobs[1].output=jobs[1].output..' ARRIVED AFTER FRAME'").await.unwrap();
+    assert!(host
+        .app_view("jobs", ctx.clone())
+        .await
+        .unwrap()
+        .join("\n")
+        .contains("LAST"));
+    host.load(
+        "between-frame-and-key",
+        "jobs[1].output=jobs[1].output..' ARRIVED AFTER FRAME'",
+    )
+    .await
+    .unwrap();
     host.app_key("jobs", " ", ctx.clone()).await.unwrap();
     let frozen = host.app_view("jobs", ctx.clone()).await.unwrap().join("\n");
     assert!(frozen.contains("LAST") && !frozen.contains("ARRIVED AFTER FRAME"));
     host.app_key("jobs", "home", ctx.clone()).await.unwrap();
     let paused = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(paused[1].contains("PAUSED") && paused[3] == "line 1");
-    host.load("append", "jobs[1].output=jobs[1].output..' NEW OUTPUT'").await.unwrap();
+    host.load("append", "jobs[1].output=jobs[1].output..' NEW OUTPUT'")
+        .await
+        .unwrap();
     assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap(), paused);
     host.app_key("jobs", "pagedown", ctx.clone()).await.unwrap();
-    assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap()[3], "line 6");
+    assert_eq!(
+        host.app_view("jobs", ctx.clone()).await.unwrap()[3],
+        "line 6"
+    );
     host.app_key("jobs", "pageup", ctx.clone()).await.unwrap();
     assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap(), paused);
     host.app_key("jobs", "end", ctx.clone()).await.unwrap();
@@ -234,27 +342,46 @@ async fn monitor_live_tail_pause_scroll_end_wrap_and_small_viewports() {
     let narrow = json!({"session":"one","rows":20,"cols":18});
     let lines = host.app_view("jobs", narrow.clone()).await.unwrap();
     let output = lines.iter().skip(3).cloned().collect::<Vec<_>>().join("");
-    assert!(output.contains("END-MARKER") && output.contains("café"), "{lines:?}");
-    assert!(!output.contains('\u{1b}') && !output.contains("[31m") && !output.contains("BAD-TITLE"));
-    host.load("tiny-output", "jobs[1].output='VISIBLE'").await.unwrap();
+    assert!(
+        output.contains("END-MARKER") && output.contains("café"),
+        "{lines:?}"
+    );
+    assert!(
+        !output.contains('\u{1b}') && !output.contains("[31m") && !output.contains("BAD-TITLE")
+    );
+    host.load("tiny-output", "jobs[1].output='VISIBLE'")
+        .await
+        .unwrap();
     for rows in 1..=4 {
-        let lines = host.app_view("jobs", json!({"session":"one","rows":rows,"cols":80})).await.unwrap();
-        assert!(lines.iter().take(rows).any(|line| line == "VISIBLE"), "{rows}: {lines:?}");
+        let lines = host
+            .app_view("jobs", json!({"session":"one","rows":rows,"cols":80}))
+            .await
+            .unwrap();
+        assert!(
+            lines.iter().take(rows).any(|line| line == "VISIBLE"),
+            "{rows}: {lines:?}"
+        );
     }
     host.load("tiny-list", "open_jobs('')").await.unwrap();
-    let lines = host.app_view("jobs", json!({"session":"one","rows":1,"cols":80})).await.unwrap();
+    let lines = host
+        .app_view("jobs", json!({"session":"one","rows":1,"cols":80}))
+        .await
+        .unwrap();
     assert!(lines[0].contains("j1"), "{lines:?}");
-    for (rows, cols) in [(0,0), (1,1), (2,2), (4,3), (10000,10000)] {
-        let lines = host.app_view("jobs", json!({"session":"one","rows":rows,"cols":cols})).await.unwrap();
+    for (rows, cols) in [(0, 0), (1, 1), (2, 2), (4, 3), (10000, 10000)] {
+        let lines = host
+            .app_view("jobs", json!({"session":"one","rows":rows,"cols":cols}))
+            .await
+            .unwrap();
         assert!(lines.len() <= 512 && lines.iter().map(String::len).sum::<usize>() <= 65536);
     }
-
 }
 
 #[tokio::test]
 async fn monitor_custom_options_keys_render_override_and_validation() {
     use rness_lua::runtime::AppKeyOutcome::{Close, Consumed, Pass};
-    let host = monitor_host_config(r#"{
+    let host = monitor_host_config(
+        r#"{
           title='My processes', refresh_ms=500, layout={height=12,width=70,style='dim'},
           keys={down='n',up=false,back={'b','esc'}},
           text={empty='Nothing running',marker='* '},
@@ -264,33 +391,61 @@ async fn monitor_custom_options_keys_render_override_and_validation() {
             return lines
           end,
         }
-    "#).await;
+    "#,
+    )
+    .await;
     host.load("mutate-shared-options", "rness.jobs.config.title='Changed'; rness.jobs.config.keys.back[1]='x'; rness.jobs.config.layout.height=50").await.unwrap();
     assert_eq!(host.app_specs().await[0].title, "My processes");
     let ctx = json!({"session":"one","rows":8,"cols":100});
     assert_eq!(host.app_key("jobs", "j", ctx.clone()).await.unwrap(), Pass);
-    assert_eq!(host.app_key("jobs", "n", ctx.clone()).await.unwrap(), Consumed);
+    assert_eq!(
+        host.app_key("jobs", "n", ctx.clone()).await.unwrap(),
+        Consumed
+    );
     assert_eq!(host.app_key("jobs", "k", ctx.clone()).await.unwrap(), Pass);
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert_eq!(lines[0], "Custom 3");
     assert!(lines[2].starts_with("* j2"));
     assert_eq!(lines.len(), 12);
     let help = lines.iter().find(|line| line.contains(": select")).unwrap();
-    assert!(help.contains("n: select") && !help.contains("k") && !help.contains("j/"), "{help}");
+    assert!(
+        help.contains("n: select") && !help.contains("k") && !help.contains("j/"),
+        "{help}"
+    );
     assert_eq!(host.app_key("jobs", "b", ctx.clone()).await.unwrap(), Close);
-    let host = monitor_host_config(r#"{
+    let host = monitor_host_config(
+        r#"{
       view=function(ctx) return {'Full '..ctx.session, string.rep('界',30000)} end,
       on_key=function(key,ctx) if key=='x' then return 'close' end end,
-    }"#).await;
+    }"#,
+    )
+    .await;
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert_eq!(lines[0], "Full one");
     assert!(lines[1].len() <= 8192 && lines[1].chars().all(|c| c == '界'));
     assert_eq!(host.app_key("jobs", "x", ctx.clone()).await.unwrap(), Close);
-    for config in ["{refresh_ms=0}", "{refresh_ms=1.5}", "{layout={height=0}}",
-        "{title=3}", "{view='bad'}", "{keys={down=7}}", "{keys={unknown='x'}}", "{text={empty=false}}"] {
+    for config in [
+        "{refresh_ms=0}",
+        "{refresh_ms=1.5}",
+        "{layout={height=0}}",
+        "{title=3}",
+        "{view='bad'}",
+        "{keys={down=7}}",
+        "{keys={unknown='x'}}",
+        "{text={empty=false}}",
+    ] {
         let invalid = LuaHost::spawn().unwrap();
-        invalid.load("options", &format!("rness.jobs.config={config}")).await.unwrap();
-        assert!(invalid.load("jobs", include_str!("../../../flavors/default/plugins/jobs.lua")).await.is_err());
+        invalid
+            .load("options", &format!("rness.jobs.config={config}"))
+            .await
+            .unwrap();
+        assert!(invalid
+            .load(
+                "jobs",
+                include_str!("../../../flavors/default/plugins/jobs.lua")
+            )
+            .await
+            .is_err());
     }
     host.unload("jobs").await.unwrap();
 }
@@ -298,23 +453,33 @@ async fn monitor_custom_options_keys_render_override_and_validation() {
 #[tokio::test]
 async fn monitor_list_paging_keeps_selected_identity_as_jobs_settle() {
     let host = monitor_host().await;
-    host.load("many", r#"
+    host.load(
+        "many",
+        r#"
         jobs={}
         for i=1,20 do jobs[i]={job_id='j'..i,kind='bash',label='task '..i,
           status='running',running=true,output='output '..i} end
-    "#).await.unwrap();
+    "#,
+    )
+    .await
+    .unwrap();
     let ctx = json!({"session":"one","rows":5,"cols":80});
     host.app_key("jobs", "pagedown", ctx.clone()).await.unwrap();
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(lines[3].starts_with("> j4 "), "{lines:?}");
-    host.load("remove-earlier", "jobs[1].running=false").await.unwrap();
+    host.load("remove-earlier", "jobs[1].running=false")
+        .await
+        .unwrap();
     assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[3].starts_with("> j4 "));
     host.app_key("jobs", "end", ctx.clone()).await.unwrap();
     assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[3].starts_with("> j20 "));
     host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
     assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[0].starts_with("j20 "));
     host.load("evict", "table.remove(jobs,20)").await.unwrap();
-    assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap()[0], "Job no longer available");
+    assert_eq!(
+        host.app_view("jobs", ctx.clone()).await.unwrap()[0],
+        "Job no longer available"
+    );
     host.app_key("jobs", "esc", ctx.clone()).await.unwrap();
     host.app_key("jobs", "home", ctx.clone()).await.unwrap();
     assert!(host.app_view("jobs", ctx).await.unwrap()[1].starts_with("> j1 "));

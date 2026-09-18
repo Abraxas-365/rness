@@ -33,7 +33,11 @@ fn render(run: &rness_engine::subagent::SubagentRun) -> Result<String, String> {
         StopReason::Completed => Ok(format!(
             "[subagent session: {}]\n{}",
             run.session,
-            if run.output.is_empty() { "(no output)" } else { &run.output }
+            if run.output.is_empty() {
+                "(no output)"
+            } else {
+                &run.output
+            }
         )),
         StopReason::Aborted => Err(format!("subagent run {} was cancelled", run.session)),
         StopReason::Error => Err(format!(
@@ -121,18 +125,27 @@ impl Tool for SubagentTool {
             "required": ["provider", "prompt"],
         });
         if !self.runtime.allows_generic() {
-            schema["required"].as_array_mut().unwrap().push(json!("agent"));
+            schema["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("agent"));
             schema["properties"]["agent"]["description"] = json!(format!(
                 "Required named role. Generic children are disabled. If no configured role fits the task, do not delegate. Available agents: {}",
                 serde_json::to_string(&self.runtime.roster()).unwrap(),
             ));
         } else if self.runtime.roster().is_empty() {
-            schema["properties"].as_object_mut().unwrap().remove("agent");
+            schema["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent");
         }
         // Avoid an empty enum (invalid for some provider schema validators).
         // Runtime validation still rejects every name when the roster is empty.
         if self.runtime.roster().is_empty() && !self.runtime.allows_generic() {
-            schema["properties"]["agent"].as_object_mut().unwrap().remove("enum");
+            schema["properties"]["agent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("enum");
         }
         schema
     }
@@ -142,18 +155,44 @@ impl Tool for SubagentTool {
     }
 
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
-        self.run_presented(session, args, None).await.map(|(output, _)| output)
+        self.run_presented(session, args, None)
+            .await
+            .map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let presentation = Some((_call.clone(), args.clone()));
         let (output, metadata) = self.run_presented(session, args, presentation).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(metadata)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(metadata),
+        ))
     }
 }
 
 impl SubagentTool {
-    async fn run_presented(&self, session: &SessionId, args: Value, presentation: Option<(String, Value)>) -> Result<(String, Value), String> {
+    async fn run_presented(
+        &self,
+        session: &SessionId,
+        args: Value,
+        presentation: Option<(String, Value)>,
+    ) -> Result<(String, Value), String> {
         let provider = crate::required_str(&args, "provider")?.to_string();
         let prompt = crate::required_str(&args, "prompt")?.to_string();
         let background = args["run_in_background"].as_bool().unwrap_or(false);
@@ -163,8 +202,14 @@ impl SubagentTool {
             Some(Value::String(name)) => Some(name.clone()),
             Some(_) => return Err("agent must be a string".into()),
         };
-        self.runtime.validate_agent(agent.as_deref()).map_err(|e| e.to_string())?;
-        let request = SubagentRequest { agent, parent: session.clone(), prompt };
+        self.runtime
+            .validate_agent(agent.as_deref())
+            .map_err(|e| e.to_string())?;
+        let request = SubagentRequest {
+            agent,
+            parent: session.clone(),
+            prompt,
+        };
 
         if continuable {
             // Continuable: start and return the child's durable id.
@@ -200,7 +245,10 @@ impl SubagentTool {
         let (id, writer) = self.jobs.start_owned("subagent", label, Some(session));
         let runtime = Arc::clone(&self.runtime);
         tokio::spawn(async move {
-            match runtime.start_presented(&provider, request, presentation).await {
+            match runtime
+                .start_presented(&provider, request, presentation)
+                .await
+            {
                 Ok(run) => match render(&run) {
                     Ok(text) => {
                         writer.append(text.as_bytes());

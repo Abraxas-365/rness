@@ -16,17 +16,35 @@ pub struct EditTool {
 
 impl EditTool {
     pub fn new(ws: Arc<Workspace>) -> Self {
-        let policy = crate::sandbox::Policy::new(rness_protocol::sandbox::SandboxMode::DangerFullAccess, ws.root());
+        let policy = crate::sandbox::Policy::new(
+            rness_protocol::sandbox::SandboxMode::DangerFullAccess,
+            ws.root(),
+        );
         Self { ws, policy }
     }
 }
 
 #[async_trait]
 impl Tool for EditTool {
-    fn for_workspace_with_policy(&self, session: &String, workspace: &std::path::Path, mode: rness_protocol::sandbox::SandboxMode) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self { ws: self.ws.for_session(session, workspace), policy: crate::sandbox::Policy { mode, workspace: workspace.to_owned() } }))
+    fn for_workspace_with_policy(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+        mode: rness_protocol::sandbox::SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            ws: self.ws.for_session(session, workspace),
+            policy: crate::sandbox::Policy {
+                mode,
+                workspace: workspace.to_owned(),
+            },
+        }))
     }
-    fn for_workspace(&self, session: &String, workspace: &std::path::Path) -> Option<Arc<dyn Tool>> {
+    fn for_workspace(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
         Some(Arc::new(Self::new(self.ws.for_session(session, workspace))))
     }
     fn name(&self) -> &str {
@@ -59,9 +77,28 @@ impl Tool for EditTool {
         self.apply(args).await.map(|(output, _)| output)
     }
 
-    async fn execute_presented(&self, _session: &String, _call: &String, args: Value, _cancel: &tokio_util::sync::CancellationToken) -> Result<(Vec<rness_protocol::events::ToolResultContentPart>, Option<rness_protocol::events::TaskSnapshot>, bool, Option<Value>), String> {
+    async fn execute_presented(
+        &self,
+        _session: &String,
+        _call: &String,
+        args: Value,
+        _cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<
+        (
+            Vec<rness_protocol::events::ToolResultContentPart>,
+            Option<rness_protocol::events::TaskSnapshot>,
+            bool,
+            Option<Value>,
+        ),
+        String,
+    > {
         let (output, presentation) = self.apply(args).await?;
-        Ok((vec![rness_protocol::events::ToolResultContentPart::Text {text:output}], None, false, Some(presentation)))
+        Ok((
+            vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
+            None,
+            false,
+            Some(presentation),
+        ))
     }
 }
 
@@ -125,20 +162,30 @@ impl EditTool {
             let mut previous = 0;
             let mut new_previous = 0;
             for (offset, matched) in content.match_indices(old).take(n) {
-                if matched.len().saturating_add(new.len()) > budget || hunks.len() >= 100 { break; }
-                let unchanged_lines = content[previous..offset].bytes().filter(|b| *b == b'\n').count();
+                if matched.len().saturating_add(new.len()) > budget || hunks.len() >= 100 {
+                    break;
+                }
+                let unchanged_lines = content[previous..offset]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count();
                 old_line += unchanged_lines;
                 new_line += unchanged_lines;
                 let new_offset = new_previous + offset - previous;
                 let line_window = |text: &str, start: usize, end: usize| {
                     let start = text[..start].rfind('\n').map_or(0, |i| i + 1);
-                    let end = if end > start && text.as_bytes().get(end - 1) == Some(&b'\n') { end }
-                        else { text[end..].find('\n').map_or(text.len(), |i| end + i + 1) };
+                    let end = if end > start && text.as_bytes().get(end - 1) == Some(&b'\n') {
+                        end
+                    } else {
+                        text[end..].find('\n').map_or(text.len(), |i| end + i + 1)
+                    };
                     (start, end)
                 };
                 let (old_start, old_end) = line_window(&content, offset, offset + matched.len());
-                let (new_start, new_end) = line_window(&replaced, new_offset, new_offset + new.len());
-                let complete_lines = (old_end - old_start).saturating_add(new_end - new_start) <= budget / 6;
+                let (new_start, new_end) =
+                    line_window(&replaced, new_offset, new_offset + new.len());
+                let complete_lines =
+                    (old_end - old_start).saturating_add(new_end - new_start) <= budget / 6;
                 let hunk = if complete_lines {
                     json!({"before":&content[old_start..old_end],"after":&replaced[new_start..new_end],"old_start":old_line,"new_start":new_line,"fragment":false})
                 } else {
@@ -153,7 +200,9 @@ impl EditTool {
                                 "old_start":last["old_start"],"new_start":last["new_start"],"fragment":false});
                             let old_size = serde_json::to_vec(last).unwrap().len();
                             let size = serde_json::to_vec(&candidate).unwrap().len();
-                            if size > budget + old_size { break; }
+                            if size > budget + old_size {
+                                break;
+                            }
                             budget = budget + old_size - size;
                             *hunks.last_mut().unwrap() = candidate;
                             last_window = Some((a, old_end.max(b), c, new_end.max(d)));
@@ -162,11 +211,16 @@ impl EditTool {
                     }
                 }
                 if !merged {
-                    let size = serde_json::to_vec(&hunk).map(|v| v.len()).unwrap_or(usize::MAX);
-                    if size > budget || hunks.len() >= 100 { break; }
+                    let size = serde_json::to_vec(&hunk)
+                        .map(|v| v.len())
+                        .unwrap_or(usize::MAX);
+                    if size > budget || hunks.len() >= 100 {
+                        break;
+                    }
                     budget -= size;
                     hunks.push(hunk);
-                    last_window = complete_lines.then_some((old_start,old_end,new_start,new_end));
+                    last_window =
+                        complete_lines.then_some((old_start, old_end, new_start, new_end));
                 }
                 captured += 1;
                 old_line += matched.bytes().filter(|b| *b == b'\n').count();
@@ -176,6 +230,9 @@ impl EditTool {
             }
             json!({"version":1,"kind":"edit","path":path,"replacements":n,"captured_replacements":captured,"changes_complete":captured == n,"hunks":hunks,"truncated":true})
         };
-        Ok((format!("Replaced {n} occurrence(s) in {}", path.display()), presentation))
+        Ok((
+            format!("Replaced {n} occurrence(s) in {}", path.display()),
+            presentation,
+        ))
     }
 }

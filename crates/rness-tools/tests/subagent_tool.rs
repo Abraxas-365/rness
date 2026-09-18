@@ -25,7 +25,9 @@ impl Provider for OneAnswer {
     async fn step(&self, _request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
         StepOutcome::Committed(AssistantMessage {
             model: "fake-1".into(),
-            content: vec![ContentPart::Text { text: "hecho".into() }],
+            content: vec![ContentPart::Text {
+                text: "hecho".into(),
+            }],
             stop: StopReason::EndTurn,
             usage: Usage::default(),
             estimated_input: 0,
@@ -38,24 +40,44 @@ fn compose(dir: &std::path::Path) -> (Arc<SessionService>, Arc<ToolRegistry>) {
     compose_with_policy(dir, true)
 }
 
-fn compose_with_policy(dir: &std::path::Path, allow_generic: bool) -> (Arc<SessionService>, Arc<ToolRegistry>) {
+fn compose_with_policy(
+    dir: &std::path::Path,
+    allow_generic: bool,
+) -> (Arc<SessionService>, Arc<ToolRegistry>) {
     let tools = Arc::new(ToolRegistry::default());
-    let sessions = Arc::new(SessionService::new(
-        SessionStore::new(dir),
-        Arc::new(OneAnswer),
-        Arc::clone(&tools),
-        TurnConfig::default(),
-        Arc::new(EventBus::default()),
-    ).with_agents([("worker".into(), rness_engine::config::AgentDefinition {
-        subagent: true, description: "Implementation".into(), instructions: "Implement carefully".into(),
-        profile: None, tools: None, sandbox: None,
-    })].into(), Default::default()));
-    let runtime = Arc::new(SubagentRuntime::new(Arc::clone(&sessions), 3).with_allow_generic(allow_generic));
+    let sessions = Arc::new(
+        SessionService::new(
+            SessionStore::new(dir),
+            Arc::new(OneAnswer),
+            Arc::clone(&tools),
+            TurnConfig::default(),
+            Arc::new(EventBus::default()),
+        )
+        .with_agents(
+            [(
+                "worker".into(),
+                rness_engine::config::AgentDefinition {
+                    subagent: true,
+                    description: "Implementation".into(),
+                    instructions: "Implement carefully".into(),
+                    profile: None,
+                    tools: None,
+                    sandbox: None,
+                },
+            )]
+            .into(),
+            Default::default(),
+        ),
+    );
+    let runtime =
+        Arc::new(SubagentRuntime::new(Arc::clone(&sessions), 3).with_allow_generic(allow_generic));
     runtime.register(Arc::new(SpawnProvider));
     runtime.register(Arc::new(ForkProvider));
     let jobs = rness_tools::jobs::JobRegistry::new();
     jobs.attach_sessions(&sessions);
-    tools.register(Arc::new(rness_tools::jobs::JobOutputTool::new(jobs.clone())));
+    tools.register(Arc::new(rness_tools::jobs::JobOutputTool::new(
+        jobs.clone(),
+    )));
     tools.register(Arc::new(rness_tools::jobs::JobListTool::new(jobs.clone())));
     tools.register(Arc::new(rness_tools::jobs::JobKillTool::new(jobs.clone())));
     rness_tools::register_subagent(&tools, Arc::clone(&runtime), jobs);
@@ -71,21 +93,36 @@ async fn bash_streams_before_exit_and_preserves_split_utf8() {
     let jobs = rness_tools::jobs::JobRegistry::new();
     jobs.attach_sessions(&sessions);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let _watch = sessions.bus().on::<rness_engine::subagent::ToolStreamEv>(move |value| { tx.send(value.clone()).unwrap(); });
+    let _watch = sessions
+        .bus()
+        .on::<rness_engine::subagent::ToolStreamEv>(move |value| {
+            tx.send(value.clone()).unwrap();
+        });
     let tool = rness_tools::bash::BashTool::new(rness_tools::Workspace::new(dir.path()), jobs);
     let gate = dir.path().join("gate");
     let command = format!("printf 'ready'; printf '\\303'; while [ ! -f '{}' ]; do :; done; printf '\\251'; printf 'stderr' >&2", gate.display());
     let run = tokio::spawn(async move {
-        tool.execute_presented(&"owner".into(), &"bash-call".into(), serde_json::json!({"command":command,"description":"stream test","timeout_ms":5000}), &CancellationToken::new()).await
+        tool.execute_presented(
+            &"owner".into(),
+            &"bash-call".into(),
+            serde_json::json!({"command":command,"description":"stream test","timeout_ms":5000}),
+            &CancellationToken::new(),
+        )
+        .await
     });
-    let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(first, ("owner".into(), "bash-call".into(), "ready".into()));
     assert!(!run.is_finished());
     std::fs::write(gate, "go").unwrap();
     run.await.unwrap().unwrap();
     let mut text = first.2;
     while let Ok((session, call, chunk)) = rx.try_recv() {
-        assert_eq!(session, "owner"); assert_eq!(call, "bash-call"); text.push_str(&chunk);
+        assert_eq!(session, "owner");
+        assert_eq!(call, "bash-call");
+        text.push_str(&chunk);
     }
     assert!(text.contains("é"));
     assert!(text.contains("stderr"));
@@ -98,9 +135,17 @@ async fn completion_waits_for_reservations_without_duplicate_delivery() {
     use rness_engine::service::ServiceError;
     struct Hold;
     impl Command for Hold {
-        fn name(&self) -> &str { "hold" }
-        fn description(&self) -> &str { "reserve the session" }
-        fn execute(&self, _: &SessionService, _: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
+        fn name(&self) -> &str {
+            "hold"
+        }
+        fn description(&self) -> &str {
+            "reserve the session"
+        }
+        fn execute(
+            &self,
+            _: &SessionService,
+            _: CommandInvocation<'_>,
+        ) -> Result<CommandResult, ServiceError> {
             Ok(CommandResult::default())
         }
     }
@@ -109,27 +154,62 @@ async fn completion_waits_for_reservations_without_duplicate_delivery() {
         let (sessions, _) = compose(dir.path());
         let parent = sessions.create(None).unwrap();
         sessions.commands().register(Arc::new(Hold)).unwrap();
-        let command = if maintenance { None } else { sessions.prepare_command(&parent, "/hold").unwrap() };
-        let guard = if maintenance { Some(sessions.try_extension_maintenance().unwrap()) } else { None };
+        let command = if maintenance {
+            None
+        } else {
+            sessions.prepare_command(&parent, "/hold").unwrap()
+        };
+        let guard = if maintenance {
+            Some(sessions.try_extension_maintenance().unwrap())
+        } else {
+            None
+        };
         let jobs = rness_tools::jobs::JobRegistry::new();
         jobs.attach_sessions(&sessions);
         let (_, writer) = jobs.start_owned("test", "reserved".into(), Some(&parent));
         writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
         writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
         tokio::task::yield_now().await;
-        assert!(!sessions.store().history(&parent).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
+        assert!(!sessions
+            .store()
+            .history(&parent)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
         drop(command);
         drop(guard);
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if sessions.store().history(&parent).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))) { break; }
+                if sessions
+                    .store()
+                    .history(&parent)
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+                {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         sessions.join(&parent).await;
         let history = sessions.store().history(&parent).unwrap();
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 1);
-        assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 1);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+                .count(),
+            1
+        );
     }
 }
 
@@ -141,32 +221,63 @@ async fn completion_reaches_busy_parent_before_it_can_go_idle() {
     }
     #[async_trait]
     impl Provider for Gated {
-        fn model(&self) -> &str { "gated" }
-        async fn step(&self, _request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
+        fn model(&self) -> &str {
+            "gated"
+        }
+        async fn step(
+            &self,
+            _request: StepRequest<'_>,
+            _cancel: &CancellationToken,
+        ) -> StepOutcome {
             self.entered.notify_one();
             self.release.notified().await;
             OneAnswer.step(_request, _cancel).await
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let provider = Arc::new(Gated { entered: Default::default(), release: Default::default() });
+    let provider = Arc::new(Gated {
+        entered: Default::default(),
+        release: Default::default(),
+    });
     let sessions = Arc::new(SessionService::new(
-        SessionStore::new(dir.path()), provider.clone(), Arc::new(ToolRegistry::default()),
-        TurnConfig::default(), Arc::new(EventBus::default()),
+        SessionStore::new(dir.path()),
+        provider.clone(),
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
     ));
     let parent = sessions.create(None).unwrap();
-    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "work".into() }]).unwrap();
+    sessions
+        .send(
+            &parent,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "work".into(),
+            }],
+        )
+        .unwrap();
     provider.entered.notified().await;
     let jobs = rness_tools::jobs::JobRegistry::new();
     jobs.attach_sessions(&sessions);
     let (_, writer) = jobs.start_owned("test", "busy".into(), Some(&parent));
     writer.settle(rness_tools::jobs::JobStatus::Exited(Some(0)));
     provider.release.notify_one();
-    tokio::time::timeout(std::time::Duration::from_secs(5), provider.entered.notified()).await.unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.entered.notified(),
+    )
+    .await
+    .unwrap();
     provider.release.notify_one();
     sessions.join(&parent).await;
     let history = sessions.store().history(&parent).unwrap();
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 2);
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+            .count(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -185,16 +296,52 @@ async fn consecutive_job_completions_wake_owner_once_without_user_input() {
         sessions.join(&parent).await;
     }
     let history = sessions.store().history(&parent).unwrap();
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::UserMessage(_))).count(), 6);
-    assert_eq!(history.iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 6);
-    assert!(!history.iter().any(|e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)));
-    assert!(!sessions.store().history(&stranger).unwrap().iter().any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
-    sessions.send(&parent, UserIntent::Followup, vec![ContentPart::Text { text: "continue".into() }]).unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::UserMessage(_)))
+            .count(),
+        6
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+            .count(),
+        6
+    );
+    assert!(!history.iter().any(
+        |e| matches!(&e.event, SessionEvent::UserMessage(m) if m.intent == UserIntent::Inject)
+    ));
+    assert!(!sessions
+        .store()
+        .history(&stranger)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::UserMessage(_))));
+    sessions
+        .send(
+            &parent,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "continue".into(),
+            }],
+        )
+        .unwrap();
     sessions.join(&parent).await;
     let (_, writer) = jobs.start_owned("test", "again".into(), Some(&parent));
     writer.settle(rness_tools::jobs::JobStatus::Killed);
     sessions.join(&parent).await;
-    assert_eq!(sessions.store().history(&parent).unwrap().iter().filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. })).count(), 8);
+    assert_eq!(
+        sessions
+            .store()
+            .history(&parent)
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+            .count(),
+        8
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -208,18 +355,34 @@ async fn subagent_tool_delegates_through_dispatch() {
         name: "subagent".into(),
         args: serde_json::json!({ "provider": "spawn", "agent": "worker", "prompt": "delega esto" }),
     }];
-    let results = tools.dispatch(&parent, &calls, 1, &Default::default()).await;
+    let results = tools
+        .dispatch(&parent, &calls, 1, &Default::default())
+        .await;
 
     assert!(!results[0].is_error, "{}", results[0].output);
     assert!(results[0].output.contains("hecho"));
     assert!(results[0].output.contains("[subagent session:"));
     // The child exists with lineage stamped.
     assert_eq!(sessions.list().unwrap().len(), 2);
-    let child = sessions.list().unwrap().into_iter().find(|id| id != &parent).unwrap();
-    assert_eq!(sessions.config(&child).unwrap().agent.unwrap().name, "worker");
+    let child = sessions
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|id| id != &parent)
+        .unwrap();
+    assert_eq!(
+        sessions.config(&child).unwrap().agent.unwrap().name,
+        "worker"
+    );
     let schema = tools.get("subagent").unwrap().input_schema();
-    assert_eq!(schema["properties"]["agent"]["enum"], serde_json::json!(["worker"]));
-    assert!(!schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
+    assert_eq!(
+        schema["properties"]["agent"]["enum"],
+        serde_json::json!(["worker"])
+    );
+    assert!(!schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("agent")));
 }
 
 #[tokio::test]
@@ -227,30 +390,49 @@ async fn roster_only_policy_rejects_generic_calls_before_background_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let (sessions, tools) = compose_with_policy(dir.path(), false);
     let schema = tools.get("subagent").unwrap().input_schema();
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
-    assert_eq!(schema["properties"]["agent"]["enum"], serde_json::json!(["worker"]));
-    assert!(schema["properties"]["agent"]["description"].as_str().unwrap().contains("do not delegate"));
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("agent")));
+    assert_eq!(
+        schema["properties"]["agent"]["enum"],
+        serde_json::json!(["worker"])
+    );
+    assert!(schema["properties"]["agent"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("do not delegate"));
     let parent = sessions.create(None).unwrap();
     for provider in ["spawn", "fork"] {
         let before = sessions.list().unwrap();
         for mode in ["foreground", "background", "continuable"] {
-            for agent in [serde_json::Value::Null, serde_json::json!(""), serde_json::json!("invented")] {
+            for agent in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!("invented"),
+            ] {
                 let call = ToolCall {
-                    call: "blocked".into(), name: "subagent".into(),
+                    call: "blocked".into(),
+                    name: "subagent".into(),
                     args: serde_json::json!({"provider":provider, "prompt":"task", "agent":agent,
                         "run_in_background":mode == "background",
                         "background_mode":if mode == "continuable" { "continuable" } else { "one-shot" }}),
                 };
-                let results = tools.dispatch(&parent, &[call], 1, &Default::default()).await;
+                let results = tools
+                    .dispatch(&parent, &[call], 1, &Default::default())
+                    .await;
                 assert!(results[0].is_error, "{}", results[0].output);
                 assert_eq!(sessions.list().unwrap(), before);
             }
         }
         let call = ToolCall {
-            call: "named".into(), name: "subagent".into(),
+            call: "named".into(),
+            name: "subagent".into(),
             args: serde_json::json!({"provider":provider, "prompt":"task", "agent":"worker"}),
         };
-        let results = tools.dispatch(&parent, &[call], 1, &Default::default()).await;
+        let results = tools
+            .dispatch(&parent, &[call], 1, &Default::default())
+            .await;
         assert!(!results[0].is_error, "{}", results[0].output);
     }
 }
@@ -260,8 +442,11 @@ fn empty_roster_without_generic_children_marks_delegation_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let tools = Arc::new(ToolRegistry::default());
     let sessions = Arc::new(SessionService::new(
-        SessionStore::new(dir.path()), Arc::new(OneAnswer), tools.clone(),
-        TurnConfig::default(), Arc::new(EventBus::default()),
+        SessionStore::new(dir.path()),
+        Arc::new(OneAnswer),
+        tools.clone(),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
     ));
     let runtime = Arc::new(SubagentRuntime::new(sessions, 3).with_allow_generic(false));
     assert!(runtime.validate_agent(None).is_err());
@@ -270,7 +455,10 @@ fn empty_roster_without_generic_children_marks_delegation_unavailable() {
     let tool = tools.get("subagent").unwrap();
     assert!(tool.description().contains("Delegation is unavailable"));
     let schema = tool.input_schema();
-    assert!(schema["required"].as_array().unwrap().contains(&serde_json::json!("agent")));
+    assert!(schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("agent")));
     assert!(schema["properties"]["agent"].get("enum").is_none());
 }
 
@@ -287,13 +475,19 @@ async fn background_subagent_is_a_job() {
             "provider": "spawn", "prompt": "en background", "run_in_background": true
         }),
     }];
-    let results = tools.dispatch(&parent, &calls, 1, &Default::default()).await;
+    let results = tools
+        .dispatch(&parent, &calls, 1, &Default::default())
+        .await;
     assert!(!results[0].is_error);
     assert!(results[0].output.contains("job"), "{}", results[0].output);
 
-    assert!(results[0].output.contains("job_id cannot be used with send_message"));
+    assert!(results[0]
+        .output
+        .contains("job_id cannot be used with send_message"));
     assert!(results[0].output.contains("end your turn now"));
-    assert!(results[0].output.contains("Then read job_output before dependent work"));
+    assert!(results[0]
+        .output
+        .contains("Then read job_output before dependent work"));
     assert!(results[0].output.contains("not the child's answer"));
 
     // The job settles with the child's output readable via job_output.
@@ -304,11 +498,18 @@ async fn background_subagent_is_a_job() {
         .and_then(|text| text.split_whitespace().next())
         .expect("job id in output")
         .to_string();
-    let rejected = tools.dispatch(&parent, &[ToolCall {
-        call: "wrong-target".into(),
-        name: "send_message".into(),
-        args: serde_json::json!({ "agent_id": id, "message": "change direction" }),
-    }], 1, &Default::default()).await;
+    let rejected = tools
+        .dispatch(
+            &parent,
+            &[ToolCall {
+                call: "wrong-target".into(),
+                name: "send_message".into(),
+                args: serde_json::json!({ "agent_id": id, "message": "change direction" }),
+            }],
+            1,
+            &Default::default(),
+        )
+        .await;
     assert!(rejected[0].is_error);
     assert!(rejected[0].output.contains("background job ID"));
     assert!(rejected[0].output.contains("background_mode='continuable'"));
@@ -324,7 +525,7 @@ async fn background_subagent_is_a_job() {
                     args: serde_json::json!({ "job_id": id }),
                 }],
                 1,
-            &Default::default(),
+                &Default::default(),
             )
             .await;
         if out[0].output.contains("hecho") {
@@ -341,20 +542,34 @@ async fn background_subagent_without_job_controls_is_rejected_before_creation() 
     let parent = sessions.create(None).unwrap();
     let restricted = tools.restricted(&["subagent".into()]);
     let mut call = ToolCall {
-        call: "delegate".into(), name: "subagent".into(),
+        call: "delegate".into(),
+        name: "subagent".into(),
         args: serde_json::json!({"provider":"spawn", "prompt":"work", "run_in_background":true}),
     };
-    let results = restricted.dispatch(&parent, &[call.clone()], 1, &Default::default()).await;
+    let results = restricted
+        .dispatch(&parent, &[call.clone()], 1, &Default::default())
+        .await;
     assert!(results[0].is_error);
     assert!(results[0].output.contains("background jobs unavailable"));
     assert_eq!(sessions.list().unwrap(), vec![parent.clone()]);
-    let jobs = tools.dispatch(&parent, &[ToolCall {
-        call: "jobs".into(), name: "job_list".into(), args: serde_json::json!({}),
-    }], 1, &Default::default()).await;
+    let jobs = tools
+        .dispatch(
+            &parent,
+            &[ToolCall {
+                call: "jobs".into(),
+                name: "job_list".into(),
+                args: serde_json::json!({}),
+            }],
+            1,
+            &Default::default(),
+        )
+        .await;
     assert_eq!(jobs[0].output, "No background jobs");
 
     call.args["run_in_background"] = serde_json::json!(false);
-    let results = restricted.dispatch(&parent, &[call], 1, &Default::default()).await;
+    let results = restricted
+        .dispatch(&parent, &[call], 1, &Default::default())
+        .await;
     assert!(!results[0].is_error, "{}", results[0].output);
     assert!(results[0].output.contains("hecho"));
 }
@@ -365,8 +580,9 @@ async fn continuable_lifecycle_through_dispatch() {
     let (sessions, tools) = compose(dir.path());
     let parent = sessions.create(None).unwrap();
     // Continuable agents do not create jobs, even with run_in_background set.
-    let tools = tools.restricted(&["subagent", "send_message", "interrupt_agent", "list_agents"]
-        .map(str::to_owned));
+    let tools = tools.restricted(
+        &["subagent", "send_message", "interrupt_agent", "list_agents"].map(str::to_owned),
+    );
 
     // Start a continuable child through the model-facing tool.
     let results = tools
@@ -391,10 +607,14 @@ async fn continuable_lifecycle_through_dispatch() {
         .find(|w| w.len() == 26 && w.chars().all(|c| c.is_ascii_alphanumeric()))
         .expect("child id in output")
         .to_string();
-    assert!(results[0].output.contains(&format!("send_message (agent_id: {child})")));
+    assert!(results[0]
+        .output
+        .contains(&format!("send_message (agent_id: {child})")));
     assert!(results[0].output.contains("end your turn now"));
     assert!(results[0].output.contains("not the child's answer"));
-    assert!(results[0].output.contains("result will resume this session"));
+    assert!(results[0]
+        .output
+        .contains("result will resume this session"));
     sessions.join(&child).await;
 
     // list_agents sees it.
@@ -452,5 +672,9 @@ async fn continuable_lifecycle_through_dispatch() {
         )
         .await;
     assert!(refused[0].is_error);
-    assert!(refused[0].output.contains("not delivered"), "{}", refused[0].output);
+    assert!(
+        refused[0].output.contains("not delivered"),
+        "{}",
+        refused[0].output
+    );
 }

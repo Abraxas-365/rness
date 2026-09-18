@@ -9,13 +9,17 @@ use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use rness_protocol::events::{ContentPart, Envelope, SessionEvent, SessionId};
 
 use super::branch::{BranchError, SessionStore};
-use super::log::{LogError, log_file};
+use super::log::{log_file, LogError};
 
 /// Maximum task hint length in Unicode scalar values (not bytes).
 pub const TASK_HINT_CHARS: usize = 512;
 
 fn safe_char(c: char) -> char {
-    if c.is_control() { ' ' } else { c }
+    if c.is_control() {
+        ' '
+    } else {
+        c
+    }
 }
 
 /// Incremental hints for one session. Use a separate reader per session.

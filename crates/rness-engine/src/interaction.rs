@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
-use rness_protocol::events::SessionId;
 use crate::service::{ServiceError, SessionService};
+use rness_protocol::events::SessionId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,17 +27,44 @@ pub trait Command: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     /// Opt in only for commands safe to execute alongside the session writer.
-    fn allow_busy(&self) -> bool { false }
-    fn usage(&self) -> &str { "" }
-    fn arguments(&self) -> Vec<(String, String)> { Vec::new() }
-    fn complete(&self, _service: &SessionService, _invocation: CommandInvocation<'_>) -> Result<Vec<String>, ServiceError> {
-        Ok(self.arguments().into_iter().map(|(value, _)| value).collect())
+    fn allow_busy(&self) -> bool {
+        false
+    }
+    fn usage(&self) -> &str {
+        ""
+    }
+    fn arguments(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn complete(
+        &self,
+        _service: &SessionService,
+        _invocation: CommandInvocation<'_>,
+    ) -> Result<Vec<String>, ServiceError> {
+        Ok(self
+            .arguments()
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect())
     }
     /// Display hints are separate from the argument suffix inserted by clients.
-    fn complete_items(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<Vec<(String, String)>, ServiceError> {
-        self.complete(service, invocation).map(|values| values.into_iter().map(|value| (value, String::new())).collect())
+    fn complete_items(
+        &self,
+        service: &SessionService,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<Vec<(String, String)>, ServiceError> {
+        self.complete(service, invocation).map(|values| {
+            values
+                .into_iter()
+                .map(|value| (value, String::new()))
+                .collect()
+        })
     }
-    fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError>;
+    fn execute(
+        &self,
+        service: &SessionService,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<CommandResult, ServiceError>;
 }
 
 #[derive(Default)]
@@ -49,7 +76,10 @@ impl CommandRegistry {
     pub fn register(&self, command: Arc<dyn Command>) -> Result<(), String> {
         let name = command.name();
         if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-            || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-') {
+            || !name
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+        {
             return Err("command names must start with a lowercase letter and contain lowercase letters, digits, underscores or hyphens".into());
         }
         let mut commands = self.commands.write().expect("command registry lock");
@@ -61,28 +91,48 @@ impl CommandRegistry {
     }
 
     /// Validate and replace one owner's complete command set atomically.
-    pub fn replace_owned(&self, previous: &[Arc<dyn Command>], replacements: &[Arc<dyn Command>]) -> Result<(), String> {
+    pub fn replace_owned(
+        &self,
+        previous: &[Arc<dyn Command>],
+        replacements: &[Arc<dyn Command>],
+    ) -> Result<(), String> {
         let mut commands = self.commands.write().expect("command registry lock");
         for command in replacements {
             let name = command.name();
             if !name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-                || !name.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-') {
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+            {
                 return Err("invalid command name".into());
             }
-            if commands.get(name).is_some_and(|current| !previous.iter().any(|old| Arc::ptr_eq(old, current))) {
+            if commands
+                .get(name)
+                .is_some_and(|current| !previous.iter().any(|old| Arc::ptr_eq(old, current)))
+            {
                 return Err(format!("command '{name}' is already registered"));
             }
         }
         for old in previous {
-            if commands.get(old.name()).is_some_and(|current| Arc::ptr_eq(old, current)) { commands.remove(old.name()); }
+            if commands
+                .get(old.name())
+                .is_some_and(|current| Arc::ptr_eq(old, current))
+            {
+                commands.remove(old.name());
+            }
         }
-        for command in replacements { commands.insert(command.name().to_owned(), command.clone()); }
+        for command in replacements {
+            commands.insert(command.name().to_owned(), command.clone());
+        }
         Ok(())
     }
 
     pub fn unregister_if_current(&self, command: &Arc<dyn Command>) -> bool {
         let mut commands = self.commands.write().expect("command registry lock");
-        if commands.get(command.name()).is_some_and(|current| Arc::ptr_eq(current, command)) {
+        if commands
+            .get(command.name())
+            .is_some_and(|current| Arc::ptr_eq(current, command))
+        {
             commands.remove(command.name());
             true
         } else {
@@ -91,33 +141,65 @@ impl CommandRegistry {
     }
 
     pub fn catalog(&self) -> Vec<(String, String)> {
-        self.commands.read().expect("command registry lock").values()
-            .map(|c| (c.name().to_owned(), c.description().to_owned())).collect()
+        self.commands
+            .read()
+            .expect("command registry lock")
+            .values()
+            .map(|c| (c.name().to_owned(), c.description().to_owned()))
+            .collect()
     }
 
     pub fn completions(&self) -> Vec<(String, String)> {
-        let commands: Vec<_> = self.commands.read().expect("command registry lock").values().cloned().collect();
-        commands.into_iter().flat_map(|command| {
-            let mut items = vec![(command.name().to_owned(), command.description().to_owned())];
-            items.extend(command.arguments().into_iter().map(|(value, description)| (format!("{} {value}", command.name()), description)));
-            items
-        }).collect()
+        let commands: Vec<_> = self
+            .commands
+            .read()
+            .expect("command registry lock")
+            .values()
+            .cloned()
+            .collect();
+        commands
+            .into_iter()
+            .flat_map(|command| {
+                let mut items = vec![(command.name().to_owned(), command.description().to_owned())];
+                items.extend(command.arguments().into_iter().map(|(value, description)| {
+                    (format!("{} {value}", command.name()), description)
+                }));
+                items
+            })
+            .collect()
     }
 
     pub fn help(&self, name: &str) -> Result<CommandResult, ServiceError> {
         let commands = self.commands.read().expect("command registry lock");
-        let selected: Vec<_> = if name.is_empty() { commands.values().cloned().collect() } else {
-            vec![commands.get(name).cloned().ok_or_else(|| ServiceError::InvalidConfig(format!("unknown command: {name}")))?]
+        let selected: Vec<_> = if name.is_empty() {
+            commands.values().cloned().collect()
+        } else {
+            vec![commands
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ServiceError::InvalidConfig(format!("unknown command: {name}")))?]
         };
         drop(commands);
-        let message = selected.iter().map(|c| format!("/{} {} — {}", c.name(), c.usage(), c.description())).collect::<Vec<_>>().join("\n");
-        Ok(CommandResult { message, ..Default::default() })
+        let message = selected
+            .iter()
+            .map(|c| format!("/{} {} — {}", c.name(), c.usage(), c.description()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(CommandResult {
+            message,
+            ..Default::default()
+        })
     }
 
     pub fn resolve(&self, text: &str) -> Option<(Arc<dyn Command>, usize)> {
         let input = text.strip_prefix('/')?;
         let end = input.find(char::is_whitespace).unwrap_or(input.len());
-        let command = self.commands.read().expect("command registry lock").get(&input[..end]).cloned()?;
+        let command = self
+            .commands
+            .read()
+            .expect("command registry lock")
+            .get(&input[..end])
+            .cloned()?;
         Some((command, end + 1))
     }
 }
@@ -138,7 +220,10 @@ mod tests {
         assert_eq!(&text[offset..], "  reviewer\n extra");
         assert!(registry.resolve("/agent-extra").is_none());
         assert!(registry.resolve("ordinary text").is_none());
-        assert_eq!(registry.catalog(), vec![("agent".into(), "Choose an agent".into())]);
+        assert_eq!(
+            registry.catalog(),
+            vec![("agent".into(), "Choose an agent".into())]
+        );
         assert!(!registry.unregister_if_current(&other));
         assert!(registry.unregister_if_current(&original));
         assert!(registry.resolve("/agent").is_none());
@@ -147,26 +232,51 @@ mod tests {
 
 pub struct HelpCommand;
 impl Command for HelpCommand {
-    fn name(&self) -> &str { "help" }
-    fn description(&self) -> &str { "List commands or show command usage" }
-    fn usage(&self) -> &str { "[command]" }
-    fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
-        service.commands().help(invocation.raw_input.trim().trim_start_matches('/'))
+    fn name(&self) -> &str {
+        "help"
+    }
+    fn description(&self) -> &str {
+        "List commands or show command usage"
+    }
+    fn usage(&self) -> &str {
+        "[command]"
+    }
+    fn execute(
+        &self,
+        service: &SessionService,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<CommandResult, ServiceError> {
+        service
+            .commands()
+            .help(invocation.raw_input.trim().trim_start_matches('/'))
     }
 }
 
 pub struct AgentCommand;
 
 impl Command for AgentCommand {
-    fn name(&self) -> &str { "agent" }
-    fn description(&self) -> &str { "Choose an agent" }
-    fn execute(&self, service: &SessionService, invocation: CommandInvocation<'_>) -> Result<CommandResult, ServiceError> {
+    fn name(&self) -> &str {
+        "agent"
+    }
+    fn description(&self) -> &str {
+        "Choose an agent"
+    }
+    fn execute(
+        &self,
+        service: &SessionService,
+        invocation: CommandInvocation<'_>,
+    ) -> Result<CommandResult, ServiceError> {
         let mut args = invocation.raw_input.split_whitespace();
-        let name = args.next().ok_or_else(|| ServiceError::InvalidConfig("Usage: /agent <name>".into()))?;
+        let name = args
+            .next()
+            .ok_or_else(|| ServiceError::InvalidConfig("Usage: /agent <name>".into()))?;
         if args.next().is_some() {
             return Err(ServiceError::InvalidConfig("Usage: /agent <name>".into()));
         }
         service.select_agent_reserved(invocation.session, name)?;
-        Ok(CommandResult { message: format!("Agent selected: {name}"), data: serde_json::json!({"agent": name}) })
+        Ok(CommandResult {
+            message: format!("Agent selected: {name}"),
+            data: serde_json::json!({"agent": name}),
+        })
     }
 }

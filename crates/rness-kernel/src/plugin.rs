@@ -175,7 +175,9 @@ impl Kernel {
         let plugin = Arc::clone(&self.slots[name].plugin);
         let mut ctx = Context::new(&self.services, &self.bus);
         let result = plugin.apply(&mut ctx);
-        let Context { effects, provided, .. } = ctx;
+        let Context {
+            effects, provided, ..
+        } = ctx;
         let slot = self.slots.get_mut(name).unwrap();
         match result {
             Ok(()) => {
@@ -195,7 +197,9 @@ impl Kernel {
     /// Deactivate one plugin and every active plugin that injected a
     /// service it provided, recursively. Reverse-dependency cascade.
     fn deactivate(&mut self, name: &str) {
-        let Some(slot) = self.slots.get_mut(name) else { return };
+        let Some(slot) = self.slots.get_mut(name) else {
+            return;
+        };
         if slot.status != PluginStatus::Active {
             return;
         }
