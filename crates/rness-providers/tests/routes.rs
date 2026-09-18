@@ -13,23 +13,59 @@ fn store(dir: &TempDir) -> CredentialStore {
 
 fn configured_routes() -> HashMap<String, Route> {
     [
-        ("anthropic", Kind::Anthropic, "https://api.anthropic.com", Some("anthropic")),
-        ("deepseek", Kind::OpenAiCompatible, "https://api.deepseek.com/v1", Some("deepseek")),
-        ("groq", Kind::OpenAiCompatible, "https://api.groq.com/openai/v1", Some("groq")),
-        ("ollama", Kind::OpenAiCompatible, "http://localhost:11434/v1", None),
-    ].into_iter().map(|(name, kind, url, credential)| {
-        (name.into(), Route {
-            kind,
-            base_url: Some(url.into()),
-            credential: credential.map(str::to_string),
-            headers: Default::default(), stream_idle_timeout: None,
-        })
-    }).collect()
+        (
+            "anthropic",
+            Kind::Anthropic,
+            "https://api.anthropic.com",
+            Some("anthropic"),
+        ),
+        (
+            "deepseek",
+            Kind::OpenAiCompatible,
+            "https://api.deepseek.com/v1",
+            Some("deepseek"),
+        ),
+        (
+            "groq",
+            Kind::OpenAiCompatible,
+            "https://api.groq.com/openai/v1",
+            Some("groq"),
+        ),
+        (
+            "ollama",
+            Kind::OpenAiCompatible,
+            "http://localhost:11434/v1",
+            None,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, kind, url, credential)| {
+        (
+            name.into(),
+            Route {
+                kind,
+                base_url: Some(url.into()),
+                credential: credential.map(str::to_string),
+                headers: Default::default(),
+                stream_idle_timeout: None,
+                prompt_caching: matches!(kind, Kind::Anthropic),
+                cache_ttl: rness_providers::routes::CacheTtl::Auto,
+            },
+        )
+    })
+    .collect()
 }
 
 #[test]
 fn empty_configuration_has_no_implicit_providers() {
-    for name in ["anthropic", "openai", "openai-chatgpt", "deepseek", "groq", "ollama"] {
+    for name in [
+        "anthropic",
+        "openai",
+        "openai-chatgpt",
+        "deepseek",
+        "groq",
+        "ollama",
+    ] {
         assert!(matches!(
             Selection::parse(&HashMap::new(), Some(&format!("{name}/model"))),
             Err(RouteError::Unknown(_, known)) if known.is_empty()
@@ -112,7 +148,11 @@ fn model_may_contain_slashes() {
 #[test]
 fn missing_credential_names_env_and_command() {
     let dir = TempDir::new().unwrap();
-    let err = match build(&configured_routes(), &select("groq/llama-3.3-70b").unwrap(), store(&dir)) {
+    let err = match build(
+        &configured_routes(),
+        &select("groq/llama-3.3-70b").unwrap(),
+        store(&dir),
+    ) {
         Err(e @ RouteError::NoCredentials { .. }) => e,
         Err(other) => panic!("expected NoCredentials, got {other}"),
         Ok(_) => panic!("expected NoCredentials, got a provider"),
@@ -127,16 +167,24 @@ fn stored_key_builds_openai_compatible_route() {
     let dir = TempDir::new().unwrap();
     let s = store(&dir);
     s.save_api_key("deepseek", "dk-1").unwrap();
-    let provider = build(&configured_routes(), &select("deepseek/deepseek-reasoner").unwrap(), s)
-        .unwrap();
+    let provider = build(
+        &configured_routes(),
+        &select("deepseek/deepseek-reasoner").unwrap(),
+        s,
+    )
+    .unwrap();
     assert_eq!(provider.model(), "deepseek-reasoner");
 }
 
 #[test]
 fn ollama_needs_no_credentials() {
     let dir = TempDir::new().unwrap();
-    let provider =
-        build(&configured_routes(), &select("ollama/qwen3").unwrap(), store(&dir)).unwrap();
+    let provider = build(
+        &configured_routes(),
+        &select("ollama/qwen3").unwrap(),
+        store(&dir),
+    )
+    .unwrap();
     assert_eq!(provider.model(), "qwen3");
 }
 
@@ -145,9 +193,12 @@ fn anthropic_route_builds_without_stored_credentials() {
     // Credential resolution is per request for Anthropic (OAuth refresh),
     // so building succeeds even with an empty store.
     let dir = TempDir::new().unwrap();
-    let provider =
-        build(&configured_routes(), &select("anthropic/claude-sonnet-4-5").unwrap(), store(&dir))
-            .unwrap();
+    let provider = build(
+        &configured_routes(),
+        &select("anthropic/claude-sonnet-4-5").unwrap(),
+        store(&dir),
+    )
+    .unwrap();
     assert_eq!(provider.model(), "claude-sonnet-4-5");
 }
 

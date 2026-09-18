@@ -15,8 +15,13 @@ pub struct QuestionOverlayConfig {
 }
 impl QuestionOverlayConfig {
     pub fn validate(&mut self) -> Result<(), String> {
-        if self.height < 10 || self.title.trim().is_empty() || self.title.chars().any(char::is_control) {
-            return Err("questions height must be >= 10 and title nonempty single-line text".into());
+        if self.height < 10
+            || self.title.trim().is_empty()
+            || self.title.chars().any(char::is_control)
+        {
+            return Err(
+                "questions height must be >= 10 and title nonempty single-line text".into(),
+            );
         }
         self.ui.normalize();
         self.ui.validate()
@@ -61,6 +66,8 @@ pub struct StartupConfig {
     pub models: ModelRegistry,
     pub providers: BTreeMap<String, ProviderDeclaration>,
     pub stream_idle_timeouts: BTreeMap<String, u64>,
+    /// Per-provider cache TTL override ("5m" or "1h"). Absent = auto.
+    pub cache_ttls: BTreeMap<String, String>,
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
     /// Generic children are disabled unless explicitly enabled at startup.
@@ -87,8 +94,8 @@ mod permission_tests {
             assert_eq!(policy.max_age_secs, 0);
             assert_eq!(policy.cleanup_interval_secs, 60);
         }
-        let flavor = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../flavors/default/init.lua");
+        let flavor =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
         let policy = super::load(&flavor).unwrap().job_retention;
         assert_eq!(policy.max_job_bytes, 256 * 1024 * 1024);
         assert_eq!(policy.max_total_bytes, 2 * 1024 * 1024 * 1024);
@@ -106,7 +113,11 @@ mod permission_tests {
         assert_eq!(config.job_retention.max_total_bytes, 456);
         assert_eq!(config.job_retention.max_age_secs, 0);
         assert_eq!(config.job_retention.cleanup_interval_secs, 5);
-        for retention in ["{cleanup_interval_secs=0}", "{max_job_bytes=-1}", "{typo=true}"] {
+        for retention in [
+            "{cleanup_interval_secs=0}",
+            "{max_job_bytes=-1}",
+            "{typo=true}",
+        ] {
             std::fs::write(&path, format!("rness.jobs.setup{{retention={retention}}}")).unwrap();
             assert!(super::load(&path).is_err());
         }
@@ -116,15 +127,32 @@ mod permission_tests {
     fn provider_headers_are_optional_and_require_string_pairs() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
-        let source = |extra: &str| format!("rness.providers.register('test', {{protocol='openai-chat', base_url='http://localhost', auth=false, {extra}}})");
+        let source = |extra: &str| {
+            format!("rness.providers.register('test', {{protocol='openai-chat', base_url='http://localhost', auth=false, {extra}}})")
+        };
         std::fs::write(&path, source("")).unwrap();
-        assert!(super::load(&path).unwrap().providers["test"].headers.is_empty());
-        std::fs::write(&path, source("headers={['X-Title']='My App', ['HTTP-Referer']='https://example.com'}")).unwrap();
+        assert!(super::load(&path).unwrap().providers["test"]
+            .headers
+            .is_empty());
+        std::fs::write(
+            &path,
+            source("headers={['X-Title']='My App', ['HTTP-Referer']='https://example.com'}"),
+        )
+        .unwrap();
         let config = super::load(&path).unwrap();
         assert_eq!(config.providers["test"].headers["X-Title"], "My App");
-        for extra in ["headers='secret-value'", "headers={['x-test']=false}", "headers={['x-test']={}}", "headers={['x-test']=123}", "headers={[123]='secret-value'}"] {
+        for extra in [
+            "headers='secret-value'",
+            "headers={['x-test']=false}",
+            "headers={['x-test']={}}",
+            "headers={['x-test']=123}",
+            "headers={[123]='secret-value'}",
+        ] {
             std::fs::write(&path, source(extra)).unwrap();
-            let error = super::load(&path).err().expect("malformed headers must fail").to_string();
+            let error = super::load(&path)
+                .err()
+                .expect("malformed headers must fail")
+                .to_string();
             assert!(!error.contains("secret-value"), "{error}");
         }
     }
@@ -194,18 +222,36 @@ mod permission_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
         let policy = "system_prompt='Summary',prompt='Summarize',threshold_tokens=1000,retain_tokens=100,summary_tokens=100,max_overflow_retries=1,max_compactions=1,prune_threshold=8192,prune_head=4096,prune_tail=1024";
-        for declaration in ["{provider='test',model='summary'}", "{by_provider={test={model='summary'}}}"] {
+        for declaration in [
+            "{provider='test',model='summary'}",
+            "{by_provider={test={model='summary'}}}",
+        ] {
             std::fs::write(&path, format!("rness.profiles.declare('compact', {declaration}); rness.compaction={{default={{{policy},summary_profile='compact'}}}}")).unwrap();
-            assert_eq!(super::load(&path).unwrap().compaction["default"].summary_profile.as_deref(), Some("compact"));
+            assert_eq!(
+                super::load(&path).unwrap().compaction["default"]
+                    .summary_profile
+                    .as_deref(),
+                Some("compact")
+            );
         }
         for (field, expected) in [
             ("summary_profile='missing'", "unknown profile"),
             ("summary_profile=' '", "nonempty"),
-            ("summary_selection={route='test',model='summary'}", "summary_selection was removed"),
+            (
+                "summary_selection={route='test',model='summary'}",
+                "summary_selection was removed",
+            ),
             ("summary_selection=false", "summary_selection was removed"),
         ] {
-            std::fs::write(&path, format!("rness.compaction={{default={{{policy},{field}}}}}")).unwrap();
-            let error = super::load(&path).err().expect("invalid config").to_string();
+            std::fs::write(
+                &path,
+                format!("rness.compaction={{default={{{policy},{field}}}}}"),
+            )
+            .unwrap();
+            let error = super::load(&path)
+                .err()
+                .expect("invalid config")
+                .to_string();
             assert!(error.contains(expected), "{error}");
         }
     }
@@ -241,6 +287,22 @@ mod permission_tests {
             super::load(&path).unwrap().stream_idle_timeouts["anthropic"],
             0
         );
+    }
+
+    #[test]
+    fn cache_ttls_are_opt_in_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        assert!(super::load(&path).unwrap().cache_ttls.is_empty());
+        for source in [
+            "rness.providers.set_cache_ttl('anthropic', '30m')",
+            "rness.providers.set_cache_ttl('', '1h')",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+        std::fs::write(&path, "rness.providers.set_cache_ttl('anthropic', '1h')").unwrap();
+        assert_eq!(super::load(&path).unwrap().cache_ttls["anthropic"], "1h");
     }
 
     #[test]
@@ -343,22 +405,39 @@ mod permission_tests {
     fn agents_monitor_options_load_and_reject_invalid_values() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
-        std::fs::write(&path, r#"rness.ui.messagebox = { agents = {
+        std::fs::write(
+            &path,
+            r#"rness.ui.messagebox = { agents = {
             keys = { back = "q", list_up = { "k", "ctrl+p" }, toggle_tool = false },
             layout = { metadata_rows = 0, list_rows = 12, page_lines = 7 },
             text = { incoming_label = "Assignment" }, styles = { border = { fg = "red" } }
-        } }"#).unwrap();
+        } }"#,
+        )
+        .unwrap();
         let config = super::load(&path).unwrap();
         assert_eq!(config.messagebox["agents"]["keys"]["list_up"][1], "ctrl+p");
-        rness_tui::theme::Theme::default().validate_messagebox(&config.messagebox).unwrap();
-        let default_flavor = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+        rness_tui::theme::Theme::default()
+            .validate_messagebox(&config.messagebox)
+            .unwrap();
+        let default_flavor =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
         let flavor = super::load(&default_flavor).unwrap();
-        rness_tui::theme::Theme::default().validate_messagebox(&flavor.messagebox).unwrap();
+        rness_tui::theme::Theme::default()
+            .validate_messagebox(&flavor.messagebox)
+            .unwrap();
         for body in [
-            "keys={surprise='q'}", "keys={back='hyper+q'}", "keys={back=true}",
-            "keys={back={'q', 4}}", "layout={page_lines=0}", "layout={metadata_rows=-1}",
-            "layout={list_rows=1001}", "layout={page_lines=1.5}", "styles={border={unknown=true}}",
-            "text={title=false}", "text={title='bad\\nline'}", "unknown={}",
+            "keys={surprise='q'}",
+            "keys={back='hyper+q'}",
+            "keys={back=true}",
+            "keys={back={'q', 4}}",
+            "layout={page_lines=0}",
+            "layout={metadata_rows=-1}",
+            "layout={list_rows=1001}",
+            "layout={page_lines=1.5}",
+            "styles={border={unknown=true}}",
+            "text={title=false}",
+            "text={title='bad\\nline'}",
+            "unknown={}",
         ] {
             std::fs::write(&path, format!("rness.ui.messagebox={{agents={{{body}}}}}")).unwrap();
             assert!(super::load(&path).is_err(), "accepted {body}");
@@ -411,10 +490,15 @@ pub struct ProviderDeclaration {
     pub headers: BTreeMap<String, String>,
 }
 
-fn deserialize_provider_headers<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
+fn deserialize_provider_headers<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
     // serde's normal type errors can echo secret values from malformed input.
-    serde::Deserialize::deserialize(deserializer)
-        .map_err(|_| serde::de::Error::custom("provider headers must be a table of string names and string values"))
+    serde::Deserialize::deserialize(deserializer).map_err(|_| {
+        serde::de::Error::custom(
+            "provider headers must be a table of string names and string values",
+        )
+    })
 }
 
 #[derive(Clone, serde::Deserialize)]
@@ -428,34 +512,87 @@ pub enum ProviderAuth {
 
 /// Monitor-only options ride the existing messagebox configuration broadcast.
 fn validate_agents_monitor(value: &serde_json::Value, path: &str) -> Result<(), String> {
-    let object = value.as_object().ok_or_else(|| format!("{path} must be a table"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{path} must be a table"))?;
     for (section, values) in object {
         if !matches!(section.as_str(), "keys" | "layout" | "text" | "styles") {
             return Err(format!("invalid agents option: {path}.{section}"));
         }
-        let values = values.as_object().ok_or_else(|| format!("{path}.{section} must be a table"))?;
+        let values = values
+            .as_object()
+            .ok_or_else(|| format!("{path}.{section} must be a table"))?;
         for (key, value) in values {
             let field = format!("{path}.{section}.{key}");
             let valid = match section.as_str() {
                 "keys" => {
-                    let known = matches!(key.as_str(), "back" | "previous_agent" | "next_agent"
-                        | "list_up" | "list_down" | "open_detail" | "metadata_up" | "metadata_down"
-                        | "page_up" | "page_down" | "follow" | "scroll_up" | "scroll_down" | "toggle_tool");
-                    let chord = |v: &serde_json::Value| v.as_str().is_some_and(|s| rness_kernel::presentation::canonical_chord(s).is_ok());
-                    known && (value == false || chord(value) || value.as_array().is_some_and(|keys| !keys.is_empty() && keys.iter().all(chord)))
+                    let known = matches!(
+                        key.as_str(),
+                        "back"
+                            | "previous_agent"
+                            | "next_agent"
+                            | "list_up"
+                            | "list_down"
+                            | "open_detail"
+                            | "metadata_up"
+                            | "metadata_down"
+                            | "page_up"
+                            | "page_down"
+                            | "follow"
+                            | "scroll_up"
+                            | "scroll_down"
+                            | "toggle_tool"
+                    );
+                    let chord = |v: &serde_json::Value| {
+                        v.as_str()
+                            .is_some_and(|s| rness_kernel::presentation::canonical_chord(s).is_ok())
+                    };
+                    known
+                        && (value == false
+                            || chord(value)
+                            || value
+                                .as_array()
+                                .is_some_and(|keys| !keys.is_empty() && keys.iter().all(chord)))
                 }
                 "layout" => {
                     let min = if key == "metadata_rows" { 0 } else { 1 };
-                    matches!(key.as_str(), "list_rows" | "metadata_rows" | "wheel_lines" | "page_lines" | "metadata_scroll_lines")
-                        && value.as_u64().is_some_and(|n| (min..=1000).contains(&n))
+                    matches!(
+                        key.as_str(),
+                        "list_rows"
+                            | "metadata_rows"
+                            | "wheel_lines"
+                            | "page_lines"
+                            | "metadata_scroll_lines"
+                    ) && value.as_u64().is_some_and(|n| (min..=1000).contains(&n))
                 }
-                "text" => matches!(key.as_str(), "title" | "empty" | "waiting" | "incoming_label" | "following" | "paused" | "paused_new")
-                    && value.as_str().is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control)),
-                "styles" => matches!(key.as_str(), "frame" | "border" | "heading" | "hint")
-                    && validate_messagebox(&serde_json::json!({"style": value}), &field, "message").is_ok(),
+                "text" => {
+                    matches!(
+                        key.as_str(),
+                        "title"
+                            | "empty"
+                            | "waiting"
+                            | "incoming_label"
+                            | "following"
+                            | "paused"
+                            | "paused_new"
+                    ) && value
+                        .as_str()
+                        .is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control))
+                }
+                "styles" => {
+                    matches!(key.as_str(), "frame" | "border" | "heading" | "hint")
+                        && validate_messagebox(
+                            &serde_json::json!({"style": value}),
+                            &field,
+                            "message",
+                        )
+                        .is_ok()
+                }
                 _ => false,
             };
-            if !valid { return Err(format!("invalid agents option: {field}")); }
+            if !valid {
+                return Err(format!("invalid agents option: {field}"));
+            }
         }
     }
     Ok(())
@@ -907,6 +1044,21 @@ pub fn evaluate(
     )?;
     let s = state.clone();
     providers.set(
+        "set_cache_ttl",
+        lua.create_function(move |_, (name, ttl): (String, String)| {
+            if name.trim().is_empty() {
+                return Err(mlua::Error::runtime("provider name must be nonempty"));
+            }
+            match ttl.as_str() {
+                "5m" | "1h" => {}
+                _ => return Err(mlua::Error::runtime("cache_ttl must be '5m' or '1h'")),
+            }
+            s.lock().unwrap().cache_ttls.insert(name, ttl);
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    providers.set(
         "register",
         lua.create_function(move |lua, (name, value): (String, Table)| {
             let declaration: ProviderDeclaration = lua.from_value(mlua::Value::Table(value))?;
@@ -1197,6 +1349,7 @@ pub fn evaluate(
     for (table, method) in [
         ("plugins", "setup"),
         ("providers", "set_stream_idle_timeout"),
+        ("providers", "set_cache_ttl"),
         ("plugins", "load"),
         ("agents", "declare"),
         ("sandbox", "setup"),
@@ -1222,7 +1375,10 @@ pub fn evaluate(
             config.job_retention.validate()?;
         }
     }
-    config.allow_generic_subagents = match rness.get::<Table>("agents")?.get::<mlua::Value>("allow_generic")? {
+    config.allow_generic_subagents = match rness
+        .get::<Table>("agents")?
+        .get::<mlua::Value>("allow_generic")?
+    {
         mlua::Value::Nil => false,
         mlua::Value::Boolean(allow) => allow,
         _ => return Err("agents.allow_generic must be a boolean".into()),
@@ -1254,7 +1410,10 @@ pub fn evaluate(
     }
     for policy in config.compaction.values() {
         if let Some(name) = &policy.summary_profile {
-            config.models.validate_profile(name).map_err(std::io::Error::other)?;
+            config
+                .models
+                .validate_profile(name)
+                .map_err(std::io::Error::other)?;
         }
     }
     config.default_profile = rness.get("default_profile")?;
@@ -1287,12 +1446,11 @@ mod tests {
         let sources = crate::loader::discover_specs(dir.path(), &config.plugin_specs).unwrap();
         assert!(crate::loader::load_all(&host, &sources).await.is_empty());
         host.validate_bindings().await.unwrap();
-        assert!(
-            host.binding_specs()
-                .await
-                .iter()
-                .any(|binding| binding.user && binding.keys == ["f8"])
-        );
+        assert!(host
+            .binding_specs()
+            .await
+            .iter()
+            .any(|binding| binding.user && binding.keys == ["f8"]));
         host.load("check", "assert(not pcall(rness.keymap.setup, {}))")
             .await
             .unwrap();
@@ -1337,11 +1495,31 @@ mod tests {
 
     #[test]
     fn question_style_validation_matches_terminal_style_resolution() {
-        for color in ["red", "bright-black", "grey", "silver", "lightwhite", "default", "reset", "#abcdef", "255", "256", "Default", "#ggffff", "invalid"] {
+        for color in [
+            "red",
+            "bright-black",
+            "grey",
+            "silver",
+            "lightwhite",
+            "default",
+            "reset",
+            "#abcdef",
+            "255",
+            "256",
+            "Default",
+            "#ggffff",
+            "invalid",
+        ] {
             let style = serde_json::json!({"fg": color});
             let mut config = QuestionOverlayConfig::default();
             config.ui.styles.insert("panel".into(), style.clone());
-            assert_eq!(config.validate().is_ok(), rness_tui::theme::Theme::default().resolve_style(&style, Default::default()).is_ok(), "{color}");
+            assert_eq!(
+                config.validate().is_ok(),
+                rness_tui::theme::Theme::default()
+                    .resolve_style(&style, Default::default())
+                    .is_ok(),
+                "{color}"
+            );
         }
     }
 
@@ -1354,7 +1532,11 @@ mod tests {
         assert_eq!(config.question_overlay.ui.width, Some(90));
         assert_eq!(config.question_overlay.ui.keys["down"], "j");
         assert_eq!(config.question_overlay.ui.keys["submit"], "enter");
-        for ui in ["{width=5}", "{keys={submit='tab'}}", "{styles={border={fg='invalid'}}}"] {
+        for ui in [
+            "{width=5}",
+            "{keys={submit='tab'}}",
+            "{styles={border={fg='invalid'}}}",
+        ] {
             std::fs::write(&path, format!("rness.questions.enable {{ui={ui}}}")).unwrap();
             assert!(load(&path).is_err(), "accepted {ui}");
         }
@@ -1491,16 +1673,15 @@ mod tests {
             assert(rness.profiles.resolve('work').max_output_tokens == 4000)
         "#;
         host.load("check", check).await.unwrap();
-        assert!(
-            host.reload(vec![crate::loader::PluginSource {
+        assert!(host
+            .reload(vec![crate::loader::PluginSource {
                 name: "check".into(),
                 source: check.into(),
                 dependencies: Vec::new(),
             }])
             .await
             .unwrap()
-            .is_empty()
-        );
+            .is_empty());
     }
 
     #[test]
@@ -1750,11 +1931,9 @@ mod tests {
             Ok(_) => panic!("duplicate sandbox setup must be rejected"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("sandbox.setup may only be called once")
-        );
+        assert!(error
+            .to_string()
+            .contains("sandbox.setup may only be called once"));
     }
 
     #[tokio::test]
@@ -1762,7 +1941,10 @@ mod tests {
         use rness_engine::sandbox::SandboxMode;
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("init.lua");
-        for script in ["", "rness.agents.declare('worker', {description='Work', instructions='Work'})"] {
+        for script in [
+            "",
+            "rness.agents.declare('worker', {description='Work', instructions='Work'})",
+        ] {
             std::fs::write(&init, script).unwrap();
             let config = load(&init).unwrap();
             assert!(!config.sandbox_configured);
@@ -1772,14 +1954,28 @@ mod tests {
         std::fs::write(&init, "rness.sandbox.setup({default='read-only'})").unwrap();
         let (host, config) = crate::plugin_host::LuaHost::spawn_from_init(init).unwrap();
         assert_eq!(config.sandbox.default, SandboxMode::ReadOnly);
-        assert!(host.load("late", "rness.sandbox.setup({default='danger-full-access'})").await.is_err());
+        assert!(host
+            .load(
+                "late",
+                "rness.sandbox.setup({default='danger-full-access'})"
+            )
+            .await
+            .is_err());
     }
 
     #[test]
     fn sandbox_rejects_invalid_configuration() {
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("init.lua");
-        for value in ["{default='invalid'}", "{unknown=true}", "{unavailable='allow'}", "{agent_overrides='allow'}", "{process={unix_shell=''}}", "{process={windows_container_pids=0}}", "{process={windows_container_image='--privileged'}}"] {
+        for value in [
+            "{default='invalid'}",
+            "{unknown=true}",
+            "{unavailable='allow'}",
+            "{agent_overrides='allow'}",
+            "{process={unix_shell=''}}",
+            "{process={windows_container_pids=0}}",
+            "{process={windows_container_image='--privileged'}}",
+        ] {
             std::fs::write(&init, format!("rness.sandbox.setup({value})")).unwrap();
             assert!(load(&init).is_err(), "{value}");
         }

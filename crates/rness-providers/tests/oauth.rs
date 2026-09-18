@@ -94,7 +94,15 @@ async fn oauth_credential_sends_bearer_spoof_headers_and_billing_block() {
         .and(header("authorization", "Bearer at-valid"))
         // Note: wiremock parses comma-separated header values as lists —
         // the UA's "(external, sdk-cli)" splits too.
-        .and(headers("anthropic-beta", vec!["claude-code-20250219", "oauth-2025-04-20"]))
+        .and(headers("anthropic-beta", vec![
+            "claude-code-20250219",
+            "oauth-2025-04-20",
+            "prompt-caching-scope-2026-01-05",
+            "cache-diagnosis-2026-04-07",
+            "extended-cache-ttl-2025-04-11",
+            "mid-conversation-system-2026-04-07",
+            "structured-outputs-2025-12-15",
+        ]))
         .and(headers("user-agent", vec!["claude-cli/2.1.195 (external", "sdk-cli)"]))
         .and(header("x-app", "cli"))
         .and(body_partial_json(json!({

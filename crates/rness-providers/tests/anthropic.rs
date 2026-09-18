@@ -7,7 +7,7 @@ use rness_engine::tools::ToolSpec;
 use rness_engine::turn::provider::{Provider, StepOutcome, StepRequest};
 use rness_protocol::events::*;
 use rness_providers::anthropic::AnthropicProvider;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -490,13 +490,11 @@ async fn anthropic_omits_empty_text_blocks_without_shifting_images() {
         .unwrap();
     assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     assert_eq!(body["messages"][0]["content"][0]["type"], "image");
-    assert!(
-        body["messages"][0]["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|block| block["type"] != "thinking")
-    );
+    assert!(body["messages"][0]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|block| block["type"] != "thinking"));
     assert_eq!(
         body["messages"][0]["content"][1],
         json!({"type":"text","text":"hello"})
@@ -561,6 +559,70 @@ async fn happy_path_text_stream_commits_with_chunks_and_usage() {
     // The exact stream is embedded (traceability).
     assert_eq!(msg.chunks.len(), 1);
     assert!(matches!(&msg.chunks[0].delta, ChunkDelta::Text { t } if t == "hello there"));
+}
+
+#[tokio::test]
+async fn prompt_caching_uses_at_most_four_explicit_breakpoints() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&stream_happy("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("key", "test")
+        .with_base_url(server.uri())
+        .with_prompt_caching(rness_providers::routes::CacheTtl::OneHour);
+    let context = ModelContext {
+        turns: (0..10)
+            .map(|index| ModelTurn::User {
+                content: vec![ContentPart::Text {
+                    text: format!("message {index}"),
+                }],
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let tools = [ToolSpec {
+        name: "Read".into(),
+        description: "read a file".into(),
+        input_schema: json!({"type": "object"}),
+    }];
+
+    assert!(matches!(
+        step(&provider, &context, "system", &tools).await,
+        StepOutcome::Committed(_)
+    ));
+    let request = server.received_requests().await.unwrap().remove(0);
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert!(body.get("cache_control").is_none());
+
+    fn cache_controls(value: &Value) -> Vec<&Value> {
+        let mut found = Vec::new();
+        match value {
+            Value::Object(map) => {
+                if let Some(cache_control) = map.get("cache_control") {
+                    found.push(cache_control);
+                }
+                for value in map.values() {
+                    found.extend(cache_controls(value));
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    found.extend(cache_controls(value));
+                }
+            }
+            _ => {}
+        }
+        found
+    }
+
+    let cache_controls = cache_controls(&body);
+    assert_eq!(cache_controls.len(), 4);
+    assert!(cache_controls
+        .iter()
+        .all(|cache_control| *cache_control == &json!({"type": "ephemeral", "ttl": "1h"})));
 }
 
 #[tokio::test]

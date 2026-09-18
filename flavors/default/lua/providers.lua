@@ -3,6 +3,10 @@ rness.providers.register("anthropic", {
   protocol = "anthropic", base_url = "https://api.anthropic.com",
   auth = { env = "ANTHROPIC_API_KEY" },
 })
+-- Prompt caching is enabled by default for Anthropic routes. Use a 1-hour TTL
+-- by default; override it with "5m" if lower API-key cache-write cost matters.
+-- The TTL is latched on first use; changing it mid-session has no effect.
+rness.providers.set_cache_ttl("anthropic", "1h")
 rness.providers.register("chatgpt", {
   protocol = "chatgpt-responses", base_url = "https://chatgpt.com/backend-api",
   auth = { oauth = "openai-chatgpt" },

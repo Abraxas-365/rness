@@ -20,7 +20,7 @@ use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepReq
 use rness_protocol::events::{
     AssistantMessage, ChunkDelta, ContentPart, Reasoning, StopReason, TimedChunk, Usage,
 };
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::auth::{AuthError, Credential, CredentialSource};
@@ -36,6 +36,11 @@ const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
 const OAUTH_USER_AGENT: &str = "claude-cli/2.1.195 (external, sdk-cli)";
 const OAUTH_BILLING_SYSTEM: &str =
     "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=cli; cch=00000;";
+
+/// Beta header fragments for prompt caching features.
+const BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
+const BETA_EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
+const BETA_CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
 
 /// How the provider authenticates each request.
 enum Auth {
@@ -57,6 +62,17 @@ pub struct AnthropicProvider {
     auth: Auth,
     model: String,
     max_tokens: u32,
+    /// When true, inject cache_control breakpoints in requests.
+    prompt_caching: bool,
+    /// Resolved TTL state. `true` = 1-hour, `false` = 5-minute (default).
+    /// Atomic because TTL downgrade may flip it concurrently.
+    cache_ttl_1h: std::sync::atomic::AtomicBool,
+    /// Whether TTL was auto-downgraded from 1h to 5m after API rejection.
+    cache_ttl_downgraded: std::sync::atomic::AtomicBool,
+    /// Original configured TTL preference (latched once on first OAuth resolution).
+    cache_ttl_setting: crate::routes::CacheTtl,
+    /// Whether the cache TTL has been resolved (latched once).
+    cache_ttl_resolved: std::sync::atomic::AtomicBool,
 }
 
 impl AnthropicProvider {
@@ -94,6 +110,11 @@ impl AnthropicProvider {
             auth: Auth::ApiKey(api_key.into()),
             model: model.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            prompt_caching: false,
+            cache_ttl_1h: std::sync::atomic::AtomicBool::new(false),
+            cache_ttl_downgraded: std::sync::atomic::AtomicBool::new(false),
+            cache_ttl_setting: crate::routes::CacheTtl::Auto,
+            cache_ttl_resolved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -109,6 +130,12 @@ impl AnthropicProvider {
             auth: Auth::Source(source),
             model: model.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            // Credential-based providers (interactive sessions) always enable caching.
+            prompt_caching: true,
+            cache_ttl_1h: std::sync::atomic::AtomicBool::new(false),
+            cache_ttl_downgraded: std::sync::atomic::AtomicBool::new(false),
+            cache_ttl_setting: crate::routes::CacheTtl::Auto,
+            cache_ttl_resolved: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -121,6 +148,66 @@ impl AnthropicProvider {
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
         self
+    }
+
+    /// Enable prompt caching with the specified TTL preference.
+    pub fn with_prompt_caching(mut self, ttl: crate::routes::CacheTtl) -> Self {
+        self.prompt_caching = true;
+        self.cache_ttl_setting = ttl;
+        // Pre-resolve non-auto settings immediately.
+        match ttl {
+            crate::routes::CacheTtl::OneHour => {
+                self.cache_ttl_1h = std::sync::atomic::AtomicBool::new(true);
+                self.cache_ttl_resolved = std::sync::atomic::AtomicBool::new(true);
+            }
+            crate::routes::CacheTtl::FiveMinutes => {
+                self.cache_ttl_resolved = std::sync::atomic::AtomicBool::new(true);
+            }
+            crate::routes::CacheTtl::Auto => {} // Resolved on first request based on auth type.
+        }
+        self
+    }
+
+    /// Latch the cache TTL on first use when set to Auto.
+    /// OAuth → 1h (free on subscription), API key → 5m.
+    fn resolve_cache_ttl(&self, is_oauth: bool) {
+        use std::sync::atomic::Ordering;
+        if self
+            .cache_ttl_resolved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            if matches!(self.cache_ttl_setting, crate::routes::CacheTtl::Auto) {
+                self.cache_ttl_1h.store(is_oauth, Ordering::Release);
+            }
+        }
+    }
+
+    /// Build the cache_control JSON value based on resolved TTL.
+    fn cache_control_value(&self) -> Value {
+        use std::sync::atomic::Ordering;
+        if self.cache_ttl_1h.load(Ordering::Acquire) {
+            json!({"type": "ephemeral", "ttl": "1h"})
+        } else {
+            json!({"type": "ephemeral"})
+        }
+    }
+
+    /// Check if a 400 error is a TTL rejection (API doesn't support 1h for this account).
+    fn is_ttl_rejection(&self, body: &str) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.cache_ttl_1h.load(Ordering::Acquire) {
+            return false;
+        }
+        let lower = body.to_lowercase();
+        lower.contains("ttl") || lower.contains("cache_control")
+    }
+
+    /// Downgrade from 1h to 5m TTL after API rejection. Permanent for the session.
+    fn downgrade_cache_ttl(&self) {
+        use std::sync::atomic::Ordering;
+        self.cache_ttl_1h.store(false, Ordering::Release);
+        self.cache_ttl_downgraded.store(true, Ordering::Release);
     }
 
     async fn credential(&self) -> Result<Credential, AuthError> {
@@ -164,12 +251,24 @@ impl AnthropicProvider {
                 });
             }
         }
+
+        // Resolve cache TTL on first use (env > config > auto: OAuth→1h, API-key→5m).
+        if self.prompt_caching {
+            self.resolve_cache_ttl(oauth);
+        }
+
         let mut body = json!({
             "model": self.model,
             "max_tokens": max_tokens,
             "stream": true,
             "messages": messages_from_context(request.context),
         });
+
+        // Use explicit breakpoints below rather than top-level automatic
+        // caching: Anthropic permits at most four cache_control blocks per
+        // request, and system/tools plus the two strategic message points
+        // already occupy that full budget.
+
         if let Some((store, policy)) = &images {
             let mut message_index = 0;
             for turn in &request.context.turns {
@@ -254,23 +353,55 @@ impl AnthropicProvider {
             system_blocks.push(json!({ "type": "text", "text": request.system }));
         }
         if !system_blocks.is_empty() {
+            // Place cache_control on the last system block so the entire
+            // system prompt prefix is cached across turns.
+            if self.prompt_caching {
+                if let Some(last) = system_blocks.last_mut() {
+                    last["cache_control"] = self.cache_control_value();
+                }
+            }
             body["system"] = Value::Array(system_blocks);
         }
         if !request.tools.is_empty() {
-            body["tools"] = Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "input_schema": t.input_schema,
-                        })
+            let mut tools: Vec<Value> = request
+                .tools
+                .iter()
+                .map(|t| {
+                    json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.input_schema,
                     })
-                    .collect(),
-            );
+                })
+                .collect();
+            // Place cache_control on the last tool definition so the entire
+            // tool definitions prefix is cached.
+            if self.prompt_caching {
+                if let Some(last) = tools.last_mut() {
+                    last["cache_control"] = self.cache_control_value();
+                }
+            }
+            body["tools"] = Value::Array(tools);
         }
+
+        // Explicit message breakpoints for multi-turn caching:
+        // 1. Second-to-last message (most recent context, highest value).
+        // 2. For long histories (≥ 10 messages), a midpoint breakpoint at len/3.
+        if self.prompt_caching {
+            if let Some(messages) = body["messages"].as_array_mut() {
+                let len = messages.len();
+                if len >= 2 {
+                    mark_message_cache_control(&mut messages[len - 2], &self.cache_control_value());
+                }
+                if len >= 10 {
+                    let mid = len / 3;
+                    if mid > 0 {
+                        mark_message_cache_control(&mut messages[mid], &self.cache_control_value());
+                    }
+                }
+            }
+        }
+
         Ok(body)
     }
 
@@ -448,14 +579,41 @@ impl AnthropicProvider {
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", API_VERSION)
             .json(body);
+
+        // Build caching beta headers when prompt caching is active.
+        let cache_betas = if self.prompt_caching {
+            use std::sync::atomic::Ordering;
+            let mut parts = vec![BETA_PROMPT_CACHING_SCOPE, BETA_CACHE_DIAGNOSIS];
+            if self.cache_ttl_1h.load(Ordering::Acquire) {
+                parts.push(BETA_EXTENDED_CACHE_TTL);
+            }
+            Some(parts.join(","))
+        } else {
+            None
+        };
+
         match credential {
-            Credential::ApiKey(key) => base.header("x-api-key", key),
-            Credential::OAuth(token) => base
-                .bearer_auth(token)
-                .header("anthropic-beta", OAUTH_BETA)
-                .header("User-Agent", OAUTH_USER_AGENT)
-                .header("anthropic-dangerous-direct-browser-access", "true")
-                .header("x-app", "cli"),
+            Credential::ApiKey(key) => {
+                let req = base.header("x-api-key", key);
+                if let Some(betas) = cache_betas {
+                    req.header("anthropic-beta", betas)
+                } else {
+                    req
+                }
+            }
+            Credential::OAuth(token) => {
+                // Merge cache betas into the OAuth beta header string.
+                let beta_str = if let Some(betas) = cache_betas {
+                    format!("{OAUTH_BETA},{betas},mid-conversation-system-2026-04-07,structured-outputs-2025-12-15")
+                } else {
+                    OAUTH_BETA.to_string()
+                };
+                base.bearer_auth(token)
+                    .header("anthropic-beta", beta_str)
+                    .header("User-Agent", OAUTH_USER_AGENT)
+                    .header("anthropic-dangerous-direct-browser-access", "true")
+                    .header("x-app", "cli")
+            }
         }
     }
 }
@@ -512,6 +670,26 @@ fn messages_from_context(context: &rness_engine::session::projection::ModelConte
         }
     }
     messages
+}
+
+/// Place `cache_control` on the last cacheable content block of a message.
+/// Skips thinking blocks (API rejects cache_control there) and empty text blocks.
+fn mark_message_cache_control(msg: &mut Value, cc: &Value) {
+    let Some(content) = msg["content"].as_array_mut() else {
+        return;
+    };
+    for block in content.iter_mut().rev() {
+        let block_type = block["type"].as_str().unwrap_or("");
+        // Thinking blocks cannot have cache_control; skip empty text.
+        if block_type == "thinking" {
+            continue;
+        }
+        if block_type == "text" && block["text"].as_str().unwrap_or("").is_empty() {
+            continue;
+        }
+        block["cache_control"] = cc.clone();
+        return;
+    }
 }
 
 fn parts_to_json(parts: &[ContentPart]) -> Vec<Value> {
@@ -829,6 +1007,12 @@ impl Provider for AnthropicProvider {
                     if !rejected.is_empty() {
                         continue;
                     }
+                }
+                // TTL downgrade: if the API rejected our 1h TTL with a 400,
+                // switch to 5m and rebuild+retry the request once.
+                if status.as_u16() == 400 && self.prompt_caching && self.is_ttl_rejection(&body) {
+                    self.downgrade_cache_ttl();
+                    continue;
                 }
                 let message = serde_json::from_str::<Value>(&body)
                     .ok()

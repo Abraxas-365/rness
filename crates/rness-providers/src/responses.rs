@@ -31,7 +31,10 @@ pub const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 const ORIGINATOR: &str = "rness";
 
 pub struct ResponsesProvider {
-    images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
+    images: Option<(
+        std::sync::Arc<rness_engine::images::ImageStore>,
+        rness_engine::images::ImagePolicy,
+    )>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     headers: crate::headers::ProviderHeaders,
@@ -53,13 +56,20 @@ impl ResponsesProvider {
         }
     }
 
-    pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
+    pub fn with_images(
+        mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) -> Self {
         self.images = Some((store, policy));
         self
     }
 
     /// Apply validated headers to inference and file requests, never OAuth.
-    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+    pub fn with_headers(
+        mut self,
+        headers: crate::headers::ProviderHeaders,
+    ) -> Result<Self, reqwest::Error> {
         self.client = headers.client()?;
         self.headers = headers;
         Ok(self)
@@ -78,12 +88,30 @@ impl ResponsesProvider {
 
     fn build_body(&self, request: &StepRequest<'_>) -> Result<Value, ProviderError> {
         crate::validate_image_roles(request.context, self.images.is_some())?;
-        let images = self.images.as_ref().map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
-        let projected = images.as_ref().map(|(store, policy)| store.project_request(request.context, policy)).transpose().map_err(crate::image_error)?;
-        let request = StepRequest { context: projected.as_ref().unwrap_or(request.context), system: request.system, tools: request.tools, on_delta: request.on_delta };
-        if matches!(request.context.config.reasoning, Some(Reasoning::BudgetTokens { .. })) {
-            return Err(ProviderError { code: "PROVIDER", retry_after: None,
-                message: "reasoning budget tokens are unsupported by OpenAI Responses; use effort".into(),
+        let images = self
+            .images
+            .as_ref()
+            .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
+        let projected = images
+            .as_ref()
+            .map(|(store, policy)| store.project_request(request.context, policy))
+            .transpose()
+            .map_err(crate::image_error)?;
+        let request = StepRequest {
+            context: projected.as_ref().unwrap_or(request.context),
+            system: request.system,
+            tools: request.tools,
+            on_delta: request.on_delta,
+        };
+        if matches!(
+            request.context.config.reasoning,
+            Some(Reasoning::BudgetTokens { .. })
+        ) {
+            return Err(ProviderError {
+                code: "PROVIDER",
+                retry_after: None,
+                message: "reasoning budget tokens are unsupported by OpenAI Responses; use effort"
+                    .into(),
                 retryable: false,
             });
         }
@@ -145,7 +173,13 @@ impl ResponsesProvider {
 
 // -- context → input items -------------------------------------------------
 
-fn input_items(context: &ModelContext, images: Option<&(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>) -> Result<Vec<Value>, ProviderError> {
+fn input_items(
+    context: &ModelContext,
+    images: Option<&(
+        std::sync::Arc<rness_engine::images::ImageStore>,
+        rness_engine::images::ImagePolicy,
+    )>,
+) -> Result<Vec<Value>, ProviderError> {
     let mut items = Vec::new();
     for turn in &context.turns {
         match turn {
@@ -153,10 +187,16 @@ fn input_items(context: &ModelContext, images: Option<&(std::sync::Arc<rness_eng
                 let mut parts = Vec::new();
                 for part in content {
                     match part {
-                        ContentPart::Text { text } if !text.is_empty() => parts.push(json!({"type":"input_text", "text":text})),
+                        ContentPart::Text { text } if !text.is_empty() => {
+                            parts.push(json!({"type":"input_text", "text":text}))
+                        }
                         ContentPart::Image { attachment } => {
-                            let (store, policy) = images.ok_or_else(|| crate::image_error("image store not configured".into()))?;
-                            let (mime, data) = store.request_image(attachment, policy).map_err(crate::image_error)?;
+                            let (store, policy) = images.ok_or_else(|| {
+                                crate::image_error("image store not configured".into())
+                            })?;
+                            let (mime, data) = store
+                                .request_image(attachment, policy)
+                                .map_err(crate::image_error)?;
                             use base64::Engine;
                             parts.push(json!({"type":"input_image", "image_url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}));
                         }
@@ -187,7 +227,11 @@ fn input_items(context: &ModelContext, images: Option<&(std::sync::Arc<rness_eng
                 }
                 for p in content {
                     if let ContentPart::ToolUse { call, name, args } = p {
-                        let arguments = if args.is_null() { "{}".to_string() } else { args.to_string() };
+                        let arguments = if args.is_null() {
+                            "{}".to_string()
+                        } else {
+                            args.to_string()
+                        };
                         items.push(json!({
                             "type": "function_call",
                             "call_id": call,
@@ -204,21 +248,36 @@ fn input_items(context: &ModelContext, images: Option<&(std::sync::Arc<rness_eng
                     } else {
                         &r.output
                     };
-                    let output = if r.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) {
+                    let output = if r.content.iter().any(|p| {
+                        matches!(
+                            p,
+                            rness_protocol::events::ToolResultContentPart::Image { .. }
+                        )
+                    }) {
                         let mut parts = Vec::new();
                         for part in r.effective_content() {
                             match part {
-                                rness_protocol::events::ToolResultContentPart::Text { text } => parts.push(json!({"type":"input_text", "text":text})),
-                                rness_protocol::events::ToolResultContentPart::Image { attachment } => {
-                                    let (store, policy) = images.ok_or_else(|| crate::image_error("image store not configured".into()))?;
-                                    let (mime, data) = store.request_image(&attachment, policy).map_err(crate::image_error)?;
+                                rness_protocol::events::ToolResultContentPart::Text { text } => {
+                                    parts.push(json!({"type":"input_text", "text":text}))
+                                }
+                                rness_protocol::events::ToolResultContentPart::Image {
+                                    attachment,
+                                } => {
+                                    let (store, policy) = images.ok_or_else(|| {
+                                        crate::image_error("image store not configured".into())
+                                    })?;
+                                    let (mime, data) = store
+                                        .request_image(&attachment, policy)
+                                        .map_err(crate::image_error)?;
                                     use base64::Engine;
                                     parts.push(json!({"type":"input_image", "image_url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}));
                                 }
                             }
                         }
                         json!(parts)
-                    } else { json!(output) };
+                    } else {
+                        json!(output)
+                    };
                     items.push(json!({
                         "type": "function_call_output",
                         "call_id": r.call,
@@ -253,21 +312,27 @@ impl Accumulator {
         match event {
             "response.output_text.delta" => {
                 if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
-                    self.chunks
-                        .push(TimedChunk { ms: at_ms, delta: ChunkDelta::Text { t: t.into() } });
+                    self.chunks.push(TimedChunk {
+                        ms: at_ms,
+                        delta: ChunkDelta::Text { t: t.into() },
+                    });
                 }
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
-                    self.chunks
-                        .push(TimedChunk { ms: at_ms, delta: ChunkDelta::Thinking { t: t.into() } });
+                    self.chunks.push(TimedChunk {
+                        ms: at_ms,
+                        delta: ChunkDelta::Thinking { t: t.into() },
+                    });
                 }
             }
             "response.function_call_arguments.delta" => {
                 if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
                     let call = v["item_id"].as_str().unwrap_or_default().to_string();
-                    self.chunks
-                        .push(TimedChunk { ms: at_ms, delta: ChunkDelta::ToolArgs { call, t: t.into() } });
+                    self.chunks.push(TimedChunk {
+                        ms: at_ms,
+                        delta: ChunkDelta::ToolArgs { call, t: t.into() },
+                    });
                 }
             }
             "response.output_item.done" => {
@@ -278,12 +343,24 @@ impl Accumulator {
             "response.completed" | "response.incomplete" => {
                 let response = &v["response"];
                 self.status = response["status"].as_str().map(String::from).or_else(|| {
-                    Some(if event.ends_with("incomplete") { "incomplete" } else { "completed" }.into())
+                    Some(
+                        if event.ends_with("incomplete") {
+                            "incomplete"
+                        } else {
+                            "completed"
+                        }
+                        .into(),
+                    )
                 });
                 let usage = &response["usage"];
                 if !usage.is_null() {
                     self.usage.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                     self.usage.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
+                    // Responses API: automatic caching reports cached tokens
+                    // in usage.input_tokens_details.cached_tokens.
+                    self.usage.cache_read_tokens = usage["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
                 }
                 // The completed payload's output array can be empty; only
                 // trust it when we accumulated nothing.
@@ -303,8 +380,7 @@ impl Accumulator {
                 self.done = true;
             }
             "error" => {
-                self.error =
-                    Some(v["message"].as_str().unwrap_or("stream error").to_string());
+                self.error = Some(v["message"].as_str().unwrap_or("stream error").to_string());
                 self.done = true;
             }
             _ => {}
@@ -344,7 +420,10 @@ impl Accumulator {
                         .collect::<Vec<_>>()
                         .join("\n");
                     if !text.is_empty() {
-                        content.push(ContentPart::Thinking { text, signature: None });
+                        content.push(ContentPart::Thinking {
+                            text,
+                            signature: None,
+                        });
                     }
                 }
                 "function_call" => {
@@ -381,26 +460,39 @@ impl Accumulator {
 
 #[async_trait]
 impl Provider for ResponsesProvider {
-    fn configure_images(&mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) {
+    fn configure_images(
+        &mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) {
         self.images = Some((store, policy));
     }
     fn model(&self) -> &str {
         &self.model
     }
-    fn supports_max_output_tokens(&self) -> bool { false }
+    fn supports_max_output_tokens(&self) -> bool {
+        false
+    }
 
     async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
         let started = Instant::now();
         let body = match self.build_body(&request) {
             Ok(body) => body,
-            Err(error) => return StepOutcome::Failed { error, partial: vec![] },
+            Err(error) => {
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                }
+            }
         };
 
         let mut credential = match self.source.resolve().await {
             Ok(c) => c,
             Err(e) => {
                 return StepOutcome::Failed {
-                    error: ProviderError { code: "PROVIDER", retry_after: None,
+                    error: ProviderError {
+                        code: "PROVIDER",
+                        retry_after: None,
                         message: auth_message(e),
                         retryable: false,
                     },
@@ -412,7 +504,10 @@ impl Provider for ResponsesProvider {
         let mut refreshed = false;
         let response = loop {
             if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-                return StepOutcome::Failed { error, partial: vec![] };
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                };
             }
             let sent = tokio::select! {
                 biased;
@@ -424,7 +519,12 @@ impl Provider for ResponsesProvider {
                 Ok(r) => r,
                 Err(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("transport: {e}"), retryable: true },
+                        error: ProviderError {
+                            code: "PROVIDER",
+                            retry_after: None,
+                            message: format!("transport: {e}"),
+                            retryable: true,
+                        },
                         partial: vec![],
                     }
                 }
@@ -440,7 +540,12 @@ impl Provider for ResponsesProvider {
                     }
                     Err(e) => {
                         return StepOutcome::Failed {
-                            error: ProviderError { code: "PROVIDER", retry_after: None, message: auth_message(e), retryable: false },
+                            error: ProviderError {
+                                code: "PROVIDER",
+                                retry_after: None,
+                                message: auth_message(e),
+                                retryable: false,
+                            },
                             partial: vec![],
                         }
                     }
@@ -460,7 +565,12 @@ impl Provider for ResponsesProvider {
                     })
                     .unwrap_or_else(|| format!("http {status}"));
                 return StepOutcome::Failed {
-                    error: ProviderError { code: crate::request_error_code(status.as_u16(), &text), retry_after, message, retryable },
+                    error: ProviderError {
+                        code: crate::request_error_code(status.as_u16(), &text),
+                        retry_after,
+                        message,
+                        retryable,
+                    },
                     partial: vec![],
                 };
             }
@@ -474,7 +584,10 @@ impl Provider for ResponsesProvider {
             match reader.pull(cancel).await {
                 SsePull::Event { event, data } => {
                     if let Some(error) = crate::stream_overflow(&event, &data) {
-                        return StepOutcome::Failed { error, partial: acc.chunks };
+                        return StepOutcome::Failed {
+                            error,
+                            partial: acc.chunks,
+                        };
                     }
                     let at_ms = started.elapsed().as_millis() as u64;
                     acc.apply(&event, &data, at_ms);
@@ -487,27 +600,56 @@ impl Provider for ResponsesProvider {
                     if acc.done {
                         if let Some(message) = acc.error {
                             return StepOutcome::Failed {
-                                error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
+                                error: ProviderError {
+                                    code: "PROVIDER",
+                                    retry_after: None,
+                                    message,
+                                    retryable: true,
+                                },
                                 partial: acc.chunks,
                             };
                         }
                         return StepOutcome::Committed(acc.finish(&self.model));
                     }
                 }
-                SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
+                SsePull::Timeout => {
+                    return StepOutcome::Failed {
+                        error: ProviderError {
+                            code: "TIMEOUT",
+                            retry_after: None,
+                            message: "TIMEOUT: provider stream inactivity timeout".into(),
+                            retryable: true,
+                        },
+                        partial: acc.chunks,
+                    }
+                }
                 SsePull::Done => {
                     if let Some(message) = acc.error {
                         return StepOutcome::Failed {
-                            error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
+                            error: ProviderError {
+                                code: "PROVIDER",
+                                retry_after: None,
+                                message,
+                                retryable: true,
+                            },
                             partial: acc.chunks,
                         };
                     }
                     return StepOutcome::Committed(acc.finish(&self.model));
                 }
-                SsePull::Cancelled => return StepOutcome::Cancelled { partial: acc.chunks },
+                SsePull::Cancelled => {
+                    return StepOutcome::Cancelled {
+                        partial: acc.chunks,
+                    }
+                }
                 SsePull::Error(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("stream: {e}"), retryable: true },
+                        error: ProviderError {
+                            code: "PROVIDER",
+                            retry_after: None,
+                            message: format!("stream: {e}"),
+                            retryable: true,
+                        },
                         partial: acc.chunks,
                     }
                 }

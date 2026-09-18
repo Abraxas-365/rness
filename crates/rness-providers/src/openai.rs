@@ -29,7 +29,10 @@ use crate::sse::{SsePull, SseReader};
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 
 pub struct OpenAiProvider {
-    images: Option<(std::sync::Arc<rness_engine::images::ImageStore>, rness_engine::images::ImagePolicy)>,
+    images: Option<(
+        std::sync::Arc<rness_engine::images::ImageStore>,
+        rness_engine::images::ImagePolicy,
+    )>,
     idle_timeout: Option<std::time::Duration>,
     client: reqwest::Client,
     headers: crate::headers::ProviderHeaders,
@@ -54,13 +57,20 @@ impl OpenAiProvider {
         }
     }
 
-    pub fn with_images(mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) -> Self {
+    pub fn with_images(
+        mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) -> Self {
         self.images = Some((store, policy));
         self
     }
 
     /// Apply validated headers to inference and file requests, never OAuth.
-    pub fn with_headers(mut self, headers: crate::headers::ProviderHeaders) -> Result<Self, reqwest::Error> {
+    pub fn with_headers(
+        mut self,
+        headers: crate::headers::ProviderHeaders,
+    ) -> Result<Self, reqwest::Error> {
         self.client = headers.client()?;
         self.headers = headers;
         Ok(self)
@@ -89,38 +99,93 @@ impl OpenAiProvider {
         self
     }
 
-    async fn reuse_image_uploads(&self, body: &mut Value, cancel: &CancellationToken, rejected: &[(String, String)], used: &mut Vec<(String, String)>) -> Result<(), ProviderError> {
+    async fn reuse_image_uploads(
+        &self,
+        body: &mut Value,
+        cancel: &CancellationToken,
+        rejected: &[(String, String)],
+        used: &mut Vec<(String, String)>,
+    ) -> Result<(), ProviderError> {
         use base64::Engine;
         use sha2::{Digest, Sha256};
-        static UPLOADS: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>> = std::sync::OnceLock::new();
-        let Some((store, policy)) = &self.images else { return Ok(()); };
-        if !store.effective_request_policy(policy).deepseek_files { return Ok(()); }
-        let url = reqwest::Url::parse(&self.base_url).map_err(|e| crate::image_error(e.to_string()))?;
-        if !matches!(url.host_str(), Some("api.deepseek.com" | "127.0.0.1" | "localhost")) { return Ok(()); }
-        let key = self.api_key.as_ref().ok_or_else(|| crate::image_error("DeepSeek Files requires API-key authentication".into()))?;
+        static UPLOADS: std::sync::OnceLock<
+            tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>,
+        > = std::sync::OnceLock::new();
+        let Some((store, policy)) = &self.images else {
+            return Ok(());
+        };
+        if !store.effective_request_policy(policy).deepseek_files {
+            return Ok(());
+        }
+        let url =
+            reqwest::Url::parse(&self.base_url).map_err(|e| crate::image_error(e.to_string()))?;
+        if !matches!(
+            url.host_str(),
+            Some("api.deepseek.com" | "127.0.0.1" | "localhost")
+        ) {
+            return Ok(());
+        }
+        let key = self.api_key.as_ref().ok_or_else(|| {
+            crate::image_error("DeepSeek Files requires API-key authentication".into())
+        })?;
         let mut paths = Vec::new();
-        for (mi, message) in body["messages"].as_array().into_iter().flatten().enumerate() {
-            for (ci, part) in message["content"].as_array().into_iter().flatten().enumerate() {
-                if part["type"] == "image_url" { paths.push(format!("/messages/{mi}/content/{ci}")); }
+        for (mi, message) in body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (ci, part) in message["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if part["type"] == "image_url" {
+                    paths.push(format!("/messages/{mi}/content/{ci}"));
+                }
             }
         }
         let mut protected = Vec::new();
         for path in paths {
-            let data_url = body.pointer(&path).and_then(|p| p["image_url"]["url"].as_str()).ok_or_else(|| crate::image_error("missing image URL".into()))?;
-            let (prefix, encoded) = data_url.split_once(";base64,").ok_or_else(|| crate::image_error("invalid inline image URL".into()))?;
-            let mime = prefix.strip_prefix("data:").ok_or_else(|| crate::image_error("invalid inline image MIME".into()))?;
+            let data_url = body
+                .pointer(&path)
+                .and_then(|p| p["image_url"]["url"].as_str())
+                .ok_or_else(|| crate::image_error("missing image URL".into()))?;
+            let (prefix, encoded) = data_url
+                .split_once(";base64,")
+                .ok_or_else(|| crate::image_error("invalid inline image URL".into()))?;
+            let mime = prefix
+                .strip_prefix("data:")
+                .ok_or_else(|| crate::image_error("invalid inline image MIME".into()))?;
             let upload_credential = self.headers.upload_credential(key);
-            let cache_key = format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.base_url, &upload_credential, data_url)).map_err(|e| crate::image_error(e.to_string()))?));
+            let cache_key = format!(
+                "{:x}",
+                Sha256::digest(
+                    serde_json::to_vec(&(&self.base_url, &upload_credential, data_url))
+                        .map_err(|e| crate::image_error(e.to_string()))?
+                )
+            );
             let mut cache = tokio::select! {
                 _ = cancel.cancelled() => return Err(crate::image_error("image upload cancelled".into())),
                 cache = UPLOADS.get_or_init(Default::default).lock() => cache,
             };
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| crate::image_error(e.to_string()))?.as_secs();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| crate::image_error(e.to_string()))?
+                .as_secs();
             cache.retain(|_, (_, expires)| *expires > now.saturating_add(60));
-            let mut cached = cache.get(&cache_key).cloned().or(store.cached_upload(&cache_key, now).map_err(crate::image_error)?);
-            if cached.as_ref().is_some_and(|(id, _)| rejected.contains(&(cache_key.clone(), id.clone()))) {
+            let mut cached = cache.get(&cache_key).cloned().or(store
+                .cached_upload(&cache_key, now)
+                .map_err(crate::image_error)?);
+            if cached
+                .as_ref()
+                .is_some_and(|(id, _)| rejected.contains(&(cache_key.clone(), id.clone())))
+            {
                 cache.remove(&cache_key);
-                store.cache_upload(&cache_key, "expired", 0).map_err(crate::image_error)?;
+                store
+                    .cache_upload(&cache_key, "expired", 0)
+                    .map_err(crate::image_error)?;
                 cached = None;
             }
             if let Some((id, _)) = &cached {
@@ -128,38 +193,102 @@ impl OpenAiProvider {
                     _ = cancel.cancelled() => return Err(crate::image_error("image lookup cancelled".into())),
                     response = self.client.get(format!("{}/files/{}", self.base_url.trim_end_matches('/'), id)).bearer_auth(key).timeout(std::time::Duration::from_secs(30)).send() => response.map_err(|e| crate::image_error(e.to_string()))?,
                 };
-                if response.status() == reqwest::StatusCode::NOT_FOUND { cache.remove(&cache_key); store.cache_upload(&cache_key, "expired", 0).map_err(crate::image_error)?; cached = None; }
-                else { response.error_for_status().map_err(|e| crate::image_error(e.to_string()))?; }
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    cache.remove(&cache_key);
+                    store
+                        .cache_upload(&cache_key, "expired", 0)
+                        .map_err(crate::image_error)?;
+                    cached = None;
+                } else {
+                    response
+                        .error_for_status()
+                        .map_err(|e| crate::image_error(e.to_string()))?;
+                }
             }
-            let id = if let Some((id, _)) = cached { id } else {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).map_err(|e| crate::image_error(e.to_string()))?;
+            let id = if let Some((id, _)) = cached {
+                id
+            } else {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|e| crate::image_error(e.to_string()))?;
                 let endpoint = format!("{}/files", self.base_url.trim_end_matches('/'));
                 let scope = crate::upload_scope(&endpoint, &upload_credential);
-                let value = crate::upload_with_quota_recovery(store, &scope, &protected, || {
-                    let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("image").mime_str(mime).map_err(|e| crate::image_error(e.to_string()))?;
-                    let form = reqwest::multipart::Form::new().part("file", part).text("purpose", "user_data").text("expires_after[anchor]", "created_at").text("expires_after[seconds]", "3600");
-                    Ok(self.client.post(&endpoint).bearer_auth(key).multipart(form))
-                }, |id| self.client.delete(format!("{endpoint}/{id}")).bearer_auth(key), cancel).await?;
-                let id = value["id"].as_str().filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')).ok_or_else(|| crate::image_error("invalid uploaded file ID".into()))?.to_owned();
-                let expires = value["expires_at"].as_u64().filter(|expires| *expires > now + 60).ok_or_else(|| crate::image_error("invalid uploaded file expiration".into()))?;
-                store.record_owned_upload(&scope, &id, expires).map_err(crate::image_error)?;
-                store.cache_upload(&cache_key, &id, expires).map_err(crate::image_error)?;
+                let value = crate::upload_with_quota_recovery(
+                    store,
+                    &scope,
+                    &protected,
+                    || {
+                        let part = reqwest::multipart::Part::bytes(bytes.clone())
+                            .file_name("image")
+                            .mime_str(mime)
+                            .map_err(|e| crate::image_error(e.to_string()))?;
+                        let form = reqwest::multipart::Form::new()
+                            .part("file", part)
+                            .text("purpose", "user_data")
+                            .text("expires_after[anchor]", "created_at")
+                            .text("expires_after[seconds]", "3600");
+                        Ok(self.client.post(&endpoint).bearer_auth(key).multipart(form))
+                    },
+                    |id| {
+                        self.client
+                            .delete(format!("{endpoint}/{id}"))
+                            .bearer_auth(key)
+                    },
+                    cancel,
+                )
+                .await?;
+                let id = value["id"]
+                    .as_str()
+                    .filter(|id| {
+                        !id.is_empty()
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    })
+                    .ok_or_else(|| crate::image_error("invalid uploaded file ID".into()))?
+                    .to_owned();
+                let expires = value["expires_at"]
+                    .as_u64()
+                    .filter(|expires| *expires > now + 60)
+                    .ok_or_else(|| crate::image_error("invalid uploaded file expiration".into()))?;
+                store
+                    .record_owned_upload(&scope, &id, expires)
+                    .map_err(crate::image_error)?;
+                store
+                    .cache_upload(&cache_key, &id, expires)
+                    .map_err(crate::image_error)?;
                 cache.insert(cache_key.clone(), (id.clone(), expires));
                 id
             };
             used.push((cache_key, id.clone()));
             protected.push(id.clone());
-            *body.pointer_mut(&path).expect("existing image path") = json!({"type":"file", "file_id":id});
+            *body.pointer_mut(&path).expect("existing image path") =
+                json!({"type":"file", "file_id":id});
         }
         Ok(())
     }
 
     fn build_body(&self, request: &StepRequest<'_>) -> Result<Value, ProviderError> {
         crate::validate_image_roles(request.context, self.images.is_some())?;
-        let images = self.images.as_ref().map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
-        let projected = images.as_ref().map(|(store, policy)| store.project_request(request.context, policy)).transpose().map_err(crate::image_error)?;
-        let request = StepRequest { context: projected.as_ref().unwrap_or(request.context), system: request.system, tools: request.tools, on_delta: request.on_delta };
-        if matches!(request.context.config.reasoning, Some(Reasoning::BudgetTokens { .. })) {
+        let images = self
+            .images
+            .as_ref()
+            .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
+        let projected = images
+            .as_ref()
+            .map(|(store, policy)| store.project_request(request.context, policy))
+            .transpose()
+            .map_err(crate::image_error)?;
+        let request = StepRequest {
+            context: projected.as_ref().unwrap_or(request.context),
+            system: request.system,
+            tools: request.tools,
+            on_delta: request.on_delta,
+        };
+        if matches!(
+            request.context.config.reasoning,
+            Some(Reasoning::BudgetTokens { .. })
+        ) {
             return Err(ProviderError { code: "PROVIDER", retry_after: None,
                 message: "reasoning budget tokens are unsupported by OpenAI-compatible providers; use effort".into(),
                 retryable: false,
@@ -175,13 +304,20 @@ impl OpenAiProvider {
             for turn in &request.context.turns {
                 match turn {
                     ModelTurn::User { content } => {
-                        if content.iter().any(|p| matches!(p, ContentPart::Image { .. })) {
+                        if content
+                            .iter()
+                            .any(|p| matches!(p, ContentPart::Image { .. }))
+                        {
                             let mut parts = Vec::new();
                             for part in content {
                                 match part {
-                                    ContentPart::Text { text } => parts.push(json!({"type":"text", "text":text})),
+                                    ContentPart::Text { text } => {
+                                        parts.push(json!({"type":"text", "text":text}))
+                                    }
                                     ContentPart::Image { attachment } => {
-                                        let (mime, data) = store.request_image(attachment, policy).map_err(crate::image_error)?;
+                                        let (mime, data) = store
+                                            .request_image(attachment, policy)
+                                            .map_err(crate::image_error)?;
                                         use base64::Engine;
                                         parts.push(json!({"type":"image_url", "image_url":{"url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}}));
                                     }
@@ -198,13 +334,28 @@ impl OpenAiProvider {
                         // Chat Completions tool messages cannot carry images. Keep all
                         // tool replies together, then associate rich output by call ID.
                         for result in results {
-                            if !result.content.iter().any(|p| matches!(p, rness_protocol::events::ToolResultContentPart::Image { .. })) { continue; }
-                            let mut parts = vec![json!({"type":"text", "text":format!("Output from tool call {} ({})", result.call, result.name)})];
+                            if !result.content.iter().any(|p| {
+                                matches!(
+                                    p,
+                                    rness_protocol::events::ToolResultContentPart::Image { .. }
+                                )
+                            }) {
+                                continue;
+                            }
+                            let mut parts = vec![
+                                json!({"type":"text", "text":format!("Output from tool call {} ({})", result.call, result.name)}),
+                            ];
                             for part in result.effective_content() {
                                 match part {
-                                    rness_protocol::events::ToolResultContentPart::Text { text } => parts.push(json!({"type":"text", "text":text})),
-                                    rness_protocol::events::ToolResultContentPart::Image { attachment } => {
-                                        let (mime, data) = store.request_image(&attachment, policy).map_err(crate::image_error)?;
+                                    rness_protocol::events::ToolResultContentPart::Text {
+                                        text,
+                                    } => parts.push(json!({"type":"text", "text":text})),
+                                    rness_protocol::events::ToolResultContentPart::Image {
+                                        attachment,
+                                    } => {
+                                        let (mime, data) = store
+                                            .request_image(&attachment, policy)
+                                            .map_err(crate::image_error)?;
                                         use base64::Engine;
                                         parts.push(json!({"type":"image_url", "image_url":{"url":format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data))}}));
                                     }
@@ -340,7 +491,10 @@ impl Accumulator {
     fn finish(self, model: &str) -> AssistantMessage {
         let mut content = Vec::new();
         if !self.thinking.is_empty() {
-            content.push(ContentPart::Thinking { text: self.thinking, signature: None });
+            content.push(ContentPart::Thinking {
+                text: self.thinking,
+                signature: None,
+            });
         }
         if !self.text.is_empty() {
             content.push(ContentPart::Text { text: self.text });
@@ -367,13 +521,23 @@ impl Accumulator {
     fn apply(&mut self, data: &str, at_ms: u64) -> Result<(), String> {
         let v: Value = serde_json::from_str(data).map_err(|e| format!("bad json: {e}"))?;
         if let Some(err) = v.get("error") {
-            return Err(err["message"].as_str().unwrap_or("stream error").to_string());
+            return Err(err["message"]
+                .as_str()
+                .unwrap_or("stream error")
+                .to_string());
         }
         if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
             self.usage.input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
             self.usage.output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
+            // OpenAI Chat Completions: automatic caching reports cached tokens
+            // in usage.prompt_tokens_details.cached_tokens.
+            self.usage.cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0);
         }
-        let Some(choice) = v["choices"].get(0) else { return Ok(()) };
+        let Some(choice) = v["choices"].get(0) else {
+            return Ok(());
+        };
 
         if let Some(reason) = choice["finish_reason"].as_str() {
             self.stop = Some(match reason {
@@ -386,12 +550,20 @@ impl Accumulator {
         let delta = &choice["delta"];
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
             self.text.push_str(t);
-            self.chunks.push(TimedChunk { ms: at_ms, delta: ChunkDelta::Text { t: t.into() } });
+            self.chunks.push(TimedChunk {
+                ms: at_ms,
+                delta: ChunkDelta::Text { t: t.into() },
+            });
         }
-        if let Some(t) = delta["reasoning_content"].as_str().filter(|t| !t.is_empty()) {
+        if let Some(t) = delta["reasoning_content"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+        {
             self.thinking.push_str(t);
-            self.chunks
-                .push(TimedChunk { ms: at_ms, delta: ChunkDelta::Thinking { t: t.into() } });
+            self.chunks.push(TimedChunk {
+                ms: at_ms,
+                delta: ChunkDelta::Thinking { t: t.into() },
+            });
         }
         if let Some(tool_calls) = delta["tool_calls"].as_array() {
             for tc in tool_calls {
@@ -410,7 +582,10 @@ impl Accumulator {
                     call.args.push_str(args);
                     self.chunks.push(TimedChunk {
                         ms: at_ms,
-                        delta: ChunkDelta::ToolArgs { call: call.id.clone(), t: args.into() },
+                        delta: ChunkDelta::ToolArgs {
+                            call: call.id.clone(),
+                            t: args.into(),
+                        },
                     });
                 }
             }
@@ -423,7 +598,11 @@ impl Accumulator {
 
 #[async_trait]
 impl Provider for OpenAiProvider {
-    fn configure_images(&mut self, store: std::sync::Arc<rness_engine::images::ImageStore>, policy: rness_engine::images::ImagePolicy) {
+    fn configure_images(
+        &mut self,
+        store: std::sync::Arc<rness_engine::images::ImageStore>,
+        policy: rness_engine::images::ImagePolicy,
+    ) {
         self.images = Some((store, policy));
     }
     fn model(&self) -> &str {
@@ -434,62 +613,95 @@ impl Provider for OpenAiProvider {
         let started = Instant::now();
         let mut rejected = Vec::new();
         let response = loop {
-        let mut used = Vec::new();
-        let mut body = match self.build_body(&request) {
-            Ok(body) => body,
-            Err(error) => return StepOutcome::Failed { error, partial: vec![] },
-        };
-
-        if let Err(error) = self.reuse_image_uploads(&mut body, cancel, &rejected, &mut used).await {
-            if cancel.is_cancelled() { return StepOutcome::Cancelled { partial: vec![] }; }
-            return StepOutcome::Failed { error, partial: vec![] };
-        }
-        if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-            return StepOutcome::Failed { error, partial: vec![] };
-        }
-        let mut http_request = self.client.post(format!("{}/chat/completions", self.base_url)).json(&body);
-        if let Some(key) = &self.api_key { http_request = http_request.bearer_auth(key); }
-        let response = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
-            _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
-            r = http_request.send() => r,
-        };
-
-        let response = match response {
-            Ok(r) => r,
-            Err(e) => {
-                return StepOutcome::Failed {
-                    error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("transport: {e}"), retryable: true },
-                    partial: vec![],
+            let mut used = Vec::new();
+            let mut body = match self.build_body(&request) {
+                Ok(body) => body,
+                Err(error) => {
+                    return StepOutcome::Failed {
+                        error,
+                        partial: vec![],
+                    }
                 }
-            }
-        };
+            };
 
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after = crate::sse::retry_after(response.headers());
-            let retryable = status.as_u16() == 429 || status.is_server_error();
-            let body = tokio::select! {
+            if let Err(error) = self
+                .reuse_image_uploads(&mut body, cancel, &rejected, &mut used)
+                .await
+            {
+                if cancel.is_cancelled() {
+                    return StepOutcome::Cancelled { partial: vec![] };
+                }
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                };
+            }
+            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
+                return StepOutcome::Failed {
+                    error,
+                    partial: vec![],
+                };
+            }
+            let mut http_request = self
+                .client
+                .post(format!("{}/chat/completions", self.base_url))
+                .json(&body);
+            if let Some(key) = &self.api_key {
+                http_request = http_request.bearer_auth(key);
+            }
+            let response = tokio::select! {
+                biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
-                _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: crate::image_error("timeout reading provider error".into()), partial: vec![] },
-                text = response.text() => text.unwrap_or_default(),
+                _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
+                r = http_request.send() => r,
             };
-            if rejected.is_empty() && matches!(status.as_u16(), 400 | 404 | 410 | 422) {
-                rejected = crate::rejected_uploads(&body, &used);
-                if !rejected.is_empty() { continue; }
-            }
-            let message = serde_json::from_str::<Value>(&body)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(String::from))
-                .unwrap_or_else(|| format!("http {status}"));
-            return StepOutcome::Failed {
-                error: ProviderError { code: crate::request_error_code(status.as_u16(), &body), retry_after, message, retryable },
-                partial: vec![],
-            };
-        }
 
-        break response;
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    return StepOutcome::Failed {
+                        error: ProviderError {
+                            code: "PROVIDER",
+                            retry_after: None,
+                            message: format!("transport: {e}"),
+                            retryable: true,
+                        },
+                        partial: vec![],
+                    }
+                }
+            };
+
+            let status = response.status();
+            if !status.is_success() {
+                let retry_after = crate::sse::retry_after(response.headers());
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                let body = tokio::select! {
+                    _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
+                    _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: crate::image_error("timeout reading provider error".into()), partial: vec![] },
+                    text = response.text() => text.unwrap_or_default(),
+                };
+                if rejected.is_empty() && matches!(status.as_u16(), 400 | 404 | 410 | 422) {
+                    rejected = crate::rejected_uploads(&body, &used);
+                    if !rejected.is_empty() {
+                        continue;
+                    }
+                }
+                let message = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                    .unwrap_or_else(|| format!("http {status}"));
+                return StepOutcome::Failed {
+                    error: ProviderError {
+                        code: crate::request_error_code(status.as_u16(), &body),
+                        retry_after,
+                        message,
+                        retryable,
+                    },
+                    partial: vec![],
+                };
+            }
+
+            break response;
         };
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator::default();
@@ -498,7 +710,10 @@ impl Provider for OpenAiProvider {
             match reader.pull(cancel).await {
                 SsePull::Event { data, .. } => {
                     if let Some(error) = crate::stream_overflow("", &data) {
-                        return StepOutcome::Failed { error, partial: acc.chunks };
+                        return StepOutcome::Failed {
+                            error,
+                            partial: acc.chunks,
+                        };
                     }
                     if data.trim() == "[DONE]" {
                         return StepOutcome::Committed(acc.finish(&self.model));
@@ -506,7 +721,12 @@ impl Provider for OpenAiProvider {
                     let at_ms = started.elapsed().as_millis() as u64;
                     if let Err(message) = acc.apply(&data, at_ms) {
                         return StepOutcome::Failed {
-                            error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
+                            error: ProviderError {
+                                code: "PROVIDER",
+                                retry_after: None,
+                                message,
+                                retryable: true,
+                            },
                             partial: acc.chunks,
                         };
                     }
@@ -517,12 +737,31 @@ impl Provider for OpenAiProvider {
                         emitted = acc.chunks.len();
                     }
                 }
-                SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
+                SsePull::Timeout => {
+                    return StepOutcome::Failed {
+                        error: ProviderError {
+                            code: "TIMEOUT",
+                            retry_after: None,
+                            message: "TIMEOUT: provider stream inactivity timeout".into(),
+                            retryable: true,
+                        },
+                        partial: acc.chunks,
+                    }
+                }
                 SsePull::Done => return StepOutcome::Committed(acc.finish(&self.model)),
-                SsePull::Cancelled => return StepOutcome::Cancelled { partial: acc.chunks },
+                SsePull::Cancelled => {
+                    return StepOutcome::Cancelled {
+                        partial: acc.chunks,
+                    }
+                }
                 SsePull::Error(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError { code: "PROVIDER", retry_after: None, message: format!("stream: {e}"), retryable: true },
+                        error: ProviderError {
+                            code: "PROVIDER",
+                            retry_after: None,
+                            message: format!("stream: {e}"),
+                            retryable: true,
+                        },
                         partial: acc.chunks,
                     }
                 }

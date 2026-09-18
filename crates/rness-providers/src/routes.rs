@@ -21,6 +21,18 @@ pub enum Kind {
     ChatGptResponses,
 }
 
+/// Cache TTL preference for Anthropic prompt caching.
+/// `Auto` resolves at first use: OAuth → 1h (free on subscription), API key → 5m.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    /// Resolve automatically based on auth type.
+    Auto,
+    /// 5-minute TTL (default cache_control ephemeral, no extra cost).
+    FiveMinutes,
+    /// 1-hour TTL (extended-cache-ttl beta; costs 2× base input for writes).
+    OneHour,
+}
+
 #[derive(Debug, Clone)]
 pub struct Route {
     pub kind: Kind,
@@ -32,6 +44,10 @@ pub struct Route {
     pub credential: Option<String>,
     pub headers: crate::headers::ProviderHeaders,
     pub stream_idle_timeout: Option<std::time::Duration>,
+    /// Enable prompt caching for this route (Anthropic only currently).
+    pub prompt_caching: bool,
+    /// Cache TTL preference (Anthropic only). Ignored when `prompt_caching` is false.
+    pub cache_ttl: CacheTtl,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -56,7 +72,11 @@ pub enum RouteError {
     #[error(
         "no credentials for '{route}': set {env} or run `rness auth set-key --provider {credential}`"
     )]
-    NoCredentials { route: String, env: String, credential: String },
+    NoCredentials {
+        route: String,
+        env: String,
+        credential: String,
+    },
     #[error("credential store: {0}")]
     Store(#[from] crate::auth::TokensError),
     #[error("provider HTTP client: {0}")]
@@ -72,50 +92,110 @@ pub enum RouteError {
 /// (local servers). Inserting over an existing name replaces it.
 pub fn validate_base_url(value: &str) -> Result<(), String> {
     let url = reqwest::Url::parse(value).map_err(|_| "invalid provider URL".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none()
-        || !url.username().is_empty() || url.password().is_some()
-        || url.query().is_some() || url.fragment().is_some()
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
     {
-        return Err("provider URL must be HTTP(S), with a host and without credentials, query or fragment".into());
+        return Err(
+            "provider URL must be HTTP(S), with a host and without credentials, query or fragment"
+                .into(),
+        );
     }
     Ok(())
 }
 
 /// Explicit API-key authentication, independent of the route's store lookup.
-pub fn build_with_api_key(route: &Route, model: &str, key: String) -> Result<Arc<dyn Provider>, String> {
-    if let Some(url) = &route.base_url { validate_base_url(url)?; }
+pub fn build_with_api_key(
+    route: &Route,
+    model: &str,
+    key: String,
+) -> Result<Arc<dyn Provider>, String> {
+    if let Some(url) = &route.base_url {
+        validate_base_url(url)?;
+    }
     match route.kind {
         Kind::OpenAiCompatible => {
             let mut provider = OpenAiProvider::new(key, model);
-            if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider.with_headers(route.headers.clone()).map_err(|e| e.to_string())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            if let Some(url) = &route.base_url {
+                provider = provider.with_base_url(url.trim_end_matches('/'));
+            }
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())
+                    .map_err(|e| e.to_string())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
         Kind::Anthropic => {
             let mut provider = AnthropicProvider::new(key, model);
-            if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider.with_headers(route.headers.clone()).map_err(|e| e.to_string())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            if let Some(url) = &route.base_url {
+                provider = provider.with_base_url(url.trim_end_matches('/'));
+            }
+            if route.prompt_caching {
+                provider = provider.with_prompt_caching(route.cache_ttl);
+            }
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())
+                    .map_err(|e| e.to_string())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
-        Kind::ChatGptResponses => Err("ChatGPT subscription transport requires OAuth, not an API key".into()),
+        Kind::ChatGptResponses => {
+            Err("ChatGPT subscription transport requires OAuth, not an API key".into())
+        }
     }
 }
 
-pub fn build_with_oauth(route: &Route, model: &str, store: CredentialStore, credential: String) -> Result<Arc<dyn Provider>, String> {
-    if credential.is_empty() { return Err("OAuth credential name must not be empty".into()); }
-    if let Some(url) = &route.base_url { validate_base_url(url)?; }
+pub fn build_with_oauth(
+    route: &Route,
+    model: &str,
+    store: CredentialStore,
+    credential: String,
+) -> Result<Arc<dyn Provider>, String> {
+    if credential.is_empty() {
+        return Err("OAuth credential name must not be empty".into());
+    }
+    if let Some(url) = &route.base_url {
+        validate_base_url(url)?;
+    }
     match route.kind {
         Kind::Anthropic => {
             let source = CredentialSource::new(store).oauth_only(credential);
             let mut provider = AnthropicProvider::with_credentials(source, model);
-            if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider.with_headers(route.headers.clone()).map_err(|e| e.to_string())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            if let Some(url) = &route.base_url {
+                provider = provider.with_base_url(url.trim_end_matches('/'));
+            }
+            if route.prompt_caching {
+                provider = provider.with_prompt_caching(route.cache_ttl);
+            }
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())
+                    .map_err(|e| e.to_string())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
         Kind::ChatGptResponses => {
-            let source = crate::auth::openai::CodexCredentialSource::new(store).with_credential(credential);
+            let source =
+                crate::auth::openai::CodexCredentialSource::new(store).with_credential(credential);
             let mut provider = crate::responses::ResponsesProvider::new(source, model);
-            if let Some(url) = &route.base_url { provider = provider.with_base_url(url.trim_end_matches('/')); }
-            Ok(Arc::new(provider.with_headers(route.headers.clone()).map_err(|e| e.to_string())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            if let Some(url) = &route.base_url {
+                provider = provider.with_base_url(url.trim_end_matches('/'));
+            }
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())
+                    .map_err(|e| e.to_string())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
-        Kind::OpenAiCompatible => Err("OAuth is not implemented for generic OpenAI chat connections".into()),
+        Kind::OpenAiCompatible => {
+            Err("OAuth is not implemented for generic OpenAI chat connections".into())
+        }
     }
 }
 
@@ -140,7 +220,15 @@ pub fn parse_route_spec(spec: &str) -> Result<(String, Route), RouteError> {
     }
     Ok((
         name.to_string(),
-        Route { kind: Kind::OpenAiCompatible, base_url: Some(url.to_string()), credential, headers: Default::default(), stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT },
+        Route {
+            kind: Kind::OpenAiCompatible,
+            base_url: Some(url.to_string()),
+            credential,
+            headers: Default::default(),
+            stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
+            prompt_caching: false,
+            cache_ttl: CacheTtl::Auto,
+        },
     ))
 }
 
@@ -180,7 +268,10 @@ impl Selection {
         if model.is_empty() {
             return Err(RouteError::NoModel(name.to_string()));
         }
-        Ok(Selection { route: name.to_string(), model: model.to_string() })
+        Ok(Selection {
+            route: name.to_string(),
+            model: model.to_string(),
+        })
     }
 }
 
@@ -222,7 +313,14 @@ pub fn build(
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.clone());
             }
-            Ok(Arc::new(provider.with_headers(route.headers.clone())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            if route.prompt_caching {
+                provider = provider.with_prompt_caching(route.cache_ttl);
+            }
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
         Kind::ChatGptResponses => {
             // Subscription OAuth only — tokens resolve per request with
@@ -232,25 +330,35 @@ pub fn build(
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.clone());
             }
-            Ok(Arc::new(provider.with_headers(route.headers.clone())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
         Kind::OpenAiCompatible => {
             let key = match &route.credential {
-                Some(credential) => api_key_for(&store, credential)?.ok_or_else(|| {
-                    RouteError::NoCredentials {
+                Some(credential) => {
+                    api_key_for(&store, credential)?.ok_or_else(|| RouteError::NoCredentials {
                         route: name.to_string(),
                         env: env_var_for(credential),
                         credential: credential.clone(),
-                    }
-                })?,
+                    })?
+                }
                 None => "unauthenticated".to_string(),
             };
             let mut provider = OpenAiProvider::new(key, model);
-            if route.credential.is_none() { provider = provider.without_auth(); }
+            if route.credential.is_none() {
+                provider = provider.without_auth();
+            }
             if let Some(url) = &route.base_url {
                 provider = provider.with_base_url(url.trim_end_matches('/'));
             }
-            Ok(Arc::new(provider.with_headers(route.headers.clone())?.with_stream_idle_timeout(route.stream_idle_timeout)))
+            Ok(Arc::new(
+                provider
+                    .with_headers(route.headers.clone())?
+                    .with_stream_idle_timeout(route.stream_idle_timeout),
+            ))
         }
     }
 }
@@ -261,10 +369,20 @@ mod tests {
 
     #[test]
     fn base_url_validation_rejects_ambiguous_and_credential_urls() {
-        for url in ["httpgarbage", "ftp://host/v1", "https://user:secret@host/v1", "https://host/v1?key=secret", "https://host/v1#frag"] {
+        for url in [
+            "httpgarbage",
+            "ftp://host/v1",
+            "https://user:secret@host/v1",
+            "https://host/v1?key=secret",
+            "https://host/v1#frag",
+        ] {
             assert!(validate_base_url(url).is_err());
         }
-        for url in ["http://localhost:11434/v1", "https://api.example/v1", "http://[::1]:8000/v1"] {
+        for url in [
+            "http://localhost:11434/v1",
+            "https://api.example/v1",
+            "http://[::1]:8000/v1",
+        ] {
             assert!(validate_base_url(url).is_ok());
         }
     }
@@ -274,7 +392,10 @@ mod tests {
         let (name, route) = parse_route_spec("openrouter=https://openrouter.ai/api/v1").unwrap();
         assert_eq!(name, "openrouter");
         assert_eq!(route.kind, Kind::OpenAiCompatible);
-        assert_eq!(route.base_url.as_deref(), Some("https://openrouter.ai/api/v1"));
+        assert_eq!(
+            route.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
         assert_eq!(route.credential.as_deref(), Some("openrouter"));
     }
 
@@ -289,11 +410,11 @@ mod tests {
     #[test]
     fn route_spec_rejects_malformed() {
         for bad in [
-            "nourl",                       // no '='
-            "=https://x.example/v1",       // empty name
-            "a/b=https://x.example/v1",    // '/' collides with -m parsing
-            "gw=ftp://x.example",          // not http(s)
-            "gw=https://x.example/v1,",    // trailing comma, empty credential
+            "nourl",                    // no '='
+            "=https://x.example/v1",    // empty name
+            "a/b=https://x.example/v1", // '/' collides with -m parsing
+            "gw=ftp://x.example",       // not http(s)
+            "gw=https://x.example/v1,", // trailing comma, empty credential
         ] {
             assert!(parse_route_spec(bad).is_err(), "should reject {bad}");
         }
@@ -306,7 +427,9 @@ mod tests {
         let mut table = HashMap::new();
         table.insert(
             "openrouter".into(),
-            parse_route_spec("openrouter=https://openrouter.ai/api/v1").unwrap().1,
+            parse_route_spec("openrouter=https://openrouter.ai/api/v1")
+                .unwrap()
+                .1,
         );
         let sel = Selection::parse(&table, Some("openrouter/anthropic/claude-sonnet-5")).unwrap();
         assert_eq!(sel.route, "openrouter");
