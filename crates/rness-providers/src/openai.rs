@@ -527,13 +527,17 @@ impl Accumulator {
                 .to_string());
         }
         if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
-            self.usage.input_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
+            let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap_or(0);
             self.usage.output_tokens = usage["completion_tokens"].as_u64().unwrap_or(0);
             // OpenAI Chat Completions: automatic caching reports cached tokens
-            // in usage.prompt_tokens_details.cached_tokens.
+            // in usage.prompt_tokens_details.cached_tokens. Unlike Anthropic,
+            // cached_tokens is a *subset* of prompt_tokens, not additive, so
+            // input_tokens must be reduced to keep Usage semantics consistent
+            // across providers (input_tokens = newly processed tokens only).
             self.usage.cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
                 .as_u64()
                 .unwrap_or(0);
+            self.usage.input_tokens = prompt_tokens.saturating_sub(self.usage.cache_read_tokens);
         }
         let Some(choice) = v["choices"].get(0) else {
             return Ok(());

@@ -354,13 +354,24 @@ impl Accumulator {
                 });
                 let usage = &response["usage"];
                 if !usage.is_null() {
-                    self.usage.input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
+                    let input_tokens = usage["input_tokens"].as_u64().unwrap_or(0);
                     self.usage.output_tokens = usage["output_tokens"].as_u64().unwrap_or(0);
-                    // Responses API: automatic caching reports cached tokens
-                    // in usage.input_tokens_details.cached_tokens.
+                    // Responses API: automatic caching reports cached/written
+                    // tokens in usage.input_tokens_details. Unlike Anthropic,
+                    // these are a *subset* of input_tokens, not additive, so
+                    // input_tokens must be reduced to keep Usage semantics
+                    // consistent across providers (input_tokens = newly
+                    // processed tokens only).
                     self.usage.cache_read_tokens = usage["input_tokens_details"]["cached_tokens"]
                         .as_u64()
                         .unwrap_or(0);
+                    self.usage.cache_write_tokens = usage["input_tokens_details"]
+                        ["cache_write_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
+                    self.usage.input_tokens = input_tokens
+                        .saturating_sub(self.usage.cache_read_tokens)
+                        .saturating_sub(self.usage.cache_write_tokens);
                 }
                 // The completed payload's output array can be empty; only
                 // trust it when we accumulated nothing.

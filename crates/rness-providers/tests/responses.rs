@@ -191,6 +191,37 @@ async fn sends_bearer_account_header_and_codex_body_shape() {
 }
 
 #[tokio::test]
+async fn cached_and_written_tokens_are_subtracted_from_input_not_added() {
+    // Responses reports cached_tokens/cache_write_tokens as a subset of
+    // input_tokens (unlike Anthropic, where cache_read/cache_creation are
+    // additive to input_tokens). Usage.input_tokens must reflect only
+    // newly processed tokens so it stays consistent across providers.
+    let dir = TempDir::new().unwrap();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(sse(&[
+            ("response.output_text.delta", json!({"item_id": "msg_1", "delta": "hello"})),
+            ("response.output_item.done", json!({"item": {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "hello"},
+            ]}})),
+            ("response.completed", json!({"response": {"status": "completed", "output": [],
+                "usage": {"input_tokens": 1000, "output_tokens": 5,
+                    "input_tokens_details": {"cached_tokens": 800, "cache_write_tokens": 50}}}})),
+        ]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = provider_for(&server, store_with_tokens(&dir, "at-1"));
+    let StepOutcome::Committed(msg) = step(&provider, &user_context("hi"), "").await else {
+        panic!("expected commit");
+    };
+    assert_eq!(msg.usage.cache_read_tokens, 800);
+    assert_eq!(msg.usage.cache_write_tokens, 50);
+    assert_eq!(msg.usage.input_tokens, 150);
+}
+
+#[tokio::test]
 async fn explicit_output_limit_is_sent_when_configured() {
     let dir = TempDir::new().unwrap();
     let server = MockServer::start().await;

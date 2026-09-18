@@ -279,6 +279,32 @@ async fn happy_path_text_stream_commits_with_chunks_and_usage() {
 }
 
 #[tokio::test]
+async fn cached_tokens_are_subtracted_from_input_not_added() {
+    // OpenAI reports cached_tokens as a subset of prompt_tokens (unlike
+    // Anthropic, where cache_read/cache_creation are additive to
+    // input_tokens). Usage.input_tokens must reflect only newly processed
+    // tokens so it stays consistent across providers.
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions"))
+        .respond_with(sse_response(&[
+            json!({"choices": [{"delta": {"role": "assistant", "content": "ok"}}]}),
+            json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            json!({"choices": [], "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 5,
+                "prompt_tokens_details": {"cached_tokens": 900},
+            }}),
+        ]))
+        .expect(1).mount(&server).await;
+    let provider = OpenAiProvider::new("test-key", "gpt-test-1").with_base_url(server.uri());
+    let StepOutcome::Committed(msg) = step(&provider, &user_context("hi"), "", &[]).await else {
+        panic!("expected commit");
+    };
+    assert_eq!(msg.usage.cache_read_tokens, 900);
+    assert_eq!(msg.usage.input_tokens, 100);
+}
+
+#[tokio::test]
 async fn tool_call_stream_assembles_args_and_advertises_tools() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
