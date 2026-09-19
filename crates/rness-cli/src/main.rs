@@ -246,6 +246,7 @@ enum AuthAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    raise_fd_limit();
     let cli = Cli::parse();
     #[cfg(feature = "experimental-control")]
     if cli.control_socket.is_some() && cli.command.is_some() {
@@ -2104,6 +2105,45 @@ async fn run_tui(
     sessions.join(&session).await;
     eprintln!("session: {session}");
     Ok(())
+}
+
+/// Raise the open-file-descriptor limit to the OS-allowed maximum.
+/// macOS defaults to 256 which is far too low for a session store with
+/// hundreds of sessions + subagent children + MCP servers + jobs.
+/// This mirrors what Node.js (used by dsh) does automatically at startup.
+fn raise_fd_limit() {
+    #[cfg(unix)]
+    {
+        use std::io;
+        // getrlimit / setrlimit via libc
+        let mut rlim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: rlim is a valid stack-allocated struct.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) };
+        if rc != 0 {
+            tracing::debug!(
+                error = %io::Error::last_os_error(),
+                "getrlimit(NOFILE) failed; keeping inherited fd limit"
+            );
+            return;
+        }
+        let target = rlim.rlim_max.min(10240);
+        if rlim.rlim_cur >= target {
+            return;
+        }
+        rlim.rlim_cur = target;
+        // SAFETY: rlim values are within the hard limit.
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) };
+        if rc != 0 {
+            tracing::debug!(
+                error = %io::Error::last_os_error(),
+                target,
+                "setrlimit(NOFILE) failed; keeping inherited fd limit"
+            );
+        }
+    }
 }
 
 /// Match the saved workspace, not the repository root or a path prefix.
