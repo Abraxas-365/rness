@@ -279,6 +279,12 @@ pub fn install(
 
     let s = Arc::clone(&sessions);
     session.set(
+        "list_roots",
+        lua.create_function(move |_, ()| s.list_roots().map_err(err))?,
+    )?;
+
+    let s = Arc::clone(&sessions);
+    session.set(
         "phase",
         lua.create_function(move |_, id: String| {
             Ok(match s.phase(&id) {

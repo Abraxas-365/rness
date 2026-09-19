@@ -926,6 +926,11 @@ impl SessionService {
         Ok(self.store.list()?)
     }
 
+    /// List only user-created sessions (excludes subagent children).
+    pub fn list_roots(&self) -> Result<Vec<SessionId>, ServiceError> {
+        Ok(self.store.list_roots()?)
+    }
+
     pub fn phase(&self, session: &SessionId) -> Phase {
         self.live(session).inbox.lock().unwrap().phase()
     }

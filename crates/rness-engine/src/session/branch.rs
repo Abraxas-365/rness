@@ -597,6 +597,17 @@ impl SessionStore {
     /// directories (notably persisted jobs) are not sessions. Inspect only the
     /// header, not full histories; corrupt later events remain visible on read.
     pub fn list(&self) -> Result<Vec<SessionId>, BranchError> {
+        self.list_filtered(false)
+    }
+
+    /// Like [`list`] but excludes delegated (subagent) children — returns only
+    /// sessions the user created directly. Used by the session picker and
+    /// workspace-scoped listings so child sessions don't leak into the UI.
+    pub fn list_roots(&self) -> Result<Vec<SessionId>, BranchError> {
+        self.list_filtered(true)
+    }
+
+    fn list_filtered(&self, roots_only: bool) -> Result<Vec<SessionId>, BranchError> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.root).map_err(LogError::from)? {
             let entry = entry.map_err(LogError::from)?;
@@ -619,14 +630,17 @@ impl SessionStore {
             if !header.ends_with(b"\n") {
                 continue;
             }
-            if matches!(
-                serde_json::from_slice::<Envelope>(&header),
+            match serde_json::from_slice::<Envelope>(&header) {
                 Ok(Envelope {
-                    event: SessionEvent::Header(_),
+                    event: SessionEvent::Header(ref h),
                     ..
-                })
-            ) {
-                out.push(entry.file_name().to_string_lossy().into_owned());
+                }) => {
+                    if roots_only && h.delegation.is_some() {
+                        continue;
+                    }
+                    out.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                _ => continue,
             }
         }
         out.sort();

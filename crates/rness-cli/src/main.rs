@@ -2148,13 +2148,14 @@ fn raise_fd_limit() {
 
 /// Match the saved workspace, not the repository root or a path prefix.
 /// Canonicalization also recognizes alternate symlink spellings of the directory.
+/// Excludes delegated (subagent) children — those are internal sessions.
 fn sessions_in_directory(
     store: &rness_engine::session::branch::SessionStore,
     cwd: &std::path::Path,
 ) -> anyhow::Result<Vec<SessionId>> {
     let cwd = cwd.canonicalize()?;
     let mut matches = Vec::new();
-    for id in store.list()? {
+    for id in store.list_roots()? {
         let Some(workspace) = store.workspace(&id)? else {
             continue;
         };
