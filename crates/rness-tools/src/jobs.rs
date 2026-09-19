@@ -154,6 +154,8 @@ struct Registry {
     next_id: AtomicU64,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     sessions: Mutex<std::sync::Weak<rness_engine::service::SessionService>>,
+    /// Background job recovery thread handle; joined on demand.
+    recovery_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// Producer-side handle for appending output and settling a started job.
@@ -507,101 +509,16 @@ impl JobRegistry {
         if directory.is_some() || !self.inner.jobs.lock().unwrap().is_empty() {
             return Err("enable job persistence before starting jobs".into());
         }
+        // Collect stale owner directories for deferred background recovery.
+        // Only create our own owner directory synchronously — old jobs are
+        // loaded lazily to keep startup fast.
+        let mut stale_dirs = Vec::new();
         for entry in std::fs::read_dir(root).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
             if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
                 continue;
             }
-            let lock = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(entry.path().join("owner.lock"))
-                .map_err(|e| e.to_string())?;
-            match lock.try_lock_exclusive() {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Err(error.to_string()),
-            }
-            // Reconcile interrupted deletion only while holding this owner's
-            // exclusive lock. Never touch another live instance's artifacts.
-            for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
-                let path = file.map_err(|e| e.to_string())?.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("deleted") {
-                    match std::fs::remove_file(path.with_extension("output")) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.to_string()),
-                    }
-                    // A checkpoint after failed rollback may have recreated
-                    // metadata. The committed deletion wins over both copies.
-                    match std::fs::remove_file(path.with_extension("json")) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => return Err(e.to_string()),
-                    }
-                    sync_directory(path.parent().unwrap()).map_err(|e| e.to_string())?;
-                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                }
-            }
-            for file in std::fs::read_dir(entry.path()).map_err(|e| e.to_string())? {
-                let path = file.map_err(|e| e.to_string())?.path();
-                if path.extension().and_then(|s| s.to_str()) == Some("output")
-                    && !path.with_extension("json").exists()
-                {
-                    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
-                    continue;
-                }
-                if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                    continue;
-                }
-                let mut state: JobState =
-                    serde_json::from_slice(&std::fs::read(&path).map_err(|e| e.to_string())?)
-                        .map_err(|e| format!("{}: {e}", path.display()))?;
-                use std::io::{Read, Seek, SeekFrom};
-                let mut file = std::fs::File::open(path.with_extension("output"))
-                    .map_err(|e| format!("job output: {e}"))?;
-                state.output_bytes =
-                    usize::try_from(file.metadata().map_err(|e| e.to_string())?.len())
-                        .map_err(|e| e.to_string())?;
-                file.seek(SeekFrom::Start(
-                    state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64,
-                ))
-                .map_err(|e| e.to_string())?;
-                file.take(MAX_READ_BYTES as u64)
-                    .read_to_end(&mut state.output)
-                    .map_err(|e| e.to_string())?;
-                if state.read_from > state.output_bytes {
-                    return Err("invalid durable job output cursor".into());
-                }
-                if !state.settled {
-                    state.status = JobStatus::Interrupted;
-                    state.settled = true;
-                }
-                let id = path
-                    .file_stem()
-                    .unwrap()
-                    .to_str()
-                    .ok_or("invalid job ID")?
-                    .to_owned();
-                state.settled_at_ms.get_or_insert_with(retention::now_ms);
-                state.charged_bytes = state.output_bytes as u64;
-                self.inner.budget.lock().unwrap().used += state.charged_bytes;
-                let job = Arc::new(Job {
-                    budget: self.inner.budget.clone(),
-                    spool: Mutex::new(None),
-                    path: Some(path),
-                    state: Mutex::new(state),
-                    cancel: Default::default(),
-                    changed: Arc::new(tokio::sync::Notify::new()),
-                    completion: None,
-                });
-                job.persist(&job.state.lock().unwrap())
-                    .map_err(|e| e.to_string())?;
-                self.inner.jobs.lock().unwrap().insert(id, job);
-            }
-            self.inner.locks.lock().unwrap().push(lock);
+            stale_dirs.push(entry.path());
         }
         let path = root.join(ulid::Ulid::new().to_string());
         std::fs::create_dir(&path).map_err(|e| e.to_string())?;
@@ -614,7 +531,121 @@ impl JobRegistry {
         lock.try_lock_exclusive().map_err(|e| e.to_string())?;
         self.inner.locks.lock().unwrap().push(lock);
         *directory = Some(path);
+        drop(directory);
+
+        // Spawn background recovery for old job directories.
+        if !stale_dirs.is_empty() {
+            let registry = self.clone();
+            let handle = std::thread::spawn(move || {
+                registry.recover_stale_jobs(&stale_dirs);
+            });
+            *self.inner.recovery_handle.lock().unwrap() = Some(handle);
+        }
         Ok(())
+    }
+
+    /// Block until background job recovery finishes. No-op if already done.
+    pub fn wait_recovery(&self) {
+        if let Some(handle) = self.inner.recovery_handle.lock().unwrap().take() {
+            handle.join().expect("job recovery thread panicked");
+        }
+    }
+
+    /// Background: recover settled jobs from stale owner directories.
+    fn recover_stale_jobs(&self, dirs: &[std::path::PathBuf]) {
+        use fs2::FileExt;
+        for dir in dirs {
+            let lock = match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(dir.join("owner.lock"))
+            {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            match lock.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => continue,
+            }
+            // Reconcile interrupted deletion only while holding this owner's
+            // exclusive lock. Never touch another live instance's artifacts.
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for file in entries {
+                    let Ok(file) = file else { continue };
+                    let path = file.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("deleted") {
+                        let _ = std::fs::remove_file(path.with_extension("output"));
+                        let _ = std::fs::remove_file(path.with_extension("json"));
+                        let _ = sync_directory(path.parent().unwrap());
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for file in entries {
+                    let Ok(file) = file else { continue };
+                    let path = file.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("output")
+                        && !path.with_extension("json").exists()
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Ok(data) = std::fs::read(&path) else {
+                        continue;
+                    };
+                    let Ok(mut state) = serde_json::from_slice::<JobState>(&data) else {
+                        continue;
+                    };
+                    use std::io::{Read, Seek, SeekFrom};
+                    let Ok(mut file) = std::fs::File::open(path.with_extension("output")) else {
+                        continue;
+                    };
+                    let Ok(meta) = file.metadata() else {
+                        continue;
+                    };
+                    state.output_bytes = meta.len() as usize;
+                    let _ = file.seek(SeekFrom::Start(
+                        state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64,
+                    ));
+                    let _ = file.take(MAX_READ_BYTES as u64).read_to_end(&mut state.output);
+                    if state.read_from > state.output_bytes {
+                        continue;
+                    }
+                    if !state.settled {
+                        state.status = JobStatus::Interrupted;
+                        state.settled = true;
+                    }
+                    let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    let id = id.to_owned();
+                    state.settled_at_ms.get_or_insert_with(retention::now_ms);
+                    state.charged_bytes = state.output_bytes as u64;
+                    self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                    let job = Arc::new(Job {
+                        budget: self.inner.budget.clone(),
+                        spool: Mutex::new(None),
+                        path: Some(path),
+                        state: Mutex::new(state),
+                        cancel: Default::default(),
+                        changed: Arc::new(tokio::sync::Notify::new()),
+                        completion: None,
+                    });
+                    if let Ok(s) = job.state.lock() {
+                        let _ = job.persist(&s);
+                    }
+                    self.inner.jobs.lock().unwrap().insert(id, job);
+                }
+            }
+            self.inner.locks.lock().unwrap().push(lock);
+        }
     }
 
     pub(crate) fn stream_output(&self, session: &str, call: &str, output: String) {
@@ -638,6 +669,7 @@ impl JobRegistry {
                 next_id: AtomicU64::new(1),
                 jobs: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(std::sync::Weak::new()),
+                recovery_handle: Mutex::new(None),
             }),
         }
     }
@@ -990,6 +1022,7 @@ mod inspection_tests {
         drop(jobs);
         let jobs = JobRegistry::new();
         jobs.enable_persistence(dir.path()).unwrap();
+        jobs.wait_recovery();
         assert!(jobs.get(&id).is_err());
         assert!(!orphan.exists());
         assert!(!path.with_extension("deleted").exists());
@@ -1051,6 +1084,7 @@ mod inspection_tests {
         drop(jobs);
         let jobs = JobRegistry::new();
         jobs.enable_persistence(directory.path()).unwrap();
+        jobs.wait_recovery();
         assert_eq!(jobs.count("owner"), 0);
         assert!(jobs.list("foreign").is_empty());
         let inspection = jobs.inspect("owner", &id).unwrap();
@@ -1085,6 +1119,7 @@ mod durability_tests {
         drop(registry);
         let recovered = JobRegistry::new();
         recovered.enable_persistence(directory.path()).unwrap();
+        recovered.wait_recovery();
         let (output, status, _) = drain_output(&recovered.get(&id).unwrap());
         assert_eq!(output, "firstsecond");
         assert_eq!(status, JobStatus::Interrupted);
@@ -1146,12 +1181,14 @@ mod durability_tests {
         writer.append(b"recorded");
         let second = JobRegistry::new();
         second.enable_persistence(directory.path()).unwrap();
+        second.wait_recovery();
         assert!(second.get(&id).is_err());
         drop(second);
         drop(writer);
         drop(first);
         let recovered = JobRegistry::new();
         recovered.enable_persistence(directory.path()).unwrap();
+        recovered.wait_recovery();
         let job = recovered.get(&id).unwrap();
         assert_eq!(job.state.lock().unwrap().owner.as_deref(), Some("session"));
         let (output, status, _) = drain_output(&job);
@@ -1161,6 +1198,7 @@ mod durability_tests {
         drop(recovered);
         let again = JobRegistry::new();
         again.enable_persistence(directory.path()).unwrap();
+        again.wait_recovery();
         assert_eq!(drain_output(&again.get(&id).unwrap()).0, "");
     }
 }
@@ -1322,6 +1360,7 @@ mod isolation_tests {
         drop(registry);
         let recovered = JobRegistry::new();
         recovered.enable_persistence(directory.path()).unwrap();
+        recovered.wait_recovery();
         assert!(recovered.get_for_session(&id, Some("foreign")).is_err());
         assert!(recovered.get_for_session(&id, None).is_err());
         assert!(recovered.get_for_session(&id, Some("owner")).is_ok());

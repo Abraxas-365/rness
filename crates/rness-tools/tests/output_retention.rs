@@ -39,6 +39,7 @@ async fn full_background_output_is_paged_and_survives_recovery() {
     drop(jobs);
     let jobs = JobRegistry::new();
     jobs.enable_persistence(dir.path()).unwrap();
+    jobs.wait_recovery();
     let page = JobOutputTool::new(jobs)
         .execute_in(&"owner".into(), json!({"job_id":id,"offset":200000}))
         .await

@@ -53,6 +53,7 @@ async fn recovered_job_waits_for_attachment_after_startup_config() {
     recovered
         .enable_persistence(&dir.path().join("jobs"))
         .unwrap();
+    recovered.wait_recovery();
     assert_eq!(
         recovered.inspect(&session, &job).unwrap().job.status,
         "interrupted"
