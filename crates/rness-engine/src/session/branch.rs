@@ -322,7 +322,20 @@ impl SessionStore {
                 reason: "session search requires a caller workspace".into(),
             })?;
         if let Some(target) = target {
-            if self.workspace(target)?.as_deref() != Some(workspace.as_str()) {
+            let target_workspace = match self.workspace(target) {
+                Ok(ws) => ws,
+                Err(BranchError::Log(LogError::NotFound(_))) => {
+                    return Err(LogError::Corrupt {
+                        line: 0,
+                        reason: format!(
+                            "session '{target}' not found in this workspace"
+                        ),
+                    }
+                    .into());
+                }
+                Err(other) => return Err(other),
+            };
+            if target_workspace.as_deref() != Some(workspace.as_str()) {
                 return Err(LogError::Corrupt {
                     line: 0,
                     reason: "target session is outside the caller workspace".into(),

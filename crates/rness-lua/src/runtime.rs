@@ -3060,9 +3060,15 @@ fn lua_display(lua: &Lua, v: LuaValue) -> Result<String, LuaError> {
 
 /// A Lua error's message without the Rust wrapper noise.
 fn user_message(e: &mlua::Error) -> String {
-    match e {
+    let raw = match e {
         mlua::Error::RuntimeError(m) => m.clone(),
         other => other.to_string(),
+    };
+    // Strip Lua stack traceback noise from user-facing messages.
+    // Errors raised with error(msg, 0) still get tracebacks appended by mlua.
+    match raw.find("\nstack traceback:") {
+        Some(pos) => raw[..pos].to_string(),
+        None => raw,
     }
 }
 
