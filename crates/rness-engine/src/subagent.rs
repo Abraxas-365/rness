@@ -619,27 +619,18 @@ impl SubagentRuntime {
         descendants: bool,
         include_one_shot: bool,
     ) -> Result<Vec<ChildAgent>, SubagentError> {
-        // Delegation stamps only name the parent, so build the child
-        // index by scanning the store once.
-        let mut by_parent: HashMap<SessionId, Vec<(SessionId, Delegation)>> = HashMap::new();
-        for id in self.sessions.store().list()? {
-            if let Some(d) = self.sessions.store().delegation(&id)? {
-                if include_one_shot || d.mode == DelegationMode::Continuable {
-                    by_parent.entry(d.parent.clone()).or_default().push((id, d));
-                }
-            }
-        }
-        for children in by_parent.values_mut() {
-            children.sort_by(|a, b| a.0.cmp(&b.0));
-        }
-
+        // Walk the tree by querying only the children of each node
+        // instead of scanning the entire session store.
         let mut out = Vec::new();
         let mut stack: Vec<SessionId> = vec![root.clone()];
         while let Some(node) = stack.pop() {
-            let Some(children) = by_parent.get(&node) else {
-                continue;
-            };
-            for (id, d) in children {
+            let children = self.sessions.store().delegated_children(&node)?;
+            let mut node_children: Vec<(SessionId, Delegation)> = children
+                .into_iter()
+                .filter(|(_, d)| include_one_shot || d.mode == DelegationMode::Continuable)
+                .collect();
+            node_children.sort_by(|a, b| a.0.cmp(&b.0));
+            for (id, d) in &node_children {
                 out.push(ChildAgent {
                     alias: None,
                     session: id.clone(),
@@ -650,7 +641,7 @@ impl SubagentRuntime {
             }
             if descendants {
                 // Pre-order: descend into each child after listing it.
-                for (id, _) in children.iter().rev() {
+                for (id, _) in node_children.iter().rev() {
                     stack.push(id.clone());
                 }
             }

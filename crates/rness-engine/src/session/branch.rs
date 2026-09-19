@@ -7,6 +7,7 @@
 //! acyclic by construction: a fork can only reference an event already
 //! committed in the parent (invariant #4), which existed before the child.
 
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
@@ -25,9 +26,16 @@ pub enum BranchError {
     ForkAtHeader(SessionId),
 }
 
+/// Maximum number of cached session readers (bounded LRU).
+const MAX_CACHED_READERS: usize = 8;
+
 /// Root directory holding one subdirectory per session.
 pub struct SessionStore {
     root: PathBuf,
+    /// LRU-ordered reader cache. The *back* is the most recently used.
+    /// When the cache exceeds `MAX_CACHED_READERS`, the *front* (oldest)
+    /// entry is evicted, closing its file handle.
+    reader_order: std::sync::Mutex<VecDeque<SessionId>>,
     readers: std::sync::Mutex<std::collections::HashMap<SessionId, super::log::SessionReader>>,
 }
 
@@ -35,21 +43,39 @@ impl SessionStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            reader_order: Default::default(),
             readers: Default::default(),
         }
     }
 
     fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
         let mut readers = self.readers.lock().unwrap();
-        if readers.len() >= 8 && !readers.contains_key(session) {
-            if let Some(oldest) = readers.keys().next().cloned() {
-                readers.remove(&oldest);
+        let mut order = self.reader_order.lock().unwrap();
+        if !readers.contains_key(session) {
+            // Evict the least-recently-used reader when at capacity.
+            while readers.len() >= MAX_CACHED_READERS {
+                if let Some(oldest) = order.pop_front() {
+                    readers.remove(&oldest);
+                } else {
+                    break;
+                }
             }
+            readers.insert(
+                session.clone(),
+                super::log::SessionReader::new(&self.root, session),
+            );
+            order.push_back(session.clone());
+        } else {
+            // Move to the back (most recently used).
+            if let Some(pos) = order.iter().position(|id| id == session) {
+                order.remove(pos);
+            }
+            order.push_back(session.clone());
         }
         readers
-            .entry(session.clone())
-            .or_default()
-            .read(&self.root, session)
+            .get_mut(session)
+            .unwrap()
+            .read(session)
     }
 
     /// Read through the first committed event only, without touching the
@@ -541,15 +567,30 @@ impl SessionStore {
         after: &str,
     ) -> Result<Option<Vec<Envelope>>, BranchError> {
         let mut readers = self.readers.lock().unwrap();
-        if readers.len() >= 8 && !readers.contains_key(session) {
-            if let Some(key) = readers.keys().next().cloned() {
-                readers.remove(&key);
+        let mut order = self.reader_order.lock().unwrap();
+        if !readers.contains_key(session) {
+            while readers.len() >= MAX_CACHED_READERS {
+                if let Some(oldest) = order.pop_front() {
+                    readers.remove(&oldest);
+                } else {
+                    break;
+                }
             }
+            readers.insert(
+                session.clone(),
+                super::log::SessionReader::new(&self.root, session),
+            );
+            order.push_back(session.clone());
+        } else {
+            if let Some(pos) = order.iter().position(|id| id == session) {
+                order.remove(pos);
+            }
+            order.push_back(session.clone());
         }
         Ok(readers
-            .entry(session.clone())
-            .or_default()
-            .read_after(&self.root, session, after)?)
+            .get_mut(session)
+            .unwrap()
+            .read_after(session, after)?)
     }
 
     /// Session ids with a canonical log and a committed header. Auxiliary
@@ -589,6 +630,34 @@ impl SessionStore {
             }
         }
         out.sort();
+        Ok(out)
+    }
+
+    /// Find sessions that were delegated from `parent`. Scans only headers
+    /// (one `read_until` per session file), never loads full histories. This
+    /// replaces the pattern of `list()` + loop-over-all + `delegation()` used
+    /// by activity recovery and subagent listing.
+    pub fn delegated_children(
+        &self,
+        parent: &SessionId,
+    ) -> Result<Vec<(SessionId, Delegation)>, BranchError> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.root).map_err(LogError::from)? {
+            let entry = entry.map_err(LogError::from)?;
+            if !entry.file_type().map_err(LogError::from)?.is_dir() {
+                continue;
+            }
+            let child_id: SessionId = entry.file_name().to_string_lossy().into_owned();
+            let Ok(header) = self.read_header(&child_id) else {
+                continue;
+            };
+            if let Some(delegation) = header.delegation {
+                if delegation.parent == *parent {
+                    out.push((child_id, delegation));
+                }
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 }

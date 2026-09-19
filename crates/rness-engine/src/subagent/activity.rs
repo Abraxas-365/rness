@@ -305,13 +305,9 @@ impl SubagentActivity {
                 }
             }
         }
-        for child in sessions.list()? {
-            let Some(link) = sessions.store().delegation(&child)? else {
-                continue;
-            };
-            if link.parent != parent {
-                continue;
-            }
+        // Targeted lookup: only scan headers for children delegated from
+        // this parent, instead of listing every session in the store.
+        for (child, link) in sessions.store().delegated_children(&parent.to_owned())? {
             let Some(call) = link.call else { continue };
             let Some(args) = calls.get(&call) else {
                 continue;

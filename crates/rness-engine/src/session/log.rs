@@ -215,51 +215,76 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
 
 /// Incremental reader for an immutable committed prefix. Incomplete tails are
 /// retried from their starting offset, never cached as committed events.
-#[derive(Default)]
+///
+/// The file handle is cached across refreshes so that a single reader never
+/// re-opens the file. When the reader is evicted from the LRU cache in
+/// `SessionStore`, the handle is closed automatically on drop.
 pub(super) struct SessionReader {
     offset: u64,
     line: usize,
     events: Vec<Envelope>,
     positions: std::collections::HashMap<EventId, usize>,
+    /// Cached read-only handle; lazily opened on first refresh.
+    handle: Option<File>,
+    /// Path to the session log (cached to avoid recomputing).
+    path: PathBuf,
 }
 
 impl SessionReader {
+    pub(super) fn new(root: &Path, session: &SessionId) -> Self {
+        Self {
+            offset: 0,
+            line: 0,
+            events: Vec::new(),
+            positions: std::collections::HashMap::new(),
+            handle: None,
+            path: log_file(&root.join(session)),
+        }
+    }
+
     pub(super) fn read(
         &mut self,
-        root: &Path,
         session: &SessionId,
     ) -> Result<Vec<Envelope>, LogError> {
-        self.refresh(root, session)?;
+        self.refresh(session)?;
         Ok(self.events.clone())
     }
 
     pub(super) fn read_after(
         &mut self,
-        root: &Path,
         session: &SessionId,
         after: &str,
     ) -> Result<Option<Vec<Envelope>>, LogError> {
-        self.refresh(root, session)?;
+        self.refresh(session)?;
         Ok(self
             .positions
             .get(after)
             .map(|index| self.events[index + 1..].to_vec()))
     }
 
-    fn refresh(&mut self, root: &Path, session: &SessionId) -> Result<(), LogError> {
-        let path = log_file(&root.join(session));
-        let mut file = File::open(&path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                LogError::NotFound(session.clone())
-            } else {
-                LogError::Io(error)
-            }
-        })?;
+    fn refresh(&mut self, session: &SessionId) -> Result<(), LogError> {
+        // Open or reuse the cached file handle.
+        if self.handle.is_none() {
+            let file = File::open(&self.path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    LogError::NotFound(session.clone())
+                } else {
+                    LogError::Io(error)
+                }
+            })?;
+            self.handle = Some(file);
+        }
+        let file = self.handle.as_mut().unwrap();
         if file.metadata()?.len() < self.offset {
-            *self = Self::default();
+            // File was truncated (torn-tail heal); reset state but keep
+            // the handle — just seek back to start.
+            self.offset = 0;
+            self.line = 0;
+            self.events.clear();
+            self.positions.clear();
         }
         file.seek(SeekFrom::Start(self.offset))?;
-        let mut reader = BufReader::new(file);
+        let mut reader = BufReader::new(&mut *file);
         let mut bytes = Vec::new();
         loop {
             bytes.clear();
@@ -452,13 +477,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sid = "incremental".to_string();
         let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
-        let mut reader = SessionReader::default();
-        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 1);
+        let mut reader = SessionReader::new(root.path(), &sid);
+        assert_eq!(reader.read(&sid).unwrap().len(), 1);
         let offset = reader.offset;
-        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 1);
+        assert_eq!(reader.read(&sid).unwrap().len(), 1);
         assert_eq!(reader.offset, offset);
         log.append(&user_msg("hello")).unwrap();
-        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 2);
+        assert_eq!(reader.read(&sid).unwrap().len(), 2);
         let offset = reader.offset;
         let event = Envelope {
             id: "tail".into(),
@@ -469,12 +494,12 @@ mod tests {
         bytes.push(b'\n');
         let split = bytes.iter().position(|b| *b == 0xc3).unwrap() + 1;
         log.file.write_all(&bytes[..split]).unwrap();
-        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 2);
+        assert_eq!(reader.read(&sid).unwrap().len(), 2);
         assert_eq!(reader.offset, offset);
         log.file.write_all(&bytes[split..]).unwrap();
-        assert_eq!(reader.read(root.path(), &sid).unwrap().len(), 3);
+        assert_eq!(reader.read(&sid).unwrap().len(), 3);
         assert_eq!(
-            reader.read(root.path(), &sid).unwrap(),
+            reader.read(&sid).unwrap(),
             log.read_all().unwrap()
         );
     }
