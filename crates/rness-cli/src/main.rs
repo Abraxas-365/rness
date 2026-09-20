@@ -1679,7 +1679,7 @@ async fn run_tui(
                 recovery.recover(&subagents.activity, &sessions, &session);
                 let generation = cache.generation();
                 for (call, args, mut presentation) in
-                    subagents.activity.snapshots(&sessions, &session)
+                    subagents.activity.card_snapshots(&sessions, &session)
                 {
                     let ms = presentation["elapsed_ms"].as_u64().unwrap_or(0);
                     presentation["elapsed_ms"] = serde_json::json!(ms / 1000 * 1000);

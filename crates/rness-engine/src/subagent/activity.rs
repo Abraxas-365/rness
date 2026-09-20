@@ -11,6 +11,9 @@ const MAX_TOOLS: usize = 100;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_LINES: usize = 1000;
 const MAX_ACTIVITY_BYTES: usize = 4096;
+/// Card renderers truncate live text to ~160 chars; 512 bytes covers
+/// multi-byte scripts with margin.
+const MAX_CARD_LIVE_BYTES: usize = 512;
 
 /// Keep a UTF-8-safe tail; full content belongs in the session drawer.
 fn tail(text: &str, limit: usize) -> &str {
@@ -385,6 +388,32 @@ impl SubagentActivity {
         }
     }
 
+    /// Sync a Run with its child session's latest history.
+    fn refresh_run(run: &mut Run, sessions: &SessionService) {
+        let history = match &run.after {
+            Some(after) => sessions.store().history_after(&run.child, after).ok().flatten().unwrap_or_else(|| {
+                sessions.store().history(&run.child).unwrap_or_default().into_iter()
+                    .skip_while(|event| event.id != *after).skip(1).collect()
+            }),
+            None => sessions.store().history(&run.child).unwrap_or_default(),
+        };
+        for event in history {
+            let event_ms = event.at.parse::<jiff::Timestamp>().ok()
+                .and_then(|at| u64::try_from(at.as_millisecond()).ok())
+                .or_else(|| event.id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms()));
+            run.after = Some(event.id);
+            run.apply_event(event.event, event_ms);
+        }
+        // A live ToolStarted can precede the first history refresh for this turn.
+        if run.status == "running" && run.activity == "Thinking" {
+            if let Some(name) = run.tools.iter().rev()
+                .find(|tool| tool["status"] == "running")
+                .and_then(|tool| tool["name"].as_str()).filter(|name| !name.is_empty()) {
+                run.activity = tail(name, MAX_ACTIVITY_BYTES).into();
+            }
+        }
+    }
+
     pub fn snapshots(
         &self,
         sessions: &SessionService,
@@ -392,33 +421,39 @@ impl SubagentActivity {
     ) -> Vec<(String, Value, Value)> {
         let mut runs = self.runs.lock().unwrap();
         runs.values_mut().filter(|run| run.parent == parent).map(|run| {
-            let history = match &run.after {
-                Some(after) => sessions.store().history_after(&run.child, after).ok().flatten().unwrap_or_else(|| {
-                    sessions.store().history(&run.child).unwrap_or_default().into_iter()
-                        .skip_while(|event| event.id != *after).skip(1).collect()
-                }),
-                None => sessions.store().history(&run.child).unwrap_or_default(),
-            };
-            for event in history {
-                let event_ms = event.at.parse::<jiff::Timestamp>().ok()
-                    .and_then(|at| u64::try_from(at.as_millisecond()).ok())
-                    .or_else(|| event.id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms()));
-                run.after = Some(event.id);
-                run.apply_event(event.event, event_ms);
-            }
-            // A live ToolStarted can precede the first history refresh for this turn.
-            if run.status == "running" && run.activity == "Thinking" {
-                if let Some(name) = run.tools.iter().rev()
-                    .find(|tool| tool["status"] == "running")
-                    .and_then(|tool| tool["name"].as_str()).filter(|name| !name.is_empty()) {
-                    run.activity = tail(name, MAX_ACTIVITY_BYTES).into();
-                }
-            }
+            Self::refresh_run(run, sessions);
             (run.call.clone(), run.args.clone(), json!({
                 "kind":"subagent_activity", "session":run.child, "status":run.status,
                 "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
                 "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
                 "lines":run.lines, "live":run.live, "streams":run.streams, "tools":run.tools,
+            }))
+        }).collect()
+    }
+
+    /// Lightweight snapshots for card rendering. Omits `lines`, `streams`,
+    /// and heavy tool fields (`args`, `output`, `stream`) that no card
+    /// renderer reads. `live` is truncated to [`MAX_CARD_LIVE_BYTES`].
+    pub fn card_snapshots(
+        &self,
+        sessions: &SessionService,
+        parent: &str,
+    ) -> Vec<(String, Value, Value)> {
+        let mut runs = self.runs.lock().unwrap();
+        runs.values_mut().filter(|run| run.parent == parent).map(|run| {
+            Self::refresh_run(run, sessions);
+            let card_tools: Vec<Value> = run.tools.iter().map(|tool| {
+                json!({
+                    "call": tool["call"],
+                    "name": tool["name"],
+                    "status": tool["status"],
+                })
+            }).collect();
+            (run.call.clone(), run.args.clone(), json!({
+                "kind":"subagent_activity", "session":run.child, "status":run.status,
+                "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
+                "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
+                "live":tail(&run.live, MAX_CARD_LIVE_BYTES), "tools":card_tools,
             }))
         }).collect()
     }

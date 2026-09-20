@@ -348,7 +348,7 @@ pub fn spawn(
                 recovery.recover(&subagents.activity, &sessions, id);
                 let cache = state.cards(id);
                 let generation = cache.generation();
-                for (call, args, mut activity) in subagents.activity.snapshots(&sessions, id) {
+                for (call, args, mut activity) in subagents.activity.card_snapshots(&sessions, id) {
                     let ms = activity["elapsed_ms"].as_u64().unwrap_or(0);
                     activity["elapsed_ms"] = json!(ms / 1000 * 1000);
                     let key = format!("agent:{call}");
