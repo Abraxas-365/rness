@@ -10,10 +10,27 @@ use unicode_width::UnicodeWidthChar;
 pub struct Editor {
     pastes: Vec<Paste>,
     next_paste: usize,
+    /// Image placeholder blocks: same atomic-delete semantics as pastes,
+    /// but `text()` strips them instead of expanding.
+    images: Vec<ImageBlock>,
+    next_image: usize,
     /// Buffer as lines (at least one, possibly empty).
     lines: Vec<String>,
     /// Cursor: (line index, byte offset within line).
     cursor: (usize, usize),
+}
+
+/// An image placeholder in the editor text. Behaves like a paste block
+/// (atomic backspace, cursor snapping) but is stripped from `text()`.
+#[derive(Clone, Debug)]
+struct ImageBlock {
+    /// Auto-incrementing display number.
+    num: usize,
+    /// External image ID (e.g. content-addressed hash).
+    id: String,
+    /// Byte range in the flat buffer.
+    start: usize,
+    end: usize,
 }
 
 impl Default for Editor {
@@ -35,6 +52,8 @@ impl Editor {
         Self {
             pastes: Vec::new(),
             next_paste: 1,
+            images: Vec::new(),
+            next_image: 1,
             lines: vec![String::new()],
             cursor: (0, 0),
         }
@@ -102,6 +121,12 @@ impl Editor {
                 p.end = p.end - (paste.end - paste.start) + replacement.len();
             }
         }
+        for i in &mut self.images {
+            if i.start >= paste.end {
+                i.start = i.start - (paste.end - paste.start) + replacement.len();
+                i.end = i.end - (paste.end - paste.start) + replacement.len();
+            }
+        }
         self.lines = updated.split('\n').map(str::to_owned).collect();
         self.set_offset(paste.start + replacement.len());
         if let Some(content) = text {
@@ -112,6 +137,76 @@ impl Editor {
                 content: content.into(),
             });
             self.pastes.sort_by_key(|p| p.start);
+        }
+    }
+
+    /// Insert an image placeholder at the cursor. The placeholder
+    /// behaves like an atomic block: cursor snaps around it, and
+    /// backspace removes it entirely. `text()` strips image
+    /// placeholders so they don't leak into submitted content.
+    /// Returns the display number assigned to this image.
+    pub fn insert_image(&mut self, id: &str) -> usize {
+        let num = self.next_image;
+        self.next_image += 1;
+        let label = format!("[Image {num}]");
+        let start = self.before_cursor().len();
+        self.insert_str(&label);
+        self.images.push(ImageBlock {
+            num,
+            id: id.into(),
+            start,
+            end: start + label.len(),
+        });
+        self.images.sort_by_key(|i| i.start);
+        num
+    }
+
+    /// Remove an image block by index, adjusting offsets of other blocks.
+    fn remove_image_block(&mut self, index: usize) {
+        let img = self.images.remove(index);
+        let raw = self.lines.join("\n");
+        let updated = format!("{}{}", &raw[..img.start], &raw[img.end..]);
+        let delta = -((img.end - img.start) as isize);
+        for p in &mut self.pastes {
+            if p.start >= img.end {
+                p.start = p.start.saturating_add_signed(delta);
+                p.end = p.end.saturating_add_signed(delta);
+            }
+        }
+        for i in &mut self.images {
+            if i.start >= img.end {
+                i.start = i.start.saturating_add_signed(delta);
+                i.end = i.end.saturating_add_signed(delta);
+            }
+        }
+        self.lines = updated.split('\n').map(str::to_owned).collect();
+        self.set_offset(img.start);
+    }
+
+    /// Returns the external IDs of images still present in the editor.
+    pub fn image_ids(&self) -> Vec<&str> {
+        self.images.iter().map(|i| i.id.as_str()).collect()
+    }
+
+    /// Remove all image blocks whose external ID is not in `keep`.
+    pub fn clear_images(&mut self) {
+        // Remove from last to first to keep offsets valid.
+        let mut to_remove: Vec<usize> = (0..self.images.len()).collect();
+        to_remove.reverse();
+        for idx in to_remove {
+            self.remove_image_block(idx);
+        }
+    }
+
+    /// Whether the editor contains any image placeholders.
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty()
+    }
+
+    /// Remove the first image block with the given external ID.
+    pub fn remove_image_by_id(&mut self, id: &str) {
+        if let Some(idx) = self.images.iter().position(|i| i.id == id) {
+            self.remove_image_block(idx);
         }
     }
 
@@ -127,8 +222,14 @@ impl Editor {
 
     fn snap_paste(&mut self, forward: bool) {
         let pos = self.before_cursor().len();
-        if let Some(p) = self.pastes.iter().find(|p| pos > p.start && pos < p.end) {
-            self.set_offset(if forward { p.end } else { p.start });
+        let block = self
+            .pastes
+            .iter()
+            .map(|p| (p.start, p.end))
+            .chain(self.images.iter().map(|i| (i.start, i.end)))
+            .find(|&(s, e)| pos > s && pos < e);
+        if let Some((start, end)) = block {
+            self.set_offset(if forward { end } else { start });
         }
     }
 
@@ -139,6 +240,12 @@ impl Editor {
                 p.end = p.end.saturating_add_signed(bytes);
             }
         }
+        for i in &mut self.images {
+            if i.start >= at {
+                i.start = i.start.saturating_add_signed(bytes);
+                i.end = i.end.saturating_add_signed(bytes);
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -146,9 +253,31 @@ impl Editor {
     }
 
     pub fn text(&self) -> String {
+        // Collect all blocks to process: pastes expand, images strip.
+        struct Block {
+            start: usize,
+            end: usize,
+            replacement: String,
+        }
+        let mut blocks: Vec<Block> = Vec::new();
+        for p in &self.pastes {
+            blocks.push(Block {
+                start: p.start,
+                end: p.end,
+                replacement: p.content.clone(),
+            });
+        }
+        for i in &self.images {
+            blocks.push(Block {
+                start: i.start,
+                end: i.end,
+                replacement: String::new(),
+            });
+        }
+        blocks.sort_by(|a, b| b.start.cmp(&a.start));
         let mut text = self.lines.join("\n");
-        for paste in self.pastes.iter().rev() {
-            text.replace_range(paste.start..paste.end, &paste.content);
+        for block in blocks {
+            text.replace_range(block.start..block.end, &block.replacement);
         }
         text
     }
@@ -179,6 +308,7 @@ impl Editor {
         let text = self.text();
         self.lines = vec![String::new()];
         self.pastes.clear();
+        self.images.clear();
         self.cursor = (0, 0);
         text
     }
@@ -224,6 +354,14 @@ impl Editor {
             .map(|p| p.id)
         {
             self.replace_paste(id, None);
+            return;
+        }
+        if let Some(idx) = self
+            .images
+            .iter()
+            .position(|i| pos > i.start && pos <= i.end)
+        {
+            self.remove_image_block(idx);
             return;
         }
         let (row, col) = self.cursor;
@@ -520,5 +658,80 @@ mod tests {
         assert_eq!(e.cursor_wrapped(4), (0, 4));
         e.insert_char('e'); // now 2 rows, cursor after 'e'
         assert_eq!(e.cursor_wrapped(4), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_placeholder_is_displayed_but_stripped_from_text() {
+        let mut e = Editor::new();
+        e.insert_str("hello ");
+        e.insert_image("img_abc");
+        let display = e.display_lines().join("\n");
+        assert!(display.contains("[Image 1]"), "display: {display}");
+        assert_eq!(e.text(), "hello ");
+    }
+
+    #[test]
+    fn backspace_removes_image_block_atomically() {
+        let mut e = Editor::new();
+        e.insert_str("before ");
+        e.insert_image("img_1");
+        e.insert_str(" after");
+        assert_eq!(e.text(), "before  after");
+        assert_eq!(e.image_ids(), vec!["img_1"]);
+        // Cursor is after " after"; move left 6 chars to reach end of image block.
+        for _ in 0..6 {
+            e.move_left();
+        }
+        // Backspace should delete the entire [Image 1] block.
+        e.backspace();
+        assert!(e.image_ids().is_empty());
+        assert_eq!(e.text(), "before  after");
+        assert_eq!(e.display_lines().join(""), "before  after");
+    }
+
+    #[test]
+    fn multiple_images_track_independently() {
+        let mut e = Editor::new();
+        e.insert_image("img_a");
+        e.insert_image("img_b");
+        assert_eq!(e.image_ids().len(), 2);
+        assert_eq!(e.text(), "");
+        // Backspace removes img_b (last).
+        e.backspace();
+        assert_eq!(e.image_ids(), vec!["img_a"]);
+        e.backspace();
+        assert!(e.image_ids().is_empty());
+    }
+
+    #[test]
+    fn remove_image_by_id_strips_placeholder() {
+        let mut e = Editor::new();
+        e.insert_str("start ");
+        e.insert_image("x");
+        e.insert_str(" end");
+        assert!(e.display_lines().join("").contains("[Image 1]"));
+        e.remove_image_by_id("x");
+        assert!(e.image_ids().is_empty());
+        assert!(!e.display_lines().join("").contains("[Image"));
+        assert_eq!(e.text(), "start  end");
+    }
+
+    #[test]
+    fn images_and_pastes_coexist() {
+        let mut e = Editor::new();
+        e.paste("long paste\ncontent\n", 0, 0);
+        e.insert_image("photo");
+        assert_eq!(e.image_ids(), vec!["photo"]);
+        assert_eq!(e.text(), "long paste\ncontent\n");
+        // Backspace removes image, not paste.
+        e.backspace();
+        assert!(e.image_ids().is_empty());
+        assert!(e.has_pastes());
+        assert_eq!(e.text(), "long paste\ncontent\n");
     }
 }

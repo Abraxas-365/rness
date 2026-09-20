@@ -439,6 +439,46 @@ mod tests {
     }
 
     #[test]
+    fn image_placeholder_appears_in_editor_and_backspace_removes_image() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        let mut input = Input::new();
+        input.editor.insert_str("hello ");
+        let ref1 = serde_json::json!({"id":"img_aaa","media_type":"image/png","width":10,"height":10,"bytes":100});
+        let ref2 = serde_json::json!({"id":"img_bbb","media_type":"image/png","width":20,"height":20,"bytes":200});
+        input.on_action(&ctx, "input:image-added", &ref1);
+        input.on_action(&ctx, "input:image-added", &ref2);
+        assert_eq!(input.images.len(), 2);
+
+        // Display shows placeholders, but text() strips them.
+        let display = input.editor.display_lines().join("\n");
+        assert!(display.contains("[Image 1]"), "display: {display}");
+        assert!(display.contains("[Image 2]"), "display: {display}");
+        assert_eq!(input.editor.text(), "hello ");
+
+        // Submitted text should be clean (no placeholders).
+        let outcome = input.on_key(&ctx, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&outcome.actions[..], [Action::SubmitImages(text, images)] if text == "hello " && images.len() == 2),
+            "got: {:?}", outcome.actions
+        );
+
+        // Backspace deletes the last image placeholder atomically.
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(input.images.len(), 1);
+        assert_eq!(input.images[0].id, "img_aaa");
+
+        // Delete the other one.
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(input.images.len(), 0);
+        assert_eq!(input.editor.text(), "hello ");
+    }
+
+    #[test]
     fn paste_preview_keys_are_configurable_and_modifier_sensitive() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -919,11 +959,14 @@ impl Component for Input {
         if name == "input:image-added" {
             if self.image_session.as_ref() != Some(&ctx.model.session) {
                 self.images.clear();
+                self.editor.clear_images();
             }
             self.image_session = Some(ctx.model.session.clone());
-            if let Ok(image) = serde_json::from_value(payload.clone()) {
+            if let Ok(image) = serde_json::from_value::<rness_protocol::events::ImageRef>(payload.clone()) {
+                let id = image.id.clone();
                 self.images.push(image);
                 self.selected_image = self.images.len() - 1;
+                self.editor.insert_image(&id);
             }
             return;
         }
@@ -988,8 +1031,15 @@ impl Component for Input {
         }
         if name == "input:prompt-edited" {
             if let Some(text) = payload["text"].as_str() {
+                // Preserve existing images: re-insert their placeholders
+                // after replacing the editor text.
+                let saved_images: Vec<String> =
+                    self.images.iter().map(|i| i.id.clone()).collect();
                 self.editor = Editor::new();
                 self.editor.insert_str(text);
+                for id in &saved_images {
+                    self.editor.insert_image(id);
+                }
                 self.preview = None;
                 self.scroll_top = 0;
                 self.history_index = None;
@@ -1454,6 +1504,23 @@ impl Component for Input {
 }
 
 impl Input {
+    /// Remove images whose editor placeholders have been deleted.
+    fn sync_images(&mut self) {
+        let editor_ids = self.editor.image_ids();
+        let before = self.images.len();
+        self.images.retain(|img| editor_ids.contains(&img.id.as_str()));
+        if self.images.len() < before {
+            // Clean up thumbnails for removed images.
+            let remaining: std::collections::HashSet<&str> =
+                self.images.iter().map(|i| i.id.as_str()).collect();
+            self.thumbnails.retain(|id, _| remaining.contains(id.as_str()));
+            if self.images.is_empty() {
+                self.image_preview = false;
+            }
+            self.selected_image = self.selected_image.min(self.images.len().saturating_sub(1));
+        }
+    }
+
     fn handle_key(&mut self, ctx: &Ctx<'_>, key: KeyEvent, action: Option<&str>) -> KeyOutcome {
         let bindings = self.bindings();
         let matched = |name: &str| {
@@ -1473,6 +1540,7 @@ impl Input {
             self.history_preview = false;
             self.image_preview = false;
             self.image_session = None;
+            self.editor.clear_images();
         }
         if matched("history_images") {
             return KeyOutcome::act(vec![Action::PreviewHistoryImage]);
@@ -1505,6 +1573,7 @@ impl Input {
                 let removed = self
                     .images
                     .remove(self.selected_image.min(self.images.len() - 1));
+                self.editor.remove_image_by_id(&removed.id);
                 if !self.images.iter().any(|r| r.id == removed.id) {
                     self.thumbnails.remove(&removed.id);
                 }
@@ -1728,6 +1797,9 @@ impl Input {
             }
             _ => KeyOutcome::pass(),
         };
+        // Sync images: if a placeholder was deleted (via backspace), remove
+        // the corresponding ImageRef so the image list stays in sync.
+        self.sync_images();
         if self.at_token().is_some()
             && matches!(
                 key.code,
