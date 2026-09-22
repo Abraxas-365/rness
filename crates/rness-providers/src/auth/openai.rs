@@ -193,13 +193,24 @@ impl CodexOAuthClient {
 /// Run the browser PKCE login on the registered port and persist tokens
 /// under [`STORE_KEY`].
 pub async fn login(store: &CredentialStore, prompt: &LoginPrompt) -> Result<Tokens, AuthError> {
-    login_with(CodexOAuthClient::default(), store, prompt).await
+    login_as(store, prompt, STORE_KEY).await
+}
+
+/// Like [`login`] but saves tokens under an arbitrary credential key
+/// (e.g. `"openai-chatgpt/work"` for a named account).
+pub async fn login_as(
+    store: &CredentialStore,
+    prompt: &LoginPrompt,
+    credential_key: &str,
+) -> Result<Tokens, AuthError> {
+    login_with(CodexOAuthClient::default(), store, prompt, credential_key).await
 }
 
 pub async fn login_with(
     client: CodexOAuthClient,
     store: &CredentialStore,
     prompt: &LoginPrompt,
+    credential_key: &str,
 ) -> Result<Tokens, AuthError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -265,7 +276,7 @@ pub async fn login_with(
         .exchange_code(&code, &verifier, &redirect_uri)
         .await?
         .into_tokens();
-    store.save_tokens(STORE_KEY, &tokens)?;
+    store.save_tokens(credential_key, &tokens)?;
     Ok(tokens)
 }
 

@@ -228,6 +228,17 @@ pub async fn login(
     store: &CredentialStore,
     prompt: &LoginPrompt,
 ) -> Result<Tokens, AuthError> {
+    login_as(config, store, prompt, "anthropic").await
+}
+
+/// Like [`login`] but saves tokens under an arbitrary credential key
+/// (e.g. `"anthropic/work"` for a named account).
+pub async fn login_as(
+    config: OAuthConfig,
+    store: &CredentialStore,
+    prompt: &LoginPrompt,
+    credential_key: &str,
+) -> Result<Tokens, AuthError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let verifier = pkce::code_verifier();
@@ -300,7 +311,7 @@ pub async fn login(
         tokens.extra.insert("profile".into(), profile);
     }
 
-    store.save_tokens("anthropic", &tokens)?;
+    store.save_tokens(credential_key, &tokens)?;
     Ok(tokens)
 }
 

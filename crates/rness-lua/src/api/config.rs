@@ -488,6 +488,10 @@ pub struct ProviderDeclaration {
     pub auth: ProviderAuth,
     #[serde(default, deserialize_with = "deserialize_provider_headers")]
     pub headers: BTreeMap<String, String>,
+    /// Named account to use by default (e.g. "work"). When absent, the
+    /// unnamed default credential is used; `--account` overrides this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_account: Option<String>,
 }
 
 fn deserialize_provider_headers<'de, D: serde::Deserializer<'de>>(
@@ -1059,6 +1063,29 @@ pub fn evaluate(
     )?;
     let s = state.clone();
     providers.set(
+        "set_default_account",
+        lua.create_function(move |_, (name, account): (String, String)| {
+            if name.trim().is_empty() {
+                return Err(mlua::Error::runtime("provider name must be nonempty"));
+            }
+            if account.trim().is_empty() || account.contains('/') {
+                return Err(mlua::Error::runtime(
+                    "account name must be nonempty and must not contain '/'",
+                ));
+            }
+            let mut state = s.lock().unwrap();
+            if let Some(p) = state.providers.get_mut(&name) {
+                p.default_account = Some(account);
+            } else {
+                return Err(mlua::Error::runtime(format!(
+                    "provider '{name}' is not registered (call rness.providers.register first)"
+                )));
+            }
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    providers.set(
         "register",
         lua.create_function(move |lua, (name, value): (String, Table)| {
             let declaration: ProviderDeclaration = lua.from_value(mlua::Value::Table(value))?;
@@ -1350,6 +1377,7 @@ pub fn evaluate(
         ("plugins", "setup"),
         ("providers", "set_stream_idle_timeout"),
         ("providers", "set_cache_ttl"),
+        ("providers", "set_default_account"),
         ("plugins", "load"),
         ("agents", "declare"),
         ("sandbox", "setup"),

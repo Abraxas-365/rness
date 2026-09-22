@@ -29,7 +29,7 @@ use rness_protocol::api::{ClientRequest, History};
 use rness_protocol::events::{
     CallConfig, ContentPart, ModelSelection, Reasoning, SessionId, UserIntent,
 };
-use rness_providers::auth::{login, CredentialStore, LoginPrompt, OAuthConfig};
+use rness_providers::auth::{login_as, CredentialStore, LoginPrompt, OAuthConfig};
 use rness_providers::routes;
 
 #[derive(Parser)]
@@ -134,6 +134,12 @@ struct Cli {
     /// --route lan=http://192.168.1.50:8000/v1,none
     #[arg(long, value_name = "SPEC")]
     route: Vec<String>,
+
+    /// Named credential account for the selected provider (e.g.
+    /// `--account work`). Multiple keys per provider are stored
+    /// with `rness auth set-key --account <name>`.
+    #[arg(long)]
+    account: Option<String>,
 }
 
 #[derive(clap::Subcommand)]
@@ -225,6 +231,9 @@ enum AuthAction {
         /// Which provider: anthropic or openai-chatgpt.
         #[arg(long, default_value = "anthropic")]
         provider: String,
+        /// Named account (e.g. "work"). Default account when omitted.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Store an API key for a provider.
     SetKey {
@@ -233,6 +242,9 @@ enum AuthAction {
         /// Which provider the key is for.
         #[arg(long, default_value = "anthropic")]
         provider: String,
+        /// Named account (e.g. "work"). Default account when omitted.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Show credential status for every provider.
     Status,
@@ -241,6 +253,9 @@ enum AuthAction {
         /// Which provider to log out of.
         #[arg(long, default_value = "anthropic")]
         provider: String,
+        /// Named account to remove. Default account when omitted.
+        #[arg(long)]
+        account: Option<String>,
     },
 }
 
@@ -395,6 +410,24 @@ async fn main() -> anyhow::Result<()> {
             _ => routes::CacheTtl::Auto,
         };
     }
+
+    // -- account selection: --account flag overrides per-provider default_account.
+    // Qualify credential keys in auth_store / auth_oauth so the resolver reads
+    // the right slot from credentials.json (e.g. "anthropic/work" instead of "anthropic").
+    for (provider_name, declaration) in &startup.providers {
+        let effective_account = cli.account.as_deref().or(declaration.default_account.as_deref());
+        if let Some(acct) = effective_account {
+            if let Some(base) = auth_store.get(provider_name) {
+                let qualified = CredentialStore::credential_key(base, Some(acct));
+                auth_store.insert(provider_name.clone(), qualified);
+            }
+            if let Some(base) = auth_oauth.get(provider_name) {
+                let qualified = CredentialStore::credential_key(base, Some(acct));
+                auth_oauth.insert(provider_name.clone(), qualified);
+            }
+        }
+    }
+
     let cli_selection = match cli.model.as_deref() {
         Some(model) => Some(if let Some(provider) = &cli.provider {
             if !route_table.contains_key(provider) {
@@ -547,6 +580,18 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(move |selection| {
             let mut provider = (|| {
                 if let Some(credential) = auth_oauth.get(&selection.route) {
+                    // If the exact credential key has no tokens, try the first
+                    // available account for the base provider.
+                    let effective = resolver_store
+                        .tokens(credential)
+                        .ok()
+                        .flatten()
+                        .map(|_| credential.clone())
+                        .or_else(|| {
+                            let base = credential.split('/').next().unwrap_or(credential);
+                            first_available_credential(&resolver_store, base)
+                        })
+                        .unwrap_or_else(|| credential.clone());
                     let route = resolver_routes
                         .get(&selection.route)
                         .ok_or("unknown provider")?;
@@ -554,15 +599,31 @@ async fn main() -> anyhow::Result<()> {
                         route,
                         &selection.model,
                         resolver_store.clone(),
-                        credential.clone(),
+                        effective,
                     );
                 }
                 if let Some(credential) = auth_store.get(&selection.route) {
+                    // Try the exact key first; fall back to any account that
+                    // has a stored API key for the same base provider.
                     let key = resolver_store
                         .api_key(credential)
                         .map_err(|e| e.to_string())?
                         .filter(|key| !key.is_empty())
-                        .ok_or_else(|| format!("missing stored API key: {credential}"))?;
+                        .or_else(|| {
+                            let base = credential.split('/').next().unwrap_or(credential);
+                            first_available_api_key(&resolver_store, base)
+                        })
+                        .ok_or_else(|| {
+                            let base = credential.split('/').next().unwrap_or(credential);
+                            let accounts = resolver_store.accounts(base).unwrap_or_default();
+                            if accounts.is_empty() {
+                                format!(
+                                    "no API key for {base}: run `rness auth set-key --provider {base}`"
+                                )
+                            } else {
+                                format!("no API key for credential {credential}")
+                            }
+                        })?;
                     let route = resolver_routes
                         .get(&selection.route)
                         .ok_or("unknown provider")?;
@@ -2476,10 +2537,47 @@ mod app_host_tests {
     }
 }
 
+/// Find the first available API key for `base_provider`, checking the bare key
+/// first then any `base_provider/<account>` keys in sorted order.
+fn first_available_api_key(store: &CredentialStore, base_provider: &str) -> Option<String> {
+    let accounts = store.accounts(base_provider).ok()?;
+    // Try bare key first (None account), then sorted named accounts.
+    for acct in &accounts {
+        let key = CredentialStore::credential_key(base_provider, acct.as_deref());
+        if let Ok(Some(k)) = store.api_key(&key) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Find the first credential key that has OAuth tokens for `base_provider`.
+fn first_available_credential(store: &CredentialStore, base_provider: &str) -> Option<String> {
+    let accounts = store.accounts(base_provider).ok()?;
+    for acct in &accounts {
+        let key = CredentialStore::credential_key(base_provider, acct.as_deref());
+        if store
+            .tokens(&key)
+            .ok()
+            .flatten()
+            .is_some_and(|t| !t.access_token.is_empty())
+        {
+            return Some(key);
+        }
+    }
+    None
+}
+
 async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
     let store = CredentialStore::new(CredentialStore::default_path());
     match action {
-        AuthAction::Login { provider } => {
+        AuthAction::Login { provider, account } => {
+            let cred_key = CredentialStore::credential_key(&provider, account.as_deref());
+            let label = if let Some(ref a) = account {
+                format!("{provider} (account: {a})")
+            } else {
+                provider.clone()
+            };
             let prompt = LoginPrompt {
                 on_url: Box::new(|url| {
                     println!("If the browser didn't open, visit:\n\n  {url}\n");
@@ -2488,8 +2586,9 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             };
             match provider.as_str() {
                 "anthropic" => {
-                    println!("Opening browser to log in with your Claude account…");
-                    let tokens = login(OAuthConfig::default(), &store, &prompt).await?;
+                    println!("Opening browser to log in with your Claude account ({label})…");
+                    let tokens =
+                        login_as(OAuthConfig::default(), &store, &prompt, &cred_key).await?;
                     print!("Login successful");
                     if !tokens.subscription_type.is_empty() {
                         print!(" ({} subscription)", tokens.subscription_type);
@@ -2497,8 +2596,9 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                     println!("!");
                 }
                 "openai-chatgpt" | "openai" | "chatgpt" => {
-                    println!("Opening browser to sign in with ChatGPT…");
-                    let tokens = rness_providers::auth::openai::login(&store, &prompt).await?;
+                    println!("Opening browser to sign in with ChatGPT ({label})…");
+                    let tokens =
+                        rness_providers::auth::openai::login_as(&store, &prompt, &cred_key).await?;
                     print!("Login successful");
                     if let Some(email) = tokens.extra.get("email").and_then(|v| v.as_str()) {
                         print!(" ({email})");
@@ -2508,12 +2608,22 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                 other => bail!("no OAuth login for '{other}' (anthropic or openai-chatgpt)"),
             }
         }
-        AuthAction::SetKey { key, provider } => {
+        AuthAction::SetKey {
+            key,
+            provider,
+            account,
+        } => {
+            let cred_key = CredentialStore::credential_key(&provider, account.as_deref());
+            let label = if let Some(ref a) = account {
+                format!("{provider} (account: {a})")
+            } else {
+                provider.clone()
+            };
             let key = match key {
                 Some(k) => k,
                 None => {
                     use std::io::BufRead;
-                    println!("Paste your {provider} API key:");
+                    println!("Paste your {label} API key:");
                     let mut line = String::new();
                     std::io::stdin().lock().read_line(&mut line)?;
                     line.trim().to_string()
@@ -2522,8 +2632,8 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             if key.is_empty() {
                 bail!("empty API key");
             }
-            store.save_api_key(&provider, &key)?;
-            println!("{provider} API key saved to {}", store.path().display());
+            store.save_api_key(&cred_key, &key)?;
+            println!("{label} API key saved to {}", store.path().display());
         }
         AuthAction::Status => {
             let config = rness_lua::api::config::load(
@@ -2536,10 +2646,21 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             for (name, declaration) in &config.providers {
                 match &declaration.auth {
                     rness_lua::api::config::ProviderAuth::Store { credential } => {
-                        names.push(credential.clone())
+                        names.push(credential.clone());
+                        // Also collect accounts for this credential.
+                        for acct in store.accounts(credential)? {
+                            if let Some(a) = acct {
+                                names.push(CredentialStore::credential_key(credential, Some(&a)));
+                            }
+                        }
                     }
                     rness_lua::api::config::ProviderAuth::OAuth { oauth } => {
-                        names.push(oauth.clone())
+                        names.push(oauth.clone());
+                        for acct in store.accounts(oauth)? {
+                            if let Some(a) = acct {
+                                names.push(CredentialStore::credential_key(oauth, Some(&a)));
+                            }
+                        }
                     }
                     rness_lua::api::config::ProviderAuth::Env { env } => {
                         let state = if std::env::var(env).is_ok_and(|v| !v.is_empty()) {
@@ -2548,6 +2669,9 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                             "not set"
                         };
                         println!("{name:<16}env {env} ({state})");
+                        if let Some(ref default_acct) = declaration.default_account {
+                            println!("{:<16}default account: {default_acct}", "");
+                        }
                     }
                     _ => {}
                 }
@@ -2576,13 +2700,25 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                 if states.is_empty() {
                     states.push("none".into());
                 }
-                println!("{name:<16}{}", states.join(", "));
+                // Show account-qualified names with a nicer format.
+                let display = if let Some((base, acct)) = name.split_once('/') {
+                    format!("{base:<12} [{acct}]")
+                } else {
+                    name.clone()
+                };
+                println!("{display:<16}{}", states.join(", "));
             }
             println!("\nfile: {}", store.path().display());
         }
-        AuthAction::Logout { provider } => {
-            store.delete(&provider)?;
-            println!("{provider} credentials removed.");
+        AuthAction::Logout { provider, account } => {
+            let cred_key = CredentialStore::credential_key(&provider, account.as_deref());
+            let label = if let Some(ref a) = account {
+                format!("{provider} (account: {a})")
+            } else {
+                provider.clone()
+            };
+            store.delete(&cred_key)?;
+            println!("{label} credentials removed.");
         }
     }
     Ok(())

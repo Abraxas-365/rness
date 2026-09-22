@@ -152,6 +152,36 @@ impl CredentialStore {
         Ok(())
     }
 
+    // -- account-aware key helpers ----------------------------------------
+
+    /// Build the credential key for a provider/account pair.
+    /// `None` or empty account → bare provider name (default account).
+    /// Named account → `"provider/account"`.
+    pub fn credential_key(provider: &str, account: Option<&str>) -> String {
+        match account {
+            Some(a) if !a.is_empty() => format!("{provider}/{a}"),
+            _ => provider.to_string(),
+        }
+    }
+
+    /// List named accounts stored for `provider`. Returns account names
+    /// (not credential keys). The default (unnamed) account is represented
+    /// as `None` in the output when it has a stored credential.
+    pub fn accounts(&self, provider: &str) -> Result<Vec<Option<String>>, TokensError> {
+        let data = self.read()?;
+        let prefix = format!("{provider}/");
+        let mut out = Vec::new();
+        for key in data.providers.keys() {
+            if key == provider {
+                out.push(None);
+            } else if let Some(name) = key.strip_prefix(&prefix) {
+                out.push(Some(name.to_string()));
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     // -- provider-keyed records (any provider) -----------------------------
 
     pub fn tokens(&self, provider: &str) -> Result<Option<Tokens>, TokensError> {
@@ -293,5 +323,35 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn credential_key_helper() {
+        assert_eq!(CredentialStore::credential_key("anthropic", None), "anthropic");
+        assert_eq!(CredentialStore::credential_key("anthropic", Some("")), "anthropic");
+        assert_eq!(CredentialStore::credential_key("anthropic", Some("work")), "anthropic/work");
+    }
+
+    #[test]
+    fn accounts_lists_named_and_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = CredentialStore::new(&path);
+        // Default account
+        store.save_api_key("anthropic", "k1").unwrap();
+        // Named accounts
+        store.save_api_key("anthropic/work", "k2").unwrap();
+        store.save_api_key("anthropic/personal", "k3").unwrap();
+        // Different provider entirely
+        store.save_api_key("openrouter", "k4").unwrap();
+
+        let accounts = store.accounts("anthropic").unwrap();
+        assert_eq!(accounts.len(), 3);
+        assert!(accounts.contains(&None)); // default
+        assert!(accounts.contains(&Some("work".into())));
+        assert!(accounts.contains(&Some("personal".into())));
+
+        let or_accounts = store.accounts("openrouter").unwrap();
+        assert_eq!(or_accounts, vec![None]);
     }
 }
