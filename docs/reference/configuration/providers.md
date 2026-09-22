@@ -78,6 +78,53 @@ With no key positional argument, `set-key` reads standard input. Avoid placing k
 
 Custom OAuth store references select an entry; they do not define an arbitrary OAuth issuer or login implementation.
 
+## Multiple accounts per provider
+
+A single provider connection can hold more than one stored credential — for example two Anthropic accounts. Credentials are addressed by key in `credentials.json`: the bare entry name (`anthropic`) is the **default account**; a named account uses `entry/account` (`anthropic/work`).
+
+This applies to the `credential` and `oauth` auth strategies. `env`-based auth reads a single environment variable and has no account concept; switching accounts on an `env` connection means changing the variable's value yourself.
+
+### Storing keys for named accounts
+
+```sh
+rness auth set-key --provider anthropic sk-ant-default-key
+rness auth set-key --provider anthropic --account work sk-ant-work-key
+rness auth login --provider anthropic --account personal
+```
+
+`--account` is accepted by `set-key`, `login`, and `logout`. Omitting it addresses the default (bare) entry, unchanged from prior behavior. `rness auth status` lists every stored account per provider.
+
+### Selecting an account
+
+```sh
+rness --account work -m anthropic/claude-sonnet-4.5 -p "hello"
+```
+
+`--account` is a top-level CLI flag, independent of `--model`/`--provider`. It applies to whichever connection the request selects; a connection without a matching stored credential for that account name fails with a clear error at request time, not at startup.
+
+### Declaring a default account
+
+```lua
+rness.providers.register("anthropic", {
+  protocol = "anthropic", base_url = "https://api.anthropic.com",
+  auth = { credential = "anthropic" },
+})
+rness.providers.set_default_account("anthropic", "work")
+```
+
+`set_default_account` must follow `register` for the same connection name and only accepts a bare account name (no `/`). It is a startup-only declaration, like other `rness.providers.*` calls; changing it requires a restart.
+
+### Resolution order
+
+For each request, the account actually used is:
+
+1. `--account NAME` on the command line, if supplied.
+2. `default_account` from the connection's registration, if declared.
+3. The default (bare) stored entry, if it has a credential.
+4. The first account with a stored credential for that connection, in ascending name order (the default account, if any, still sorts first).
+
+Step 4 means a provider connection with only named accounts and no bare entry still works without `--account` or `default_account` — rness uses whichever account was stored, rather than failing because the unnamed slot is empty. When no credential exists under any account, the error names the connection and points at `rness auth set-key`.
+
 ## Endpoint validation
 
 URLs must parse with a host and use HTTP or HTTPS. Usernames, passwords, query strings, and fragments are rejected. Include required adapter prefixes such as `/v1` for an OpenAI-compatible endpoint. A syntactically valid URL does not prove protocol compatibility.

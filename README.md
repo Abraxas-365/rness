@@ -295,6 +295,7 @@ Reasoning effort is not a universal model capability. Do not assume every model 
 | Option | Purpose |
 | :--- | :--- |
 | `-m`, `--model` | Select `connection/model`; with `--provider`, supply a literal model ID instead. |
+| `--account NAME` | Use a named stored credential for the selected connection (e.g. a second Anthropic account); see [multiple accounts](docs/reference/configuration/providers.md#multiple-accounts-per-provider). |
 | `-p`, `--prompt` | Run a headless prompt and print the transcript. |
 | `-s`, `--session` | Continue an existing session. |
 | `--profile` / `--agent` | Select a declared profile or agent. |
