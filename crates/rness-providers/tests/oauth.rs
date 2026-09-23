@@ -103,12 +103,12 @@ async fn oauth_credential_sends_bearer_spoof_headers_and_billing_block() {
             "mid-conversation-system-2026-04-07",
             "structured-outputs-2025-12-15",
         ]))
-        .and(headers("user-agent", vec!["claude-cli/2.1.195 (external", "sdk-cli)"]))
+        .and(headers("user-agent", vec!["claude-cli/2.1.280 (external", "sdk-cli)"]))
         .and(header("x-app", "cli"))
         .and(body_partial_json(json!({
             // Billing block first, then the real system prompt.
             "system": [
-                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=cli; cch=00000;"},
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.280; cc_entrypoint=cli; cch=00000;"},
                 {"type": "text", "text": "sys"},
             ],
         })))

@@ -33,9 +33,9 @@ const DEFAULT_MAX_TOKENS: u32 = 32_000;
 // OAuth attribution headers (Claude Code — subscription billing
 // requires the request to look like Claude Code).
 const OAUTH_BETA: &str = "claude-code-20250219,oauth-2025-04-20";
-const OAUTH_USER_AGENT: &str = "claude-cli/2.1.195 (external, sdk-cli)";
+const OAUTH_USER_AGENT: &str = "claude-cli/2.1.280 (external, sdk-cli)";
 const OAUTH_BILLING_SYSTEM: &str =
-    "x-anthropic-billing-header: cc_version=2.1.195; cc_entrypoint=cli; cch=00000;";
+    "x-anthropic-billing-header: cc_version=2.1.280; cc_entrypoint=cli; cch=00000;";
 
 /// Beta header fragments for prompt caching features.
 const BETA_PROMPT_CACHING_SCOPE: &str = "prompt-caching-scope-2026-01-05";
