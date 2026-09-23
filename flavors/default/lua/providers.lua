@@ -20,7 +20,7 @@ rness.providers.register("ollama", {
 })
 -- Model metadata: OpenAI model pages and platform.claude.com/docs/en/models/overview.
 -- These are declarations, not availability guarantees for your account.
-for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna" }) do
+for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna","gpt-6-sol", "gpt-6-luna" }) do
   rness.models.declare {
     provider = "chatgpt", model = model,
     capabilities = {
@@ -34,7 +34,7 @@ for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6
     },
   }
 end
-for _, model in ipairs({ "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8" }) do
+for _, model in ipairs({ "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8","claude-opus-5.5","claude-opus-5.5"}) do
   rness.models.declare {
     provider = "anthropic", model = model,
     capabilities = {
