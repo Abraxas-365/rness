@@ -9,6 +9,7 @@ pub mod config;
 pub mod fs;
 pub mod http;
 pub mod jobs;
+pub mod llm;
 pub mod mcp;
 pub mod process;
 pub mod session;

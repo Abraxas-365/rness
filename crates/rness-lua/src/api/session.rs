@@ -30,10 +30,10 @@ use rness_engine::service::SessionService;
 use rness_protocol::events::{ContentPart, UserIntent};
 
 /// Private, single-use handoff; no Lua values cross onto the binding runtime.
-pub(crate) type CompactionFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>;
-pub(crate) struct CompactionRequest(pub(crate) CompactionFuture);
-impl mlua::UserData for CompactionRequest {}
+pub(crate) type CommandFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>>;
+pub(crate) struct CommandYield(pub(crate) CommandFuture);
+impl mlua::UserData for CommandYield {}
 
 pub(crate) struct SearchRequest(
     pub(crate)  std::pin::Pin<
@@ -43,7 +43,7 @@ pub(crate) struct SearchRequest(
 impl mlua::UserData for SearchRequest {}
 
 /// Yield from Lua rather than through a non-yieldable Rust callback frame.
-pub(crate) fn compaction_wrapper(
+pub(crate) fn command_yield_wrapper(
     lua: &Lua,
     prepare: mlua::Function,
 ) -> mlua::Result<mlua::Function> {
@@ -179,7 +179,7 @@ pub fn install(
                     })))
                 },
             )?;
-            compaction_wrapper(lua, prepare)
+            command_yield_wrapper(lua, prepare)
         })?,
     )?;
 
@@ -581,7 +581,7 @@ pub fn install(
             return Err(err("command cancelled"));
         }
         let s = s.clone();
-        Ok(CompactionRequest(Box::pin(async move {
+        Ok(CommandYield(Box::pin(async move {
             s.compact_region_with_permit(
                 &id,
                 opts.start - 1,
@@ -592,10 +592,11 @@ pub fn install(
                 cancel,
             )
             .await
+            .map(|v| serde_json::Value::Bool(v))
             .map_err(|e| e.to_string())
         })))
     })?;
-    session.set("compact_region_async", compaction_wrapper(lua, prepare)?)?;
+    session.set("compact_region_async", command_yield_wrapper(lua, prepare)?)?;
 
     let s = Arc::clone(&sessions);
     session.set(

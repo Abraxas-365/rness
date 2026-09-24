@@ -710,7 +710,7 @@ enum Cmd {
     },
     ResumeCommand {
         id: u64,
-        result: Result<bool, String>,
+        result: Result<serde_json::Value, String>,
     },
     PluginNames {
         reply: tokio::sync::oneshot::Sender<Vec<String>>,
@@ -1007,7 +1007,7 @@ struct PendingCommand {
 struct CompactionCompletion {
     tx: std::sync::Arc<mpsc::Sender<Cmd>>,
     id: u64,
-    result: Option<Result<bool, String>>,
+    result: Option<Result<serde_json::Value, String>>,
 }
 
 impl Drop for CompactionCompletion {
@@ -1151,7 +1151,14 @@ impl LuaHost {
                         Cmd::ResumeCommand { id, result } => {
                             let Some(mut command) = pending_commands.remove(&id) else { continue; };
                             let step = match result {
-                                Ok(result) => rt.resume_command(&mut command.thread, (true, result), command.permit.clone(), &command.cancel),
+                                Ok(value) => {
+                                    use mlua::LuaSerdeExt;
+                                    let lua_val = rt.lua().to_value(&value);
+                                    match lua_val {
+                                        Ok(v) => rt.resume_command(&mut command.thread, (true, v), command.permit.clone(), &command.cancel),
+                                        Err(e) => rt.resume_command(&mut command.thread, (false, e.to_string()), command.permit.clone(), &command.cancel),
+                                    }
+                                }
                                 Err(error) => rt.resume_command(&mut command.thread, (false, error), command.permit.clone(), &command.cancel),
                             };
                             command_step(id, command, step, &mut pending_commands,

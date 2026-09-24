@@ -113,7 +113,7 @@ pub(crate) enum ToolStep {
 }
 
 pub(crate) enum CommandStep {
-    Pending(crate::api::session::CompactionFuture),
+    Pending(crate::api::session::CommandFuture),
     Complete(rness_engine::interaction::CommandResult),
 }
 
@@ -1040,7 +1040,7 @@ impl LuaRuntime {
             let supported_yield = result.as_ref().is_ok_and(|values| {
                 values.len() == 1
                     && matches!(values.front(), Some(LuaValue::UserData(request))
-                    if request.is::<crate::api::session::CompactionRequest>())
+                    if request.is::<crate::api::session::CommandYield>())
             });
             if result.is_err()
                 || (command.thread.status() == mlua::ThreadStatus::Resumable && !supported_yield)
@@ -1085,9 +1085,9 @@ impl LuaRuntime {
         if command.thread.status() == mlua::ThreadStatus::Resumable {
             if values.len() == 1 {
                 if let Some(LuaValue::UserData(request)) = values.pop_front() {
-                    if request.is::<crate::api::session::CompactionRequest>() {
+                    if request.is::<crate::api::session::CommandYield>() {
                         return request
-                            .take::<crate::api::session::CompactionRequest>()
+                            .take::<crate::api::session::CommandYield>()
                             .map(|request| CommandStep::Pending(request.0))
                             .map_err(|e| e.to_string());
                     }
@@ -1336,10 +1336,24 @@ impl LuaRuntime {
             let Some(LuaValue::UserData(data)) = values.front() else {
                 return Err("unsupported tool yield".into());
             };
-            let request = data
-                .take::<crate::api::session::SearchRequest>()
-                .map_err(|e| e.to_string())?;
-            return Ok(ToolStep::Pending(request));
+            if data.is::<crate::api::session::SearchRequest>() {
+                let request = data
+                    .take::<crate::api::session::SearchRequest>()
+                    .map_err(|e| e.to_string())?;
+                return Ok(ToolStep::Pending(request));
+            }
+            // CommandYield (e.g. rness.llm.complete) — wrap into SearchRequest
+            // so tool execution can await it with the same pipeline.
+            if data.is::<crate::api::session::CommandYield>() {
+                let cmd_yield = data
+                    .take::<crate::api::session::CommandYield>()
+                    .map_err(|e| e.to_string())?;
+                let search = crate::api::session::SearchRequest(Box::pin(async move {
+                    cmd_yield.0.await.map(|v| v)
+                }));
+                return Ok(ToolStep::Pending(search));
+            }
+            return Err("unsupported tool yield".into());
         }
         let value = values.front().cloned().unwrap_or(LuaValue::Nil);
         let metadata = values.get(1).cloned().unwrap_or(LuaValue::Nil);
@@ -1617,6 +1631,7 @@ impl LuaRuntime {
         // key plugins pass to rness.models.get. Composition-root fact.
         rness.set("model", model)?;
         crate::api::session::install(&self.lua, &rness, sessions.clone(), rt.clone())?;
+        crate::api::llm::install(&self.lua, &rness, sessions.clone())?;
         crate::api::subagents::install(&self.lua, &rness, subagents, sessions, rt.clone())?;
         crate::api::mcp::install(&self.lua, &rness, registry, mcp, rt)?;
         Ok(())
@@ -3383,8 +3398,8 @@ mod tests {
         let prepare = rt
             .lua()
             .create_function(|_, ()| {
-                Ok(crate::api::session::CompactionRequest(Box::pin(async {
-                    Ok(false)
+                Ok(crate::api::session::CommandYield(Box::pin(async {
+                    Ok(serde_json::Value::Bool(false))
                 })))
             })
             .unwrap();
@@ -3392,7 +3407,7 @@ mod tests {
             .globals()
             .set(
                 "compact_test",
-                crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap(),
+                crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap(),
             )
             .unwrap();
         rt.load(
@@ -3412,16 +3427,16 @@ mod tests {
             .resume(rt.lua().to_value(&json!({"message":"done"})).unwrap())
             .unwrap();
         assert!(request
-            .take::<crate::api::session::CompactionRequest>()
+            .take::<crate::api::session::CommandYield>()
             .is_ok());
         assert!(
             request
-                .take::<crate::api::session::CompactionRequest>()
+                .take::<crate::api::session::CommandYield>()
                 .is_err(),
             "single use"
         );
         let request: mlua::AnyUserData = command.thread.resume((true, false)).unwrap();
-        assert!(request.is::<crate::api::session::CompactionRequest>());
+        assert!(request.is::<crate::api::session::CommandYield>());
         let returned = command.thread.resume::<LuaValue>((true, true)).unwrap();
         assert_eq!(command.thread.status(), mlua::ThreadStatus::Finished);
         let result = rt.command_result(returned).unwrap();
@@ -3447,8 +3462,8 @@ mod tests {
         let prepare = rt
             .lua()
             .create_function(|_, ()| {
-                Ok(crate::api::session::CompactionRequest(Box::pin(async {
-                    Ok(true)
+                Ok(crate::api::session::CommandYield(Box::pin(async {
+                    Ok(serde_json::Value::Bool(true))
                 })))
             })
             .unwrap();
@@ -3456,7 +3471,7 @@ mod tests {
             .globals()
             .set(
                 "compact_test",
-                crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap(),
+                crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap(),
             )
             .unwrap();
         rt.load("async-test", "rness.commands.register{name='async-test', run=function() compact_test(); error('unreachable') end}").unwrap();
@@ -3527,8 +3542,8 @@ mod tests {
                         assert!(lua
                             .app_data_ref::<tokio_util::sync::CancellationToken>()
                             .is_some());
-                        Ok(crate::api::session::CompactionRequest(Box::pin(async {
-                            Ok(true)
+                        Ok(crate::api::session::CommandYield(Box::pin(async {
+                            Ok(serde_json::Value::Bool(true))
                         })))
                     })
                     .unwrap();
@@ -3536,7 +3551,7 @@ mod tests {
                     .globals()
                     .set(
                         "compact_test",
-                        crate::api::session::compaction_wrapper(rt.lua(), prepare).unwrap(),
+                        crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap(),
                     )
                     .unwrap();
                 let token = input.cancel.clone();

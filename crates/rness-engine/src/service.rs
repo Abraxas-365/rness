@@ -1071,6 +1071,88 @@ impl SessionService {
         Ok(())
     }
 
+    /// Profile-aware LLM completion for plugins.
+    ///
+    /// Resolves `profile` (or falls back to `session`'s current model when
+    /// `None`), builds a one-shot `summarize_step` call, and returns the
+    /// text response.  The call is bounded by `timeout`.
+    pub async fn llm_complete(
+        &self,
+        session: &SessionId,
+        system: &str,
+        prompt: &str,
+        profile: Option<&str>,
+        timeout: std::time::Duration,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<String, ServiceError> {
+        let session_config = self.config(session)?;
+        let config = match profile {
+            Some(name) => self
+                .models
+                .resolve_profile_for(
+                    name,
+                    session_config
+                        .selection
+                        .as_ref()
+                        .map(|s| s.route.as_str()),
+                )
+                .map_err(ServiceError::InvalidConfig)?,
+            None => session_config,
+        };
+        let provider = self.provider_for(&config)?;
+        let context = crate::session::projection::ModelContext {
+            turns: vec![crate::session::projection::ModelTurn::User {
+                content: vec![ContentPart::Text {
+                    text: prompt.to_string(),
+                }],
+            }],
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            timeout,
+            provider.summarize_step(
+                crate::turn::provider::StepRequest {
+                    context: &context,
+                    system,
+                    tools: &[],
+                    on_delta: None,
+                },
+                &cancel,
+            ),
+        )
+        .await;
+        match result {
+            Ok(crate::turn::provider::StepOutcome::Committed(msg)) => {
+                let text: String = msg
+                    .content
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    Err(ServiceError::Summarizer("empty LLM response".into()))
+                } else {
+                    Ok(text)
+                }
+            }
+            Ok(crate::turn::provider::StepOutcome::Cancelled { .. }) => {
+                Err(ServiceError::Summarizer("cancelled".into()))
+            }
+            Ok(crate::turn::provider::StepOutcome::Failed { error, .. }) => {
+                Err(ServiceError::Summarizer(error.message))
+            }
+            Err(_elapsed) => Err(ServiceError::Summarizer(format!(
+                "LLM call timed out after {}s",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
     // -- read side ---------------------------------------------------------
 
     /// Frontend transcript (attempts and all), derived across forks.
