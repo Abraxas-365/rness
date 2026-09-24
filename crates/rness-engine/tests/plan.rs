@@ -97,6 +97,7 @@ async fn approval_continues_next_step_but_dismissal_stops() {
             &mut Vec::new,
             1,
             &|_| {},
+            None,
         )
         .await
         .unwrap();

@@ -129,6 +129,217 @@ rness.web_hooks.register("fetch", {
 
 One plugin may own each operation (`search` or `fetch`); duplicate ownership fails. Removing a plugin from the reload set removes its callbacks, and failed reloads retain the previous callbacks. Plugin callbacks take precedence over startup callbacks for the whole operation; after unload, startup callbacks apply again. Registration is only allowed while loading a plugin. Each callback invocation is serialized with reload in the Lua actor. A callback already executing finishes before reload; a network request spanning reload uses the newly installed `after` callback when it returns (not a request-wide callback snapshot).
 
+## Tool-pipeline hooks
+
+Every dispatched tool call (native, Lua, MCP, nested `run_code` calls, and subagent sessions) runs:
+
+```
+pre_tool chain → [ask → approval] → guard → approval policy → tool_execute(next = tool) → post_tool chain → tool_result
+```
+
+```lua
+-- Interception hooks are middleware: fn(ev, next). First registered is outermost.
+-- Call next() to continue; return a decision to short-circuit; nil = next()'s default.
+rness.hook.on("pre_tool", { match = "Bash" }, function(ev, next)
+  if ev.args.command:match("rm %-rf /") then
+    return { kind = "deny", reason = "refusing to delete /" }
+  end
+  if ev.args.command:match("^git push") then
+    return { kind = "ask", reason = "pushes need a human" }
+  end
+  return next()                                  -- default { kind = "allow" }
+end)
+
+-- Final synchronous veto, after the whole pre_tool chain allowed.
+rness.hook.guard(function(ev)
+  if ev.tool == "Write" and ev.args.path:match("%.env$") then
+    return { kind = "deny", reason = ".env is read-only" }
+  end
+end)
+
+rness.hook.on("post_tool", { match = "Bash" }, function(ev, next)
+  local d = next()                               -- default { kind = "accept" }
+  if not ev.result.is_error and #ev.result.output > 20000 then
+    return { kind = "accept", content = ev.result.output:sub(1, 20000) .. "\n[truncated by hook]" }
+  end
+  if ev.result.output:match("FAILED") then
+    return { kind = "block", feedback = "Tests failed; fix them before continuing.",
+             additional_contexts = { "Run `cargo test` after each change." } }
+  end
+  return d
+end)
+
+rness.hook.on("tool_result", function(ev)        -- observe-only
+  rness.log.info(ev.tool .. " -> " .. (ev.result.is_error and "error" or "ok"))
+end)
+
+-- Around the tool body: next() runs it and returns { content, output, is_error }.
+-- Call next() again to retry, or skip it to short-circuit.
+rness.hook.on("tool_execute", { match = "WebFetch" }, function(ev, next)
+  local r = next()
+  if r.is_error and r.output:match("timed out") then r = next() end
+  return r
+end)
+```
+
+- Payload: `session`, `call`, `tool`, `args` (frozen: arguments cannot be rewritten, and whatever you pass to `next` is ignored), `parent` and `lineage` (delegating ancestors, nearest first; `nil`/empty for top-level sessions). `post_tool`/`tool_result` add `result = { content, output, is_error, duration_ms }`.
+- `opts.match` is an anchored regex (Rust syntax) over `ev.tool`. `opts.agent = "<session id>"` limits a handler to that session and its delegated descendants. Hooks without `agent` fire for every session, including subagents. A filtered-out handler is transparent.
+- `pre_tool` decisions: `{kind="allow"}` means no objection — it never bypasses the configured approval policy or per-tool rules. `{kind="deny", reason}` fails the call with `reason`. `{kind="ask", reason?}` prompts even under `--approval allow`; the reason is shown in the approval card. A granted ask is that call's approval. With no approver, or under `never`/a `deny` rule, the ask fails closed.
+- `guard` returns `{kind="deny", reason}` or `nil`. Guards run in registration order; the first denial wins. A failing guard denies.
+- `post_tool` decisions: `{kind="accept", content=?}` or `value=?` (not both) to replace model-visible output (string or content-part array); `{kind="block", feedback}` replaces the result with an error. Both accept `additional_contexts` (string or string array), committed as sourced user messages after the step's tool results, before the next model request. Denied calls also reach `post_tool`.
+- Failures: an error thrown in `pre_tool` becomes the call's final error result (no `post_tool`). An error in `post_tool` replaces the result with an error. An unknown decision `kind` counts as a failure. `tool_result` errors are logged only.
+- `tool_execute` runs only for calls that passed every gate. It must return `{content = string | parts, is_error = bool?}` (`output` is accepted as a text alias, so `return next()` works unchanged). Returning `nil` after calling `next()` keeps the last run's result; returning `nil` without calling it is an error. An error in the wrapper becomes an error result that still reaches `post_tool`. `next()` yields the VM while the tool runs, so other hooks and parallel calls keep flowing; any other `coroutine.yield` inside a wrapper is an error. Each wrapper segment gets its own 30-second ceiling. If the turn is cancelled after the tool body has run, the call keeps the body's result.
+- Each chain runs on the Lua actor with a 30-second ceiling. Turn cancellation interrupts `pre_tool`/`guard`. Parallel calls serialize through the single VM. Do not synchronously dispatch tools from a hook. When no handler is registered for a phase, the phase skips the VM entirely.
+
+**Agent scoping** — all hooks (tool, loop, lifecycle, notification) support `opts.agent`:
+
+```lua
+-- Only fires for session "root" and its delegation descendants.
+rness.hook.on("pre_step", {agent = "root"}, function(ev, next)
+  return next()
+end)
+
+-- Same scoping works on notification hooks.
+rness.hook.on("session_start", {agent = "root"}, function(ev)
+  rness.session.inject(ev.session, "You are the root agent.")
+end)
+```
+
+The `agent` value is a session ID. A handler fires when:
+1. `ev.session` matches the agent ID exactly, OR
+2. The agent ID appears in `ev.lineage` (the delegation ancestor chain, nearest first).
+
+This means a handler scoped to a parent session also fires for all its subagent children. When `opts.agent` is omitted, the handler fires for all sessions.
+
+### Loop hooks
+
+These intercept the agent turn loop. Like tool hooks, they use `fn(ev, next)` middleware chains; `ev` always carries `session`, `turn`, `step`.
+
+```lua
+-- Reject the step entirely (no model call).
+rness.hook.on("pre_step", function(ev, next)
+  if ev.step > 20 then return { kind = "reject" } end
+  return next()  -- default { kind = "enter" }
+end)
+
+-- Inject context into the model request.
+rness.hook.on("pre_step", function(ev, next)
+  return { kind = "enter", messages = { "Remember: always use British English." } }
+end)
+
+-- Observe every model request (currently no config override).
+rness.hook.on("request", function(ev, next) return next() end)
+
+-- Retry a non-retryable error.
+rness.hook.on("request_error", function(ev, next)
+  if ev.error.code == "RATE_LIMIT" then return { kind = "retry" } end
+  return next()  -- default: let the engine's retry/fail logic decide
+end)
+
+-- Extend a turn that would otherwise stop.
+rness.hook.on("turn_stopping", function(ev, next)
+  if ev.step == 1 then
+    return { kind = "continue", messages = { "Please also write unit tests." } }
+  end
+  return next()  -- default { kind = "stop" }
+end)
+```
+
+- `pre_step` decisions: `{kind="enter"}` (default), `{kind="enter", messages={"...", ...}}` to inject context, or `{kind="reject"}` to end the turn. Injected messages are committed as `UserMessage{intent: Inject, source: Hook}`.
+- `request` is currently observe-only (`next()` returns nil). A future phase will expose per-step model config overrides.
+- `request_error` decisions: `{kind="retry"}` forces a retry even for non-retryable errors (the 500 ms backoff still applies); `nil`/no `kind` defers to the engine's built-in retry budget. The payload includes `ev.error = {code, message, retryable, attempt, max_retries}`.
+- `turn_stopping` fires when the model says "end turn" (EndTurn or truncation with no tool calls). Return `{kind="continue", messages={"..."}}` to inject a steer and continue; `{kind="stop"}` (default) closes the turn. Messages are committed as `UserMessage{intent: Steer, source: Hook}`.
+- Failure semantics: a throwing `pre_step` is logged and treated as Enter (step proceeds); other hook errors are logged and the default applies. No loop hook failure is fatal to the turn.
+
+### Lifecycle hooks
+
+Notification-only hooks for session and subagent lifecycle events. These fire via `rness.hook.on()` but are not waterfall chains — there is no `next()` or return value.
+
+```lua
+-- Fires once per burst (idle → running transition).
+-- source: "startup" (first run) or "resume" (subsequent).
+rness.hook.on("session_start", function(ev)
+  print("session started:", ev.session, ev.source)
+  if ev.delegation then
+    print("  child of", ev.delegation.parent, "depth", ev.delegation.depth)
+  end
+  -- Inject context visible to the model on the first step:
+  rness.session.inject(ev.session, "Always respond in formal English.")
+end)
+
+-- Fires when a subagent child is created (before its first turn).
+rness.hook.on("subagent_start", function(ev)
+  print("subagent started:", ev.child, "parent:", ev.parent)
+  -- ev.agent: agent name (or nil for generic)
+  -- ev.mode: "OneShot" or "Continuable"
+  -- ev.depth: delegation depth
+end)
+
+-- Fires when a subagent settles (one-shot completes, or continuable idles).
+rness.hook.on("subagent_stop", function(ev)
+  print("subagent stopped:", ev.child, "outcome:", ev.outcome)
+  -- ev.outcome: "completed", "aborted", or "error"
+end)
+```
+
+**`rness.session.inject(session, text)`** — Queue context into a session's next step without waking an idle session or starting a turn. The message is committed as `UserMessage{intent: Inject}`. Useful inside `session_start` to seed model context. Returns `"queued"`, `"started"`, or `"logged"`.
+
+### hooks.json bridge
+
+Declarative command hooks — no Lua required. Place a `hooks.json` in `.rness/hooks.json` (project) or `~/.rness/hooks.json` (user). Format:
+
+```json
+{
+  "hooks": {
+    "pre_tool": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "my-pre-tool-checker", "timeout": 10 }
+        ]
+      }
+    ],
+    "session_start": [
+      {
+        "hooks": [
+          { "type": "command", "command": "my-session-logger" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Each command hook:
+- Receives the hook payload as JSON on **stdin**.
+- Prints a JSON decision on **stdout** (for interception hooks: `pre_tool`, `guard`, `post_tool`, `tool_execute`, `pre_step`, `request`, `request_error`, `turn_stopping`). Notification hooks ignore stdout.
+- Exit code 0 = success; non-zero = error (logged, default decision applied).
+- `timeout` is in seconds (default 30).
+- `matcher` is optional: when set, only fires for matching `tool`/`source` names (same as `opts.match` in Lua).
+- Only `"type": "command"` hooks are supported; other types are logged and skipped.
+
+The bare format (without the `"hooks"` wrapper) is also accepted:
+```json
+{
+  "pre_tool": [
+    { "hooks": [{ "type": "command", "command": "echo ok" }] }
+  ]
+}
+```
+
+Project hooks (`.rness/hooks.json`) load before user hooks (`~/.rness/hooks.json`). Both files are optional.
+
+### Hook audit events
+
+Every hook invocation is durably recorded in the session log as paired `hook/invoked` + `hook/result` events:
+
+```json
+{"hook/invoked": {"turn": 1, "point": "pre_tool", "source": "lua", "matcher": "Bash", "handler_id": "..."}}
+{"hook/result":  {"turn": 1, "point": "pre_tool", "handler_id": "...", "decision": "allow", "duration_ms": 3}}
+```
+
+For command hooks, `source` is `"command"` and `hook/result` includes `exit_code` and `stderr_summary` (bounded to 500 chars). These events are audit-only — they never appear in model context.
+
 ### Durable background jobs
 
 The CLI persists jobs under `<session-root>/jobs`, including owner, status, output and read cursor. Output is appended and synced to a separate `.output` file; small metadata snapshots are atomically replaced only on lifecycle/read/delivery changes. Abandoned running jobs recover as `interrupted`, never automatically rerun. Process-owner file locks prevent another live Rness instance from being mistaken for a crashed owner; live instances' jobs are not imported. Completion notices carry a stable job ID in the session message's provenance. Admission deduplicates queued IDs and checks durable provenance before retrying, so losing the job-side acknowledgment after the session commit does not append a duplicate. The job is acknowledged only after the session record is visible. This guarantees idempotent session-message insertion under the session service's existing single-writer ownership; it does not promise exactly-once model execution or external side effects. Persistence errors cancel the producer and are logged. Tests cover concurrent retries, lost acknowledgment/restart, output-before-settlement recovery, abandoned partial metadata, append failure, read-cursor recovery and live-owner exclusion. No supervisor or process reconnection is provided.

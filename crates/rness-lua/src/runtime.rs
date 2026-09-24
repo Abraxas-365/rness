@@ -264,6 +264,7 @@ impl LuaRuntime {
 
     pub fn new() -> Result<Self, LuaError> {
         let lua = Lua::new();
+        lua.set_app_data(HookCounts::default());
         install_api(&lua)?;
         Ok(Self {
             lua,
@@ -1327,20 +1328,7 @@ impl LuaRuntime {
         command: &mut CommandThread,
         args: impl mlua::IntoLuaMulti,
     ) -> Result<ToolStep, String> {
-        let globals = self.lua.globals();
-        let run = || -> mlua::Result<mlua::MultiValue> {
-            let owner: LuaValue = globals.get("__rness_callback_owner")?;
-            let depth: LuaValue = globals.get("__rness_callback_depth")?;
-            globals.set("__rness_callback_owner", command.owner.clone())?;
-            globals.set("__rness_callback_depth", command.depth.clone())?;
-            let result = command.thread.resume(args);
-            command.owner = globals.get("__rness_callback_owner")?;
-            command.depth = globals.get("__rness_callback_depth")?;
-            globals.set("__rness_callback_owner", owner)?;
-            globals.set("__rness_callback_depth", depth)?;
-            result
-        };
-        let values = run().map_err(|e| user_message(&e))?;
+        let values = self.resume_thread(command, args)?;
         if command.thread.status() == mlua::ThreadStatus::Resumable {
             if values.len() != 1 {
                 return Err("unsupported tool yield".into());
@@ -1424,6 +1412,157 @@ impl LuaRuntime {
             }
             Err(e) => Ok(Err(user_message(&e))),
         }
+    }
+
+    /// Run an interception chain: `fn(ev, next)` handlers, first
+    /// registered outermost; the innermost `next()` returns `default`.
+    /// Guards (`rness.hook.guard`) instead run in order with no `next`;
+    /// the first non-nil return wins. A nil chain result means `default`.
+    pub(crate) fn intercept(
+        &self,
+        event: &str,
+        payload: &serde_json::Value,
+        default: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let run = || -> mlua::Result<serde_json::Value> {
+            let hooks: Table = self.lua.globals().get("__rness_hooks")?;
+            let handlers = match hooks.get::<Option<Table>>(event)? {
+                Some(handlers) => handlers.sequence_values::<Function>().collect::<mlua::Result<Vec<_>>>()?,
+                None => Vec::new(),
+            };
+            let ev = self.lua.to_value(payload)?;
+            if event == GUARD_EVENT {
+                for handler in handlers {
+                    let returned: LuaValue = handler.call((ev.clone(), LuaValue::Nil))?;
+                    if !returned.is_nil() {
+                        return self.lua.from_value(returned);
+                    }
+                }
+                return Ok(default.clone());
+            }
+            let fallback = self.lua.to_value(default)?;
+            let mut next = {
+                let fallback = fallback.clone();
+                self.lua.create_function(move |_, _: mlua::MultiValue| Ok(fallback.clone()))?
+            };
+            for handler in handlers.into_iter().rev() {
+                let (ev, inner) = (ev.clone(), next);
+                // Arguments are frozen: whatever `next` receives, the chain
+                // continues with the original event.
+                next = self.lua.create_function(move |_, _: mlua::MultiValue| {
+                    handler.call::<LuaValue>((ev.clone(), inner.clone()))
+                })?;
+            }
+            let returned: LuaValue = next.call(())?;
+            if returned.is_nil() {
+                return Ok(default.clone());
+            }
+            self.lua.from_value(returned)
+        };
+        run().map_err(|e| user_message(&e))
+    }
+
+    /// Live handler counts, shared with the host handle.
+    pub(crate) fn hook_counts(&self) -> HookCounts {
+        self.lua.app_data_ref::<HookCounts>().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    /// Start a `tool_execute` chain in its own coroutine. The innermost
+    /// `next()` yields a private sentinel; the host runs the tool body and
+    /// resumes with its outcome. Handlers are snapshotted, so unsubscribing
+    /// mid-call does not reshape an in-flight chain.
+    pub(crate) fn execute_thread(&self, payload: &serde_json::Value) -> Result<ExecuteThread, String> {
+        let build = || -> mlua::Result<ExecuteThread> {
+            let hooks: Table = self.lua.globals().get("__rness_hooks")?;
+            let handlers = self.lua.create_sequence_from(match hooks.get::<Option<Table>>(EXECUTE_EVENT)? {
+                Some(handlers) => handlers.sequence_values::<Function>().collect::<mlua::Result<Vec<_>>>()?,
+                None => Vec::new(),
+            })?;
+            let sentinel = self.lua.create_table()?;
+            let start: Function = self
+                .lua
+                .load(
+                    r#"
+                    local handlers, ev, sentinel = ...
+                    local yield = coroutine.yield
+                    -- Arguments are frozen: whatever `next` receives, the
+                    -- chain continues with the original event.
+                    local function body() return yield(sentinel) end
+                    local function at(i)
+                      local handler = handlers[i]
+                      if handler == nil then return body end
+                      local inner = at(i + 1)
+                      return function() return handler(ev, inner) end
+                    end
+                    return at(1)
+                    "#,
+                )
+                .set_name("=rness.hook.tool_execute")
+                .call((handlers, self.lua.to_value(payload)?, sentinel.clone()))?;
+            Ok(ExecuteThread {
+                thread: CommandThread { thread: self.lua.create_thread(start)?, owner: LuaValue::Nil, depth: LuaValue::Nil },
+                sentinel,
+            })
+        };
+        build().map_err(|e| user_message(&e))
+    }
+
+    /// Resume a `tool_execute` chain: `input` is `None` to start, else the
+    /// last body outcome. Stops at the next `next()` or the chain's result.
+    pub(crate) fn resume_execute(
+        &self,
+        exec: &mut ExecuteThread,
+        input: Option<serde_json::Value>,
+        cancel: &tokio_util::sync::CancellationToken,
+        deadline: std::time::Instant,
+    ) -> Result<ExecuteStep, String> {
+        let token = cancel.clone();
+        exec.thread.thread.set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+            if token.is_cancelled() || std::time::Instant::now() >= deadline {
+                Err(mlua::Error::runtime("tool_execute hook cancelled or timed out"))
+            } else {
+                Ok(mlua::VmState::Continue)
+            }
+        });
+        let result = if cancel.is_cancelled() {
+            Err("tool_execute hook cancelled".to_string())
+        } else {
+            input
+                .map(|value| self.lua.to_value(&value))
+                .transpose()
+                .map_err(|e| e.to_string())
+                .and_then(|value| self.resume_thread(&mut exec.thread, value.unwrap_or(LuaValue::Nil)))
+        };
+        self.lua.remove_hook();
+        let values = result?;
+        if exec.thread.thread.status() == mlua::ThreadStatus::Resumable {
+            return match values.front() {
+                Some(LuaValue::Table(t)) if values.len() == 1 && *t == exec.sentinel => Ok(ExecuteStep::Body),
+                _ => Err("unsupported yield in a tool_execute hook".into()),
+            };
+        }
+        match values.into_iter().next().unwrap_or(LuaValue::Nil) {
+            LuaValue::Nil => Ok(ExecuteStep::Done(serde_json::Value::Null)),
+            value => self.lua.from_value(value).map(ExecuteStep::Done).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Resume a parked coroutine with its own callback-owner context.
+    fn resume_thread(&self, command: &mut CommandThread, args: impl mlua::IntoLuaMulti) -> Result<mlua::MultiValue, String> {
+        let globals = self.lua.globals();
+        let run = || -> mlua::Result<mlua::MultiValue> {
+            let owner: LuaValue = globals.get("__rness_callback_owner")?;
+            let depth: LuaValue = globals.get("__rness_callback_depth")?;
+            globals.set("__rness_callback_owner", command.owner.clone())?;
+            globals.set("__rness_callback_depth", command.depth.clone())?;
+            let result = command.thread.resume(args);
+            command.owner = globals.get("__rness_callback_owner")?;
+            command.depth = globals.get("__rness_callback_depth")?;
+            globals.set("__rness_callback_owner", owner)?;
+            globals.set("__rness_callback_depth", depth)?;
+            result
+        };
+        run().map_err(|e| user_message(&e))
     }
 
     /// Fire an event's hooks in registration order. Hook errors are
@@ -1967,6 +2106,168 @@ impl LuaRuntime {
     }
 }
 
+/// Event name of `rness.hook.guard` handlers.
+pub(crate) const GUARD_EVENT: &str = "guard";
+/// Around-execution wrapper chain (dsh `tools/execute`).
+pub(crate) const EXECUTE_EVENT: &str = "tool_execute";
+
+/// A `tool_execute` chain parked on the VM actor. Its `next()` yields
+/// `sentinel` to request one tool-body run.
+pub(crate) struct ExecuteThread {
+    thread: CommandThread,
+    sentinel: Table,
+}
+
+pub(crate) enum ExecuteStep {
+    /// The chain called `next()`: run the tool body, then resume.
+    Body,
+    Done(serde_json::Value),
+}
+
+/// Live handler count per hook event, shared with the host handle so
+/// engine seams can skip the actor round trip when nobody listens.
+#[derive(Clone, Default)]
+pub struct HookCounts(std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>);
+
+impl HookCounts {
+    pub fn has(&self, event: &str) -> bool {
+        self.0.lock().expect("hook counts lock").get(event).is_some_and(|n| *n > 0)
+    }
+
+    fn adjust(lua: &Lua, event: &str, up: bool) {
+        let Some(counts) = lua.app_data_ref::<HookCounts>() else { return };
+        let mut counts = counts.0.lock().expect("hook counts lock");
+        let n = counts.entry(event.to_owned()).or_default();
+        *n = if up { *n + 1 } else { n.saturating_sub(1) };
+    }
+}
+
+/// `rness.hook.on` opts: `match` is an anchored regex over the payload's
+/// subject (`tool`, else `source`); `agent` keeps events of that session
+/// and its delegated descendants (payload `lineage`).
+struct HookFilter {
+    matcher: Option<regex::Regex>,
+    agent: Option<String>,
+}
+
+impl HookFilter {
+    fn parse(opts: Option<&Table>) -> mlua::Result<Self> {
+        let Some(opts) = opts else { return Ok(Self { matcher: None, agent: None }) };
+        let pattern: Option<String> = opts.get("match")?;
+        let matcher = pattern
+            .filter(|p| !p.is_empty() && p != "*")
+            .map(|p| regex::Regex::new(&format!("^(?:{p})$")))
+            .transpose()
+            .map_err(|e| mlua::Error::runtime(format!("rness.hook.on: invalid match: {e}")))?;
+        Ok(Self { matcher, agent: opts.get("agent")? })
+    }
+
+    fn accepts(&self, payload: &LuaValue) -> mlua::Result<bool> {
+        if self.matcher.is_none() && self.agent.is_none() {
+            return Ok(true);
+        }
+        let LuaValue::Table(ev) = payload else { return Ok(false) };
+        if let Some(matcher) = &self.matcher {
+            let subject = match ev.get::<Option<String>>("tool")? {
+                Some(tool) => Some(tool),
+                None => ev.get::<Option<String>>("source")?,
+            };
+            if !subject.is_some_and(|s| matcher.is_match(&s)) {
+                return Ok(false);
+            }
+        }
+        if let Some(agent) = &self.agent {
+            if ev.get::<Option<String>>("session")?.as_deref() == Some(agent.as_str()) {
+                return Ok(true);
+            }
+            let Some(lineage) = ev.get::<Option<Table>>("lineage")? else { return Ok(false) };
+            for index in 1..=lineage.raw_len() {
+                if lineage.raw_get::<Option<String>>(index)?.as_deref() == Some(agent.as_str()) {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+/// Shared by `rness.hook.on` and `rness.hook.guard`. Handlers are stored
+/// as `wrapper(ev, next)` in `__rness_hooks[event]`; a filtered-out
+/// wrapper is transparent (delegates to `next`, or returns nil).
+fn register_hook(
+    lua: &Lua,
+    event: String,
+    second: LuaValue,
+    third: Option<Function>,
+) -> mlua::Result<Function> {
+    let (opts, handler) = match (second, third) {
+        (LuaValue::Function(handler), None) => (None, handler),
+        (LuaValue::Table(opts), Some(handler)) => (Some(opts), handler),
+        (LuaValue::Nil, Some(handler)) => (None, handler),
+        _ => return Err(mlua::Error::runtime("usage: rness.hook.on(event, [opts,] fn)")),
+    };
+    let filter = HookFilter::parse(opts.as_ref())?;
+    let hooks: Table = lua.globals().get("__rness_hooks")?;
+    let handlers: Table = match hooks.get::<Option<Table>>(&*event)? {
+        Some(t) => t,
+        None => {
+            let t = lua.create_table()?;
+            hooks.set(&*event, &t)?;
+            t
+        }
+    };
+    let handler = owned_command(lua, handler)?;
+    // Lua-source frames so a `tool_execute` handler can yield from `next()`.
+    let cell = lua.create_table()?;
+    cell.raw_set(1, handler)?;
+    let accepts = lua.create_function(move |_, payload: LuaValue| filter.accepts(&payload))?;
+    let wrapper: Function = lua
+        .load(
+            r#"
+            local cell, accepts = ...
+            return function(ev, next)
+              local handler = cell[1]
+              if handler ~= nil and accepts(ev) then return handler(ev, next) end
+              if next ~= nil then return next(ev) end
+            end
+            "#,
+        )
+        .set_name("=rness.hook")
+        .call((cell.clone(), accepts))?;
+    handlers.push(wrapper.clone())?;
+    HookCounts::adjust(lua, &event, true);
+    let unsubscribe = lua.create_function(move |lua, ()| {
+        let removed = cell.raw_get::<Option<Function>>(1)?.is_some();
+        if removed {
+            cell.raw_set(1, LuaValue::Nil)?;
+            HookCounts::adjust(lua, &event, false);
+            for index in 1..=handlers.raw_len() {
+                if handlers.raw_get::<Function>(index)? == wrapper {
+                    for next in index + 1..=handlers.raw_len() {
+                        handlers.raw_set(next - 1, handlers.raw_get::<Function>(next)?)?;
+                    }
+                    handlers.raw_set(handlers.raw_len(), LuaValue::Nil)?;
+                    break;
+                }
+            }
+        }
+        Ok(removed)
+    })?;
+    let loading: Option<Table> = lua.globals().get("__rness_loading_hooks")?;
+    let owner: Option<Table> = lua.globals().get("__rness_callback_owner")?;
+    let owner = owner.or(lua.globals().get::<Option<Table>>("__rness_load_owner")?);
+    if let Some(owner) = &owner {
+        owner.push(unsubscribe.clone())?;
+    }
+    if let Some(cleanup) = loading {
+        if owner.as_ref() != Some(&cleanup) {
+            cleanup.push(unsubscribe.clone())?;
+        }
+    }
+    Ok(unsubscribe)
+}
+
 /// Capture the registration owner and restore it across nested callbacks,
 /// including errors. Declaration APIs remain load-time only.
 fn owned_callback(lua: &Lua, callback: Function) -> mlua::Result<Function> {
@@ -2090,6 +2391,40 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     // event name → array of handlers. Lua-side so rness.events.emit and
     // host-fired hooks dispatch to the same table.
     lua.globals().set("__rness_hooks", lua.create_table()?)?;
+
+    // Command hook runner for hooks.json bridge. Runs a shell command
+    // synchronously (the Lua actor is a plain OS thread), writes the
+    // payload JSON to stdin, parses stdout as a JSON decision.
+    lua.globals().set(
+        "__rness_run_command_hook",
+        lua.create_function(
+            |lua, (command, timeout, payload): (String, u64, LuaValue)| {
+                let payload_json = match serde_json::to_string(
+                    &lua.from_value::<serde_json::Value>(payload)?,
+                ) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return Err(mlua::Error::runtime(format!(
+                            "command hook payload serialization: {e}"
+                        )));
+                    }
+                };
+                let result =
+                    crate::hooks_json::run_command(&command, timeout, &payload_json);
+                if result.exit_code != 0 {
+                    let msg = result
+                        .stderr_summary
+                        .unwrap_or_else(|| format!("exit code {}", result.exit_code));
+                    tracing::warn!(command = %command, exit_code = result.exit_code, "command hook failed: {msg}");
+                    return Ok(LuaValue::Nil);
+                }
+                match result.decision {
+                    Some(value) => lua.to_value(&value),
+                    None => Ok(LuaValue::Nil),
+                }
+            },
+        )?,
+    )?;
 
     let rness = lua.create_table()?;
     let web_hooks = lua.create_table()?;
@@ -2610,58 +2945,23 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     )?;
     rness.set("tasks", tasks)?;
 
-    // rness.hook.on(event, handler)
+    // rness.hook.on(event, [opts,] handler) — opts.match (anchored regex
+    // on ev.tool / ev.source) and opts.agent (session id: that agent and
+    // its delegated descendants). Handlers get (ev, next): interception
+    // events pass a `next` continuation; notifications pass nil.
     let hook = lua.create_table()?;
     hook.set(
         "on",
-        lua.create_function(|lua, (event, handler): (String, Function)| {
-            let hooks: Table = lua.globals().get("__rness_hooks")?;
-            let handlers: Table = match hooks.get::<Option<Table>>(&*event)? {
-                Some(t) => t,
-                None => {
-                    let t = lua.create_table()?;
-                    hooks.set(&*event, &t)?;
-                    t
-                }
-            };
-            let handler = owned_callback(lua, handler)?;
-            let callback = std::sync::Arc::new(std::sync::Mutex::new(Some(handler)));
-            let current = callback.clone();
-            let wrapper = lua.create_function(move |_, payload: LuaValue| {
-                let handler = current.lock().expect("hook lock").clone();
-                if let Some(handler) = handler {
-                    handler.call::<()>(payload)?;
-                }
-                Ok(())
-            })?;
-            handlers.push(wrapper.clone())?;
-            let unsubscribe = lua.create_function(move |_, ()| {
-                let removed = callback.lock().expect("hook lock").take().is_some();
-                if removed {
-                    for index in 1..=handlers.raw_len() {
-                        if handlers.raw_get::<Function>(index)? == wrapper {
-                            for next in index + 1..=handlers.raw_len() {
-                                handlers.raw_set(next - 1, handlers.raw_get::<Function>(next)?)?;
-                            }
-                            handlers.raw_set(handlers.raw_len(), LuaValue::Nil)?;
-                            break;
-                        }
-                    }
-                }
-                Ok(removed)
-            })?;
-            let loading: Option<Table> = lua.globals().get("__rness_loading_hooks")?;
-            let owner: Option<Table> = lua.globals().get("__rness_callback_owner")?;
-            let owner = owner.or(lua.globals().get::<Option<Table>>("__rness_load_owner")?);
-            if let Some(owner) = &owner {
-                owner.push(unsubscribe.clone())?;
-            }
-            if let Some(cleanup) = loading {
-                if owner.as_ref() != Some(&cleanup) {
-                    cleanup.push(unsubscribe.clone())?;
-                }
-            }
-            Ok(unsubscribe)
+        lua.create_function(|lua, (event, second, third): (String, LuaValue, Option<Function>)| {
+            register_hook(lua, event, second, third)
+        })?,
+    )?;
+    // rness.hook.guard([opts,] fn) — final synchronous veto after the
+    // pre_tool chain allowed: return {kind="deny", reason} or nil.
+    hook.set(
+        "guard",
+        lua.create_function(|lua, (first, second): (LuaValue, Option<Function>)| {
+            register_hook(lua, GUARD_EVENT.into(), first, second)
         })?,
     )?;
     rness.set("hook", hook)?;
@@ -3830,6 +4130,111 @@ mod tests {
     }
 
     #[test]
+    fn intercept_chains_with_next_filters_and_guards() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load(
+            "chain",
+            r#"
+            order = {}
+            rness.hook.on("pre_tool", function(ev, next)
+              order[#order+1] = "outer"
+              local d = next()
+              order[#order+1] = "outer:" .. d.kind
+              return d
+            end)
+            rness.hook.on("pre_tool", {match = "Bash|Write"}, function(ev, next)
+              order[#order+1] = "inner:" .. ev.tool
+              if ev.args.command == "rm -rf /" then return {kind = "deny", reason = "nope"} end
+              return next({args = "ignored"})
+            end)
+            rness.hook.on("pre_tool", {agent = "root"}, function(ev, next)
+              order[#order+1] = "scoped:" .. ev.session
+              return {kind = "ask", reason = "child of root"}
+            end)
+            rness.hook.guard(function(ev) if ev.tool == "Write" then return {kind = "deny", reason = "ro"} end end)
+            rness.hook.guard(function(ev) error("unreached for Write") end)
+            "#,
+        )
+        .unwrap();
+        let allow = json!({"kind": "allow"});
+        assert!(rt.hook_counts().has("pre_tool") && rt.hook_counts().has(GUARD_EVENT));
+        assert!(!rt.hook_counts().has("post_tool"));
+
+        let d = rt.intercept("pre_tool", &json!({"session": "s", "tool": "Read", "args": {}}), &allow).unwrap();
+        assert_eq!(d, allow);
+        let d = rt.intercept("pre_tool", &json!({"session": "s", "tool": "Bash", "args": {"command": "rm -rf /"}}), &allow).unwrap();
+        assert_eq!(d, json!({"kind": "deny", "reason": "nope"}));
+        let child = json!({"session": "c", "lineage": ["root"], "tool": "Bash", "args": {"command": "ls"}});
+        let d = rt.intercept("pre_tool", &child, &allow).unwrap();
+        assert_eq!(d["kind"], "ask");
+        rt.load(
+            "check",
+            r#"
+            local want = {"outer", "outer:allow", "outer", "inner:Bash", "outer:deny", "outer", "inner:Bash", "scoped:c", "outer:ask"}
+            assert(#order == #want, #order)
+            for i, v in ipairs(want) do assert(order[i] == v, i .. ":" .. tostring(order[i])) end
+            "#,
+        )
+        .unwrap();
+
+        let d = rt.intercept(GUARD_EVENT, &json!({"tool": "Write"}), &serde_json::Value::Null).unwrap();
+        assert_eq!(d["reason"], "ro");
+        assert!(rt.intercept(GUARD_EVENT, &json!({"tool": "Read"}), &serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn tool_execute_chain_yields_for_the_body_and_can_retry() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load(
+            "exec",
+            r#"
+            rness.hook.on("tool_execute", function(ev, next)
+              local r = next()
+              if r.is_error then r = next() end
+              return {content = (r.output or r.content) .. "+outer", is_error = r.is_error}
+            end)
+            rness.hook.on("tool_execute", {match = "cached"}, function(ev, next)
+              return {content = "hit"}
+            end)
+            "#,
+        )
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut exec = rt.execute_thread(&json!({"tool": "echo"})).unwrap();
+        assert!(matches!(rt.resume_execute(&mut exec, None, &cancel, deadline), Ok(ExecuteStep::Body)));
+        assert!(matches!(rt.resume_execute(&mut exec, Some(json!({"output": "x", "is_error": true})), &cancel, deadline), Ok(ExecuteStep::Body)));
+        let Ok(ExecuteStep::Done(done)) = rt.resume_execute(&mut exec, Some(json!({"output": "ok", "is_error": false})), &cancel, deadline) else { panic!() };
+        assert_eq!(done, json!({"content": "ok+outer", "is_error": false}));
+
+        // The inner handler short-circuits: the body never runs.
+        let mut exec = rt.execute_thread(&json!({"tool": "cached"})).unwrap();
+        let Ok(ExecuteStep::Done(done)) = rt.resume_execute(&mut exec, None, &cancel, deadline) else { panic!() };
+        assert_eq!(done["content"], "hit+outer");
+
+        // Foreign yields are rejected rather than parked.
+        rt.load("y", r#"rness.hook.on("tool_execute", {match = "odd"}, function() coroutine.yield(1) end)"#).unwrap();
+        let mut exec = rt.execute_thread(&json!({"tool": "odd"})).unwrap();
+        assert!(matches!(rt.resume_execute(&mut exec, None, &cancel, deadline), Err(e) if e.contains("unsupported yield")));
+    }
+
+    #[test]
+    fn intercept_errors_and_unsubscribe_update_counts() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load("p", r#"off = rness.hook.on("post_tool", function() error("bad hook") end)"#).unwrap();
+        let err = rt.intercept("post_tool", &json!({}), &json!({"kind": "accept"})).unwrap_err();
+        assert!(err.contains("bad hook"));
+        rt.load("q", "assert(off() == true)").unwrap();
+        assert!(!rt.hook_counts().has("post_tool"));
+        assert_eq!(rt.intercept("post_tool", &json!({}), &json!({"kind": "accept"})).unwrap(), json!({"kind": "accept"}));
+        assert!(rt.load("bad", r#"rness.hook.on("pre_tool", {match = "("}, function() end)"#).is_err());
+        // Existing notification handlers still get (payload) and work.
+        rt.load("n", r#"got = nil; rness.hook.on("tick", function(p, next) got = p.n; assert(next == nil) end)"#).unwrap();
+        assert!(rt.fire_hook("tick", &json!({"n": 3})).is_empty());
+        rt.load("c", "assert(got == 3)").unwrap();
+    }
+
+    #[test]
     fn statusline_provider_is_queried() {
         let mut rt = LuaRuntime::new().unwrap();
         assert_eq!(rt.statusline(), None);
@@ -3957,6 +4362,123 @@ mod tests {
         .unwrap();
         assert!(rt.fire_hook("test", &serde_json::json!({})).is_empty());
         rt.load("check", "assert(seen == 'accdcd')").unwrap();
+    }
+
+    #[test]
+    fn fire_hook_agent_scoping_filters_by_session_and_lineage() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load(
+            "hooks",
+            r#"
+            hits = {}
+            -- Global handler (no opts.agent): fires for all sessions.
+            rness.hook.on("session_start", function(ev)
+                hits[#hits+1] = "all:" .. ev.session
+            end)
+            -- Scoped handler: fires only for session "root" and its children.
+            rness.hook.on("session_start", {agent = "root"}, function(ev)
+                hits[#hits+1] = "root:" .. ev.session
+            end)
+            -- Scoped handler: fires only for session "child" exactly.
+            rness.hook.on("session_start", {agent = "child"}, function(ev)
+                hits[#hits+1] = "child:" .. ev.session
+            end)
+            "#,
+        )
+        .unwrap();
+
+        // Fire for "root" session (no lineage).
+        assert!(rt
+            .fire_hook(
+                "session_start",
+                &serde_json::json!({"session": "root", "lineage": []}),
+            )
+            .is_empty());
+
+        // Fire for "child" session (child of "root").
+        assert!(rt
+            .fire_hook(
+                "session_start",
+                &serde_json::json!({"session": "child", "lineage": ["root"]}),
+            )
+            .is_empty());
+
+        // Fire for "other" session (no lineage, not "root" or "child").
+        assert!(rt
+            .fire_hook(
+                "session_start",
+                &serde_json::json!({"session": "other", "lineage": []}),
+            )
+            .is_empty());
+
+        rt.load(
+            "check",
+            r#"
+            local want = {
+                "all:root", "root:root",           -- root: global + root-scoped
+                "all:child", "root:child", "child:child", -- child: global + root (ancestor) + child
+                "all:other",                       -- other: global only
+            }
+            assert(#hits == #want, "count: " .. #hits .. " vs " .. #want)
+            for i, v in ipairs(want) do
+                assert(hits[i] == v, i .. ": expected " .. v .. " got " .. tostring(hits[i]))
+            end
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn intercept_agent_scoping_works_on_loop_hooks() {
+        let mut rt = LuaRuntime::new().unwrap();
+        rt.load(
+            "hooks",
+            r#"
+            results = {}
+            -- Global handler.
+            rness.hook.on("pre_step", function(ev, next)
+                results[#results+1] = "all:" .. ev.session
+                return next()
+            end)
+            -- Scoped to "parent" and its delegation descendants.
+            rness.hook.on("pre_step", {agent = "parent"}, function(ev, next)
+                results[#results+1] = "parent:" .. ev.session
+                return {kind = "reject"}
+            end)
+            "#,
+        )
+        .unwrap();
+
+        let default = serde_json::json!({"kind": "enter"});
+        // Unscoped session: global fires, scoped skips → enters.
+        let d = rt
+            .intercept(
+                "pre_step",
+                &serde_json::json!({"session": "s1", "turn": 1, "step": 1, "lineage": []}),
+                &default,
+            )
+            .unwrap();
+        assert_eq!(d["kind"], "enter");
+
+        // Child of "parent": global fires, scoped fires → reject.
+        let d = rt
+            .intercept(
+                "pre_step",
+                &serde_json::json!({"session": "child", "turn": 1, "step": 1, "lineage": ["parent"]}),
+                &default,
+            )
+            .unwrap();
+        assert_eq!(d["kind"], "reject");
+
+        rt.load(
+            "check",
+            r#"
+            local want = {"all:s1", "all:child", "parent:child"}
+            assert(#results == #want, "count: " .. #results)
+            for i, v in ipairs(want) do assert(results[i] == v, i .. ":" .. tostring(results[i])) end
+            "#,
+        )
+        .unwrap();
     }
 
     #[test]

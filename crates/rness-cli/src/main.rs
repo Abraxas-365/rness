@@ -327,7 +327,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Routes and credentials remain exclusively at this composition root.
     // The resolver receives only the durable public route/model selection.
-    let (lua, startup) = rness_lua::plugin_host::LuaHost::spawn_from_init(
+    let (mut lua, startup) = rness_lua::plugin_host::LuaHost::spawn_from_init(
         dirs::home_dir()
             .context("no home directory")?
             .join(".rness/init.lua"),
@@ -680,6 +680,10 @@ async fn main() -> anyhow::Result<()> {
         rness_tools::web::register_with_hooks(&tools, web, Arc::new(lua.clone()))
             .map_err(|e| anyhow::anyhow!("invalid rness.web: {e}"))?;
     }
+    // Tool-pipeline hooks (pre_tool / guard / post_tool / tool_result).
+    // Shared by every derived registry, so they also govern subagents; with
+    // no handler registered each phase short-circuits without the VM.
+    tools.set_hooks(Some(Arc::new(lua.clone())));
 
     // Lua host: the VM boots now, but plugins load AFTER the engine
     // mounts — rness.session/subagents/mcp must exist when a plugin's
@@ -747,6 +751,10 @@ async fn main() -> anyhow::Result<()> {
         .get::<SessionService>("sessions")
         .context("sessions service missing")?;
     sessions.set_images(image_store)?;
+    lua.set_bus(Arc::clone(kernel.bus()));
+    sessions.set_loop_hooks(Some(Arc::new(lua.clone())));
+    // Re-set tool hooks so the clone carries the bus reference for audit events.
+    tools.set_hooks(Some(Arc::new(lua.clone())));
     sessions.set_default_workspace(cwd.to_string_lossy().into_owned())?;
     let legacy_skill_roots = rness_tools::skills::default_roots(&cwd);
     sessions.set_input_resolver(Arc::new(move |workspace, content| {
@@ -825,6 +833,34 @@ async fn main() -> anyhow::Result<()> {
     for (name, err) in rness_lua::loader::load_all(&lua, &plugins).await {
         eprintln!("warning: lua plugin '{name}' failed: {err}");
     }
+
+    // Load hooks.json (project .rness/hooks.json, then user ~/.rness/hooks.json).
+    {
+        let project_hooks = cwd.join(".rness/hooks.json");
+        let user_hooks = dirs::home_dir()
+            .map(|h| h.join(".rness/hooks.json"))
+            .unwrap_or_default();
+        for path in [&project_hooks, &user_hooks] {
+            match rness_lua::hooks_json::load(path) {
+                Ok(Some(config)) => {
+                    let code = rness_lua::hooks_json::generate_lua(&config);
+                    if !code.is_empty() {
+                        if let Err(e) = lua.load("hooks.json", &code).await {
+                            eprintln!(
+                                "warning: hooks.json at {}: {e}",
+                                path.display()
+                            );
+                        } else {
+                            tracing::info!(path = %path.display(), "loaded hooks.json");
+                        }
+                    }
+                }
+                Ok(None) => {} // file doesn't exist, skip
+                Err(e) => eprintln!("warning: {}: {e}", path.display()),
+            }
+        }
+    }
+
     lua.validate_bindings().await.map_err(anyhow::Error::msg)?;
     let installed_lua_tools = rness_lua::api::tools::sync_lua_tools(&tools, &lua, &[]).await;
     lua.fire_hook("ready", serde_json::json!({}));
@@ -832,7 +868,9 @@ async fn main() -> anyhow::Result<()> {
     // Fan bus events out to Lua hooks (fire-and-forget: a slow hook
     // can't block the engine).
     let _lua_hook_subs = {
-        use rness_engine::service::{TurnEndedEv, TurnStartedEv};
+        use rness_engine::service::{
+            SessionStartEv, SubagentStartEv, SubagentStopEv, TurnEndedEv, TurnStartedEv,
+        };
         let l1: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
         let s1 = kernel.bus().on::<TurnStartedEv>(move |n| {
             l1.fire_hook(
@@ -860,7 +898,51 @@ async fn main() -> anyhow::Result<()> {
                 l3.fire_hook("frame", payload);
             }
         });
-        (s1, s2, s3)
+        // Session lifecycle: first burst entry.
+        let l4: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s4 = kernel.bus().on::<SessionStartEv>(move |n| {
+            l4.fire_hook(
+                "session_start",
+                serde_json::json!({
+                    "session": n.session,
+                    "workspace": n.workspace,
+                    "source": n.source,
+                    "delegation": n.delegation.as_ref().map(|d| serde_json::json!({
+                        "parent": d.parent,
+                        "depth": d.depth,
+                        "mode": format!("{:?}", d.mode),
+                    })),
+                }),
+            );
+        });
+        // Subagent lifecycle.
+        let l5: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s5 = kernel.bus().on::<SubagentStartEv>(move |n| {
+            l5.fire_hook(
+                "subagent_start",
+                serde_json::json!({
+                    "session": n.parent,
+                    "parent": n.parent,
+                    "child": n.child,
+                    "agent": n.agent,
+                    "mode": format!("{:?}", n.mode),
+                    "depth": n.depth,
+                }),
+            );
+        });
+        let l6: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s6 = kernel.bus().on::<SubagentStopEv>(move |n| {
+            l6.fire_hook(
+                "subagent_stop",
+                serde_json::json!({
+                    "session": n.parent,
+                    "parent": n.parent,
+                    "child": n.child,
+                    "outcome": n.outcome,
+                }),
+            );
+        });
+        (s1, s2, s3, s4, s5, s6)
     };
 
     if cli.list {

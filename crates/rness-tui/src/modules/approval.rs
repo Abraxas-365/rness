@@ -123,5 +123,9 @@ fn render_args(request: &ApprovalRequest) -> Vec<Line<'static>> {
     if pretty.lines().count() > MAX_LINES {
         lines.push(Line::raw("…"));
     }
+    if let Some(reason) = request.reason.as_deref().filter(|r| !r.trim().is_empty()) {
+        let reason: String = reason.lines().next().unwrap_or("").chars().take(MAX_WIDTH).collect();
+        lines.insert(0, Line::raw(format!("reason: {reason}")));
+    }
     lines
 }

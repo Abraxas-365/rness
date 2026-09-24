@@ -124,6 +124,20 @@ impl Approvals {
         self.decide(request, self.policy()).await
     }
 
+    /// A hook explicitly asked: prompt even under `allow`. `never` and an
+    /// explicit deny rule still reject without prompting (dsh: `ask`
+    /// routes to the approval service, which applies session policy).
+    pub async fn ask(&self, request: &ApprovalRequest) -> Decision {
+        let denied = self.rules.read().expect("rules lock").get(&request.tool).copied()
+            == Some(ToolPolicy::Deny);
+        let policy = match self.policy() {
+            _ if denied => Policy::Never,
+            Policy::Never => Policy::Never,
+            Policy::Allow | Policy::Ask => Policy::Ask,
+        };
+        self.decide(request, policy).await
+    }
+
     async fn decide(&self, request: &ApprovalRequest, policy: Policy) -> Decision {
         match policy {
             Policy::Allow => Decision::Allowed,
@@ -158,6 +172,7 @@ mod tests {
             call: "c1".into(),
             tool: "Bash".into(),
             args: serde_json::json!({}),
+            reason: None,
         }
     }
 

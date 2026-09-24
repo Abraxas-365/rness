@@ -3551,6 +3551,7 @@ mod tests {
                 call: "c1".into(),
                 tool: "Bash".into(),
                 args: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                reason: None,
             },
             respond,
         });

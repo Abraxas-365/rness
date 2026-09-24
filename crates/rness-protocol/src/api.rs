@@ -34,6 +34,9 @@ pub struct ApprovalRequest {
     pub call: ToolCallId,
     pub tool: String,
     pub args: serde_json::Value,
+    /// Why approval is requested, when a `pre_tool` hook asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// The user's answer to an [`ApprovalRequest`]. One-shot: applies to

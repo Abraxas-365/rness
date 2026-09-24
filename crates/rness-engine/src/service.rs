@@ -17,7 +17,7 @@
 //! durable record is written by the turn loop itself.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use rness_kernel::{Context, Event, EventBus, Plugin};
 use rness_protocol::events::{
@@ -93,6 +93,70 @@ pub struct SessionIdleEv;
 impl Event for SessionIdleEv {
     const NAME: &'static str = "session/idle";
     type Payload = SessionId;
+}
+
+/// Fired when a session's first turn begins. Delegation info is included so
+/// listeners can distinguish root sessions from subagent children.
+#[derive(Debug, Clone)]
+pub struct SessionStartNotice {
+    pub session: SessionId,
+    pub workspace: Option<String>,
+    pub delegation: Option<rness_protocol::branch::Delegation>,
+    /// `"startup"` (first run, turns_so_far==0), `"resume"` (subsequent).
+    pub source: String,
+}
+pub struct SessionStartEv;
+impl Event for SessionStartEv {
+    const NAME: &'static str = "session/start";
+    type Payload = SessionStartNotice;
+}
+
+/// Fired when a subagent child is created (before its first turn).
+#[derive(Debug, Clone)]
+pub struct SubagentStartNotice {
+    pub parent: SessionId,
+    pub child: SessionId,
+    pub agent: Option<String>,
+    pub mode: rness_protocol::branch::DelegationMode,
+    pub depth: u32,
+}
+pub struct SubagentStartEv;
+impl Event for SubagentStartEv {
+    const NAME: &'static str = "subagent/start";
+    type Payload = SubagentStartNotice;
+}
+
+/// Fired when a continuable subagent settles (idles after a turn).
+#[derive(Debug, Clone)]
+pub struct SubagentStopNotice {
+    pub parent: SessionId,
+    pub child: SessionId,
+    pub outcome: String,
+}
+pub struct SubagentStopEv;
+impl Event for SubagentStopEv {
+    const NAME: &'static str = "subagent/stop";
+    type Payload = SubagentStopNotice;
+}
+
+/// Emitted by the hook host to durably record hook invocations/results.
+/// The burst loop subscribes and appends to the session log.
+/// `session` allows filtering when multiple sessions share a bus.
+#[derive(Debug, Clone)]
+pub struct HookAuditNotice {
+    pub session: String,
+    pub event: HookAuditEvent,
+}
+
+#[derive(Debug, Clone)]
+pub enum HookAuditEvent {
+    Invoked(rness_protocol::events::HookInvoked),
+    Result(rness_protocol::events::HookResult),
+}
+pub struct HookAuditEv;
+impl Event for HookAuditEv {
+    const NAME: &'static str = "hook/audit";
+    type Payload = HookAuditNotice;
 }
 
 /// Live streaming frames (deltas, tool progress, commits) for attached
@@ -247,6 +311,7 @@ pub struct SessionService {
     /// Workspace instruction policy (None = feature off). Mechanism in
     /// [`crate::instructions`]; this only holds the caller's choices.
     instructions: Mutex<Option<crate::instructions::InstructionsConfig>>,
+    loop_hooks: RwLock<Option<Arc<dyn crate::turn::hooks::LoopHooks>>>,
 }
 
 impl SessionService {
@@ -494,7 +559,17 @@ impl SessionService {
             lifecycle: Arc::new(tokio::sync::RwLock::new(())),
             closing: Mutex::new(std::collections::HashSet::new()),
             instructions: Mutex::new(None),
+            loop_hooks: RwLock::new(None),
         }
+    }
+
+    /// Install (or clear) the loop-level hooks used by `run_turn`.
+    pub fn set_loop_hooks(&self, hooks: Option<Arc<dyn crate::turn::hooks::LoopHooks>>) {
+        *self.loop_hooks.write().expect("loop hooks lock") = hooks;
+    }
+
+    fn loop_hooks(&self) -> Option<Arc<dyn crate::turn::hooks::LoopHooks>> {
+        self.loop_hooks.read().expect("loop hooks lock").clone()
     }
 
     pub fn set_images(&self, images: Arc<crate::images::ImageStore>) -> Result<(), ServiceError> {
@@ -1384,6 +1459,7 @@ impl SessionService {
                     log,
                     token,
                     turns_so_far,
+                    self.loop_hooks(),
                 );
                 let handle = tokio::spawn(async move {
                     let _activity = activity;
@@ -2074,12 +2150,55 @@ async fn burst(
     log: crate::session::log::SessionLog,
     token: CancellationToken,
     turns_so_far: u32,
+    loop_hooks: Option<Arc<dyn crate::turn::hooks::LoopHooks>>,
 ) {
     let session = log.session().clone();
     let mut log = Some(log);
     let mut turn_no = turns_so_far;
 
+    // Fire session_start once per burst (i.e. when the session transitions
+    // from idle to running).
+    {
+        let delegation = store.delegation(&session).ok().flatten();
+        let workspace = store.workspace(&session).ok().flatten();
+        let source = if turns_so_far == 0 { "startup" } else { "resume" };
+        bus.emit::<SessionStartEv>(&SessionStartNotice {
+            session: session.clone(),
+            workspace,
+            delegation,
+            source: source.into(),
+        });
+    }
+
+    // Collect durable hook audit events; drained into the log at step
+    // boundaries so the single-writer invariant is preserved.
+    let (audit_tx, audit_rx) = std::sync::mpsc::channel::<rness_protocol::events::SessionEvent>();
+    let audit_session = session.clone();
+    let _audit_sub = bus.on::<HookAuditEv>(move |notice| {
+        if notice.session != audit_session.to_string() {
+            return; // Ignore events from other sessions.
+        }
+        let event = match &notice.event {
+            HookAuditEvent::Invoked(h) => {
+                rness_protocol::events::SessionEvent::HookInvoked(h.clone())
+            }
+            HookAuditEvent::Result(h) => {
+                rness_protocol::events::SessionEvent::HookResult(h.clone())
+            }
+        };
+        let _ = audit_tx.send(event);
+    });
+
     loop {
+        // Flush any hook audit events collected since the last drain.
+        if let Some(log_ref) = log.as_mut() {
+            while let Ok(event) = audit_rx.try_recv() {
+                if let Err(e) = log_ref.append(&event) {
+                    tracing::warn!(session = %session, "hook audit append failed: {e}");
+                }
+            }
+        }
+
         turn_no += 1;
         bus.emit::<TurnStartedEv>(&TurnNotice {
             session: session.clone(),
@@ -2102,6 +2221,7 @@ async fn burst(
             &mut steers,
             turn_no,
             &frames,
+            loop_hooks.as_deref(),
         )
         .await;
 
@@ -2192,6 +2312,12 @@ async fn burst(
                     if start_turn && !append_failed {
                         continue; // the degraded followup runs as its own turn
                     }
+                    // Final flush of hook audit events before going idle.
+                    if let Some(log_ref) = log.as_mut() {
+                        while let Ok(event) = audit_rx.try_recv() {
+                            let _ = log_ref.append(&event);
+                        }
+                    }
                     let mut inbox = live.inbox.lock().unwrap();
                     drop(log.take());
                     inbox.set_phase(Phase::Idle);
@@ -2201,6 +2327,12 @@ async fn burst(
                     });
                     bus.emit::<SessionIdleEv>(&session);
                     return;
+                }
+                // Final flush of hook audit events before going idle.
+                if let Some(log_ref) = log.as_mut() {
+                    while let Ok(event) = audit_rx.try_recv() {
+                        let _ = log_ref.append(&event);
+                    }
                 }
                 drop(log.take()); // release the writer lock before going idle
                 inbox.set_phase(Phase::Idle);

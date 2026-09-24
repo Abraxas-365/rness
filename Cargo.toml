@@ -30,6 +30,7 @@ repository = "https://github.com/Abraxas-365/rness"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 async-trait = "0.1"
+regex = "1"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"

@@ -225,7 +225,9 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
             | SessionEvent::PlanMode { .. }
             | SessionEvent::AssistantAttempt(_)
             | SessionEvent::TurnStarted { .. }
-            | SessionEvent::TurnEnded { .. } => {}
+            | SessionEvent::TurnEnded { .. }
+            | SessionEvent::HookInvoked(_)
+            | SessionEvent::HookResult(_) => {}
         }
     }
     flush_tools(&mut ctx, &mut pending_tools);
@@ -346,7 +348,9 @@ pub fn transcript(history: &[Envelope]) -> Transcript {
             | SessionEvent::PlanMode { .. }
             | SessionEvent::RequestConfig(_)
             | SessionEvent::TurnStarted { .. }
-            | SessionEvent::TurnEnded { .. } => {}
+            | SessionEvent::TurnEnded { .. }
+            | SessionEvent::HookInvoked(_)
+            | SessionEvent::HookResult(_) => {}
         }
     }
     t

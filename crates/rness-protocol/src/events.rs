@@ -133,6 +133,14 @@ pub enum SessionEvent {
 
     #[serde(rename = "plan/mode")]
     PlanMode { active: bool },
+
+    /// Audit: a hook handler was invoked. Paired with `HookResult` by `handler_id`.
+    #[serde(rename = "hook/invoked")]
+    HookInvoked(HookInvoked),
+
+    /// Audit: a hook handler returned/failed. Paired with `HookInvoked` by `handler_id`.
+    #[serde(rename = "hook/result")]
+    HookResult(HookResult),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -372,6 +380,13 @@ pub enum MessageSource {
     Instructions {
         identity: String,
     },
+    /// Context a tool-pipeline hook attached to a call (`post_tool`
+    /// `additional_contexts`). Committed after the step's tool results.
+    Hook {
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call: Option<ToolCallId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -567,4 +582,39 @@ pub enum ChunkDelta {
         call: ToolCallId,
         t: String,
     },
+}
+
+// ── hook audit events ─────────────────────────────────────────────────
+
+/// Recorded when a hook handler is invoked. Paired with [`HookResult`]
+/// by `handler_id`. Audit-only: never inserted into model-visible history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookInvoked {
+    pub turn: u32,
+    /// Hook point name, e.g. `"pre_tool"`, `"session_start"`.
+    pub point: String,
+    /// Source type: `"lua"` or `"command"` (hooks.json bridge).
+    pub source: String,
+    /// Optional tool/event matcher that selected this handler.
+    pub matcher: Option<String>,
+    /// Correlation key linking this invocation to its result.
+    pub handler_id: String,
+}
+
+/// Recorded when a hook handler returns or fails.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HookResult {
+    pub turn: u32,
+    pub point: String,
+    /// Same key as the paired [`HookInvoked`].
+    pub handler_id: String,
+    /// Outcome summary: `"allow"`, `"deny"`, `"ask"`, `"enter"`, `"reject"`,
+    /// `"retry"`, `"stop"`, `"continue"`, `"error"`, etc.
+    pub decision: String,
+    /// Shell exit code (command hooks only).
+    pub exit_code: Option<i32>,
+    /// Bounded stderr summary (command hooks only).
+    pub stderr_summary: Option<String>,
+    /// Wall-clock milliseconds.
+    pub duration_ms: u64,
 }

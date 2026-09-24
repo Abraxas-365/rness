@@ -5,9 +5,10 @@
 //! Results remain in MODEL ORDER regardless of completion order (invariant #8).
 
 pub mod exposure;
+pub mod hooks;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -16,6 +17,27 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalRequest, Approvals, Decision};
+use hooks::{ExecuteOutcome, HookContext, PostToolDecision, PreToolDecision, ToolHookEvent, ToolHooks};
+
+/// Side data of the most recent tool-body run under `tool_execute`.
+#[derive(Default)]
+struct BodyRun {
+    outcome: Option<ExecuteOutcome>,
+    tasks: Option<rness_protocol::events::TaskSnapshot>,
+    presentation: Option<serde_json::Value>,
+    plan_review: Option<rness_protocol::events::PlanReview>,
+}
+
+/// Shared by every registry derived from one composition root, so hooks
+/// installed on the main registry also govern subagent sessions.
+#[derive(Default)]
+struct HookState {
+    hooks: RwLock<Option<Arc<dyn ToolHooks>>>,
+    contexts: Mutex<Vec<(SessionId, HookContext)>>,
+    /// Current turn number, set by the turn loop before dispatch.
+    /// Used to populate `ToolHookEvent.turn` for audit events.
+    current_turn: std::sync::atomic::AtomicU32,
+}
 
 /// A tool implementation. Kept deliberately minimal at the engine seam;
 /// schemas/descriptions live with registration metadata later.
@@ -188,6 +210,7 @@ pub struct ToolRegistry {
     pub file_references: Arc<crate::file_references::FileReferences>,
     pub plan_selections: Arc<crate::plan::PlanSelections>,
     approvals: Arc<Approvals>,
+    hooks: Arc<HookState>,
 }
 
 impl ToolRegistry {
@@ -223,6 +246,7 @@ impl ToolRegistry {
             tools: RwLock::new(tools),
             deferred: RwLock::new(self.deferred.read().expect("registry lock").clone()),
             approvals: Arc::clone(&self.approvals),
+            hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             file_references: self.file_references.clone(),
         }
@@ -242,6 +266,7 @@ impl ToolRegistry {
             tools: RwLock::new(tools),
             deferred: RwLock::new(self.deferred.read().expect("registry lock").clone()),
             approvals: Arc::clone(&self.approvals),
+            hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             file_references: self.file_references.clone(),
         }
@@ -346,6 +371,31 @@ impl ToolRegistry {
     /// The approval seam: set policy / mount answerers here.
     pub fn approvals(&self) -> &Arc<Approvals> {
         &self.approvals
+    }
+
+    /// Install (or clear) the tool-pipeline hooks. Shared with every
+    /// derived registry, including subagent sessions'.
+    pub fn set_hooks(&self, hooks: Option<Arc<dyn ToolHooks>>) {
+        *self.hooks.hooks.write().expect("hooks lock") = hooks;
+    }
+
+    /// Record the current turn number so tool hooks include it in audit events.
+    pub fn set_current_turn(&self, turn: u32) {
+        self.hooks.current_turn.store(turn, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn tool_hooks(&self) -> Option<Arc<dyn ToolHooks>> {
+        self.hooks.hooks.read().expect("hooks lock").clone()
+    }
+
+    /// Drain `post_tool` additional contexts produced for `session`, in
+    /// dispatch (model) order.
+    pub fn take_hook_contexts(&self, session: &SessionId) -> Vec<HookContext> {
+        let mut pending = self.hooks.contexts.lock().expect("hook contexts lock");
+        let (mine, rest): (Vec<_>, Vec<_>) =
+            pending.drain(..).partition(|(owner, _)| owner == session);
+        *pending = rest;
+        mine.into_iter().map(|(_, context)| context).collect()
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -466,6 +516,8 @@ impl ToolRegistry {
                     missing_job_controls.join(", "),
                 ));
             let approvals = Arc::clone(&self.approvals);
+            let hook_state = Arc::clone(&self.hooks);
+            let hooks = self.tool_hooks();
             let call = call.clone();
             let session = session.clone();
             let cancel = cancel.clone();
@@ -475,6 +527,16 @@ impl ToolRegistry {
                 let mut plan_review = None;
                 let mut presentation = None;
                 let mut failure_kind = "execution_failed";
+                let event = ToolHookEvent {
+                    session: session.clone(),
+                    call: call.call.clone(),
+                    tool: call.name.clone(),
+                    args: call.args.clone(),
+                    turn: hook_state.current_turn.load(std::sync::atomic::Ordering::Relaxed),
+                };
+                // dsh: a throwing pre-tool hook (or an unknown tool) is a
+                // final result; denials and executions reach post_tool.
+                let mut run_post = true;
                 let outcome = match tool {
                     _ if cancel.is_cancelled() => {
                         failure_kind = "approval_cancelled";
@@ -484,56 +546,192 @@ impl ToolRegistry {
                         failure_kind = "background_jobs_unavailable";
                         Err(background_error.unwrap())
                     }
-                    Some(t) => {
-                        {
-                            let request = ApprovalRequest {
-                                session: session.clone(),
-                                call: call.call.clone(),
-                                tool: call.name.clone(),
-                                args: call.args.clone(),
+                    Some(t) => 'gate: {
+                        // pre_tool → [ask] → guard → policy → execute.
+                        let mut asked = false;
+                        let mut reason = None;
+                        if let Some(h) = &hooks {
+                            let decision = tokio::select! {
+                                biased;
+                                d = h.pre_tool(&event, &cancel) => d,
+                                _ = cancel.cancelled() => Err("cancelled".into()),
                             };
-                            // The question must not outlive the turn: a
-                            // cancel while the user deliberates withdraws
-                            // it (the dropped check future cleans up
-                            // answerer-side state).
+                            match decision {
+                                Err(_) if cancel.is_cancelled() => {
+                                    failure_kind = "approval_cancelled";
+                                    break 'gate Err("tool call cancelled before execution".into());
+                                }
+                                Err(e) => {
+                                    failure_kind = "hook_failed";
+                                    run_post = false;
+                                    break 'gate Err(format!("pre_tool hook failed: {e}"));
+                                }
+                                Ok(PreToolDecision::Deny { reason }) => {
+                                    failure_kind = "hook_denied";
+                                    break 'gate Err(reason);
+                                }
+                                Ok(PreToolDecision::Ask { reason: r }) => {
+                                    asked = true;
+                                    reason = r;
+                                }
+                                Ok(PreToolDecision::Allow) => {}
+                            }
+                        }
+                        let request = ApprovalRequest {
+                            session: session.clone(),
+                            call: call.call.clone(),
+                            tool: call.name.clone(),
+                            args: call.args.clone(),
+                            reason,
+                        };
+                        // The question must not outlive the turn: a cancel
+                        // while the user deliberates withdraws it (the
+                        // dropped check future cleans up answerer state).
+                        if asked {
+                            let decision = tokio::select! {
+                                biased;
+                                d = approvals.ask(&request) => d,
+                                _ = cancel.cancelled() => Decision::Cancelled,
+                            };
+                            if let Some((kind, error)) = refusal(decision) {
+                                failure_kind = kind;
+                                break 'gate Err(error);
+                            }
+                        }
+                        if let Some(h) = &hooks {
+                            match h.guard(&event, &cancel).await {
+                                Ok(None) => {}
+                                Ok(Some(reason)) => {
+                                    failure_kind = "guard_denied";
+                                    break 'gate Err(reason);
+                                }
+                                Err(e) => {
+                                    failure_kind = "guard_denied";
+                                    break 'gate Err(format!("guard failed: {e}"));
+                                }
+                            }
+                        }
+                        // A granted hook ask is this call's approval.
+                        if !asked {
                             let decision = tokio::select! {
                                 biased;
                                 d = approvals.check_tool(&request, t.sensitive()) => d,
                                 _ = cancel.cancelled() => Decision::Cancelled,
                             };
-                            match decision {
-                                Decision::Allowed if t.plan_config().is_some() => {
-                                    t.review_plan(&session, &call.call, call.args.clone(), &cancel).await.map(|(output, review)| { plan_review = Some(review); (vec![ToolResultContentPart::Text { text: output }], None, false) })
+                            if let Some((kind, error)) = refusal(decision) {
+                                failure_kind = kind;
+                                break 'gate Err(error);
+                            }
+                        }
+                        if cancel.is_cancelled() {
+                            failure_kind = "approval_cancelled";
+                            break 'gate Err("tool call cancelled before execution".into());
+                        }
+                        // The body may run zero or more times under a
+                        // tool_execute wrapper; side data follows the last run.
+                        let body = Arc::new(Mutex::new(BodyRun::default()));
+                        let run_body = {
+                            let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), call.call.clone(), call.args.clone(), cancel.clone(), call.name.clone());
+                            move || -> hooks::ExecuteFuture {
+                                let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), id.clone(), args.clone(), cancel.clone(), name.clone());
+                                Box::pin(async move {
+                                    let mut run = BodyRun::default();
+                                    let result = if t.plan_config().is_some() {
+                                        t.review_plan(&session, &id, args, &cancel).await.map(|(output, review)| { run.plan_review = Some(review); (vec![ToolResultContentPart::Text { text: output }], false) })
+                                    } else {
+                                        t.execute_presented(&session, &id, args, &cancel).await.map(|(content, tasks, error, metadata)| {
+                                            run.tasks = tasks;
+                                            run.presentation = metadata.filter(|value| {
+                                                let valid = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 256 * 1024);
+                                                if !valid { tracing::warn!(tool = %name, "discarding oversized tool presentation metadata"); }
+                                                valid
+                                            });
+                                            (content, error)
+                                        })
+                                    };
+                                    let outcome = match result {
+                                        Ok((content, is_error)) => ExecuteOutcome { content, is_error },
+                                        Err(e) => ExecuteOutcome { content: vec![ToolResultContentPart::Text { text: e }], is_error: true },
+                                    };
+                                    run.outcome = Some(outcome.clone());
+                                    *body.lock().expect("tool body lock") = run;
+                                    outcome
+                                })
+                            }
+                        };
+                        let executed = match &hooks {
+                            Some(h) => h.tool_execute(&event, &run_body, &cancel).await,
+                            None => Ok(run_body().await),
+                        };
+                        let run = std::mem::take(&mut *body.lock().expect("tool body lock"));
+                        match executed {
+                            Err(_) if cancel.is_cancelled() => {
+                                failure_kind = "approval_cancelled";
+                                Err("tool call cancelled".into())
+                            }
+                            Err(e) => {
+                                failure_kind = "hook_failed";
+                                Err(format!("tool_execute hook failed: {e}"))
+                            }
+                            Ok(outcome) => {
+                                // Tool-authored presentation describes the body's own
+                                // output; a wrapper that replaced it gets the generic one.
+                                if run.outcome.as_ref() == Some(&outcome) {
+                                    presentation = run.presentation;
                                 }
-                                Decision::Allowed => t.execute_presented(&session, &call.call, call.args.clone(), &cancel).await.map(|(content, tasks, error, metadata)| {
-                                    presentation = metadata.filter(|value| {
-                                        let valid = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 256 * 1024);
-                                        if !valid { tracing::warn!(tool = %call.name, "discarding oversized tool presentation metadata"); }
-                                        valid
-                                    });
-                                    (content, tasks, error)
-                                }),
-                                Decision::Rejected => {
-                                    failure_kind = "approval_rejected";
-                                    Err("the user rejected this tool call".into())
-                                }
-                                Decision::Cancelled => {
-                                    failure_kind = "approval_cancelled";
-                                    Err("approval request was cancelled".into())
-                                }
-                                Decision::Unavailable => {
-                                    failure_kind = "approval_unavailable";
-                                    Err("approval required but no approver is available — the call was blocked".into())
-                                },
+                                plan_review = run.plan_review;
+                                Ok((outcome.content, run.tasks, outcome.is_error))
                             }
                         }
                     }
-                    None => { failure_kind = "unknown_tool"; Err(format!("unknown tool '{}'", call.name)) },
+                    None => {
+                        run_post = false;
+                        failure_kind = "unknown_tool";
+                        Err(format!("unknown tool '{}'", call.name))
+                    }
                 };
-                let (content, tasks, is_error) = match outcome {
+                let (mut content, tasks, mut is_error) = match outcome {
                     Ok((content, tasks, is_error)) => (content, tasks, is_error),
                     Err(e) => (vec![ToolResultContentPart::Text { text: e }], None, true),
                 };
+                if let Some(h) = hooks.as_ref().filter(|_| run_post) {
+                    let draft = ToolResult {
+                        plan_review,
+                        presentation: None,
+                        tasks: tasks.clone(),
+                        call: call.call.clone(),
+                        name: call.name.clone(),
+                        output: ToolResult::text_output(&content),
+                        content: content.clone(),
+                        is_error,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    };
+                    // Post hooks see the settled result even after a turn
+                    // cancel; the host bounds them with its own timeout.
+                    let decision = h.post_tool(&event, &draft, &CancellationToken::new()).await;
+                    let contexts = match decision {
+                        Ok(PostToolDecision::Accept { content: replacement, additional_contexts }) => {
+                            if let Some(replacement) = replacement {
+                                content = replacement;
+                            }
+                            additional_contexts
+                        }
+                        Ok(PostToolDecision::Block { feedback, additional_contexts }) => {
+                            failure_kind = "hook_blocked";
+                            content = feedback;
+                            is_error = true;
+                            additional_contexts
+                        }
+                        Err(e) => {
+                            failure_kind = "hook_failed";
+                            content = vec![ToolResultContentPart::Text { text: format!("post_tool hook failed: {e}") }];
+                            is_error = true;
+                            Vec::new()
+                        }
+                    };
+                    let contexts = contexts.into_iter().filter(|text| !text.trim().is_empty()).map(|text| (session.clone(), HookContext { call: call.call.clone(), text }));
+                    hook_state.contexts.lock().expect("hook contexts lock").extend(contexts);
+                }
                 let output = ToolResult::text_output(&content);
                 let duration_ms = started.elapsed().as_millis() as u64;
                 if presentation.is_none() {
@@ -545,7 +743,7 @@ impl ToolRegistry {
                         "has_plan_review":plan_review.is_some(),
                     }));
                 }
-                ToolResult {
+                let result = ToolResult {
                     plan_review,
                     presentation,
                     tasks,
@@ -555,7 +753,11 @@ impl ToolRegistry {
                     output,
                     is_error,
                     duration_ms,
+                };
+                if let Some(h) = &hooks {
+                    h.tool_result(&event, &result);
                 }
+                result
             }));
         }
         // Await in model order — commit order == call order regardless of
@@ -565,6 +767,20 @@ impl ToolRegistry {
             results.push(h.await.expect("tool task never panics"));
         }
         results
+    }
+}
+
+/// Map a non-allowing approval decision to its failure kind and the
+/// model-visible error; `None` means allowed.
+fn refusal(decision: Decision) -> Option<(&'static str, String)> {
+    match decision {
+        Decision::Allowed => None,
+        Decision::Rejected => Some(("approval_rejected", "the user rejected this tool call".into())),
+        Decision::Cancelled => Some(("approval_cancelled", "approval request was cancelled".into())),
+        Decision::Unavailable => Some((
+            "approval_unavailable",
+            "approval required but no approver is available — the call was blocked".into(),
+        )),
     }
 }
 
@@ -655,5 +871,154 @@ mod tests {
             .await;
         assert!(results[0].is_error);
         assert!(results[0].output.contains("unknown tool"));
+    }
+
+    /// Scripted hooks: deny `rm`, ask for `ask`, guard-deny `guarded`,
+    /// block `blocked` output, annotate everything else; records phases.
+    #[derive(Default)]
+    struct Script(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl ToolHooks for Script {
+        async fn pre_tool(&self, e: &ToolHookEvent, _: &CancellationToken) -> Result<PreToolDecision, String> {
+            let say = e.args["say"].as_str().unwrap_or("").to_string();
+            self.0.lock().unwrap().push(format!("pre:{say}"));
+            Ok(match say.as_str() {
+                "rm" => PreToolDecision::Deny { reason: "no rm".into() },
+                "ask" => PreToolDecision::Ask { reason: Some("why".into()) },
+                "boom" => return Err("exploded".into()),
+                _ => PreToolDecision::Allow,
+            })
+        }
+        async fn guard(&self, e: &ToolHookEvent, _: &CancellationToken) -> Result<Option<String>, String> {
+            self.0.lock().unwrap().push("guard".into());
+            Ok((e.args["say"] == "guarded").then(|| "guard says no".into()))
+        }
+        async fn tool_execute(&self, e: &ToolHookEvent, next: &hooks::ExecuteNext, _: &CancellationToken) -> Result<ExecuteOutcome, String> {
+            match e.args["say"].as_str() {
+                Some("cached") => Ok(ExecuteOutcome { content: vec![ToolResultContentPart::Text { text: "from cache".into() }], is_error: false }),
+                Some("retry") => {
+                    let first = next().await;
+                    let second = next().await;
+                    Ok(ExecuteOutcome { content: [first.content, second.content].concat(), is_error: false })
+                }
+                Some("wrapfail") => Err("wrapper broke".into()),
+                _ => Ok(next().await),
+            }
+        }
+        async fn post_tool(&self, e: &ToolHookEvent, r: &ToolResult, _: &CancellationToken) -> Result<PostToolDecision, String> {
+            self.0.lock().unwrap().push(format!("post:{}", r.output));
+            Ok(if e.args["say"] == "blocked" {
+                PostToolDecision::Block { feedback: vec![ToolResultContentPart::Text { text: "try again".into() }], additional_contexts: vec![] }
+            } else {
+                PostToolDecision::Accept { content: None, additional_contexts: vec![format!("saw {}", r.output)] }
+            })
+        }
+        fn tool_result(&self, _: &ToolHookEvent, r: &ToolResult) {
+            self.0.lock().unwrap().push(format!("result:{}", r.is_error));
+        }
+    }
+
+    struct Answer(Decision, std::sync::Mutex<Option<ApprovalRequest>>);
+    #[async_trait]
+    impl crate::approval::Answerer for Answer {
+        async fn answer(&self, request: &ApprovalRequest) -> Decision {
+            *self.1.lock().unwrap() = Some(request.clone());
+            self.0
+        }
+    }
+
+    async fn run(reg: &ToolRegistry, say: &str) -> ToolResult {
+        let call = ToolCall { call: say.into(), name: "sleep_echo".into(), args: serde_json::json!({"say": say}) };
+        reg.dispatch(&"s".into(), &[call], 1, &CancellationToken::new()).await.remove(0)
+    }
+
+    #[tokio::test]
+    async fn hooks_gate_transform_and_observe_tool_calls() {
+        let reg = ToolRegistry::default();
+        reg.register(Arc::new(SleepEcho));
+        let script = Arc::new(Script::default());
+        reg.set_hooks(Some(script.clone()));
+
+        let ok = run(&reg, "hi").await;
+        assert_eq!((ok.output.as_str(), ok.is_error), ("hi", false));
+        assert_eq!(*script.0.lock().unwrap(), ["pre:hi", "guard", "post:hi", "result:false"]);
+        let contexts = reg.take_hook_contexts(&"s".into());
+        assert_eq!(contexts, [HookContext { call: "hi".into(), text: "saw hi".into() }]);
+        assert!(reg.take_hook_contexts(&"s".into()).is_empty());
+
+        script.0.lock().unwrap().clear();
+        let denied = run(&reg, "rm").await;
+        assert!(denied.is_error);
+        assert_eq!(denied.output, "no rm");
+        assert_eq!(denied.presentation.as_ref().unwrap()["outcome"], "hook_denied");
+        // Denials skip guard and the body but still reach post_tool.
+        assert_eq!(*script.0.lock().unwrap(), ["pre:rm", "post:no rm", "result:true"]);
+
+        let guarded = run(&reg, "guarded").await;
+        assert_eq!((guarded.output.as_str(), guarded.is_error), ("guard says no", true));
+
+        let blocked = run(&reg, "blocked").await;
+        assert_eq!((blocked.output.as_str(), blocked.is_error), ("try again", true));
+        assert_eq!(blocked.presentation.as_ref().unwrap()["outcome"], "hook_blocked");
+
+        script.0.lock().unwrap().clear();
+        let failed = run(&reg, "boom").await;
+        assert!(failed.is_error && failed.output.contains("exploded"));
+        // A failing pre hook is final: no post_tool.
+        assert_eq!(*script.0.lock().unwrap(), ["pre:boom", "result:true"]);
+    }
+
+    #[tokio::test]
+    async fn hook_ask_prompts_even_under_allow_and_carries_reason() {
+        let reg = ToolRegistry::default();
+        reg.register(Arc::new(SleepEcho));
+        reg.set_hooks(Some(Arc::new(Script::default())));
+        let answer = Arc::new(Answer(Decision::Rejected, Default::default()));
+        reg.approvals().set_answerer(answer.clone());
+
+        let rejected = run(&reg, "ask").await;
+        assert_eq!(rejected.presentation.as_ref().unwrap()["outcome"], "approval_rejected");
+        assert_eq!(answer.1.lock().unwrap().as_ref().unwrap().reason.as_deref(), Some("why"));
+
+        // No approver: fail closed.
+        let reg2 = ToolRegistry::default();
+        reg2.register(Arc::new(SleepEcho));
+        reg2.set_hooks(Some(Arc::new(Script::default())));
+        assert_eq!(run(&reg2, "ask").await.presentation.unwrap()["outcome"], "approval_unavailable");
+
+        // Policy `never` rejects without prompting.
+        reg.approvals().set_policy(crate::approval::Policy::Never);
+        *answer.1.lock().unwrap() = None;
+        assert!(run(&reg, "ask").await.is_error);
+        assert!(answer.1.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn tool_execute_wraps_retries_and_short_circuits_the_body() {
+        let reg = ToolRegistry::default();
+        reg.register(Arc::new(SleepEcho));
+        let script = Arc::new(Script::default());
+        reg.set_hooks(Some(script.clone()));
+
+        let cached = run(&reg, "cached").await;
+        assert_eq!((cached.output.as_str(), cached.is_error), ("from cache", false));
+        let retried = run(&reg, "retry").await;
+        assert_eq!(retried.output, "retry\nretry");
+
+        script.0.lock().unwrap().clear();
+        let failed = run(&reg, "wrapfail").await;
+        assert!(failed.is_error && failed.output.contains("wrapper broke"), "{}", failed.output);
+        assert_eq!(failed.presentation.as_ref().unwrap()["outcome"], "hook_failed");
+        // A failing wrapper is still a settled result: post_tool sees it.
+        assert_eq!(script.0.lock().unwrap()[2..], ["post:tool_execute hook failed: wrapper broke".to_string(), "result:true".into()]);
+    }
+
+    #[tokio::test]
+    async fn hooks_are_shared_with_derived_registries() {
+        let reg = ToolRegistry::default();
+        reg.register(Arc::new(SleepEcho));
+        let child = reg.restricted(&["sleep_echo".into()]);
+        reg.set_hooks(Some(Arc::new(Script::default())));
+        assert_eq!(run(&child, "rm").await.output, "no rm");
     }
 }

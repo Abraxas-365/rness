@@ -13,6 +13,7 @@
 //! - Tool calls run through the registry (parallel, model-order commits).
 
 pub mod compaction;
+pub mod hooks;
 pub mod provider;
 
 use rness_protocol::events::{
@@ -27,6 +28,7 @@ use crate::session::branch::SessionStore;
 use crate::session::log::SessionLog;
 use crate::session::replay::{replay, ReplayError};
 use crate::tools::{ToolCall, ToolRegistry};
+use hooks::{LoopEvent, LoopHooks, PreStepDecision, RequestErrorAction, TurnStoppingAction};
 use provider::{Provider, StepOutcome, StepRequest};
 
 /// Live frame observer for one turn (invariant #9: ephemeral, never
@@ -88,10 +90,11 @@ pub async fn run_turn(
     steers: &mut SteerSource<'_>,
     turn_no: u32,
     frames: &FrameSink<'_>,
+    loop_hooks: Option<&dyn LoopHooks>,
 ) -> Result<TurnOutcome, TurnError> {
     log.append(&SessionEvent::TurnStarted { turn: turn_no })?;
     let outcome = drive(
-        store, log, provider, tools, config, cancel, steers, turn_no, frames,
+        store, log, provider, tools, config, cancel, steers, turn_no, frames, loop_hooks,
     )
     .await;
     let ended = match &outcome {
@@ -116,8 +119,10 @@ async fn drive(
     steers: &mut SteerSource<'_>,
     turn_no: u32,
     frames: &FrameSink<'_>,
+    loop_hooks: Option<&dyn LoopHooks>,
 ) -> Result<TurnOutcome, TurnError> {
     let session = log.session().clone();
+    tools.set_current_turn(turn_no);
     let workspace = store.workspace(&session).map_err(ReplayError::from)?;
     let call_config = replay(store, log.session())?.context.config;
     let sandbox = call_config
@@ -147,7 +152,9 @@ async fn drive(
     };
     let mut activated =
         crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
+    let mut step_no = 0u32;
     loop {
+        step_no += 1;
         let tool_specs = config.tool_exposure.specs(tools, &activated);
         if cancel.is_cancelled() {
             log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
@@ -180,6 +187,38 @@ async fn drive(
                 content: pending.content,
                 source: pending.source,
             }))?;
+        }
+
+        // Loop hook: pre_step — may inject messages or reject the step.
+        if let Some(hooks) = loop_hooks {
+            let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+            let decision = tokio::select! {
+                biased;
+                d = hooks.pre_step(&loop_event, cancel) => d,
+                _ = cancel.cancelled() => Err("cancelled".into()),
+            };
+            match decision {
+                Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
+                Err(e) => {
+                    tracing::warn!(session = %session, "pre_step hook failed: {e}");
+                    // A failing pre_step is not fatal; proceed as Enter.
+                }
+                Ok(PreStepDecision::Reject) => return Ok(TurnOutcome::Completed),
+                Ok(PreStepDecision::EnterWithMessages { messages }) => {
+                    for text in messages {
+                        log.append(&SessionEvent::UserMessage(UserMessage {
+                            content: vec![rness_protocol::events::ContentPart::Text { text }],
+                            intent: rness_protocol::events::UserIntent::Inject,
+                            source: Some(rness_protocol::events::MessageSource::Hook {
+                                event: "pre_step".into(),
+                                call: None,
+                            }),
+                        }))?;
+                        frames(Frame::HistoryChanged { session: session.clone() });
+                    }
+                }
+                Ok(PreStepDecision::Enter) => {}
+            }
         }
 
         // Derive the request input from the log — never from memory.
@@ -277,6 +316,14 @@ async fn drive(
                 tools: &tool_specs,
                 on_delta: Some(&on_delta),
             };
+            // Loop hook: request — currently observe-only.
+            if let Some(hooks) = loop_hooks {
+                let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                if let Err(e) = hooks.request(&loop_event, cancel).await {
+                    if cancel.is_cancelled() { return Ok(TurnOutcome::Cancelled); }
+                    tracing::warn!(session = %session, "request hook failed: {e}");
+                }
+            }
             match provider.step(request, cancel).await {
                 StepOutcome::Committed(mut msg) => {
                     msg.estimated_input = estimated_input;
@@ -313,6 +360,25 @@ async fn drive(
                     frames(Frame::HistoryChanged {
                         session: session.clone(),
                     });
+                    // Loop hook: request_error — may force a retry even
+                    // when the built-in policy would not.
+                    let mut hook_retry = false;
+                    if let Some(hooks) = loop_hooks {
+                        let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                        let info = hooks::RequestError {
+                            code: error.code.into(),
+                            message: error.message.clone(),
+                            retryable: error.retryable,
+                            attempt: attempts,
+                            max_retries: config.max_retries,
+                        };
+                        match hooks.request_error(&loop_event, &info, cancel).await {
+                            Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
+                            Err(e) => tracing::warn!(session = %session, "request_error hook failed: {e}"),
+                            Ok(RequestErrorAction::Retry) => hook_retry = true,
+                            Ok(RequestErrorAction::Default) => {}
+                        }
+                    }
                     if error.code == "CONTEXT_OVERFLOW" {
                         if let Some(policy) =
                             policy.filter(|p| overflow_retries < p.max_overflow_retries)
@@ -350,13 +416,13 @@ async fn drive(
                             }
                         }
                     }
-                    if !retryable || attempts > config.max_retries {
+                    if !hook_retry && (!retryable || attempts > config.max_retries) {
                         return Err(TurnError::ModelExhausted {
                             attempts,
                             last: error.message,
                         });
                     }
-                    if let Some(delay) = retry_delay {
+                    if let Some(delay) = retry_delay.or(hook_retry.then(|| std::time::Duration::from_millis(500))) {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
@@ -389,16 +455,45 @@ async fn drive(
                 });
             })?;
 
+        // Is this a terminal stop (EndTurn, or max_tokens with no tool calls)?
+        let is_stopping = stop == StopReason::EndTurn
+            || (stop == StopReason::MaxTokens && calls.is_empty());
+
+        if is_stopping {
+            // Loop hook: turn_stopping — listeners may inject messages
+            // to continue the turn instead of closing it.
+            if let Some(hooks) = loop_hooks {
+                let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                match hooks.turn_stopping(&loop_event, cancel).await {
+                    Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
+                    Err(e) => tracing::warn!(session = %session, "turn_stopping hook failed: {e}"),
+                    Ok(TurnStoppingAction::Continue { messages }) if !messages.is_empty() => {
+                        for text in messages {
+                            log.append(&SessionEvent::UserMessage(UserMessage {
+                                content: vec![rness_protocol::events::ContentPart::Text { text }],
+                                intent: rness_protocol::events::UserIntent::Steer,
+                                source: Some(rness_protocol::events::MessageSource::Hook {
+                                    event: "turn_stopping".into(),
+                                    call: None,
+                                }),
+                            }))?;
+                            frames(Frame::HistoryChanged { session: session.clone() });
+                        }
+                        continue; // another step
+                    }
+                    Ok(_) => {} // Stop or Continue with no messages
+                }
+            }
+            return Ok(TurnOutcome::Completed);
+        }
+
         match stop {
-            StopReason::EndTurn => return Ok(TurnOutcome::Completed),
-            // A max-tokens stop with no tool_use content is a normal
-            // truncated-but-complete turn. When content does include a
-            // (possibly truncated) tool_use, Anthropic requires every
-            // tool_use to be followed immediately by a tool_result — so
-            // this must be treated like ToolUse, not a terminal stop, or
-            // the dangling call corrupts the next request (naked
-            // "tool_use ids were found without tool_result" rejection).
-            StopReason::MaxTokens if calls.is_empty() => return Ok(TurnOutcome::Completed),
+            // Already handled by is_stopping above.
+            StopReason::EndTurn => unreachable!("is_stopping is true for EndTurn"),
+            // A max-tokens stop with tool_use content: Anthropic requires every
+            // tool_use to be followed immediately by a tool_result, so this must
+            // be treated like ToolUse, not a terminal stop, or the dangling call
+            // corrupts the next request.
             StopReason::MaxTokens | StopReason::ToolUse => {
                 for call in &calls {
                     frames(Frame::ToolStarted {
@@ -493,6 +588,22 @@ async fn drive(
                     });
                     tools.file_references.invalidate();
                     log.append(&SessionEvent::ToolResult(result))?;
+                    frames(Frame::HistoryChanged {
+                        session: session.clone(),
+                    });
+                }
+                // post_tool additional contexts: durable, sourced user
+                // messages after the whole result block (providers need
+                // tool results adjacent to their calls).
+                for context in tools.take_hook_contexts(&session) {
+                    log.append(&SessionEvent::UserMessage(rness_protocol::events::UserMessage {
+                        content: vec![rness_protocol::events::ContentPart::Text { text: context.text }],
+                        intent: rness_protocol::events::UserIntent::Inject,
+                        source: Some(rness_protocol::events::MessageSource::Hook {
+                            event: "post_tool".into(),
+                            call: Some(context.call),
+                        }),
+                    }))?;
                     frames(Frame::HistoryChanged {
                         session: session.clone(),
                     });

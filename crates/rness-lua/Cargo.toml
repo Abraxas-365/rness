@@ -14,6 +14,7 @@ rness-protocol.workspace = true
 rness-engine.workspace = true
 rness-mcp.workspace = true
 mlua.workspace = true
+regex.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

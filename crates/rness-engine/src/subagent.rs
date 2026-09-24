@@ -217,6 +217,15 @@ impl SubagentRuntime {
                     StopReason::Aborted => "aborted",
                     StopReason::Error => "error",
                 };
+
+                watch_sessions.bus().emit::<crate::service::SubagentStopEv>(
+                    &crate::service::SubagentStopNotice {
+                        parent: d.parent.clone(),
+                        child: child.clone(),
+                        outcome: stop.to_string(),
+                    },
+                );
+
                 let text = format!(
                     "[subagent {child} settled: {stop}]\n{}",
                     if run.output.is_empty() {
@@ -350,6 +359,16 @@ impl SubagentRuntime {
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
 
+        self.sessions.bus().emit::<crate::service::SubagentStartEv>(
+            &crate::service::SubagentStartNotice {
+                parent: request.parent.clone(),
+                child: child.clone(),
+                agent: request.agent.clone(),
+                mode: DelegationMode::OneShot,
+                depth,
+            },
+        );
+
         // Activation boundary: events present BEFORE our prompt (the
         // fork seed). The settled output must come from after it, so a
         // fork never re-reads inherited assistant text as its "result".
@@ -373,7 +392,22 @@ impl SubagentRuntime {
             })?;
         self.sessions.join(&child).await;
 
-        Ok(settle(&self.sessions, &child, boundary)?)
+        let run = settle(&self.sessions, &child, boundary)?;
+
+        let outcome = match run.stop {
+            StopReason::Completed => "completed",
+            StopReason::Aborted => "aborted",
+            StopReason::Error => "error",
+        };
+        self.sessions.bus().emit::<crate::service::SubagentStopEv>(
+            &crate::service::SubagentStopNotice {
+                parent: request.parent.clone(),
+                child: child.clone(),
+                outcome: outcome.to_string(),
+            },
+        );
+
+        Ok(run)
     }
 
     // -- continuable children (dsh two-shapes model) ------------------------
@@ -437,6 +471,17 @@ impl SubagentRuntime {
             .delegated_config(&request.parent, request.agent.as_deref())?;
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
+
+        self.sessions.bus().emit::<crate::service::SubagentStartEv>(
+            &crate::service::SubagentStartNotice {
+                parent: request.parent.clone(),
+                child: child.clone(),
+                agent: request.agent.clone(),
+                mode: DelegationMode::Continuable,
+                depth,
+            },
+        );
+
         if let Some((call, args)) = presentation {
             self.activity
                 .register(&self.sessions, &request.parent, &call, &child, args);

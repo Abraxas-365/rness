@@ -508,6 +508,7 @@ async fn restricted_turn_without_workspace_fails_before_provider_and_logs_failur
             &mut || vec![],
             1,
             &|_| {},
+            None,
         )
         .await;
         let restricted = sandbox.is_some_and(|mode| mode != SandboxMode::DangerFullAccess);

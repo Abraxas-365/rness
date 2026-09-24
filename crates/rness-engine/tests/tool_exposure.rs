@@ -211,6 +211,7 @@ async fn background_admission_uses_permissions_not_turn_exposure() {
                 &mut || vec![],
                 1,
                 &|_| {},
+                None,
             )
             .await
             .unwrap();
@@ -309,6 +310,7 @@ async fn activation_and_nested_audit_survive_replay() {
         &mut || vec![],
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();

@@ -398,6 +398,7 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
             &mut Vec::new,
             1,
             &|frame| frames.lock().unwrap().push(frame),
+            None,
         )
         .await
         .unwrap();
@@ -533,6 +534,7 @@ async fn context_usage_matches_request_meter_not_reported_usage() {
             &mut Vec::new,
             1,
             &|f| observed.lock().unwrap().push(f),
+            None,
         )
         .await
         .unwrap();
@@ -635,6 +637,7 @@ async fn calibration_scales_pressure_and_commit_records_estimate() {
             &mut Vec::new,
             1,
             &|f| frames.lock().unwrap().push(f),
+            None,
         )
         .await
         .unwrap();
@@ -756,7 +759,8 @@ async fn overflowing_indivisible_request_does_not_retry() {
         &CancellationToken::new(),
         &mut Vec::new,
         1,
-        &|_| {}
+        &|_| {},
+        None,
     )
     .await
     .is_err());
@@ -1027,6 +1031,7 @@ async fn max_tokens_stop_with_tool_use_dispatches_and_continues() {
         &mut no_steers(),
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1069,6 +1074,7 @@ async fn max_tokens_stop_without_tool_use_completes_the_turn() {
         &mut no_steers(),
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1134,6 +1140,7 @@ async fn agent_instructions_and_ceiling_apply_to_schema_and_dispatch() {
             &mut no_steers(),
             1,
             &|_| {},
+            None,
         )
         .await
         .unwrap();
@@ -1175,6 +1182,7 @@ async fn tasks_commit_in_model_order_and_survive_compaction_and_resume() {
         &mut no_steers(),
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1256,6 +1264,7 @@ async fn final_tool_result_notifies_after_persistence_without_another_model_step
         &mut no_steers(),
         1,
         &frames,
+        None,
     )
     .await
     .unwrap();
@@ -1298,6 +1307,7 @@ async fn tool_roundtrips_continue_beyond_fifty_model_requests() {
         &mut no_steers(),
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1360,6 +1370,7 @@ async fn tool_roundtrip_turn_commits_and_replays() {
         &mut steers,
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1389,6 +1400,8 @@ async fn tool_roundtrip_turn_commits_and_replays() {
             SessionEvent::Prune(_) => "prune",
             SessionEvent::PlanMode { .. } => "plan",
             SessionEvent::RequestConfig(_) => "config",
+            SessionEvent::HookInvoked(_) => "hook-invoked",
+            SessionEvent::HookResult(_) => "hook-result",
         })
         .collect();
     assert_eq!(
@@ -1460,6 +1473,7 @@ async fn steer_lands_before_next_step() {
         &mut steers,
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1509,6 +1523,7 @@ async fn retryable_failure_becomes_attempt_then_succeeds() {
         &mut steers,
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1557,6 +1572,7 @@ async fn non_retryable_failure_fails_turn_but_commits_trace() {
         &mut steers,
         1,
         &|_| {},
+        None,
     )
     .await;
     assert!(matches!(
@@ -1608,6 +1624,7 @@ async fn cancellation_mid_stream_preserves_partial() {
         &mut steers,
         1,
         &|_| {},
+        None,
     )
     .await
     .unwrap();
@@ -1627,4 +1644,196 @@ async fn cancellation_mid_stream_preserves_partial() {
     assert_eq!(attempt.chunks.len(), 1);
     // Model context untouched by the dead stream.
     assert_eq!(replayed.context.turns.len(), 1);
+}
+
+// ── loop hook tests ───────────────────────────────────────────────────
+
+mod loop_hooks_tests {
+    use super::*;
+    use rness_engine::turn::hooks::*;
+
+    struct ScriptedLoop {
+        pre_step: Mutex<Vec<PreStepDecision>>,
+        turn_stopping: Mutex<Vec<TurnStoppingAction>>,
+        request_error: Mutex<Vec<RequestErrorAction>>,
+        log: Mutex<Vec<String>>,
+    }
+    impl ScriptedLoop {
+        fn new() -> Self {
+            Self {
+                pre_step: Mutex::new(Vec::new()),
+                turn_stopping: Mutex::new(Vec::new()),
+                request_error: Mutex::new(Vec::new()),
+                log: Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl LoopHooks for ScriptedLoop {
+        async fn pre_step(&self, ev: &LoopEvent, _: &CancellationToken) -> Result<PreStepDecision, String> {
+            self.log.lock().unwrap().push(format!("pre_step:{}:{}", ev.turn, ev.step));
+            Ok(self.pre_step.lock().unwrap().pop().unwrap_or_default())
+        }
+        async fn request(&self, ev: &LoopEvent, _: &CancellationToken) -> Result<(), String> {
+            self.log.lock().unwrap().push(format!("request:{}:{}", ev.turn, ev.step));
+            Ok(())
+        }
+        async fn request_error(&self, ev: &LoopEvent, err: &RequestError, _: &CancellationToken) -> Result<RequestErrorAction, String> {
+            self.log.lock().unwrap().push(format!("request_error:{}:{}:{}", ev.turn, ev.step, err.code));
+            Ok(self.request_error.lock().unwrap().pop().unwrap_or_default())
+        }
+        async fn turn_stopping(&self, ev: &LoopEvent, _: &CancellationToken) -> Result<TurnStoppingAction, String> {
+            self.log.lock().unwrap().push(format!("turn_stopping:{}:{}", ev.turn, ev.step));
+            Ok(self.turn_stopping.lock().unwrap().pop().unwrap_or_default())
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_step_reject_ends_turn_without_model_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        })).unwrap();
+        let provider = Scripted::new(vec![
+            // Should never be reached.
+            StepOutcome::Committed(assistant("never", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        hooks.pre_step.lock().unwrap().push(PreStepDecision::Reject);
+        let outcome = run_turn(
+            &store, &mut log, &provider, &ToolRegistry::default(),
+            &TurnConfig::default(), &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(provider.seen_contexts.lock().unwrap().len(), 0, "model should not be called");
+        assert_eq!(hooks.log.lock().unwrap().as_slice(), &["pre_step:1:1"]);
+    }
+
+    #[tokio::test]
+    async fn pre_step_inject_messages_visible_to_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        })).unwrap();
+        let provider = Scripted::new(vec![
+            StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        hooks.pre_step.lock().unwrap().push(PreStepDecision::EnterWithMessages {
+            messages: vec!["injected context".into()],
+        });
+        let outcome = run_turn(
+            &store, &mut log, &provider, &ToolRegistry::default(),
+            &TurnConfig::default(), &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        // The injected message should appear in model context.
+        let texts = provider.seen_texts.lock().unwrap();
+        assert!(texts[0].contains("injected context"), "model should see injected text: {}", texts[0]);
+    }
+
+    #[tokio::test]
+    async fn turn_stopping_continue_extends_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        })).unwrap();
+        let provider = Scripted::new(vec![
+            StepOutcome::Committed(assistant("first", StopReason::EndTurn, vec![])),
+            StepOutcome::Committed(assistant("second", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        // First turn_stopping: continue with a message. Second: stop.
+        hooks.turn_stopping.lock().unwrap().push(TurnStoppingAction::Stop);
+        hooks.turn_stopping.lock().unwrap().push(TurnStoppingAction::Continue {
+            messages: vec!["keep going".into()],
+        });
+        // Note: pop() takes the last element, so Continue is first.
+        let outcome = run_turn(
+            &store, &mut log, &provider, &ToolRegistry::default(),
+            &TurnConfig::default(), &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(provider.seen_contexts.lock().unwrap().len(), 2, "two steps");
+        let texts = provider.seen_texts.lock().unwrap();
+        assert!(texts[1].contains("keep going"), "model should see steer: {}", texts[1]);
+    }
+
+    #[tokio::test]
+    async fn request_error_retry_overrides_non_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        })).unwrap();
+        let provider = Scripted::new(vec![
+            StepOutcome::Failed {
+                error: ProviderError { code: "RATE_LIMIT", retryable: false, message: "too fast".into(), retry_after: None },
+                partial: vec![],
+            },
+            StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        hooks.request_error.lock().unwrap().push(RequestErrorAction::Retry);
+        let outcome = run_turn(
+            &store, &mut log, &provider, &ToolRegistry::default(),
+            &TurnConfig { max_retries: 0, ..Default::default() },
+            &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let log_entries = hooks.log.lock().unwrap();
+        assert!(log_entries.contains(&"request_error:1:1:RATE_LIMIT".to_string()));
+    }
+
+    #[tokio::test]
+    async fn request_hook_observes_every_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        })).unwrap();
+        let tools = ToolRegistry::default();
+        tools.register(Arc::new(Echo));
+        let provider = Scripted::new(vec![
+            StepOutcome::Committed(assistant("call", StopReason::ToolUse, vec![("c1", "Echo")])),
+            StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        let outcome = run_turn(
+            &store, &mut log, &provider, &tools,
+            &TurnConfig::default(), &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let log_entries = hooks.log.lock().unwrap();
+        assert_eq!(log_entries.iter().filter(|l| l.starts_with("request:")).count(), 2);
+        assert_eq!(log_entries.iter().filter(|l| l.starts_with("pre_step:")).count(), 2);
+    }
 }

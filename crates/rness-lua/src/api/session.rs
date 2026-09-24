@@ -313,6 +313,26 @@ pub fn install(
         })?,
     )?;
 
+    // Inject context into a session without waking its idle state. The message
+    // is visible to the model on the next step but does not start a turn.
+    let s = Arc::clone(&sessions);
+    let inject_rt = rt.clone();
+    session.set(
+        "inject",
+        lua.create_function(move |_, (id, text): (String, String)| {
+            let _guard = inject_rt.enter();
+            let disposition = s
+                .send(&id, UserIntent::Inject, vec![ContentPart::Text { text }])
+                .map_err(err)?;
+            Ok(match disposition {
+                Disposition::Command(_) => "command",
+                Disposition::StartTurn => "started",
+                Disposition::Queued => "queued",
+                Disposition::LogOnly => "logged",
+            })
+        })?,
+    )?;
+
     let s = Arc::clone(&sessions);
     session.set(
         "fork",
