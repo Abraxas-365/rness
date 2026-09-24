@@ -78,8 +78,14 @@ const KNOWN_HOOK_POINTS: &[&str] = &[
     "request_error",
     "turn_stopping",
     "session_start",
+    "session_created",
+    "session_idle",
     "subagent_start",
     "subagent_stop",
+    "turn_start",
+    "turn_end",
+    "frame",
+    "ready",
 ];
 
 /// Generate Lua code that registers all command hooks from a parsed config.

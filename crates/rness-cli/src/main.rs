@@ -869,7 +869,8 @@ async fn main() -> anyhow::Result<()> {
     // can't block the engine).
     let _lua_hook_subs = {
         use rness_engine::service::{
-            SessionStartEv, SubagentStartEv, SubagentStopEv, TurnEndedEv, TurnStartedEv,
+            SessionCreatedEv, SessionIdleEv, SessionStartEv, SubagentStartEv, SubagentStopEv,
+            TurnEndedEv, TurnStartedEv,
         };
         let l1: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
         let s1 = kernel.bus().on::<TurnStartedEv>(move |n| {
@@ -942,7 +943,31 @@ async fn main() -> anyhow::Result<()> {
                 }),
             );
         });
-        (s1, s2, s3, s4, s5, s6)
+        // Session created (brand-new, not resumed).
+        let l7: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s7 = kernel.bus().on::<SessionCreatedEv>(move |n| {
+            l7.fire_hook(
+                "session_created",
+                serde_json::json!({
+                    "session": n.session,
+                    "workspace": n.workspace,
+                    "delegation": n.delegation.as_ref().map(|d| serde_json::json!({
+                        "parent": d.parent,
+                        "depth": d.depth,
+                        "mode": format!("{:?}", d.mode),
+                    })),
+                }),
+            );
+        });
+        // Session idle (turn finished, waiting for input).
+        let l8: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s8 = kernel.bus().on::<SessionIdleEv>(move |session| {
+            l8.fire_hook(
+                "session_idle",
+                serde_json::json!({"session": session}),
+            );
+        });
+        (s1, s2, s3, s4, s5, s6, s7, s8)
     };
 
     if cli.list {

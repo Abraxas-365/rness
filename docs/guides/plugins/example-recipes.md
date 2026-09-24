@@ -280,6 +280,17 @@ rness.hook.on("subagent_stop", function(ev)
   print("subagent stopped:", ev.child, "outcome:", ev.outcome)
   -- ev.outcome: "completed", "aborted", or "error"
 end)
+
+-- Fires when a brand-new session is created (not on resume).
+rness.hook.on("session_created", function(ev)
+  print("new session:", ev.session, "workspace:", ev.workspace)
+  -- ev.delegation: nil for root sessions, {parent, depth, mode} for subagents
+end)
+
+-- Fires when a session goes idle (turn finished, waiting for input).
+rness.hook.on("session_idle", function(ev)
+  print("session idle:", ev.session)
+end)
 ```
 
 **`rness.session.inject(session, text)`** — Queue context into a session's next step without waking an idle session or starting a turn. The message is committed as `UserMessage{intent: Inject}`. Useful inside `session_start` to seed model context. Returns `"queued"`, `"started"`, or `"logged"`.

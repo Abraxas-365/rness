@@ -95,6 +95,19 @@ impl Event for SessionIdleEv {
     type Payload = SessionId;
 }
 
+/// Fired when a brand-new session is created (not resumed).
+#[derive(Debug, Clone)]
+pub struct SessionCreatedNotice {
+    pub session: SessionId,
+    pub workspace: Option<String>,
+    pub delegation: Option<rness_protocol::branch::Delegation>,
+}
+pub struct SessionCreatedEv;
+impl Event for SessionCreatedEv {
+    const NAME: &'static str = "session/created";
+    type Payload = SessionCreatedNotice;
+}
+
 /// Fired when a session's first turn begins. Delegation info is included so
 /// listeners can distinguish root sessions from subagent children.
 #[derive(Debug, Clone)]
@@ -920,7 +933,13 @@ impl SessionService {
         if seed != CallConfig::default() {
             log.append(&SessionEvent::RequestConfig(seed))?;
         }
-        Ok(log.session().clone())
+        let session = log.session().clone();
+        self.bus.emit::<SessionCreatedEv>(&SessionCreatedNotice {
+            session: session.clone(),
+            workspace: self.store.workspace(&session).ok().flatten(),
+            delegation: None,
+        });
+        Ok(session)
     }
 
     /// Create a delegated fresh session with this service's explicit seed.
@@ -944,7 +963,14 @@ impl SessionService {
         if seed != CallConfig::default() {
             log.append(&SessionEvent::RequestConfig(seed))?;
         }
-        Ok(log.session().clone())
+        let session = log.session().clone();
+        let delegation = self.store.delegation(&session).ok().flatten();
+        self.bus.emit::<SessionCreatedEv>(&SessionCreatedNotice {
+            session: session.clone(),
+            workspace: self.store.workspace(&session).ok().flatten(),
+            delegation,
+        });
+        Ok(session)
     }
 
     fn creation_config(&self) -> Result<CallConfig, ServiceError> {
