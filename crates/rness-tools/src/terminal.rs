@@ -82,6 +82,8 @@ impl OutputBuffer {
 struct TerminalSession {
     id: String,
     name: String,
+    /// The rness session that created this terminal (ownership scoping).
+    owner: String,
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
@@ -126,6 +128,7 @@ impl TerminalRegistry {
         name: Option<String>,
         shell: Option<String>,
         cwd: Option<std::path::PathBuf>,
+        owner: String,
     ) -> Result<String, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -183,6 +186,7 @@ impl TerminalRegistry {
             TerminalSession {
                 id: id.clone(),
                 name: session_name,
+                owner,
                 master: pair.master,
                 writer,
                 child,
@@ -202,6 +206,7 @@ impl TerminalRegistry {
         text: &str,
         submit: bool,
         wait_ms: Option<u64>,
+        owner: &str,
     ) -> Result<String, String> {
         let wait = Duration::from_millis(
             wait_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS),
@@ -213,6 +218,7 @@ impl TerminalRegistry {
                 .sessions
                 .get_mut(id)
                 .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+            Self::check_owner(session, owner)?;
 
             // Record position before sending.
             let mark = session.output.lock().expect("output lock").total_written();
@@ -273,12 +279,13 @@ impl TerminalRegistry {
     }
 
     /// Read scrollback from a terminal session.
-    pub fn read(&self, id: &str, offset: Option<usize>) -> Result<(String, usize), String> {
+    pub fn read(&self, id: &str, offset: Option<usize>, owner: &str) -> Result<(String, usize), String> {
         let inner = self.inner.lock().expect("registry lock");
         let session = inner
             .sessions
             .get(id)
             .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+        Self::check_owner(session, owner)?;
         let buf = session.output.lock().expect("output lock");
         let from = offset.unwrap_or_else(|| buf.total_written().saturating_sub(MAX_READ_BYTES));
         let (bytes, next_offset) = buf.read_from(from, MAX_READ_BYTES);
@@ -288,7 +295,7 @@ impl TerminalRegistry {
 
     /// Send a signal to the terminal's shell process group.
     #[cfg(unix)]
-    pub fn signal(&self, id: &str, signal: i32) -> Result<(), String> {
+    pub fn signal(&self, id: &str, signal: i32, owner: &str) -> Result<(), String> {
         // Only allow common signals.
         const ALLOWED: &[i32] = &[2, 15, 9, 18, 19, 20]; // INT, TERM, KILL, CONT, STOP, TSTP
         if !ALLOWED.contains(&signal) {
@@ -302,6 +309,7 @@ impl TerminalRegistry {
             .sessions
             .get(id)
             .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+        Self::check_owner(session, owner)?;
         let pid = session
             .child
             .process_id()
@@ -324,16 +332,17 @@ impl TerminalRegistry {
     }
 
     #[cfg(not(unix))]
-    pub fn signal(&self, _id: &str, _signal: i32) -> Result<(), String> {
+    pub fn signal(&self, _id: &str, _signal: i32, _owner: &str) -> Result<(), String> {
         Err("signals not supported on this platform".into())
     }
 
-    /// List all open terminal sessions.
-    pub fn list(&self) -> Vec<TerminalInfo> {
+    /// List open terminal sessions owned by the given session.
+    pub fn list(&self, owner: &str) -> Vec<TerminalInfo> {
         let inner = self.inner.lock().expect("registry lock");
         inner
             .sessions
             .values()
+            .filter(|s| s.owner == owner)
             .map(|s| TerminalInfo {
                 id: s.id.clone(),
                 name: s.name.clone(),
@@ -342,12 +351,17 @@ impl TerminalRegistry {
     }
 
     /// Close a terminal session.
-    pub fn close(&self, id: &str) -> Result<(), String> {
+    pub fn close(&self, id: &str, owner: &str) -> Result<(), String> {
         let mut inner = self.inner.lock().expect("registry lock");
-        let mut session = inner
-            .sessions
-            .remove(id)
-            .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+        // Check ownership before removing.
+        {
+            let session = inner
+                .sessions
+                .get(id)
+                .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+            Self::check_owner(session, owner)?;
+        }
+        let mut session = inner.sessions.remove(id).unwrap();
         // Drop the lock before blocking on join.
         drop(inner);
 
@@ -363,6 +377,16 @@ impl TerminalRegistry {
         drop(session.master);
         // Wait for the reader thread to finish (bounded — it exits on EOF).
         let _ = session._reader_handle.join();
+        Ok(())
+    }
+
+    fn check_owner(session: &TerminalSession, owner: &str) -> Result<(), String> {
+        if session.owner != owner {
+            return Err(format!(
+                "terminal session '{}' belongs to another session",
+                session.id,
+            ));
+        }
         Ok(())
     }
 
@@ -418,16 +442,32 @@ fn reader_loop(
 
 use async_trait::async_trait;
 use rness_engine::tools::Tool;
+use rness_protocol::events::SessionId;
+use rness_protocol::sandbox::SandboxMode;
 use serde_json::{json, Value};
+
+fn sandbox_deny(mode: SandboxMode) -> Result<String, String> {
+    Err(format!(
+        "terminal tools are disabled in {mode:?} sandbox mode \
+         (requires DangerFullAccess)"
+    ))
+}
+
+// ── terminal_open ─────────────────────────────────────────────────
 
 pub struct TerminalOpenTool {
     registry: TerminalRegistry,
     ws: Arc<crate::Workspace>,
+    sandbox: SandboxMode,
 }
 
 impl TerminalOpenTool {
     pub fn new(registry: TerminalRegistry, ws: Arc<crate::Workspace>) -> Self {
-        Self { registry, ws }
+        Self {
+            registry,
+            ws,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -459,14 +499,25 @@ impl Tool for TerminalOpenTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_open requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
+        if self.sandbox != SandboxMode::DangerFullAccess {
+            return sandbox_deny(self.sandbox);
+        }
         let name = args["name"].as_str().map(String::from);
         let shell = args["shell"].as_str().map(String::from);
         let cwd = Some(self.ws.root().to_path_buf());
-        let id = self.registry.open(name, shell, cwd)?;
+        let id = self.registry.open(name, shell, cwd, session.clone())?;
         // Give the shell a moment to start and print its banner.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let (output, _) = self.registry.read(&id, Some(0))?;
+        let (output, _) = self.registry.read(&id, Some(0), session)?;
         Ok(format!("Terminal session opened: {id}\n{output}"))
     }
 
@@ -479,17 +530,38 @@ impl Tool for TerminalOpenTool {
         Some(Arc::new(Self {
             registry: self.registry.clone(),
             ws: self.ws.for_session(&String::new(), workspace),
+            sandbox: self.sandbox,
+        }))
+    }
+
+    fn for_workspace_with_policy(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        let _ = session;
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            ws: self.ws.for_session(&String::new(), workspace),
+            sandbox,
         }))
     }
 }
 
+// ── terminal_send ─────────────────────────────────────────────────
+
 pub struct TerminalSendTool {
     registry: TerminalRegistry,
+    sandbox: SandboxMode,
 }
 
 impl TerminalSendTool {
     pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -529,7 +601,18 @@ impl Tool for TerminalSendTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_send requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
+        if self.sandbox != SandboxMode::DangerFullAccess {
+            return sandbox_deny(self.sandbox);
+        }
         let id = crate::required_str(&args, "session_id")?;
         let text = crate::required_str(&args, "text")?;
         let submit = args["submit"].as_bool().unwrap_or(true);
@@ -538,19 +621,38 @@ impl Tool for TerminalSendTool {
         let registry = self.registry.clone();
         let id = id.to_string();
         let text = text.to_string();
-        tokio::task::spawn_blocking(move || registry.send(&id, &text, submit, wait_ms))
+        let owner = session.clone();
+        tokio::task::spawn_blocking(move || registry.send(&id, &text, submit, wait_ms, &owner))
             .await
             .map_err(|e| format!("terminal send task: {e}"))?
     }
+
+    fn for_workspace_with_policy(
+        &self,
+        _session: &String,
+        _workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            sandbox,
+        }))
+    }
 }
+
+// ── terminal_read ─────────────────────────────────────────────────
 
 pub struct TerminalReadTool {
     registry: TerminalRegistry,
+    sandbox: SandboxMode,
 }
 
 impl TerminalReadTool {
     pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -582,25 +684,54 @@ impl Tool for TerminalReadTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_read requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
+        if self.sandbox != SandboxMode::DangerFullAccess {
+            return sandbox_deny(self.sandbox);
+        }
         let id = crate::required_str(&args, "session_id")?;
         let offset = args["offset"].as_u64().map(|v| v as usize);
-        let (text, next_offset) = self.registry.read(id, offset)?;
+        let (text, next_offset) = self.registry.read(id, offset, session)?;
         if text.is_empty() {
             Ok(format!("(no output; next_offset: {next_offset})"))
         } else {
             Ok(format!("{text}\n[next_offset: {next_offset}]"))
         }
     }
+
+    fn for_workspace_with_policy(
+        &self,
+        _session: &String,
+        _workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            sandbox,
+        }))
+    }
 }
+
+// ── terminal_signal ───────────────────────────────────────────────
 
 pub struct TerminalSignalTool {
     registry: TerminalRegistry,
+    sandbox: SandboxMode,
 }
 
 impl TerminalSignalTool {
     pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -632,21 +763,51 @@ impl Tool for TerminalSignalTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_signal requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
+        if self.sandbox != SandboxMode::DangerFullAccess {
+            return sandbox_deny(self.sandbox);
+        }
         let id = crate::required_str(&args, "session_id")?;
         let signal = args["signal"].as_i64().unwrap_or(2) as i32;
-        self.registry.signal(id, signal)?;
+        self.registry.signal(id, signal, session)?;
         Ok(format!("Signal {signal} sent to {id}"))
+    }
+
+    fn for_workspace_with_policy(
+        &self,
+        _session: &String,
+        _workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            sandbox,
+        }))
     }
 }
 
+// ── terminal_list ─────────────────────────────────────────────────
+
 pub struct TerminalListTool {
     registry: TerminalRegistry,
+    #[allow(dead_code)] // Carried for for_workspace_with_policy propagation.
+    sandbox: SandboxMode,
 }
 
 impl TerminalListTool {
     pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -657,7 +818,7 @@ impl Tool for TerminalListTool {
     }
 
     fn description(&self) -> &str {
-        "List all open persistent terminal sessions."
+        "List open persistent terminal sessions for this session."
     }
 
     fn input_schema(&self) -> Value {
@@ -667,9 +828,17 @@ impl Tool for TerminalListTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_list requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
         let _ = args;
-        let sessions = self.registry.list();
+        let sessions = self.registry.list(session);
         if sessions.is_empty() {
             return Ok("No open terminal sessions.".into());
         }
@@ -679,15 +848,33 @@ impl Tool for TerminalListTool {
         }
         Ok(out)
     }
+
+    fn for_workspace_with_policy(
+        &self,
+        _session: &String,
+        _workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            sandbox,
+        }))
+    }
 }
+
+// ── terminal_close ────────────────────────────────────────────────
 
 pub struct TerminalCloseTool {
     registry: TerminalRegistry,
+    sandbox: SandboxMode,
 }
 
 impl TerminalCloseTool {
     pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            sandbox: SandboxMode::DangerFullAccess,
+        }
     }
 }
 
@@ -714,10 +901,33 @@ impl Tool for TerminalCloseTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> Result<String, String> {
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Err("terminal_close requires session context; use execute_in".into())
+    }
+
+    async fn execute_in(
+        &self,
+        session: &SessionId,
+        args: Value,
+    ) -> Result<String, String> {
+        if self.sandbox != SandboxMode::DangerFullAccess {
+            return sandbox_deny(self.sandbox);
+        }
         let id = crate::required_str(&args, "session_id")?;
-        self.registry.close(id)?;
+        self.registry.close(id, session)?;
         Ok(format!("Terminal session {id} closed."))
+    }
+
+    fn for_workspace_with_policy(
+        &self,
+        _session: &String,
+        _workspace: &std::path::Path,
+        sandbox: SandboxMode,
+    ) -> Option<Arc<dyn Tool>> {
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            sandbox,
+        }))
     }
 }
 
