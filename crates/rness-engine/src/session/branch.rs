@@ -48,7 +48,7 @@ impl SessionStore {
         }
     }
 
-    fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
+    pub fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
         let mut readers = self.readers.lock().unwrap();
         let mut order = self.reader_order.lock().unwrap();
         if !readers.contains_key(session) {

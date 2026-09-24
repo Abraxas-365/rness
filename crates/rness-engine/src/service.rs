@@ -1038,11 +1038,12 @@ impl SessionService {
     }
 
     /// Get the current title for a session (last `session/title` event wins).
-    /// Returns `None` if no title has been set.
+    /// Reads only the session's own log (not fork ancestors), since titles
+    /// are always leaf-local.
     pub fn title(&self, session: &SessionId) -> Result<Option<String>, ServiceError> {
-        let history = self.store.history(session)?;
+        let events = self.store.read_session(session)?;
         // Last-wins: scan from the end.
-        for envelope in history.iter().rev() {
+        for envelope in events.iter().rev() {
             if let rness_protocol::events::SessionEvent::Title(t) = &envelope.event {
                 return Ok(Some(t.title.clone()));
             }
@@ -1051,12 +1052,18 @@ impl SessionService {
     }
 
     /// Set a session title (appends a `session/title` event).
+    /// Fails with `Busy` if the session's log is locked (e.g. during a turn).
     pub fn set_title(
         &self,
         session: &SessionId,
         title: String,
         source: rness_protocol::events::TitleSource,
     ) -> Result<(), ServiceError> {
+        if title.len() > 200 {
+            return Err(ServiceError::InvalidConfig(
+                "title exceeds 200 bytes".into(),
+            ));
+        }
         let mut log = self.store.open(session)?;
         log.append(&rness_protocol::events::SessionEvent::Title(
             rness_protocol::events::SessionTitle { title, source },
@@ -2208,20 +2215,25 @@ async fn summarize(
 ///
 /// 1. Write a deterministic fallback (first ~8 words of the user message).
 /// 2. Try an LLM call to produce a better title; overwrite on success.
+///
+/// Takes the burst's log writer to avoid releasing the advisory lock
+/// (which would let external writers race with the title generation).
 async fn auto_title(
-    store: &SessionStore,
+    log: &mut crate::session::log::SessionLog,
     session: &SessionId,
+    store: &SessionStore,
     provider: &dyn Provider,
 ) -> Result<(), ServiceError> {
-    // Already titled? (e.g. forked session inherited a title, or user set one)
-    let history = store.history(session)?;
-    if history
+    // Already titled in this session's own log? (Not fork ancestry.)
+    let own_events = store.read_session(session)?;
+    if own_events
         .iter()
         .any(|e| matches!(e.event, SessionEvent::Title(_)))
     {
         return Ok(());
     }
-    // Extract first user message text.
+    // Extract first user message text (from full history, including fork ancestors).
+    let history = store.history(session)?;
     let first_user_text = history
         .iter()
         .find_map(|e| match &e.event {
@@ -2242,8 +2254,11 @@ async fn auto_title(
                 }
             }
             _ => None,
-        })
-        .ok_or(ServiceError::Busy)?; // no user message — shouldn't happen
+        });
+    let first_user_text = match first_user_text {
+        Some(t) => t,
+        None => return Ok(()), // no user message — nothing to title
+    };
 
     // 1. Deterministic fallback: first ~8 words, max 60 chars.
     let fallback: String = first_user_text
@@ -2256,13 +2271,10 @@ async fn auto_title(
     } else {
         fallback
     };
-    {
-        let mut log = store.open(session)?;
-        log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
-            title: fallback,
-            source: rness_protocol::events::TitleSource::Fallback,
-        }))?;
-    }
+    log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
+        title: fallback,
+        source: rness_protocol::events::TitleSource::Fallback,
+    }))?;
 
     // 2. LLM title generation (best-effort).
     let system = "Create a concise title for an AI coding-assistant session from the supplied \
@@ -2314,7 +2326,6 @@ async fn auto_title(
         return Ok(());
     }
     // Overwrite with the model-generated title.
-    let mut log = store.open(session)?;
     log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
         title,
         source: rness_protocol::events::TitleSource::Model,
@@ -2424,15 +2435,14 @@ async fn burst(
         });
 
         // Auto-generate a session title after the first successful turn.
-        // Must release the log writer first — auto_title opens its own.
         if turn_no == 1 && outcome == TurnOutcome::Completed {
-            drop(log.take());
-            if let Err(e) =
-                auto_title(&store, &session, provider.as_ref()).await
-            {
-                tracing::debug!(session = %session, "auto-title: {e}");
+            if let Some(log_ref) = log.as_mut() {
+                if let Err(e) =
+                    auto_title(log_ref, &session, &store, provider.as_ref()).await
+                {
+                    tracing::debug!(session = %session, "auto-title: {e}");
+                }
             }
-            log = Some(store.open(&session).expect("reopen log after title"));
         }
 
         // Continuation decision under the inbox lock: a followup queued
