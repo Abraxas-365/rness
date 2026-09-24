@@ -663,9 +663,10 @@ async fn main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("no working directory")?;
     let tools = Arc::new(ToolRegistry::default());
     tools.set_spill_root(root.clone());
+    let ws = rness_tools::Workspace::new(&cwd);
     let jobs = rness_tools::register_all_configured(
         &tools,
-        rness_tools::Workspace::new(&cwd),
+        ws.clone(),
         startup.sandbox.process.clone(),
     );
     jobs.configure_retention(startup.job_retention.clone())
@@ -804,7 +805,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
     let terminals = rness_tools::terminal::TerminalRegistry::new();
-    rness_tools::terminal::register_terminal_tools(&tools, terminals.clone());
+    rness_tools::terminal::register_terminal_tools(&tools, terminals.clone(), ws);
 
     // Skills: filesystem catalogs, project shadowing user on name
     // conflicts. The catalog lives in the tool's description.

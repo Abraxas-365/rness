@@ -61,8 +61,11 @@ impl OutputBuffer {
     }
 
     /// Read bytes from logical offset `from` onward, up to `limit`.
+    /// If `from` has been evicted, starts from the oldest retained byte.
     fn read_from(&self, from: usize, limit: usize) -> (Vec<u8>, usize) {
-        let start = from.saturating_sub(self.base_offset);
+        // Clamp to the oldest retained offset if the requested offset was evicted.
+        let effective_from = from.max(self.base_offset);
+        let start = effective_from - self.base_offset;
         let end = (start + limit).min(self.data.len());
         if start >= self.data.len() {
             return (Vec::new(), self.total_written());
@@ -118,7 +121,12 @@ impl TerminalRegistry {
     }
 
     /// Open a new PTY session with the given shell.
-    pub fn open(&self, name: Option<String>, shell: Option<String>) -> Result<String, String> {
+    pub fn open(
+        &self,
+        name: Option<String>,
+        shell: Option<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Result<String, String> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -133,7 +141,9 @@ impl TerminalRegistry {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
         });
         let mut cmd = CommandBuilder::new(&shell_cmd);
-        cmd.cwd(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/")));
+        cmd.cwd(cwd.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        }));
 
         let child = pair
             .slave
@@ -197,7 +207,7 @@ impl TerminalRegistry {
             wait_ms.unwrap_or(DEFAULT_WAIT_MS).min(MAX_WAIT_MS),
         );
 
-        let (output_buf, notify, mark) = {
+        let (output_buf, _notify, mark) = {
             let mut inner = self.inner.lock().expect("registry lock");
             let session = inner
                 .sessions
@@ -229,10 +239,11 @@ impl TerminalRegistry {
         };
 
         // Wait for output with idle detection: if no new output arrives for
-        // 200ms after the first chunk, assume the command has finished.
+        // 200ms after the last chunk, assume the command has finished.
         let deadline = Instant::now() + wait;
         let idle_threshold = Duration::from_millis(200);
         let mut last_output_at = Instant::now();
+        let mut prev_total = mark;
 
         loop {
             let now = Instant::now();
@@ -240,16 +251,18 @@ impl TerminalRegistry {
                 break;
             }
             let current = output_buf.lock().expect("output lock").total_written();
-            if current > mark {
+            if current != prev_total {
+                // New output arrived since last check.
                 last_output_at = now;
+                prev_total = current;
             }
             if current > mark && now.duration_since(last_output_at) >= idle_threshold {
+                // Output received and then silence — command likely done.
                 break;
             }
-            // Wait briefly for new output.
+            // Sleep briefly to allow output to arrive.
             let sleep = idle_threshold.min(deadline - now);
-            let guard = output_buf.lock().expect("output lock");
-            let _ = notify.wait_timeout(guard, sleep);
+            std::thread::sleep(sleep);
         }
 
         // Read everything from mark onward.
@@ -273,22 +286,32 @@ impl TerminalRegistry {
         Ok((text, next_offset))
     }
 
-    /// Send a signal to the terminal's foreground process.
+    /// Send a signal to the terminal's shell process group.
     #[cfg(unix)]
     pub fn signal(&self, id: &str, signal: i32) -> Result<(), String> {
+        // Only allow common signals.
+        const ALLOWED: &[i32] = &[2, 15, 9, 18, 19, 20]; // INT, TERM, KILL, CONT, STOP, TSTP
+        if !ALLOWED.contains(&signal) {
+            return Err(format!(
+                "signal {signal} not allowed; permitted: {}",
+                ALLOWED.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "),
+            ));
+        }
         let inner = self.inner.lock().expect("registry lock");
         let session = inner
             .sessions
             .get(id)
             .ok_or_else(|| format!("terminal session '{id}' not found"))?;
-        // Send signal to the child process group.
         let pid = session
             .child
             .process_id()
             .ok_or("cannot get child PID")?;
-        // Signal the process group (negative PID).
+        let pid_i32 = i32::try_from(pid)
+            .map_err(|_| format!("PID {pid} out of range for signal"))?;
+        // Signal the process group (negative PID). The PTY child is a
+        // session leader so its PID == its PGID.
         unsafe {
-            if libc::kill(-(pid as i32), signal) != 0 {
+            if libc::kill(-pid_i32, signal) != 0 {
                 return Err(format!(
                     "kill({}, {}) failed: {}",
                     pid,
@@ -325,6 +348,8 @@ impl TerminalRegistry {
             .sessions
             .remove(id)
             .ok_or_else(|| format!("terminal session '{id}' not found"))?;
+        // Drop the lock before blocking on join.
+        drop(inner);
 
         // Kill the child process.
         session
@@ -333,9 +358,11 @@ impl TerminalRegistry {
             .map_err(|e| format!("failed to kill terminal process: {e}"))?;
         let _ = session.child.wait();
         // Drop the master to close the PTY, which will cause the reader
-        // thread to exit.
+        // thread to exit on EOF.
         drop(session.writer);
         drop(session.master);
+        // Wait for the reader thread to finish (bounded — it exits on EOF).
+        let _ = session._reader_handle.join();
         Ok(())
     }
 
@@ -395,11 +422,12 @@ use serde_json::{json, Value};
 
 pub struct TerminalOpenTool {
     registry: TerminalRegistry,
+    ws: Arc<crate::Workspace>,
 }
 
 impl TerminalOpenTool {
-    pub fn new(registry: TerminalRegistry) -> Self {
-        Self { registry }
+    pub fn new(registry: TerminalRegistry, ws: Arc<crate::Workspace>) -> Self {
+        Self { registry, ws }
     }
 }
 
@@ -434,11 +462,24 @@ impl Tool for TerminalOpenTool {
     async fn execute(&self, args: Value) -> Result<String, String> {
         let name = args["name"].as_str().map(String::from);
         let shell = args["shell"].as_str().map(String::from);
-        let id = self.registry.open(name, shell)?;
+        let cwd = Some(self.ws.root().to_path_buf());
+        let id = self.registry.open(name, shell, cwd)?;
         // Give the shell a moment to start and print its banner.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let (output, _) = self.registry.read(&id, Some(0))?;
         Ok(format!("Terminal session opened: {id}\n{output}"))
+    }
+
+    fn for_workspace(
+        &self,
+        session: &String,
+        workspace: &std::path::Path,
+    ) -> Option<Arc<dyn Tool>> {
+        let _ = session;
+        Some(Arc::new(Self {
+            registry: self.registry.clone(),
+            ws: self.ws.for_session(&String::new(), workspace),
+        }))
     }
 }
 
@@ -684,8 +725,9 @@ impl Tool for TerminalCloseTool {
 pub fn register_terminal_tools(
     registry: &rness_engine::tools::ToolRegistry,
     terminals: TerminalRegistry,
+    ws: Arc<crate::Workspace>,
 ) {
-    registry.register(Arc::new(TerminalOpenTool::new(terminals.clone())));
+    registry.register(Arc::new(TerminalOpenTool::new(terminals.clone(), ws)));
     registry.register(Arc::new(TerminalSendTool::new(terminals.clone())));
     registry.register(Arc::new(TerminalReadTool::new(terminals.clone())));
     registry.register(Arc::new(TerminalSignalTool::new(terminals.clone())));
