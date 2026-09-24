@@ -19,6 +19,12 @@ use tokio_util::sync::CancellationToken;
 use crate::approval::{ApprovalRequest, Approvals, Decision};
 use hooks::{ExecuteOutcome, HookContext, PostToolDecision, PreToolDecision, ToolHookEvent, ToolHooks};
 
+/// Max bytes of tool-result text kept inline for the model. Larger results
+/// are spilled to a file and replaced with a head/tail preview.
+const MAX_INLINE_BYTES: usize = 50 * 1024;
+/// How many bytes of head and tail to keep in the inline preview.
+const SPILL_PREVIEW_BYTES: usize = 2048;
+
 /// Side data of the most recent tool-body run under `tool_execute`.
 #[derive(Default)]
 struct BodyRun {
@@ -211,6 +217,100 @@ pub struct ToolRegistry {
     pub plan_selections: Arc<crate::plan::PlanSelections>,
     approvals: Arc<Approvals>,
     hooks: Arc<HookState>,
+    /// Root directory for spill files (oversized tool output).
+    /// When set, tool results exceeding `MAX_INLINE_BYTES` are saved here
+    /// and the model gets a head/tail preview with a file pointer.
+    spill_root: RwLock<Option<std::path::PathBuf>>,
+}
+
+/// Save oversized tool-result text to a spill file and replace the content
+/// with a head/tail preview pointing at the file. If the combined text of
+/// all content parts is within `MAX_INLINE_BYTES`, or if no `spill_root`
+/// is configured, the content is returned unchanged.
+fn spill_if_oversized(
+    content: Vec<ToolResultContentPart>,
+    spill_root: &Option<std::path::PathBuf>,
+    session: &SessionId,
+    call_id: &ToolCallId,
+    tool_name: &str,
+) -> Vec<ToolResultContentPart> {
+    let Some(root) = spill_root else {
+        return content;
+    };
+    // Compute total text size across all parts.
+    let total_bytes: usize = content
+        .iter()
+        .map(|part| match part {
+            ToolResultContentPart::Text { text } => text.len(),
+            _ => 0,
+        })
+        .sum();
+    if total_bytes <= MAX_INLINE_BYTES {
+        return content;
+    }
+    // Concatenate all text parts for the spill file.
+    let mut full_text = String::with_capacity(total_bytes);
+    let mut non_text = Vec::new();
+    for part in content {
+        match part {
+            ToolResultContentPart::Text { text } => full_text.push_str(&text),
+            other => non_text.push(other),
+        }
+    }
+    // Write spill file: <root>/<session>/spill/<call_id>-<tool>.txt
+    let spill_dir = root.join(session.as_str()).join("spill");
+    let safe_name = tool_name
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect::<String>();
+    let file_name = format!("{}-{}.txt", call_id, safe_name);
+    let file_path = spill_dir.join(&file_name);
+    if let Err(e) = std::fs::create_dir_all(&spill_dir) {
+        tracing::warn!(%e, "spill: cannot create directory, returning inline");
+        return vec![ToolResultContentPart::Text { text: full_text }];
+    }
+    if let Err(e) = std::fs::write(&file_path, &full_text) {
+        tracing::warn!(%e, "spill: cannot write file, returning inline");
+        return vec![ToolResultContentPart::Text { text: full_text }];
+    }
+    // Build head/tail preview.
+    let head_end = char_boundary_before(&full_text, SPILL_PREVIEW_BYTES);
+    let tail_start = char_boundary_after(&full_text, full_text.len().saturating_sub(SPILL_PREVIEW_BYTES));
+    let omitted = full_text.len() - head_end - (full_text.len() - tail_start);
+    let preview = format!(
+        "{}\n\n(Omitted {} bytes. Full result: {}. Use Read with offset/limit to page, or Grep to search.)\n\n{}",
+        &full_text[..head_end],
+        omitted,
+        file_path.display(),
+        &full_text[tail_start..],
+    );
+    tracing::debug!(
+        tool = tool_name,
+        total_bytes,
+        spill_path = %file_path.display(),
+        "tool output spilled to file"
+    );
+    let mut result = vec![ToolResultContentPart::Text { text: preview }];
+    result.extend(non_text);
+    result
+}
+
+/// Find the largest byte offset ≤ `target` that is a char boundary.
+fn char_boundary_before(s: &str, target: usize) -> usize {
+    let mut pos = target.min(s.len());
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Find the smallest byte offset ≥ `target` that is a char boundary.
+fn char_boundary_after(s: &str, target: usize) -> usize {
+    let mut pos = target.min(s.len());
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
 }
 
 impl ToolRegistry {
@@ -249,6 +349,7 @@ impl ToolRegistry {
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             file_references: self.file_references.clone(),
+            spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
         }
     }
 
@@ -269,6 +370,7 @@ impl ToolRegistry {
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             file_references: self.file_references.clone(),
+            spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
         }
     }
 
@@ -382,6 +484,12 @@ impl ToolRegistry {
     /// Record the current turn number so tool hooks include it in audit events.
     pub fn set_current_turn(&self, turn: u32) {
         self.hooks.current_turn.store(turn, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Set the root directory for spill files. Session-scoped subdirectories
+    /// are created on demand (e.g. `<root>/<session>/spill/`).
+    pub fn set_spill_root(&self, root: std::path::PathBuf) {
+        *self.spill_root.write().expect("registry lock") = Some(root);
     }
 
     fn tool_hooks(&self) -> Option<Arc<dyn ToolHooks>> {
@@ -518,6 +626,7 @@ impl ToolRegistry {
             let approvals = Arc::clone(&self.approvals);
             let hook_state = Arc::clone(&self.hooks);
             let hooks = self.tool_hooks();
+            let spill_root = self.spill_root.read().expect("registry lock").clone();
             let call = call.clone();
             let session = session.clone();
             let cancel = cancel.clone();
@@ -732,6 +841,9 @@ impl ToolRegistry {
                     let contexts = contexts.into_iter().filter(|text| !text.trim().is_empty()).map(|text| (session.clone(), HookContext { call: call.call.clone(), text }));
                     hook_state.contexts.lock().expect("hook contexts lock").extend(contexts);
                 }
+                // Spill: if the text output exceeds the inline budget, save the
+                // full result to a file and replace with head/tail + file pointer.
+                let content = spill_if_oversized(content, &spill_root, &session, &call.call, &call.name);
                 let output = ToolResult::text_output(&content);
                 let duration_ms = started.elapsed().as_millis() as u64;
                 if presentation.is_none() {

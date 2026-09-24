@@ -24,6 +24,7 @@ pub mod read_image;
 pub mod skills;
 pub mod subagent;
 pub mod subagent_control;
+pub mod terminal;
 pub mod web;
 pub mod write;
 

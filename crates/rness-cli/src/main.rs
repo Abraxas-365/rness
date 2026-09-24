@@ -662,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
     // the hot-reload watcher re-syncs Lua tools into the same registry.
     let cwd = std::env::current_dir().context("no working directory")?;
     let tools = Arc::new(ToolRegistry::default());
+    tools.set_spill_root(root.clone());
     let jobs = rness_tools::register_all_configured(
         &tools,
         rness_tools::Workspace::new(&cwd),
@@ -800,6 +801,10 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("lua jobs bridge: {e}"))?;
     rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs.clone());
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
+
+    // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
+    let terminals = rness_tools::terminal::TerminalRegistry::new();
+    rness_tools::terminal::register_terminal_tools(&tools, terminals.clone());
 
     // Skills: filesystem catalogs, project shadowing user on name
     // conflicts. The catalog lives in the tool's description.
