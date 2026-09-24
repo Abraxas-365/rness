@@ -2211,18 +2211,15 @@ async fn summarize(
     }
 }
 
-/// Generate a session title after the first turn.
+/// Generate a deterministic session title after the first turn.
 ///
-/// 1. Write a deterministic fallback (first ~8 words of the user message).
-/// 2. Try an LLM call to produce a better title; overwrite on success.
-///
-/// Takes the burst's log writer to avoid releasing the advisory lock
-/// (which would let external writers race with the title generation).
-async fn auto_title(
+/// Writes the first ~8 words of the user message as a fallback title.
+/// Plugins can override this via `rness.session.title(id, text)` or by
+/// hooking `turn_end` to generate an LLM-based title.
+fn auto_title(
     log: &mut crate::session::log::SessionLog,
     session: &SessionId,
     store: &SessionStore,
-    provider: &dyn Provider,
 ) -> Result<(), ServiceError> {
     // Already titled in this session's own log? (Not fork ancestry.)
     let own_events = store.read_session(session)?;
@@ -2260,7 +2257,7 @@ async fn auto_title(
         None => return Ok(()), // no user message — nothing to title
     };
 
-    // 1. Deterministic fallback: first ~8 words, max 60 chars.
+    // Deterministic fallback: first ~8 words, max 60 chars.
     let fallback: String = first_user_text
         .split_whitespace()
         .take(8)
@@ -2274,61 +2271,6 @@ async fn auto_title(
     log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
         title: fallback,
         source: rness_protocol::events::TitleSource::Fallback,
-    }))?;
-
-    // 2. LLM title generation (best-effort).
-    let system = "Create a concise title for an AI coding-assistant session from the supplied \
-        human message. Return only the title on one line, in plain text of natural language, \
-        no quotes, no prefix, no markdown, no code. Use the language of the message. \
-        Aim for 4-8 words.";
-    // Truncate input to ~500 chars to save tokens.
-    let input = if first_user_text.len() > 500 {
-        format!("{}…", &first_user_text[..first_user_text.floor_char_boundary(497)])
-    } else {
-        first_user_text
-    };
-    let context = crate::session::projection::ModelContext {
-        turns: vec![crate::session::projection::ModelTurn::User {
-            content: vec![ContentPart::Text { text: input }],
-        }],
-        ..Default::default()
-    };
-    let cancel = CancellationToken::new();
-    let timeout = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        provider.summarize_step(
-            crate::turn::provider::StepRequest {
-                context: &context,
-                system,
-                tools: &[],
-                on_delta: None,
-            },
-            &cancel,
-        ),
-    )
-    .await;
-    let title = match timeout {
-        Ok(crate::turn::provider::StepOutcome::Committed(msg)) => {
-            msg.content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("")
-                .trim()
-                .to_string()
-        }
-        _ => return Ok(()), // LLM failed — keep the fallback
-    };
-    if title.is_empty() || title.len() > 200 {
-        return Ok(());
-    }
-    // Overwrite with the model-generated title.
-    log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
-        title,
-        source: rness_protocol::events::TitleSource::Model,
     }))?;
     Ok(())
 }
@@ -2438,7 +2380,7 @@ async fn burst(
         if turn_no == 1 && outcome == TurnOutcome::Completed {
             if let Some(log_ref) = log.as_mut() {
                 if let Err(e) =
-                    auto_title(log_ref, &session, &store, provider.as_ref()).await
+                    auto_title(log_ref, &session, &store)
                 {
                     tracing::debug!(session = %session, "auto-title: {e}");
                 }
