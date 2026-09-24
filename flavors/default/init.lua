@@ -60,6 +60,7 @@ rness.plugins.setup({
   { name = "questions", file = "plugins/questions.lua" },
   { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
   { name = "commands", file = "plugins/commands.lua" },
+  { name = "title", file = "plugins/title.lua" },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },
   { name = "models", file = "plugins/models.lua" },
 })
