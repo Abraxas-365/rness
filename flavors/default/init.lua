@@ -59,8 +59,13 @@ rness.plugins.setup({
   { name = "tasks", file = "plugins/tasks.lua" },
   { name = "questions", file = "plugins/questions.lua" },
   { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
-  { name = "time-context", file = "plugins/time-context.lua" },
-  { name = "tmux-context", file = "plugins/tmux-context.lua" },
+  -- Optional context injection: give the model awareness of current time and
+  -- tmux location. Useful for long-running sessions, scheduled tasks, or when
+  -- the model needs to reason about time gaps between messages. Each injects a
+  -- short message before model calls via pre_step hooks. Configure throttling
+  -- with rness.time_context / rness.tmux_context tables above plugins.setup.
+  -- { name = "time-context", file = "plugins/time-context.lua" },
+  -- { name = "tmux-context", file = "plugins/tmux-context.lua" },
   { name = "commands", file = "plugins/commands.lua" },
   { name = "title", file = "plugins/title.lua" },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },
