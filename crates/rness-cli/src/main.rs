@@ -756,9 +756,12 @@ async fn main() -> anyhow::Result<()> {
     // Re-set tool hooks so the clone carries the bus reference for audit events.
     tools.set_hooks(Some(Arc::new(lua.clone())));
     sessions.set_default_workspace(cwd.to_string_lossy().into_owned())?;
-    let legacy_skill_roots = rness_tools::skills::default_roots(&cwd);
+    let custom_skill_roots_for_resolver = startup.skill_roots.clone();
+    let legacy_skill_roots =
+        rness_tools::skills::default_roots_with_custom(&cwd, &custom_skill_roots_for_resolver);
     sessions.set_input_resolver(Arc::new(move |workspace, content| {
-        let roots = workspace.map(rness_tools::skills::default_roots);
+        let roots = workspace
+            .map(|w| rness_tools::skills::default_roots_with_custom(w, &custom_skill_roots_for_resolver));
         rness_tools::skills::resolve_input(roots.as_deref().unwrap_or(&legacy_skill_roots), content)
     }));
 
@@ -800,9 +803,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Skills: filesystem catalogs, project shadowing user on name
     // conflicts. The catalog lives in the tool's description.
-    rness_tools::skills::register_skills(
+    // Roots: <git-root>/.rness/skills, <git-root>/.agents/skills,
+    //        custom from init.lua, ~/.rness/skills, ~/.agents/skills.
+    let custom_skill_roots = startup.skill_roots.clone();
+    rness_tools::skills::register_skills_with_custom(
         &tools,
-        rness_tools::skills::default_roots(&std::env::current_dir()?),
+        rness_tools::skills::default_roots_with_custom(
+            &std::env::current_dir()?,
+            &custom_skill_roots,
+        ),
+        custom_skill_roots.clone(),
     );
 
     // Surface the engine to plugins: rness.session + rness.subagents
@@ -1102,6 +1112,7 @@ async fn main() -> anyhow::Result<()> {
             startup.promptbox.clone(),
             startup.messagebox.clone(),
             control_path,
+            startup.skill_roots.clone(),
         )
         .await;
     };
@@ -1533,6 +1544,7 @@ async fn run_tui(
     promptbox_config: serde_json::Value,
     messagebox_config: serde_json::Value,
     control_path: Option<std::path::PathBuf>,
+    custom_skill_roots: Vec<std::path::PathBuf>,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -1573,7 +1585,7 @@ async fn run_tui(
         .workspace(&session)?
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots(&workspace)) {
+    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots_with_custom(&workspace, &custom_skill_roots)) {
         candidates.push((format!("skill {}", skill.name), skill.description.clone()));
         if !["agent", "skill", "unload"].contains(&skill.name.as_str()) {
             candidates.push((skill.name, format!("Skill: {}", skill.description)));

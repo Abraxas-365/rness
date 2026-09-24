@@ -78,6 +78,8 @@ pub struct StartupConfig {
     pub sandbox: rness_engine::sandbox::SandboxConfig,
     pub job_retention: rness_tools::jobs::Retention,
     pub sandbox_configured: bool,
+    /// Custom skill directories from `rness.skills.roots`.
+    pub skill_roots: Vec<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -1450,6 +1452,19 @@ pub fn evaluate(
             .models
             .resolve_profile(name)
             .map_err(std::io::Error::other)?;
+    }
+    // Custom skill roots: rness.skills = { roots = { "/path/one", "/path/two" } }
+    if let Some(skills) = rness.get::<Option<Table>>("skills")? {
+        if let Some(roots) = skills.get::<Option<Table>>("roots")? {
+            let mut dirs = Vec::new();
+            for entry in roots.sequence_values::<String>() {
+                let dir = entry.map_err(|_| {
+                    std::io::Error::other("rness.skills.roots entries must be strings")
+                })?;
+                dirs.push(std::path::PathBuf::from(dir));
+            }
+            config.skill_roots = dirs;
+        }
     }
     Ok(config)
 }

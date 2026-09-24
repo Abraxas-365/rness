@@ -6,9 +6,15 @@
 //!   <root>/<anything>.md          flat skill
 //!   <root>/<name>/SKILL.md        directory bundle (resources beside it)
 //!
-//! Roots are ranked: project `.rness/skills` shadows user
-//! `~/.rness/skills` on name conflicts. Invalid files are skipped, not
-//! fatal — a broken skill never takes discovery down.
+//! Roots are ranked (lower wins on name conflicts):
+//!   0  `<git-root>/.rness/skills`   project
+//!   1  `<git-root>/.agents/skills`  shared agent convention
+//!   2  custom dirs from Lua config  user-chosen
+//!   3  `~/.rness/skills`            user
+//!   4  `~/.agents/skills`           shared user agent convention
+//!
+//! Invalid files are skipped, not fatal — a broken skill never takes
+//! discovery down.
 //!
 //! The catalog lives in the `skill` tool's description (specs are sent
 //! to the model every step), and `execute` re-discovers, so a skill
@@ -40,19 +46,62 @@ pub struct Skill {
     pub rank: u32,
 }
 
-/// Conventional roots for a workspace: project `.rness/skills` (rank 0)
-/// shadowing user `~/.rness/skills` (rank 1).
+/// Walk up from `cwd` to the nearest `.git` directory, falling back to
+/// `cwd` itself. Replicates `rness_engine::instructions::project_root`.
+pub fn project_root(cwd: &Path) -> PathBuf {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return d.to_path_buf();
+        }
+        dir = d.parent();
+    }
+    cwd.to_path_buf()
+}
+
+/// Full skill roots for a workspace, matching dsh priority order.
+/// `custom` dirs (from Lua config) are inserted at rank 2.
 pub fn default_roots(workspace: &Path) -> Vec<SkillRoot> {
-    let mut roots = vec![SkillRoot {
-        path: workspace.join(".rness/skills"),
+    default_roots_with_custom(workspace, &[])
+}
+
+/// Full skill roots including custom directories from Lua config.
+pub fn default_roots_with_custom(workspace: &Path, custom: &[PathBuf]) -> Vec<SkillRoot> {
+    let git_root = project_root(workspace);
+    let mut roots = Vec::new();
+
+    // Rank 0: project .rness/skills (at git root).
+    roots.push(SkillRoot {
+        path: git_root.join(".rness/skills"),
         rank: 0,
-    }];
+    });
+
+    // Rank 1: shared agent convention (at git root).
+    roots.push(SkillRoot {
+        path: git_root.join(".agents/skills"),
+        rank: 1,
+    });
+
+    // Rank 2: custom dirs from Lua config.
+    for dir in custom {
+        roots.push(SkillRoot {
+            path: dir.clone(),
+            rank: 2,
+        });
+    }
+
+    // Rank 3-4: user dirs.
     if let Some(home) = dirs_home() {
         roots.push(SkillRoot {
             path: home.join(".rness/skills"),
-            rank: 1,
+            rank: 3,
+        });
+        roots.push(SkillRoot {
+            path: home.join(".agents/skills"),
+            rank: 4,
         });
     }
+
     roots
 }
 
@@ -198,11 +247,17 @@ pub fn resolve_input(
 /// the tool is re-registered (compose, hot reload).
 pub struct SkillTool {
     roots: Vec<SkillRoot>,
+    /// Custom dirs from Lua config, passed through to `for_workspace`.
+    custom: Vec<PathBuf>,
     description: String,
 }
 
 impl SkillTool {
     pub fn new(roots: Vec<SkillRoot>) -> Self {
+        Self::with_custom(roots, Vec::new())
+    }
+
+    pub fn with_custom(roots: Vec<SkillRoot>, custom: Vec<PathBuf>) -> Self {
         let skills = discover(&roots);
         let mut description = String::from(
             "Load the full instructions for an available skill. Call this with \
@@ -228,7 +283,7 @@ impl SkillTool {
                 description.push_str(&format!("- {}: {}\n", s.name, d));
             }
         }
-        Self { roots, description }
+        Self { roots, custom, description }
     }
 }
 
@@ -239,7 +294,10 @@ impl Tool for SkillTool {
         _session: &String,
         workspace: &std::path::Path,
     ) -> Option<Arc<dyn Tool>> {
-        Some(Arc::new(Self::new(default_roots(workspace))))
+        Some(Arc::new(Self::with_custom(
+            default_roots_with_custom(workspace, &self.custom),
+            self.custom.clone(),
+        )))
     }
     fn name(&self) -> &str {
         "skill"
@@ -313,4 +371,13 @@ impl SkillTool {
 /// roots, nothing is implicit).
 pub fn register_skills(registry: &ToolRegistry, roots: Vec<SkillRoot>) {
     registry.register(Arc::new(SkillTool::new(roots)));
+}
+
+/// Register the skill loader with custom directories from Lua config.
+pub fn register_skills_with_custom(
+    registry: &ToolRegistry,
+    roots: Vec<SkillRoot>,
+    custom: Vec<PathBuf>,
+) {
+    registry.register(Arc::new(SkillTool::with_custom(roots, custom)));
 }
