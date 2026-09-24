@@ -1037,6 +1037,33 @@ impl SessionService {
         self.live(session).inbox.lock().unwrap().phase()
     }
 
+    /// Get the current title for a session (last `session/title` event wins).
+    /// Returns `None` if no title has been set.
+    pub fn title(&self, session: &SessionId) -> Result<Option<String>, ServiceError> {
+        let history = self.store.history(session)?;
+        // Last-wins: scan from the end.
+        for envelope in history.iter().rev() {
+            if let rness_protocol::events::SessionEvent::Title(t) = &envelope.event {
+                return Ok(Some(t.title.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Set a session title (appends a `session/title` event).
+    pub fn set_title(
+        &self,
+        session: &SessionId,
+        title: String,
+        source: rness_protocol::events::TitleSource,
+    ) -> Result<(), ServiceError> {
+        let mut log = self.store.open(session)?;
+        log.append(&rness_protocol::events::SessionEvent::Title(
+            rness_protocol::events::SessionTitle { title, source },
+        ))?;
+        Ok(())
+    }
+
     // -- read side ---------------------------------------------------------
 
     /// Frontend transcript (attempts and all), derived across forks.
@@ -2177,6 +2204,124 @@ async fn summarize(
     }
 }
 
+/// Generate a session title after the first turn.
+///
+/// 1. Write a deterministic fallback (first ~8 words of the user message).
+/// 2. Try an LLM call to produce a better title; overwrite on success.
+async fn auto_title(
+    store: &SessionStore,
+    session: &SessionId,
+    provider: &dyn Provider,
+) -> Result<(), ServiceError> {
+    // Already titled? (e.g. forked session inherited a title, or user set one)
+    let history = store.history(session)?;
+    if history
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::Title(_)))
+    {
+        return Ok(());
+    }
+    // Extract first user message text.
+    let first_user_text = history
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::UserMessage(m) => {
+                let text: String = m
+                    .content
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        })
+        .ok_or(ServiceError::Busy)?; // no user message — shouldn't happen
+
+    // 1. Deterministic fallback: first ~8 words, max 60 chars.
+    let fallback: String = first_user_text
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let fallback = if fallback.len() > 60 {
+        format!("{}…", &fallback[..fallback.floor_char_boundary(57)])
+    } else {
+        fallback
+    };
+    {
+        let mut log = store.open(session)?;
+        log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
+            title: fallback,
+            source: rness_protocol::events::TitleSource::Fallback,
+        }))?;
+    }
+
+    // 2. LLM title generation (best-effort).
+    let system = "Create a concise title for an AI coding-assistant session from the supplied \
+        human message. Return only the title on one line, in plain text of natural language, \
+        no quotes, no prefix, no markdown, no code. Use the language of the message. \
+        Aim for 4-8 words.";
+    // Truncate input to ~500 chars to save tokens.
+    let input = if first_user_text.len() > 500 {
+        format!("{}…", &first_user_text[..first_user_text.floor_char_boundary(497)])
+    } else {
+        first_user_text
+    };
+    let context = crate::session::projection::ModelContext {
+        turns: vec![crate::session::projection::ModelTurn::User {
+            content: vec![ContentPart::Text { text: input }],
+        }],
+        ..Default::default()
+    };
+    let cancel = CancellationToken::new();
+    let timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        provider.summarize_step(
+            crate::turn::provider::StepRequest {
+                context: &context,
+                system,
+                tools: &[],
+                on_delta: None,
+            },
+            &cancel,
+        ),
+    )
+    .await;
+    let title = match timeout {
+        Ok(crate::turn::provider::StepOutcome::Committed(msg)) => {
+            msg.content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+                .trim()
+                .to_string()
+        }
+        _ => return Ok(()), // LLM failed — keep the fallback
+    };
+    if title.is_empty() || title.len() > 200 {
+        return Ok(());
+    }
+    // Overwrite with the model-generated title.
+    let mut log = store.open(session)?;
+    log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
+        title,
+        source: rness_protocol::events::TitleSource::Model,
+    }))?;
+    Ok(())
+}
+
 /// One burst: the initial turn plus any followups queued while running.
 /// Owns the writer log for its whole lifetime.
 #[allow(clippy::too_many_arguments)]
@@ -2277,6 +2422,18 @@ async fn burst(
             turn: turn_no,
             outcome,
         });
+
+        // Auto-generate a session title after the first successful turn.
+        // Must release the log writer first — auto_title opens its own.
+        if turn_no == 1 && outcome == TurnOutcome::Completed {
+            drop(log.take());
+            if let Err(e) =
+                auto_title(&store, &session, provider.as_ref()).await
+            {
+                tracing::debug!(session = %session, "auto-title: {e}");
+            }
+            log = Some(store.open(&session).expect("reopen log after title"));
+        }
 
         // Continuation decision under the inbox lock: a followup queued
         // at this exact moment is either popped here or submitted after

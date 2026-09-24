@@ -8,6 +8,8 @@
 //!
 //!   rness.session.list()            -> { id, ... }
 //!   rness.session.phase(id)         -> "idle" | "running"
+//!   rness.session.title(id)         -> string|nil (get current title)
+//!   rness.session.title(id, text)   -> string (set title, returns it)
 //!   rness.session.send(id, text)    -> "started"|"queued"|"logged"
 //!   rness.session.fork(id)          -> child id
 //!   rness.session.transcript(id)    -> { {role=, text=}, ... }
@@ -268,6 +270,22 @@ pub fn install(
                 s.select_agent(&id, &name).map_err(err)?;
             }
             lua.to_value(&s.config(&id).map_err(err)?.agent)
+        })?,
+    )?;
+
+    let s = Arc::clone(&sessions);
+    session.set(
+        "title",
+        lua.create_function(move |_, (id, new_title): (String, Option<String>)| {
+            if let Some(title) = new_title {
+                s.set_title(
+                    &id,
+                    title,
+                    rness_protocol::events::TitleSource::User,
+                )
+                .map_err(err)?;
+            }
+            Ok(s.title(&id).map_err(err)?)
         })?,
     )?;
 

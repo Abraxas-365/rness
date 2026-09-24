@@ -44,7 +44,9 @@ rness.ui.app{
       local here = (id == ctx.session) and " (current)" or ""
       local phase = rness.session.phase(id)
       local badge = (phase == "running") and " ●" or ""
-      lines[#lines + 1] = marker .. id .. here .. badge
+      local title = rness.session.title(id)
+      local label = title and (title .. "  " .. id) or id
+      lines[#lines + 1] = marker .. label .. here .. badge
     end
     if last < #ids then
       lines[#lines + 1] = "  ↓ " .. (#ids - last) .. " more"

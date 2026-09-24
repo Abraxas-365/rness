@@ -227,7 +227,8 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
             | SessionEvent::TurnStarted { .. }
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
-            | SessionEvent::HookResult(_) => {}
+            | SessionEvent::HookResult(_)
+            | SessionEvent::Title(_) => {}
         }
     }
     flush_tools(&mut ctx, &mut pending_tools);
@@ -350,7 +351,8 @@ pub fn transcript(history: &[Envelope]) -> Transcript {
             | SessionEvent::TurnStarted { .. }
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
-            | SessionEvent::HookResult(_) => {}
+            | SessionEvent::HookResult(_)
+            | SessionEvent::Title(_) => {}
         }
     }
     t
