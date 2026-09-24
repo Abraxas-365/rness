@@ -59,6 +59,8 @@ rness.plugins.setup({
   { name = "tasks", file = "plugins/tasks.lua" },
   { name = "questions", file = "plugins/questions.lua" },
   { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
+  { name = "time-context", file = "plugins/time-context.lua" },
+  { name = "tmux-context", file = "plugins/tmux-context.lua" },
   { name = "commands", file = "plugins/commands.lua" },
   { name = "title", file = "plugins/title.lua" },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },
