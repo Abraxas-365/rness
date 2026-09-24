@@ -115,7 +115,8 @@ pub struct SessionStartNotice {
     pub session: SessionId,
     pub workspace: Option<String>,
     pub delegation: Option<rness_protocol::branch::Delegation>,
-    /// `"startup"` (first run, turns_so_far==0), `"resume"` (subsequent).
+    /// `"startup"` (first run, turns_so_far==0), `"resume"` (subsequent),
+    /// or `"compact"` (first burst after a compaction).
     pub source: String,
 }
 pub struct SessionStartEv;
@@ -1465,11 +1466,23 @@ impl SessionService {
                         source,
                     }))?;
                 }
-                let turns_so_far = log
-                    .read_all()?
+                let all_events = log.read_all()?;
+                let turns_so_far = all_events
                     .iter()
                     .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
                     .count() as u32;
+                let has_compaction = all_events
+                    .iter()
+                    .rev()
+                    .take_while(|e| !matches!(e.event, SessionEvent::TurnEnded { .. }))
+                    .any(|e| matches!(e.event, SessionEvent::Compaction(_)));
+                let start_source = if turns_so_far == 0 {
+                    "startup"
+                } else if has_compaction {
+                    "compact"
+                } else {
+                    "resume"
+                }.into();
                 inbox.set_phase(Phase::Running);
                 drop(inbox);
 
@@ -1485,6 +1498,7 @@ impl SessionService {
                     log,
                     token,
                     turns_so_far,
+                    start_source,
                     self.loop_hooks(),
                 );
                 let handle = tokio::spawn(async move {
@@ -2176,6 +2190,7 @@ async fn burst(
     log: crate::session::log::SessionLog,
     token: CancellationToken,
     turns_so_far: u32,
+    start_source: String,
     loop_hooks: Option<Arc<dyn crate::turn::hooks::LoopHooks>>,
 ) {
     let session = log.session().clone();
@@ -2187,12 +2202,11 @@ async fn burst(
     {
         let delegation = store.delegation(&session).ok().flatten();
         let workspace = store.workspace(&session).ok().flatten();
-        let source = if turns_so_far == 0 { "startup" } else { "resume" };
         bus.emit::<SessionStartEv>(&SessionStartNotice {
             session: session.clone(),
             workspace,
             delegation,
-            source: source.into(),
+            source: start_source,
         });
     }
 
