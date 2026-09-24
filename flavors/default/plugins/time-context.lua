@@ -31,25 +31,6 @@ local function format_duration(seconds)
   return table.concat(parts, " ")
 end
 
---- Recover last message time from the durable session transcript.
---- Called once per session on first pre_step to survive process restarts.
-local function recover_last_message_time(session_id)
-  local ok, transcript = pcall(rness.session.transcript, session_id)
-  if not ok or not transcript or #transcript == 0 then return nil end
-  -- Walk backward for the latest message with a timestamp.
-  for i = #transcript, 1, -1 do
-    local entry = transcript[i]
-    if entry and entry.at then
-      -- entry.at is ISO 8601; parse the epoch from os-level.
-      -- Approximate: use the current time minus a small fudge if we can't parse.
-      -- Actually, the transcript 'at' is a string; Lua can't parse ISO easily.
-      -- Instead, just mark "we had prior messages" so the *next* step can show elapsed.
-      return nil -- can't parse ISO in pure Lua reliably, but state is seeded
-    end
-  end
-  return nil
-end
-
 rness.hook.on("pre_step", function(ev, next)
   local decision = next()
   local now = os.time()

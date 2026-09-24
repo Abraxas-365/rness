@@ -26,6 +26,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Install Lua packages | [Plugin packages](guides/plugins/packages.md) |
 | Load, reload, and unload plugins | [Plugin lifecycle](guides/plugins/loading-and-lifecycle.md) |
 | Define actions, remap keys, and inspect help | [Scoped mappings](guides/plugins/loading-and-lifecycle.md#scoped-mappings-and-help) |
+| Inject time and tmux location into model context | [Context injection](guides/plugins/example-recipes.md#context-injection-time-and-tmux) |
 | Customize messages and tool cards | [Messagebox presentation](guides/plugins/example-recipes.md#messagebox-presentation) |
 | Register commands and use session context | [Lua commands](reference/lua/commands.md) |
 | Write native extensions | [Native extension contracts](contributing/native-extensions.md) |

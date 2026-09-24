@@ -2,6 +2,66 @@
 
 Examples are opt-in. Review them before copying into your personal configuration. Files in the repository are never automatically loaded.
 
+## Context injection: time and tmux
+
+The default flavor includes two context-injection plugins that give the model awareness of time and its tmux environment. Both use `pre_step` hooks to inject messages before each model call. No Rust changes are required.
+
+### Time context
+
+`time-context.lua` injects the current local time (with timezone) and elapsed duration since the last message at every model step:
+
+```
+Current time: 2026-09-24T15:30:45-0500 (CDT)
+Elapsed since last message: 2m 15s
+```
+
+The elapsed tracker uses in-process state. In the interactive TUI, it persists across turns within a session. In headless `-p` mode (separate process per turn), elapsed is seeded on the first step of resumed sessions so subsequent steps within that turn show elapsed correctly.
+
+Configure in `init.lua` before the `plugins.setup` call:
+
+```lua
+rness.time_context = {
+  refresh_interval = 60,  -- seconds; 0 = every step (default)
+}
+```
+
+A nonzero `refresh_interval` throttles injection: if less than that many seconds have passed since the last injection, the step proceeds without a time message. This reduces context noise in multi-step turns.
+
+The plugin also registers a `turn_end` hook to record when each turn finishes, so the elapsed duration on the next turn's first step reflects the gap between turns, not steps.
+
+### tmux context
+
+`tmux-context.lua` injects the current tmux session, window, and pane at step 1 of each turn:
+
+```
+tmux location (turn 1):
+session "main", window 2 "code", pane 1 (%42)
+window active, pane active
+```
+
+The plugin reads `$TMUX_PANE` and queries `tmux display-message` for the seven fields (session name, window index/name, pane index/id, window active, pane active). It is a silent no-op when:
+- `$TMUX_PANE` is unset or empty (not running inside tmux).
+- The `tmux` command fails or returns unexpected output.
+
+Re-injection is suppressed when the tmux state (everything after the turn header) has not changed since the last injection within the same process. This avoids redundant context in the interactive TUI when the user stays in the same pane across turns.
+
+Configure in `init.lua` before the `plugins.setup` call:
+
+```lua
+rness.tmux_context = {
+  refresh_interval = 300,  -- seconds; 0 = every turn (default)
+}
+```
+
+Both plugins are selected in the default flavor's `rness.plugins.setup` list:
+
+```lua
+{ name = "time-context", file = "plugins/time-context.lua" },
+{ name = "tmux-context", file = "plugins/tmux-context.lua" },
+```
+
+Remove either entry to disable that context injection. Neither plugin registers tools, commands, or UI elements — they only inject context through hooks.
+
 ## Read-only LSP navigation
 
 Rness exposes the same four semantic operations as DSH: `goToDefinition`, `findReferences`, `goToImplementation`, and `hover`. This is operation-scope parity, not complete provider/lifecycle parity. Rename, formatting, code actions, symbols and diagnostics are not exposed.
@@ -865,6 +925,8 @@ rness.plugins.setup({
 | `sessions.lua` | Session-selection overlay |
 | `branches.lua` | Branch navigation application |
 | `mcp-clima.lua` | Optional MCP server connection; inspect its external script prerequisite |
+| `time-context.lua` | `pre_step` hook injecting current time and elapsed duration; configurable throttle |
+| `tmux-context.lua` | `pre_step` hook injecting tmux session/window/pane; silent outside tmux, change-suppression |
 
 Use `bottomline` as an alternative to the spinner, not as a second independent bar. The current API is `rness.ui.statusline`, not `rness.ui.bottomline`. Its latest-session label comes from events and is not a guarantee of the currently selected frontend session.
 
