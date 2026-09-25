@@ -84,12 +84,12 @@ local function card(call)
   }
 end
 
-local function register(name, description, properties, required)
+local function register(name, description, properties, required, prompt)
   -- Omit an empty required list: plain Lua {} encodes as a JSON object.
   if #required == 0 then required = nil end
   rness.ui.messagebox.tool_card(name, card)
   rness.tool.register {
-    name = name, description = description,
+    name = name, description = description, prompt = prompt,
     schema = { type = "object", properties = properties, required = required, additionalProperties = false },
     run = function(args, ctx)
       assert(ctx and type(ctx.session) == "string" and ctx.session ~= "", "execution session required")
@@ -100,7 +100,10 @@ local function register(name, description, properties, required)
 end
 
 for _, spec in ipairs {
-  { "session_search", "Search saved events with a literal phrase; returns the strongest matching event per session in the caller workspace, including current session. Paginated. Source-local history, not duplicated ancestor history." },
+  -- System-prompt guidance for the whole family rides on the entry-point tool:
+  -- sent only while session_search is usable, removed when this plugin unloads.
+  { "session_search", "Search saved events with a literal phrase; returns the strongest matching event per session in the caller workspace, including current session. Paginated. Source-local history, not duplicated ancestor history.",
+    { order = 2300, text = "Use session_search to find relevant work from prior sessions, or session_event_search to search earlier events in one session. Follow a useful hit with session_trace, session_event_trace or session_event_read when you need lineage or exact data." } },
   { "session_event_search", "Search saved events in one authorized session, default current session. Returns individual event hits, paginated. Includes reasoning, tool calls/results and audit text; encoded images/stream chunks are not searched." },
 } do
   register(spec[1], spec[2], {
@@ -110,7 +113,7 @@ for _, spec in ipairs {
     surfaces = { type = "array", maxItems = 3, items = { type = "string", enum = { "current", "shadowed", "log-only" } } },
     time_from = { type = "string", description = "Inclusive timezone-qualified RFC3339 event time." },
     time_to = { type = "string", description = "Inclusive timezone-qualified RFC3339 event time." },
-  }, { "query" })
+  }, { "query" }, spec[3])
 end
 
 register("session_event_read", "Read original event JSON from authorized source-local JSONL. Returns chunks of at most 8192 Unicode characters; concatenate chunk fields using next_cursor for the full event. Does not open SQLite.",

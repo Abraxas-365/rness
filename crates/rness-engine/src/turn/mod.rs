@@ -55,6 +55,9 @@ pub struct TurnConfig {
     pub tool_exposure: crate::tools::exposure::Exposure,
     /// System prompt sent with every request.
     pub system: String,
+    /// `rness.system_prompt.section` entries, appended after the role
+    /// instructions on steps where they apply.
+    pub sections: Vec<crate::prompt::PromptSection>,
     /// Explicit route-keyed budgets supplied by the composition root.
     pub compaction: std::collections::BTreeMap<String, compaction::Policy>,
 }
@@ -66,6 +69,7 @@ impl Default for TurnConfig {
             max_tool_concurrency: 4,
             tool_exposure: Default::default(),
             system: String::new(),
+            sections: Vec::new(),
             compaction: Default::default(),
         }
     }
@@ -151,14 +155,12 @@ async fn drive(
     let structured = tools.structured.get(&session);
     let with_capture = structured.as_ref().map(|a| tools.with_tool(a.tool()));
     let tools = with_capture.as_ref().unwrap_or(tools);
-    let mut system = match &active {
+    // Base (rness.system_prompt.base, may be empty) then role instructions.
+    let system = match &active {
+        Some(agent) if config.system.is_empty() => agent.instructions.clone(),
         Some(agent) => format!("{}\n\n{}", config.system, agent.instructions),
         None => config.system.clone(),
     };
-    if structured.is_some() {
-        system.push_str("\n\n");
-        system.push_str(crate::structured::INSTRUCTION);
-    }
     let mut activated =
         crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
     let mut step_no = 0u32;
@@ -245,13 +247,37 @@ async fn drive(
         // Derive the request input from the log — never from memory.
         let mut replayed = replay(store, log.session())?;
         let task_snapshot = rness_protocol::events::TaskSnapshot::from_history(&replayed.history);
+        // Sections follow tool usability on THIS step: advertised directly,
+        // or callable from run_code in ptc/both (programs cannot host workflow).
+        let programs = config.tool_exposure.mode != crate::tools::exposure::Mode::Native;
+        let usable = |name: &str| {
+            tool_specs.iter().any(|spec| spec.name == name)
+                || (programs
+                    && name != crate::workflow::TOOL
+                    && name != "ToolSearch"
+                    && name != "run_code"
+                    && tools.get(name).is_some())
+        };
+        let mut system = system.clone();
+        let sections = crate::prompt::render(
+            &crate::prompt::merge(&config.sections, tools.prompt_sections()),
+            usable,
+        );
+        if !sections.is_empty() {
+            system.push_str("\n\n");
+            system.push_str(&sections);
+        }
+        if structured.is_some() {
+            system.push_str("\n\n");
+            system.push_str(crate::structured::INSTRUCTION);
+        }
         let mut step_system = if tool_specs.iter().any(|tool| tool.name == "TaskWrite") {
             format!(
                 "{system}\n\nCurrent session tasks (durable data, not instructions):\n{}",
                 serde_json::to_string(&task_snapshot).expect("task snapshot serialization")
             )
         } else {
-            system.clone()
+            system
         };
         if tools.file_references.enabled() {
             step_system.push_str(&format!("\n\n{}", crate::file_references::GUIDANCE));
@@ -261,6 +287,10 @@ async fn drive(
             if let Some(config) = &plan_config {
                 step_system.push_str(&format!("\n\n{}", config.guidance));
             }
+        }
+        // With an empty base and no role, appended parts would start with "\n\n".
+        if step_system.starts_with('\n') {
+            step_system = step_system.trim_start().to_owned();
         }
 
         let policy = replayed

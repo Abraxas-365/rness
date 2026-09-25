@@ -1105,6 +1105,261 @@ impl Provider for RestrictedRequest {
 }
 
 #[tokio::test]
+async fn base_prompt_precedes_role_instructions_and_may_be_empty() {
+    struct Captures(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl Provider for Captures {
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            self.0.lock().unwrap().push(request.system.to_owned());
+            StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![]))
+        }
+    }
+    for (base, role, expected) in [
+        ("Base.", true, "Base.\n\nOnly review"),
+        ("", true, "Only review"),
+        ("Base.", false, "Base."),
+        ("", false, ""),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        if role {
+            log.append(&SessionEvent::RequestConfig(CallConfig {
+                agent: Some(AgentSnapshot {
+                    name: "reviewer".into(),
+                    instructions: "Only review".into(),
+                    tools: None,
+                }),
+                ..Default::default()
+            }))
+            .unwrap();
+        }
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        }))
+        .unwrap();
+        let provider = Captures(Default::default());
+        let config = TurnConfig {
+            system: base.into(),
+            ..Default::default()
+        };
+        run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &ToolRegistry::default(),
+            &config,
+            &CancellationToken::new(),
+            &mut no_steers(),
+            1,
+            &|_| {},
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider.0.lock().unwrap().as_slice(), [expected]);
+    }
+}
+
+#[tokio::test]
+async fn sections_follow_tool_usability_and_sit_after_role_instructions() {
+    use rness_engine::prompt::PromptSection;
+    use rness_engine::tools::exposure::{Exposure, Mode};
+    struct Captures(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl Provider for Captures {
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            self.0.lock().unwrap().push(request.system.to_owned());
+            StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![]))
+        }
+    }
+    let section = |name: &str, order, tools: &[&str]| PromptSection {
+        name: name.into(),
+        order,
+        tools: tools.iter().map(|t| t.to_string()).collect(),
+        text: format!("<{name}>"),
+    };
+    let sections = vec![
+        section("echo", 1000, &["Echo"]),
+        section("always", 500, &[]),
+        section("absent", 0, &["NotRegistered"]),
+        section("workflow", 2600, &["workflow"]),
+    ];
+    // (role tool allowlist, deferred Echo, exposure mode, expected system)
+    let cases: [(Option<Vec<String>>, bool, Mode, &str); 5] = [
+        (None, false, Mode::Native, "B\n\nROLE\n\n<always>\n\n<echo>"),
+        (Some(vec![]), false, Mode::Native, "B\n\nROLE\n\n<always>"),
+        (None, true, Mode::Native, "B\n\nROLE\n\n<always>"),
+        (None, false, Mode::Ptc, "B\n\nROLE\n\n<always>\n\n<echo>"),
+        (None, true, Mode::Ptc, "B\n\nROLE\n\n<always>\n\n<echo>"),
+    ];
+    for (allow, deferred, mode, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::RequestConfig(CallConfig {
+            agent: Some(AgentSnapshot {
+                name: "r".into(),
+                instructions: "ROLE".into(),
+                tools: allow.clone(),
+            }),
+            ..Default::default()
+        }))
+        .unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        }))
+        .unwrap();
+        let tools = ToolRegistry::default();
+        tools.register(Arc::new(Echo));
+        if deferred {
+            tools.defer(["Echo".to_string()]);
+        }
+        let provider = Captures(Default::default());
+        let config = TurnConfig {
+            system: "B".into(),
+            sections: sections.clone(),
+            tool_exposure: Exposure {
+                mode: mode.clone(),
+                deferred: vec![],
+            },
+            ..Default::default()
+        };
+        run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &tools,
+            &config,
+            &CancellationToken::new(),
+            &mut no_steers(),
+            1,
+            &|_| {},
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.0.lock().unwrap().as_slice(),
+            [expected],
+            "allow={allow:?} deferred={deferred} mode={mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_owned_sections_follow_their_tool_and_config_can_replace_them() {
+    use rness_engine::prompt::{PromptSection, ToolPrompt};
+    struct Guided;
+    #[async_trait]
+    impl rness_engine::tools::Tool for Guided {
+        fn name(&self) -> &str {
+            "Guided"
+        }
+        fn prompt_section(&self) -> Option<ToolPrompt> {
+            Some(ToolPrompt {
+                order: 10,
+                text: "<guided>".into(),
+            })
+        }
+        async fn execute(&self, _: serde_json::Value) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+    struct Captures(std::sync::Mutex<Vec<String>>);
+    #[async_trait]
+    impl Provider for Captures {
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn step(&self, request: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            self.0.lock().unwrap().push(request.system.to_owned());
+            StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![]))
+        }
+    }
+    let late = PromptSection {
+        name: "late".into(),
+        order: 20,
+        tools: vec![],
+        text: "<late>".into(),
+    };
+    let reworded = PromptSection {
+        name: "tool:Guided".into(),
+        order: 30,
+        tools: vec!["Guided".into()],
+        text: "<reworded>".into(),
+    };
+    // (role allowlist, deferred, config sections, expected system)
+    let cases: [(Option<Vec<String>>, bool, Vec<PromptSection>, &str); 4] = [
+        (None, false, vec![late.clone()], "B\n\n<guided>\n\n<late>"),
+        (Some(vec![]), false, vec![late.clone()], "B\n\n<late>"),
+        (None, true, vec![late.clone()], "B\n\n<late>"),
+        (
+            None,
+            false,
+            vec![late.clone(), reworded],
+            "B\n\n<late>\n\n<reworded>",
+        ),
+    ];
+    for (allow, deferred, sections, expected) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::RequestConfig(CallConfig {
+            tool_ceiling: allow.clone(),
+            ..Default::default()
+        }))
+        .unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "hi".into() }],
+            source: None,
+        }))
+        .unwrap();
+        let tools = ToolRegistry::default();
+        tools.register(Arc::new(Guided));
+        if deferred {
+            tools.defer(["Guided".to_string()]);
+        }
+        let provider = Captures(Default::default());
+        let config = TurnConfig {
+            system: "B".into(),
+            sections,
+            ..Default::default()
+        };
+        run_turn(
+            &store,
+            &mut log,
+            &provider,
+            &tools,
+            &config,
+            &CancellationToken::new(),
+            &mut no_steers(),
+            1,
+            &|_| {},
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider.0.lock().unwrap().as_slice(),
+            [expected],
+            "allow={allow:?} deferred={deferred}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn agent_instructions_and_ceiling_apply_to_schema_and_dispatch() {
     for ceiling in [false, true] {
         let dir = tempfile::tempdir().unwrap();

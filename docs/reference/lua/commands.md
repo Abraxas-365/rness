@@ -234,3 +234,5 @@ rness.tool.register {
 ```
 
 Use `ctx.workspace` to construct paths explicitly. The host never changes the process working directory. Direct calls outside a scoped turn receive an empty context unless the caller supplies one. Native Rust tools can implement `Tool::for_workspace(session, workspace)` to return a bound adapter. This is context propagation, not a sandbox or filesystem restriction.
+
+Optional `prompt = "text"` or `prompt = { text = "…", order = N }` adds a `tool:<name>` system-prompt section that is sent only while this tool is usable and is removed with the plugin. Native Rust tools implement `Tool::prompt_section`. See [tool-owned sections](../configuration/agents.md#tool-owned-sections).

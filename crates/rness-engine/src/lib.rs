@@ -23,6 +23,7 @@ pub mod interaction;
 pub mod invariants;
 pub mod plan;
 pub mod presentation;
+pub mod prompt;
 pub mod questions;
 pub mod service;
 pub mod session;

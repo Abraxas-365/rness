@@ -83,6 +83,11 @@ pub struct StartupConfig {
     /// `rness.workflow` — the workflow tool is registered only when this is
     /// set (opt-in; `{}` enables it with default limits).
     pub workflow: Option<rness_tools::workflow::WorkflowConfig>,
+    /// `rness.system_prompt.base` — sent first in every request, before the
+    /// active role's instructions. Empty (unset) sends no base text.
+    pub system_prompt: String,
+    /// `rness.system_prompt.section{...}` declarations, in declaration order.
+    pub sections: Vec<rness_engine::prompt::PromptSection>,
 }
 
 #[cfg(test)]
@@ -1199,6 +1204,44 @@ pub fn evaluate(
     rness.set("keymap", keymap.clone())?;
     rness.set("agents", agents)?;
     rness.set("providers", providers)?;
+    let system_prompt = lua.create_table()?;
+    let s = state.clone();
+    system_prompt.set(
+        "section",
+        lua.create_function(move |lua, value: Table| {
+            let section: rness_engine::prompt::PromptSection =
+                lua.from_value(mlua::Value::Table(value))?;
+            let text = section.text.trim();
+            if section.name.trim().is_empty() || text.is_empty() {
+                return Err(mlua::Error::runtime(
+                    "system_prompt.section name and text must not be empty",
+                ));
+            }
+            if text.len() > 4096 {
+                return Err(mlua::Error::runtime(
+                    "system_prompt.section text exceeds 4096 bytes",
+                ));
+            }
+            if section.tools.iter().any(|tool| tool.trim().is_empty()) {
+                return Err(mlua::Error::runtime(
+                    "system_prompt.section tools entries must not be empty",
+                ));
+            }
+            let mut state = s.lock().unwrap();
+            if state.sections.iter().any(|s| s.name == section.name) {
+                return Err(mlua::Error::runtime(format!(
+                    "duplicate system_prompt.section {:?}",
+                    section.name
+                )));
+            }
+            state.sections.push(rness_engine::prompt::PromptSection {
+                text: text.to_owned(),
+                ..section
+            });
+            Ok(())
+        })?,
+    )?;
+    rness.set("system_prompt", system_prompt)?;
     lua.globals().set("rness", rness.clone())?;
     if let Some(root) = path.parent() {
         let package: Table = lua.globals().get("package")?;
@@ -1411,6 +1454,7 @@ pub fn evaluate(
         ("providers", "set_default_account"),
         ("plugins", "load"),
         ("agents", "declare"),
+        ("system_prompt", "section"),
         ("sandbox", "setup"),
         ("providers", "register"),
         ("profiles", "declare"),
@@ -1498,7 +1542,41 @@ pub fn evaluate(
     if let Some(workflow) = rness.get::<Option<Table>>("workflow")? {
         config.workflow = Some(workflow_config(workflow)?);
     }
+    config.system_prompt = system_prompt_config(rness.get("system_prompt")?)?;
     Ok(config)
+}
+
+/// `rness.system_prompt = { base = "…" }`: the base must be a string;
+/// unknown keys are rejected so typos do not silently drop the prompt.
+fn system_prompt_config(
+    value: mlua::Value,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let table = match value {
+        mlua::Value::Nil => return Ok(String::new()),
+        mlua::Value::Table(table) => table,
+        _ => return Err("rness.system_prompt must be a table".into()),
+    };
+    let mut base = String::new();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        match pair? {
+            (mlua::Value::String(key), value) if key.to_str()?.as_ref() == "base" => {
+                base = match value {
+                    mlua::Value::String(text) => text.to_str()?.trim().to_owned(),
+                    _ => return Err("rness.system_prompt.base must be a string".into()),
+                };
+            }
+            (mlua::Value::String(key), mlua::Value::Function(_))
+                if key.to_str()?.as_ref() == "section" => {}
+            (key, _) => {
+                return Err(format!(
+                    "rness.system_prompt.{} is not recognized (base, section)",
+                    key.to_string().unwrap_or_else(|_| "?".into())
+                )
+                .into())
+            }
+        }
+    }
+    Ok(base)
 }
 
 /// `rness.workflow = { … }`: positive integer limits, unknown keys rejected.
@@ -1922,6 +2000,71 @@ mod tests {
         for invalid in ["'false'", "0", "{}"] {
             std::fs::write(&path, format!("rness.agents.allow_generic = {invalid}")).unwrap();
             assert!(load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn system_prompt_base_is_configurable_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load(&path).unwrap().system_prompt, "", "no hardcoded base");
+        std::fs::write(&path, "rness.system_prompt.base = '  Be terse.\\n'").unwrap();
+        assert_eq!(load(&path).unwrap().system_prompt, "Be terse.");
+        std::fs::write(&path, "rness.system_prompt = { base = 'Whole table' }").unwrap();
+        assert_eq!(load(&path).unwrap().system_prompt, "Whole table");
+        for invalid in [
+            "rness.system_prompt = 'x'",
+            "rness.system_prompt.base = 5",
+            "rness.system_prompt.bse = 'typo'",
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(load(&path).is_err(), "{invalid} should be rejected");
+        }
+    }
+
+    #[test]
+    fn system_prompt_sections_are_declared_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(
+            &path,
+            "rness.system_prompt.base = 'B'
+             rness.system_prompt.section({ name = 'tool:bash', order = 1000, tools = { 'Bash' }, text = ' Check exit codes. ' })
+             rness.system_prompt.section({ name = 'house', text = 'Small commits.' })",
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.system_prompt, "B");
+        assert_eq!(
+            config.sections,
+            vec![
+                rness_engine::prompt::PromptSection {
+                    name: "tool:bash".into(),
+                    order: 1000,
+                    tools: vec!["Bash".into()],
+                    text: "Check exit codes.".into(),
+                },
+                rness_engine::prompt::PromptSection {
+                    name: "house".into(),
+                    order: 0,
+                    tools: vec![],
+                    text: "Small commits.".into(),
+                },
+            ]
+        );
+        let long = "x".repeat(4097);
+        for (invalid, needle) in [
+            ("rness.system_prompt.section({ name = 'a', text = '' })", "must not be empty"),
+            ("rness.system_prompt.section({ name = '', text = 't' })", "must not be empty"),
+            ("rness.system_prompt.section({ name = 'a', text = 't', tool = 'Bash' })", "unknown field"),
+            ("rness.system_prompt.section({ name = 'a', text = 't', tools = { '' } })", "tools entries"),
+            ("rness.system_prompt.section({ name = 'a', text = 't' }) rness.system_prompt.section({ name = 'a', text = 'u' })", "duplicate"),
+            (&format!("rness.system_prompt.section({{ name = 'a', text = '{long}' }})"), "4096"),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = load(&path).err().expect(invalid).to_string();
+            assert!(error.contains(needle), "{invalid}: {error}");
         }
     }
 

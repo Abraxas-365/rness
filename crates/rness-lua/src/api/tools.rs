@@ -49,6 +49,10 @@ impl Tool for LuaTool {
         self.spec.input_schema.clone()
     }
 
+    fn prompt_section(&self) -> Option<rness_engine::prompt::ToolPrompt> {
+        self.spec.prompt.clone()
+    }
+
     fn plan_config(&self) -> Option<rness_engine::plan::PlanConfig> {
         self.spec
             .plan

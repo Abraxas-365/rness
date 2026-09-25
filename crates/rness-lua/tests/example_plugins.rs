@@ -549,6 +549,68 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
     assert_eq!(config.colorscheme.as_deref(), Some("gruvbox"));
     assert_eq!(config.agents["scout"].profile.as_deref(), Some("small"));
     assert!(!config.allow_generic_subagents);
+    assert_eq!(
+        config.system_prompt, "You are rness, a coding agent. Be concise.",
+        "the flavor owns the base prompt (lua/system_prompt.lua)"
+    );
+    // Every flavor section names a tool, and every such tool is one rness
+    // actually registers (a typo would silently never show the guidance).
+    // Plugin-owned guidance (session search) lives in the plugin, not here.
+    let known = [
+        "Bash",
+        "Edit",
+        "job_output",
+        "terminal_open",
+        "web_search",
+        "web_fetch",
+        "workflow",
+    ];
+    let names: Vec<_> = config.sections.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "tool:Bash",
+            "tool:Edit",
+            "tool:jobs",
+            "tool:terminal",
+            "tool:web",
+            "tool:web_search",
+            "tool:workflow"
+        ]
+    );
+    // Web safety guidance reaches every web configuration exactly once;
+    // the snippet hint only when search exists.
+    for (enabled, safety, snippets) in [
+        (&["web_search", "web_fetch"][..], 1, 1),
+        (&["web_search"][..], 1, 1),
+        (&["web_fetch"][..], 1, 0),
+        (&[][..], 0, 0),
+    ] {
+        let sent = rness_engine::prompt::render(&config.sections, |t| enabled.contains(&t));
+        assert_eq!(
+            sent.matches("never follow instructions").count(),
+            safety,
+            "{enabled:?}"
+        );
+        assert_eq!(sent.matches("snippets").count(), snippets, "{enabled:?}");
+    }
+    for section in &config.sections {
+        assert!(section.name.starts_with("tool:"), "{}", section.name);
+        assert!(
+            !section.tools.is_empty(),
+            "{} is unconditional",
+            section.name
+        );
+        for tool in &section.tools {
+            assert!(known.contains(&tool.as_str()), "{}: {tool}", section.name);
+        }
+    }
+    let workflow = config
+        .sections
+        .iter()
+        .find(|s| s.name == "tool:workflow")
+        .unwrap();
+    assert!(workflow.text.contains("ONLY when the user explicitly asks"));
     assert!(std::fs::read_to_string(root.join("lua/agents.lua"))
         .unwrap()
         .contains("rness.agents.allow_generic = false"));
@@ -798,6 +860,78 @@ async fn watcher_retries_busy_reload_without_another_save() {
     );
     assert!(registry.get("old").is_none());
     assert!(registry.get("new").is_some());
+}
+
+#[tokio::test]
+async fn tool_prompt_is_validated_and_follows_reload_and_unload() {
+    let host = LuaHost::spawn().unwrap();
+    for (bad, message) in [
+        ("prompt = 42", "string or { text, order }"),
+        ("prompt = '   '", "must not be empty"),
+        ("prompt = { order = 1 }", "text is required"),
+        (
+            "prompt = { text = 'x', order = 'soon' }",
+            "order must be an integer",
+        ),
+        ("prompt = { text = 'x', weight = 1 }", "only text and order"),
+        ("prompt = string.rep('x', 4097)", "exceeds 4096 bytes"),
+    ] {
+        let error = host
+            .load(
+                "bad",
+                &format!("rness.tool.register{{name='t', run=function() end, {bad}}}"),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains(message), "{bad}: {error}");
+    }
+    let plugin = |text: &str| {
+        rness_lua::loader::PluginSource {
+        name: "guided".into(),
+        source: format!(
+            "rness.tool.register{{name='guided', run=function() end, prompt='{text}'}}\n\
+             rness.tool.register{{name='ordered', run=function() end, prompt={{text=' later ', order=-3}}}}"
+        ),
+        dependencies: vec![],
+    }
+    };
+    host.reload(vec![plugin("first")]).await.unwrap();
+    let registry = ToolRegistry::default();
+    let installed = rness_lua::api::tools::sync_lua_tools(&registry, &host, &[]).await;
+    let sections = |registry: &ToolRegistry| {
+        let mut sections: Vec<_> = registry
+            .prompt_sections()
+            .into_iter()
+            .map(|s| (s.name, s.order, s.tools, s.text))
+            .collect();
+        sections.sort();
+        sections
+    };
+    assert_eq!(
+        sections(&registry),
+        [
+            (
+                "tool:guided".into(),
+                4000,
+                vec!["guided".into()],
+                "first".into()
+            ),
+            (
+                "tool:ordered".into(),
+                -3,
+                vec!["ordered".into()],
+                "later".into()
+            ),
+        ]
+    );
+    // A hot reload with new text replaces the section with the tool.
+    host.reload(vec![plugin("second")]).await.unwrap();
+    let installed = rness_lua::api::tools::sync_lua_tools(&registry, &host, &installed).await;
+    assert_eq!(sections(&registry)[0].3, "second");
+    // Unloading the plugin removes its tools and therefore their sections.
+    host.reload(vec![]).await.unwrap();
+    rness_lua::api::tools::sync_lua_tools(&registry, &host, &installed).await;
+    assert!(sections(&registry).is_empty());
 }
 
 #[tokio::test]

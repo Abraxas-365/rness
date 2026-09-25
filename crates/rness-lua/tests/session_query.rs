@@ -96,6 +96,13 @@ async fn opt_in_query_yields_while_sqlite_is_locked() {
     .await
     .unwrap();
     assert_eq!(host.tool_specs().await.len(), 5);
+    // Family guidance rides on the entry-point tool only.
+    let specs = host.tool_specs().await;
+    let prompted: Vec<_> = specs
+        .iter()
+        .filter_map(|spec| spec.prompt.as_ref().map(|p| (spec.name.as_str(), p.order)))
+        .collect();
+    assert_eq!(prompted, [("session_search", 2300)]);
     let output = host
         .call_tool_context(
             "session_search",

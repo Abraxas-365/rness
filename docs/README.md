@@ -15,6 +15,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Understand providers, profiles, and roles | [Configuration concepts](explanation/providers-models-profiles-agents.md) |
 | Use multiple accounts for one provider (e.g. two Anthropic accounts) | [Provider configuration reference](reference/configuration/providers.md#multiple-accounts-per-provider) |
 | Look up agent fields | [Agent configuration reference](reference/configuration/agents.md) |
+| Set the base prompt and add tool guidance sections | [System prompt guide](guides/system-prompt.md), [reference](reference/configuration/agents.md#system-prompt) |
 | Understand scheduling, MCP, server auth and output retention | [Execution hardening](guides/execution-hardening.md) |
 | Read images and configure processing limits | [Image reading](guides/image-reading.md) |
 | Opt into filesystem write restrictions | [Sandbox configuration](reference/configuration/sandbox.md) |

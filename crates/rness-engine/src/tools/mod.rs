@@ -50,6 +50,12 @@ struct HookState {
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
+    /// Usage guidance this tool contributes to the system prompt. It is sent
+    /// only on steps where this tool is usable, so it follows the tool
+    /// through registration, role restriction, deferral and plugin unload.
+    fn prompt_section(&self) -> Option<crate::prompt::ToolPrompt> {
+        None
+    }
     fn plan_config(&self) -> Option<crate::plan::PlanConfig> {
         None
     }
@@ -537,6 +543,25 @@ impl ToolRegistry {
             .collect();
         v.sort();
         v
+    }
+
+    /// Sections contributed by the tools in this registry (`Tool::prompt_section`),
+    /// each tied to its own tool.
+    pub fn prompt_sections(&self) -> Vec<crate::prompt::PromptSection> {
+        self.tools
+            .read()
+            .expect("registry lock")
+            .values()
+            .filter_map(|tool| {
+                tool.prompt_section()
+                    .map(|prompt| crate::prompt::PromptSection {
+                        name: format!("tool:{}", tool.name()),
+                        order: prompt.order,
+                        tools: vec![tool.name().to_owned()],
+                        text: prompt.text,
+                    })
+            })
+            .collect()
     }
 
     /// Specs for every registered tool, name-sorted — what providers

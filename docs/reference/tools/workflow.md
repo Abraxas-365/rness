@@ -12,6 +12,7 @@ This tool matches the `workflow` package in deepseek-harness. The rness differen
 - When generic children are disabled, the description tells the model that each `agent()` call must set `opts.role`. Enabled roles are listed with their descriptions.
 - `ptc` [tool exposure](../../guides/plugins/example-recipes.md#deferred-tools-and-programmatic-tool-calling) omits `workflow`. It is neither listed nor returned by `ToolSearch`. In `native` and `both` modes it is an ordinary tool, and it can be deferred.
 - `run_code` programs cannot call `workflow`. Its members (the child sessions it starts) cannot see or call it either, so workflows never nest.
+- The default flavor's `tool:workflow` [system-prompt section](../configuration/agents.md#sections) tells the model to use workflows only when explicitly asked for one or for large multi-agent orchestration. It is sent only while the tool is usable, the same usage policy dsh ships.
 
 ## Input
 

@@ -743,7 +743,8 @@ async fn main() -> anyhow::Result<()> {
             config: TurnConfig {
                 compaction: startup.compaction.clone(),
                 tool_exposure: startup.tool_exposure.clone(),
-                system: "You are rness, a coding agent. Be concise.".into(),
+                system: startup.system_prompt.clone(),
+                sections: startup.sections.clone(),
                 ..Default::default()
             },
         })

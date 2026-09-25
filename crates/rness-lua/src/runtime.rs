@@ -68,6 +68,8 @@ pub struct LuaToolSpec {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub sensitive: bool,
+    /// `prompt` from rness.tool.register: this tool's system-prompt section.
+    pub prompt: Option<rness_engine::prompt::ToolPrompt>,
     pub plan: Option<std::sync::Arc<rness_engine::plan::ExitPlan>>,
     pub tasks: Option<rness_engine::tasks::TasksConfig>,
     pub read_image: Option<ImageReaderConfig>,
@@ -2031,6 +2033,15 @@ impl LuaRuntime {
                     .map(|table| self.lua.from_value(LuaValue::Table(table)))
                     .transpose()?,
                 sensitive: entry.get::<Option<bool>>("sensitive")?.unwrap_or(false),
+                prompt: entry
+                    .get::<Option<Table>>("prompt")?
+                    .map(|table| -> mlua::Result<_> {
+                        Ok(rness_engine::prompt::ToolPrompt {
+                            order: table.get("order")?,
+                            text: table.get("text")?,
+                        })
+                    })
+                    .transpose()?,
             };
             let key = self.lua.create_registry_value(run)?;
             if let Some(owner) = owner {
@@ -2344,6 +2355,55 @@ fn owned_command(lua: &Lua, callback: Function) -> mlua::Result<Function> {
     "#,
     )
     .call((callback, owner))
+}
+
+/// `rness.tool.register{ prompt = "text" | { text = "...", order = N } }`.
+/// Default order 4000 places plugin tool guidance after the built-in tool
+/// sections (dsh orders 1000–2900).
+fn tool_prompt(value: LuaValue) -> mlua::Result<Option<rness_engine::prompt::ToolPrompt>> {
+    let (text, order) = match value {
+        LuaValue::Nil => return Ok(None),
+        LuaValue::String(text) => (text.to_str()?.to_string(), 4000),
+        LuaValue::Table(table) => {
+            for key in table.pairs::<LuaValue, LuaValue>() {
+                let (key, _) = key?;
+                if !matches!(&key, LuaValue::String(k) if matches!(k.to_str()?.as_ref(), "text" | "order"))
+                {
+                    return Err(mlua::Error::runtime(
+                        "tool prompt accepts only text and order",
+                    ));
+                }
+            }
+            let text: String = table
+                .get::<Option<String>>("text")
+                .map_err(|_| mlua::Error::runtime("tool prompt text must be a string"))?
+                .ok_or_else(|| mlua::Error::runtime("tool prompt text is required"))?;
+            let order: i64 = table
+                .get::<Option<i64>>("order")
+                .map_err(|_| mlua::Error::runtime("tool prompt order must be an integer"))?
+                .unwrap_or(4000);
+            (text, order)
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "tool prompt must be a string or { text, order }",
+            ))
+        }
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(mlua::Error::runtime("tool prompt text must not be empty"));
+    }
+    if text.len() > rness_engine::prompt::MAX_TEXT_BYTES {
+        return Err(mlua::Error::runtime(format!(
+            "tool prompt text exceeds {} bytes",
+            rness_engine::prompt::MAX_TEXT_BYTES
+        )));
+    }
+    Ok(Some(rness_engine::prompt::ToolPrompt {
+        order,
+        text: text.to_owned(),
+    }))
 }
 
 fn require_declaration_phase(lua: &Lua) -> mlua::Result<()> {
@@ -2784,6 +2844,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                     .map_err(|_| mlua::Error::runtime("tool 'run' (function) is required"))?;
                 let description: Option<String> = spec.get("description")?;
                 let sensitive: Option<bool> = spec.get("sensitive")?;
+                let prompt = tool_prompt(spec.get("prompt")?)?;
                 let schema: LuaValue = spec.get("schema")?;
                 let schema: serde_json::Value = if schema.is_nil() {
                     serde_json::json!({ "type": "object" })
@@ -2807,6 +2868,12 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                 entry.set("run", owned_command(lua, run)?)?;
                 entry.set("description", description)?;
                 entry.set("sensitive", sensitive)?;
+                if let Some(prompt) = prompt {
+                    let value = lua.create_table()?;
+                    value.set("text", prompt.text)?;
+                    value.set("order", prompt.order)?;
+                    entry.set("prompt", value)?;
+                }
                 entry.set("schema", lua.to_value(&schema)?)?;
                 tools.push(entry)?;
                 declared.set(name, true)?;

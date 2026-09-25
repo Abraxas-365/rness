@@ -2,6 +2,7 @@
 require("providers")
 require("theme")
 require("agents")
+require("system_prompt")
 
 -- Set mode to "both" or "ptc" to enable isolated Lua run_code programs.
 -- Add exact tool names to deferred to load their schemas through ToolSearch.

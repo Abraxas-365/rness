@@ -129,6 +129,14 @@ rness.profiles.declare("router-sonnet", {
 --   },
 -- }
 
+-- Base system prompt: sent first, before the active role's instructions.
+-- There is no built-in base; unset or "" sends only the role instructions.
+-- rness.system_prompt.base = "You are rness, a coding agent. Be concise."
+-- Sections follow the role instructions; `tools` limits a section to steps
+-- where one of those tools is usable (see flavors/default/lua/system_prompt.lua).
+-- rness.system_prompt.section({ name = "house-style", order = 4000,
+--   text = "Prefer small, reviewable commits." })
+
 -- Roles are selectable as the principal agent; named delegation requires opt-in.
 -- Generic children are disabled by default; use only configured roster roles.
 -- Set true to opt in to generic children. Restart to apply.
