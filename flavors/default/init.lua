@@ -66,6 +66,14 @@ rness.plugins.setup({
   -- with rness.time_context / rness.tmux_context tables above plugins.setup.
   -- { name = "time-context", file = "plugins/time-context.lua" },
   -- { name = "tmux-context", file = "plugins/tmux-context.lua" },
+  -- Optional reminders: schedule_create/list/delete tools let the model set
+  -- one-shot or recurring reminders ("every 10 minutes check the deploy").
+  -- A due reminder wakes the idle session and starts a turn. Enable it when you
+  -- keep rness open and want the agent to follow up on its own. Only fires
+  -- while rness is running. If a turn is running when one comes due, it waits
+  -- for that turn to end (delivery = "queue", default) or joins it at the next
+  -- step (delivery = "steer"): rness.schedule = { delivery = "steer" }.
+  -- { name = "schedule", file = "plugins/schedule.lua" },
   { name = "commands", file = "plugins/commands.lua" },
   { name = "title", file = "plugins/title.lua" },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },

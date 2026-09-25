@@ -1606,6 +1606,17 @@ impl LuaRuntime {
         errors
     }
 
+    /// Route due `rness.timer` ids to `sink` (the host forwards them back
+    /// to the VM thread, which calls [`Self::fire_timer`]).
+    pub fn set_timer_sink(&self, sink: crate::api::timer::TimerSink) {
+        crate::api::timer::set_sink(&self.lua, sink);
+    }
+
+    /// Run one due timer callback. Errors are returned, not propagated.
+    pub fn fire_timer(&self, id: u64) -> Result<(), String> {
+        crate::api::timer::fire(&self.lua, id).map_err(|e| user_message(&e))
+    }
+
     /// Inject shared background jobs independently of the session binding.
     pub fn install_jobs(&self, jobs: rness_tools::jobs::JobRegistry) -> Result<(), LuaError> {
         let rness: Table = self.lua.globals().get("rness")?;
@@ -2283,9 +2294,16 @@ fn register_hook(
     Ok(unsubscribe)
 }
 
+/// The owner table that runtime subscriptions (hooks, timers) attach to:
+/// the running callback's plugin, else the plugin currently loading.
+pub(crate) fn subscription_owner(lua: &Lua) -> mlua::Result<Option<Table>> {
+    let owner: Option<Table> = lua.globals().get("__rness_callback_owner")?;
+    Ok(owner.or(lua.globals().get::<Option<Table>>("__rness_load_owner")?))
+}
+
 /// Capture the registration owner and restore it across nested callbacks,
 /// including errors. Declaration APIs remain load-time only.
-fn owned_callback(lua: &Lua, callback: Function) -> mlua::Result<Function> {
+pub(crate) fn owned_callback(lua: &Lua, callback: Function) -> mlua::Result<Function> {
     let owner: Option<Table> = lua.globals().get("__rness_callback_owner")?;
     let owner = match owner {
         Some(owner) => Some(owner),
@@ -3355,6 +3373,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     crate::api::fs::install(lua, &rness)?;
     crate::api::http::install(lua, &rness)?;
     crate::api::process::install(lua, &rness)?;
+    crate::api::timer::install(lua, &rness)?;
 
     lua.globals().set("rness", rness)?;
     Ok(())
@@ -5265,5 +5284,429 @@ mod tests {
         assert!(rt
             .load("bad2", "rness.questions.enable { title = '' }")
             .is_err());
+    }
+
+    fn timer_rt() -> (LuaRuntime, std::sync::mpsc::Receiver<u64>) {
+        let rt = LuaRuntime::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        rt.set_timer_sink(Box::new(move |id| {
+            let _ = tx.lock().unwrap().send(id);
+        }));
+        (rt, rx)
+    }
+
+    fn pump(
+        rt: &LuaRuntime,
+        rx: &std::sync::mpsc::Receiver<u64>,
+        wait: std::time::Duration,
+    ) -> Vec<u64> {
+        let deadline = std::time::Instant::now() + wait;
+        let mut fired = Vec::new();
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(id) => {
+                    rt.fire_timer(id).unwrap();
+                    fired.push(id);
+                }
+                Err(_) => break,
+            }
+        }
+        fired
+    }
+
+    #[test]
+    fn timer_after_fires_once_every_repeats_cancel_stops() {
+        let (mut rt, rx) = timer_rt();
+        rt.load(
+            "t",
+            r#"
+            hits = { once = 0, rep = 0 }
+            rness.timer.after(0.05, function() hits.once = hits.once + 1 end)
+            rep_id = rness.timer.every(1, function() hits.rep = hits.rep + 1 end)
+            dead = rness.timer.after(0.05, function() hits.dead = true end)
+            assert(rness.timer.cancel(dead) == true)
+            assert(rness.timer.cancel(dead) == false)
+        "#,
+        )
+        .unwrap();
+        pump(&rt, &rx, std::time::Duration::from_millis(2300));
+        let hits: Table = rt.lua().globals().get("hits").unwrap();
+        assert_eq!(hits.get::<i64>("once").unwrap(), 1);
+        assert_eq!(hits.get::<i64>("rep").unwrap(), 2);
+        assert!(hits.get::<Option<bool>>("dead").unwrap().is_none());
+        rt.lua().load("rness.timer.cancel(rep_id)").exec().unwrap();
+        assert!(pump(&rt, &rx, std::time::Duration::from_millis(1200)).is_empty());
+    }
+
+    #[test]
+    fn timer_rejects_bad_intervals() {
+        let (mut rt, _rx) = timer_rt();
+        for bad in [
+            "rness.timer.after(0, print)",
+            "rness.timer.after(-1, print)",
+            "rness.timer.after(0/0, print)",
+            "rness.timer.every(0.5, print)",
+        ] {
+            assert!(rt.load("bad", bad).is_err(), "{bad} should fail");
+        }
+    }
+
+    #[test]
+    fn timer_callback_error_keeps_repeating_timer_alive() {
+        let (mut rt, rx) = timer_rt();
+        rt.load(
+            "t",
+            "n = 0; rness.timer.every(1, function() n = n + 1; error('boom') end)",
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2300);
+        let mut errors = 0;
+        while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(id) => {
+                    if rt.fire_timer(id).is_err() {
+                        errors += 1
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(errors, 2);
+        assert_eq!(rt.lua().globals().get::<i64>("n").unwrap(), 2);
+    }
+
+    #[test]
+    fn timer_cancelled_on_unload_and_failed_load() {
+        let (mut rt, rx) = timer_rt();
+        rt.load(
+            "keep",
+            "kept = 0; rness.timer.after(0.3, function() kept = kept + 1 end)",
+        )
+        .unwrap();
+        rt.load(
+            "gone",
+            "gone = 0; rness.timer.after(0.3, function() gone = gone + 1 end)",
+        )
+        .unwrap();
+        assert!(rt
+            .load(
+                "broken",
+                "rness.timer.after(0.3, function() broke = true end); error('x')"
+            )
+            .is_err());
+        assert!(rt.unload("gone").unwrap());
+        pump(&rt, &rx, std::time::Duration::from_millis(700));
+        let g = rt.lua().globals();
+        assert_eq!(g.get::<i64>("kept").unwrap(), 1);
+        assert_eq!(g.get::<i64>("gone").unwrap(), 0);
+        assert!(g.get::<Option<bool>>("broke").unwrap().is_none());
+    }
+
+    #[test]
+    fn timer_created_inside_callback_is_owned_by_plugin() {
+        let (mut rt, rx) = timer_rt();
+        rt.load(
+            "p",
+            r#"
+            inner = 0
+            outer = 0
+            rness.timer.after(0.05, function()
+              outer = outer + 1
+              rness.timer.after(0.3, function() inner = inner + 1 end)
+            end)
+        "#,
+        )
+        .unwrap();
+        pump(&rt, &rx, std::time::Duration::from_millis(150));
+        // Guard: the inner timer must exist before unload, or this proves nothing.
+        assert_eq!(rt.lua().globals().get::<i64>("outer").unwrap(), 1);
+        assert!(rt.unload("p").unwrap());
+        pump(&rt, &rx, std::time::Duration::from_millis(500));
+        assert_eq!(rt.lua().globals().get::<i64>("inner").unwrap(), 0);
+    }
+
+    #[test]
+    fn timer_busy_vm_gets_one_pending_fire_not_a_burst() {
+        let (mut rt, rx) = timer_rt();
+        rt.load("p", "n = 0; rness.timer.every(1, function() n = n + 1 end)")
+            .unwrap();
+        // VM "busy": don't run callbacks. Slots at 1s and 2s elapse.
+        std::thread::sleep(std::time::Duration::from_millis(2300));
+        let queued: Vec<u64> = rx.try_iter().collect();
+        assert_eq!(queued.len(), 1, "only one pending fire while VM is busy");
+        rt.fire_timer(queued[0]).unwrap();
+        // After the pending fire runs, the timer resumes normally.
+        let fired = pump(&rt, &rx, std::time::Duration::from_millis(1200));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(rt.lua().globals().get::<i64>("n").unwrap(), 2);
+    }
+
+    // ── schedule.lua (flavors/default/plugins) ────────────────────────────
+
+    const SCHEDULE: &str = include_str!("../../../flavors/default/plugins/schedule.lua");
+    const SID: &str = "01TESTSESSION";
+
+    /// Loads schedule.lua with a fake clock (`clock`), a stub rness.session
+    /// recording deliveries in `sent`, and a 1s tick.
+    fn schedule_rt(
+        dir: &std::path::Path,
+        delivery: &str,
+    ) -> (LuaRuntime, std::sync::mpsc::Receiver<u64>) {
+        let (mut rt, rx) = timer_rt();
+        rt.lua()
+            .load(format!(
+                r#"
+                clock = 1000000
+                local real_time = os.time
+                os.time = function(t) if t then return real_time(t) end return clock end
+                sent, phase, fail_with = {{}}, "idle", nil
+                local function deliver(sid, text)
+                  if fail_with then error(fail_with) end
+                  sent[#sent + 1] = {{ sid = sid, text = text }}
+                  return "started"
+                end
+                rness.session = {{
+                  send = deliver, steer = deliver,
+                  phase = function() return phase end,
+                }}
+                rness.schedule = {{ delivery = {delivery:?}, tick_seconds = 1, dir = {dir:?} }}
+                "#,
+                dir = dir.to_str().unwrap()
+            ))
+            .exec()
+            .unwrap();
+        rt.load("schedule", SCHEDULE).unwrap();
+        (rt, rx)
+    }
+
+    fn sched_call(rt: &LuaRuntime, tool: &str, args: serde_json::Value) -> Result<String, String> {
+        rt.call_tool_context(tool, &args, &serde_json::json!({ "session": SID }))
+            .unwrap()
+    }
+
+    fn sent_count(rt: &LuaRuntime) -> usize {
+        rt.lua().load("return #sent").eval::<usize>().unwrap()
+    }
+
+    fn advance(rt: &LuaRuntime, secs: i64) {
+        rt.lua()
+            .load(format!("clock = clock + {secs}"))
+            .exec()
+            .unwrap();
+    }
+
+    fn tick(rt: &LuaRuntime, rx: &std::sync::mpsc::Receiver<u64>) {
+        pump(rt, rx, std::time::Duration::from_millis(1300));
+    }
+
+    #[test]
+    fn schedule_once_delivers_then_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "queue");
+        let out = sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "stretch", "after_seconds": 60}),
+        )
+        .unwrap();
+        assert!(out.contains(r#""id":"1""#), "{out}");
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 0, "not due yet");
+        advance(&rt, 61);
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1);
+        let text: String = rt.lua().load("return sent[1].text").eval().unwrap();
+        assert!(
+            text.starts_with("[SCHEDULE REMINDER]") && text.contains(r#""stretch""#),
+            "{text}"
+        );
+        assert_eq!(sched_call(&rt, "schedule_list", json!({})).unwrap(), "[]");
+        // Ids are never reused.
+        let out = sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "again", "after_seconds": 5}),
+        )
+        .unwrap();
+        assert!(out.contains(r#""id":"2""#), "{out}");
+    }
+
+    #[test]
+    fn schedule_busy_session_is_retried_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "queue");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "every_seconds": 300}),
+        )
+        .unwrap();
+        rt.lua()
+            .load(r#"fail_with = "session is busy — wait for the active operation to finish and retry""#)
+            .exec()
+            .unwrap();
+        advance(&rt, 301);
+        for _ in 0..4 {
+            tick(&rt, &rx);
+        }
+        assert_eq!(sent_count(&rt), 0);
+        let list = sched_call(&rt, "schedule_list", json!({})).unwrap();
+        assert!(
+            list.contains(r#""id":"1""#),
+            "busy must not drop the series: {list}"
+        );
+        rt.lua().load("fail_with = nil").exec().unwrap();
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1);
+    }
+
+    #[test]
+    fn schedule_real_failures_drop_after_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "queue");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 1}),
+        )
+        .unwrap();
+        rt.lua()
+            .load(r#"fail_with = "no such session""#)
+            .exec()
+            .unwrap();
+        advance(&rt, 2);
+        for _ in 0..3 {
+            tick(&rt, &rx);
+        }
+        assert_eq!(sched_call(&rt, "schedule_list", json!({})).unwrap(), "[]");
+    }
+
+    #[test]
+    fn schedule_queue_mode_holds_while_turn_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "queue");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "every_seconds": 300}),
+        )
+        .unwrap();
+        rt.lua().load(r#"phase = "running""#).exec().unwrap();
+        // Three periods elapse during one long turn.
+        for _ in 0..3 {
+            advance(&rt, 300);
+            tick(&rt, &rx);
+        }
+        assert_eq!(sent_count(&rt), 0, "nothing piles up while running");
+        rt.lua().load(r#"phase = "idle""#).exec().unwrap();
+        tick(&rt, &rx);
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1, "exactly one occurrence after the turn");
+    }
+
+    #[test]
+    fn schedule_steer_mode_delivers_during_running_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "steer");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 1}),
+        )
+        .unwrap();
+        rt.lua().load(r#"phase = "running""#).exec().unwrap();
+        advance(&rt, 2);
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1);
+    }
+
+    #[test]
+    fn schedule_accepts_json_null_for_unused_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _rx) = schedule_rt(dir.path(), "queue");
+        let out = sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 5, "at": null, "every_seconds": null}),
+        );
+        assert!(out.is_ok(), "{out:?}");
+    }
+
+    #[test]
+    fn schedule_unreadable_file_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, rx) = schedule_rt(dir.path(), "queue");
+        let path = dir.path().join(format!("{SID}.json"));
+        std::fs::write(&path, "{ not json").unwrap();
+        let out = sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 5}),
+        );
+        assert!(out.unwrap_err().contains("unreadable"));
+        tick(&rt, &rx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn schedule_live_sessions_survive_plugin_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut rt, rx) = schedule_rt(dir.path(), "queue");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 10}),
+        )
+        .unwrap();
+        assert!(rt.unload("schedule").unwrap());
+        rt.load("schedule", SCHEDULE).unwrap();
+        advance(&rt, 11);
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1, "session stays live across reload");
+    }
+
+    #[test]
+    fn schedule_hot_reload_keeps_live_and_one_tick_timer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut rt, rx) = schedule_rt(dir.path(), "queue");
+        sched_call(
+            &rt,
+            "schedule_create",
+            json!({"prompt": "p", "after_seconds": 10}),
+        )
+        .unwrap();
+        let source = crate::loader::PluginSource {
+            dependencies: vec![],
+            name: "schedule".into(),
+            source: SCHEDULE.into(),
+        };
+        rt.reload_plugins(std::slice::from_ref(&source), |_| Ok(()))
+            .unwrap();
+        rt.reload_plugins(&[source], |_| Ok(())).unwrap();
+        let timers: usize = rt
+            .lua()
+            .load("local n = 0 for _ in pairs(__rness_timers) do n = n + 1 end return n")
+            .eval()
+            .unwrap();
+        assert_eq!(timers, 1, "old tick timers are cancelled on reload");
+        advance(&rt, 11);
+        tick(&rt, &rx);
+        assert_eq!(sent_count(&rt), 1, "delivered exactly once after reloads");
+    }
+
+    #[test]
+    fn schedule_rejects_invalid_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut rt, _rx) = timer_rt();
+        rt.lua()
+            .load(format!(
+                "rness.session = {{}}; rness.schedule = {{ delivery = 'nope', dir = {:?} }}",
+                dir.path().to_str().unwrap()
+            ))
+            .exec()
+            .unwrap();
+        let err = rt.load("schedule", SCHEDULE).unwrap_err().to_string();
+        assert!(err.contains(r#"must be "queue" or "steer""#), "{err}");
     }
 }

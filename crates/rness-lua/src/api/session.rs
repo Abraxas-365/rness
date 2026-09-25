@@ -11,6 +11,8 @@
 //!   rness.session.title(id)         -> string|nil (get current title)
 //!   rness.session.title(id, text)   -> string (set title, returns it)
 //!   rness.session.send(id, text)    -> "started"|"queued"|"logged"
+//!   rness.session.steer(id, text)   -> "started"|"queued" (joins the running
+//!     turn at its next step boundary; starts a turn when idle)
 //!   rness.session.fork(id)          -> child id
 //!   rness.session.transcript(id)    -> { {role=, text=}, ... }
 //!   rness.session.usage(id)         -> { input=, output= } (context tokens)
@@ -321,6 +323,26 @@ pub fn install(
             let _guard = send_rt.enter();
             let disposition = s
                 .send(&id, UserIntent::Followup, vec![ContentPart::Text { text }])
+                .map_err(err)?;
+            Ok(match disposition {
+                Disposition::Command(_) => "command",
+                Disposition::StartTurn => "started",
+                Disposition::Queued => "queued",
+                Disposition::LogOnly => "logged",
+            })
+        })?,
+    )?;
+
+    // Steer a session: a running turn receives the text at its next model-step
+    // boundary (without aborting in-flight work); an idle session starts a turn.
+    let s = Arc::clone(&sessions);
+    let steer_rt = rt.clone();
+    session.set(
+        "steer",
+        lua.create_function(move |_, (id, text): (String, String)| {
+            let _guard = steer_rt.enter();
+            let disposition = s
+                .send(&id, UserIntent::Steer, vec![ContentPart::Text { text }])
                 .map_err(err)?;
             Ok(match disposition {
                 Disposition::Command(_) => "command",

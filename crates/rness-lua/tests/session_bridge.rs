@@ -726,6 +726,129 @@ async fn lua_drives_a_session_through_the_bridge() {
     assert_eq!(sessions.list().unwrap().len(), 2);
 }
 
+/// Step 1 parks until released (so Lua can steer mid-turn), then calls an
+/// unknown tool to force a step boundary; step 2 records whether the steer
+/// text reached the model.
+struct SteerProbe {
+    step: std::sync::atomic::AtomicUsize,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    saw_steer: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Provider for SteerProbe {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
+        let n = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (content, stop) = if n == 0 {
+            self.entered.notify_one();
+            self.release.notified().await;
+            (
+                vec![ContentPart::ToolUse {
+                    call: "c1".into(),
+                    name: "absent".into(),
+                    args: serde_json::json!({}),
+                }],
+                StopReason::ToolUse,
+            )
+        } else {
+            let seen = request.context.turns.iter().any(|t| {
+                matches!(t, rness_engine::session::projection::ModelTurn::User { content }
+                    if content.iter().any(|p| matches!(p, ContentPart::Text { text } if text == "steer me")))
+            });
+            self.saw_steer
+                .store(seen, std::sync::atomic::Ordering::SeqCst);
+            (
+                vec![ContentPart::Text {
+                    text: "done".into(),
+                }],
+                StopReason::EndTurn,
+            )
+        };
+        StepOutcome::Committed(AssistantMessage {
+            model: "fake-1".into(),
+            content,
+            stop,
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            estimated_input: 0,
+            chunks: vec![],
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lua_steer_joins_the_running_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(SteerProbe {
+        step: Default::default(),
+        entered: Default::default(),
+        release: Default::default(),
+        saw_steer: Default::default(),
+    });
+    let store = SessionStore::new(dir.path());
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()),
+        provider.clone(),
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    ));
+    let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(
+        Arc::clone(&sessions),
+        3,
+    ));
+    let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+    host.install_session(
+        Arc::clone(&sessions),
+        subagents,
+        Arc::new(ToolRegistry::default()),
+        Default::default(),
+        tokio::runtime::Handle::current(),
+        "test/model".into(),
+    )
+    .await
+    .unwrap();
+
+    let id = sessions.create(None).unwrap();
+    // Idle: steer behaves like a prompt and starts the turn.
+    host.load(
+        "start.lua",
+        &format!(r#"assert(rness.session.steer("{id}", "go") == "started")"#),
+    )
+    .await
+    .unwrap();
+    provider.entered.notified().await;
+    // Running: steer is queued for the next step boundary of this same turn.
+    host.load(
+        "steer.lua",
+        &format!(r#"assert(rness.session.steer("{id}", "steer me") == "queued")"#),
+    )
+    .await
+    .unwrap();
+    provider.release.notify_one();
+    sessions.join(&id).await;
+
+    assert!(
+        provider.saw_steer.load(std::sync::atomic::Ordering::SeqCst),
+        "step 2 must see the steer"
+    );
+    let events = store.read_session(&id).unwrap();
+    let turns = events
+        .iter()
+        .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+        .count();
+    assert_eq!(turns, 1, "steer must not start a separate turn");
+    assert!(events.iter().any(|e| matches!(&e.event,
+        SessionEvent::UserMessage(m) if m.intent == UserIntent::Steer)));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lua_delegates_to_a_subagent() {
     let dir = tempfile::tempdir().unwrap();

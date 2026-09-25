@@ -14,4 +14,5 @@ pub mod mcp;
 pub mod process;
 pub mod session;
 pub mod subagents;
+pub mod timer;
 pub mod tools;

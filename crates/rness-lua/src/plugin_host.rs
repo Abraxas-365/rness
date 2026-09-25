@@ -748,6 +748,8 @@ enum Cmd {
         event: String,
         payload: serde_json::Value,
     },
+    /// A `rness.timer` deadline elapsed; run its callback on the VM thread.
+    FireTimer { id: u64 },
     StatusView {
         context: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
@@ -1092,6 +1094,13 @@ impl LuaHost {
             .spawn(move || {
                 let mut rt = match LuaRuntime::new() {
                     Ok(mut rt) => {
+                        // Before init.lua runs, so timers it creates are delivered.
+                        let timer_tx = command_tx.clone();
+                        rt.set_timer_sink(Box::new(move |id| {
+                            if let Some(tx) = timer_tx.upgrade() {
+                                let _ = tx.send(Cmd::FireTimer { id });
+                            }
+                        }));
                         if let Some(path) = &init {
                             match rt.startup(path) {
                                 Ok(startup) => config = startup,
@@ -1339,6 +1348,17 @@ impl LuaHost {
                             add_lineage(session_binding.as_ref(), &mut payload);
                             for err in rt.fire_hook(&event, &payload) {
                                 tracing::warn!(target: "lua", "hook '{event}' failed: {err}");
+                            }
+                        }
+                        Cmd::FireTimer { id } => {
+                            let deadline = std::time::Instant::now() + HOOK_TIMEOUT;
+                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
+                                if std::time::Instant::now() >= deadline { Err(mlua::Error::runtime("timer callback timed out")) } else { Ok(mlua::VmState::Continue) }
+                            });
+                            let result = rt.fire_timer(id);
+                            rt.lua().remove_hook();
+                            if let Err(err) = result {
+                                tracing::warn!(target: "lua", "timer {id} failed: {err}");
                             }
                         }
                         Cmd::StatusView { context, reply } => {

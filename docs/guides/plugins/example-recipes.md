@@ -62,6 +62,68 @@ Both plugins are selected in the default flavor's `rness.plugins.setup` list:
 
 Remove either entry to disable that context injection. Neither plugin registers tools, commands, or UI elements — they only inject context through hooks.
 
+## Timers and scheduled reminders
+
+### `rness.timer` Lua API
+
+Plugins can run code later without a user turn:
+
+```lua
+local id = rness.timer.after(30, function() rness.log.info("30s later") end)
+local tick = rness.timer.every(60, function() --[[ once a minute ]] end)
+rness.timer.cancel(tick) -- true if it was active, false otherwise
+```
+
+- `after(seconds, fn)` fires once; `every(seconds, fn)` repeats. Both return a numeric id. Fractional seconds are allowed; `every` needs at least 1 second; the maximum is one year.
+- Callbacks run on the Lua host thread between other plugin work, never concurrently with hooks or tools. A slow callback delays other Lua work, so keep them short; a callback running longer than 30 seconds is aborted.
+- A recurring timer that falls behind skips missed slots rather than firing a burst. While the Lua host is busy, each timer has at most one pending fire.
+- An error in a callback is logged; a recurring timer keeps running.
+- Timers belong to the plugin that created them, including timers created inside a timer callback. Unloading the plugin, or a failed load, cancels them.
+- Timers are in-process only. They do not survive a restart, and in headless `-p` mode they stop when the process exits.
+- The 30-second limit counts Lua instructions. It does not bound blocking native calls such as `rness.process`, or coroutines started inside the callback.
+
+To have a timer start a turn, call `rness.session.send(session, text)`: an idle session starts a turn; a busy one receives the text when its current turn ends. `rness.session.steer(session, text)` also starts a turn when idle, but a busy session receives the text at its next model-step boundary, inside the running turn. This matches the TUI's Ctrl+Enter (see [Queue and Steer](../queue-and-steer.md)).
+
+### Schedule plugin
+
+`schedule.lua` builds reminders on top of `rness.timer`. It gives the model three tools:
+
+| Tool | Arguments |
+| --- | --- |
+| `schedule_create` | `prompt` plus exactly one of `after_seconds` (integer delay), `every_seconds` (recurring, at least `min_every_seconds`), or `at` (RFC 3339 with offset, e.g. `2026-09-24T15:30:00-05:00`) |
+| `schedule_list` | none; returns ids, UTC targets, and `scheduled`/`overdue` state |
+| `schedule_delete` | `id`; returns `deleted: false` for unknown ids |
+
+A due reminder is sent into its session as a followup message framed as `[SCHEDULE REMINDER]`, with the prompt JSON-encoded and marked as untrusted reminder content. An idle session wakes and runs a turn without user input, so "every 10 minutes check whether the deploy finished" works while rness stays open.
+
+Delivery rules:
+
+- **Busy sessions** depend on `delivery`:
+  - `"queue"` (default): while a turn runs, the reminder waits. It runs as its own turn once that turn ends, like pressing Enter while the agent works. The running task is not disturbed. A recurring reminder that comes due several times during one long turn is delivered once, not once per missed period.
+  - `"steer"`: the reminder joins the running turn at its next step boundary, like Ctrl+Enter. The model sees it mid-task without waiting for the task to finish. In-flight requests and tools are not aborted. A reminder that arrives during the turn's final step runs as its own turn instead.
+
+  Either way, if you cancel the turn or it fails, a pending reminder stays parked with the rest of the queue. It is not run automatically. While the session is busy compacting, running a command or reloading, delivery is retried on the next tick without counting as a failure.
+- **Session-local.** Reminders fire only for sessions live in the running rness process, meaning ones that ran a turn or used a schedule tool there. Live sessions are remembered across plugin hot reload. A reminder that comes due while rness is closed becomes overdue. It fires once you resume that session and start a turn: after that turn in queue mode, during it in steer mode.
+- **Recurring reminders** stay aligned to their creation time and skip missed occurrences.
+- **Durable.** Reminders are stored as one JSON file per session under `~/.rness/schedules/`. An unreadable file is never overwritten: the tools report an error until you fix or remove it.
+- **One process per session.** Two rness processes on the same session can deliver a reminder twice or lose an edit.
+- **Subagents.** Default subagent roles cannot use the schedule tools. If you allow them for a role, a reminder created by a subagent wakes that subagent's session, not its parent's.
+- **At-least-once.** A crash between delivery and saving can repeat a reminder. If delivery fails three times in a row (for example, the session was deleted), the reminder is dropped.
+
+It is commented out in the default flavor. To enable it, uncomment the entry and optionally configure it before `plugins.setup`:
+
+```lua
+rness.schedule = {
+  delivery = "queue",      -- "queue" (default) or "steer"; any other value fails the plugin load
+  min_every_seconds = 300, -- floor for every_seconds (default 300)
+  tick_seconds = 5,        -- how often due reminders are checked (default 5)
+  max_per_session = 50,    -- active reminders per session (default 50)
+  dir = "/abs/path",       -- where schedule files live (default $HOME/.rness/schedules)
+}
+-- in rness.plugins.setup (the file ships in flavors/default/plugins/):
+{ name = "schedule", file = "plugins/schedule.lua" },
+```
+
 ## Read-only LSP navigation
 
 Rness exposes the same four semantic operations as DSH: `goToDefinition`, `findReferences`, `goToImplementation`, and `hover`. This is operation-scope parity, not complete provider/lifecycle parity. Rename, formatting, code actions, symbols and diagnostics are not exposed.
@@ -354,6 +416,8 @@ end)
 ```
 
 **`rness.session.inject(session, text)`** — Queue context into a session's next step without waking an idle session or starting a turn. The message is committed as `UserMessage{intent: Inject}`. Useful inside `session_start` to seed model context. Returns `"queued"`, `"started"`, or `"logged"`.
+
+**`rness.session.steer(session, text)`** — Deliver a message into the running turn at its next model-step boundary, committed as `UserMessage{intent: Steer}`. It does not abort in-flight requests or tools. On an idle session it starts a turn, like `send`. Returns `"queued"` (running), `"started"` (idle), or `"command"` when the text is a slash command.
 
 ### hooks.json bridge
 
@@ -927,6 +991,7 @@ rness.plugins.setup({
 | `mcp-clima.lua` | Optional MCP server connection; inspect its external script prerequisite |
 | `time-context.lua` | `pre_step` hook injecting current time and elapsed duration; configurable throttle |
 | `tmux-context.lua` | `pre_step` hook injecting tmux session/window/pane; silent outside tmux, change-suppression |
+| `schedule.lua` (in `flavors/default/plugins/`, not `examples/plugins/`) | `schedule_create/list/delete` tools; due reminders wake idle sessions via `rness.timer` + `rness.session.send`/`steer` |
 
 Use `bottomline` as an alternative to the spinner, not as a second independent bar. The current API is `rness.ui.statusline`, not `rness.ui.bottomline`. Its latest-session label comes from events and is not a guarantee of the currently selected frontend session.
 
