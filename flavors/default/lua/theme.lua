@@ -105,10 +105,27 @@ rness.ui.messagebox = {
   },
   keys = {
     select_message = "alt+m",
+    toggle_hidden = "alt+i",
   },
   user = {
     style = { fg = p.fg, bg = p.card }, padding = { left = 1, right = 1 },
     marker = false, label = { text = "You", style = "user_prefix" },
+    -- Engine-injected user-role messages, layered over `user`:
+    --   user → sources.<kind> → sources.hook.tags.<tag>
+    -- Only rendering changes; the model always receives these messages.
+    -- Toggle hidden ones with keys.toggle_hidden (alt+i).
+    sources = {
+      hook = {
+        -- visible = false hides these messages completely: no box, no label,
+        -- no blank row. display/label below apply only while revealed with
+        -- keys.toggle_hidden (alt+i), or if you set visible = true.
+        visible = false, display = "collapsed", label = { text = "Hook", style = "dim" },
+      },
+      -- Same for the AGENTS.md / CLAUDE.md baseline: hidden entirely unless revealed.
+      instructions = { visible = false, display = "collapsed", label = { text = "AGENTS.md", style = "dim" } },
+      job = { display = "preview", preview_lines = 6, label = { text = "Job", style = "tool_name" } },
+      external = { label = { text = "External", style = "tool_name" } },
+    },
   },
   assistant = { style = "assistant_text", marker = false },
   thinking = { display = "preview", preview_lines = 3, style = "thinking" },

@@ -8,7 +8,7 @@ The default flavor includes two context-injection plugins that give the model aw
 
 ### Time context
 
-`time-context.lua` injects the current local time (with timezone) and elapsed duration since the last message at every model step:
+`time-context.lua` injects the current local time (with timezone) and elapsed duration since the last message at every model step (or once per turn with `every = "turn"`):
 
 ```
 Current time: 2026-09-24T15:30:45-0500 (CDT)
@@ -21,11 +21,22 @@ Configure in `init.lua` before the `plugins.setup` call:
 
 ```lua
 rness.time_context = {
-  refresh_interval = 60,  -- seconds; 0 = every step (default)
+  every = "turn",         -- "step" (default) = before every model call; "turn" = first step of each turn only
+  resend_after = 600,     -- seconds; with every = "turn", resend mid-turn after this long. 0 = never (default)
+  subagents = false,      -- false = skip delegated (subagent) sessions. Default true
+  refresh_interval = 60,  -- seconds; minimum gap between any two injections. 0 = no throttle (default)
 }
 ```
 
-A nonzero `refresh_interval` throttles injection: if less than that many seconds have passed since the last injection, the step proceeds without a time message. This reduces context noise in multi-step turns.
+`every = "turn"` sends the time once per user prompt instead of before every tool-loop step. Each injected message stays in the context until compaction, so a tool-heavy turn with `every = "step"` accumulates one message per model call.
+
+`resend_after` only matters with `every = "turn"`: on a later step of the same turn, the time is sent again once at least that many seconds have passed since the last time message. A long autonomous tool loop still sees roughly current time, without paying for a message per step.
+
+`subagents = false` skips sessions that have a delegating parent (the `pre_step` payload's `parent` field is set). Subagents usually run for minutes inside a parent turn that already carries the time.
+
+Invalid values (`every` other than `"step"`/`"turn"`, a negative or non-numeric `resend_after`, a non-boolean `subagents`) are load errors.
+
+A nonzero `refresh_interval` throttles injection: if less than that many seconds have passed since the last injection, the step proceeds without a time message. It applies after `every`, so `every = "turn"` with `refresh_interval = 300` sends at most one message per turn and skips turns that start within five minutes of the last one.
 
 The plugin also registers a `turn_end` hook to record when each turn finishes, so the elapsed duration on the next turn's first step reflects the gap between turns, not steps.
 
@@ -61,6 +72,8 @@ Both plugins are selected in the default flavor's `rness.plugins.setup` list:
 ```
 
 Remove either entry to disable that context injection. Neither plugin registers tools, commands, or UI elements — they only inject context through hooks.
+
+Their messages are tagged `time` and `tmux`. The default theme hides all hook-injected messages and the AGENTS.md baseline in the TUI (`user.sources.hook/instructions = { visible = false }`). The model still receives them. Press `alt+i` to reveal them, or set `user.sources.hook.tags.time = { visible = true }` (or `hook.visible = true`) to show them permanently.
 
 ## Timers and scheduled reminders
 
@@ -310,7 +323,7 @@ end)
 - `opts.match` is an anchored regex (Rust syntax) over `ev.tool`. `opts.agent = "<session id>"` limits a handler to that session and its delegated descendants. Hooks without `agent` fire for every session, including subagents. A filtered-out handler is transparent.
 - `pre_tool` decisions: `{kind="allow"}` means no objection — it never bypasses the configured approval policy or per-tool rules. `{kind="deny", reason}` fails the call with `reason`. `{kind="ask", reason?}` prompts even under `--approval allow`; the reason is shown in the approval card. A granted ask is that call's approval. With no approver, or under `never`/a `deny` rule, the ask fails closed.
 - `guard` returns `{kind="deny", reason}` or `nil`. Guards run in registration order; the first denial wins. A failing guard denies.
-- `post_tool` decisions: `{kind="accept", content=?}` or `value=?` (not both) to replace model-visible output (string or content-part array); `{kind="block", feedback}` replaces the result with an error. Both accept `additional_contexts` (string or string array), committed as sourced user messages after the step's tool results, before the next model request. Denied calls also reach `post_tool`.
+- `post_tool` decisions: `{kind="accept", content=?}` or `value=?` (not both) to replace model-visible output (string or content-part array); `{kind="block", feedback}` replaces the result with an error. Both accept `additional_contexts` (a string, a `{text="...", tag="name"}` table, or an array mixing both), committed as sourced user messages (`Hook{event="post_tool", call, tag}`) after the step's tool results, before the next model request. The tag lets the TUI style or hide them via `user.sources.hook.tags.<name>`. Denied calls also reach `post_tool`.
 - Failures: an error thrown in `pre_tool` becomes the call's final error result (no `post_tool`). An error in `post_tool` replaces the result with an error. An unknown decision `kind` counts as a failure. `tool_result` errors are logged only.
 - `tool_execute` runs only for calls that passed every gate. It must return `{content = string | parts, is_error = bool?}` (`output` is accepted as a text alias, so `return next()` works unchanged). Returning `nil` after calling `next()` keeps the last run's result; returning `nil` without calling it is an error. An error in the wrapper becomes an error result that still reaches `post_tool`. `next()` yields the VM while the tool runs, so other hooks and parallel calls keep flowing; any other `coroutine.yield` inside a wrapper is an error. Each wrapper segment gets its own 30-second ceiling. If the turn is cancelled after the tool body has run, the call keeps the body's result.
 - Each chain runs on the Lua actor with a 30-second ceiling. Turn cancellation interrupts `pre_tool`/`guard`. Parallel calls serialize through the single VM. Do not synchronously dispatch tools from a hook. When no handler is registered for a phase, the phase skips the VM entirely.
@@ -369,10 +382,10 @@ rness.hook.on("turn_stopping", function(ev, next)
 end)
 ```
 
-- `pre_step` decisions: `{kind="enter"}` (default), `{kind="enter", messages={"...", ...}}` to inject context, or `{kind="reject"}` to end the turn. Injected messages are committed as `UserMessage{intent: Inject, source: Hook}`.
+- `pre_step` decisions: `{kind="enter"}` (default), `{kind="enter", messages={"...", ...}}` to inject context, or `{kind="reject"}` to end the turn. Injected messages are committed as `UserMessage{intent: Inject, source: Hook}`. Each message may instead be a table `{text="...", tag="name"}`; the tag is stored on the source (`Hook{tag}`) so the TUI can style or hide it via `user.sources.hook.tags.<name>`. Plain strings and tables can be mixed.
 - `request` is currently observe-only (`next()` returns nil). A future phase will expose per-step model config overrides.
 - `request_error` decisions: `{kind="retry"}` forces a retry even for non-retryable errors (the 500 ms backoff still applies); `nil`/no `kind` defers to the engine's built-in retry budget. The payload includes `ev.error = {code, message, retryable, attempt, max_retries}`.
-- `turn_stopping` fires when the model says "end turn" (EndTurn or truncation with no tool calls). Return `{kind="continue", messages={"..."}}` to inject a steer and continue; `{kind="stop"}` (default) closes the turn. Messages are committed as `UserMessage{intent: Steer, source: Hook}`.
+- `turn_stopping` fires when the model says "end turn" (EndTurn or truncation with no tool calls). Return `{kind="continue", messages={"..."}}` to inject a steer and continue; `{kind="stop"}` (default) closes the turn. Messages are committed as `UserMessage{intent: Steer, source: Hook}` and accept the same `{text, tag}` form.
 - Failure semantics: a throwing `pre_step` is logged and treated as Enter (step proceeds); other hook errors are logged and the default applies. No loop hook failure is fatal to the turn.
 
 ### Lifecycle hooks
@@ -449,7 +462,7 @@ Declarative command hooks — no Lua required. Place a `hooks.json` in `.rness/h
 
 Each command hook:
 - Receives the hook payload as JSON on **stdin**.
-- Prints a JSON decision on **stdout** (for interception hooks: `pre_tool`, `guard`, `post_tool`, `tool_execute`, `pre_step`, `request`, `request_error`, `turn_stopping`). Notification hooks ignore stdout.
+- Prints a JSON decision on **stdout** (for interception hooks: `pre_tool`, `guard`, `post_tool`, `tool_execute`, `pre_step`, `request`, `request_error`, `turn_stopping`). Notification hooks ignore stdout. The decision has the same shape as the Lua return value, so `messages` / `additional_contexts` entries may be `{"text": "...", "tag": "name"}` objects to label injected messages (see [Injected messages](#injected-messages-hooks-agentsmd-jobs)).
 - Exit code 0 = success; non-zero = error (logged, default decision applied).
 - `timeout` is in seconds (default 30).
 - `matcher` is optional: when set, only fires for matching `tool`/`source` names (same as `opts.match` in Lua).
@@ -636,12 +649,46 @@ rness.ui.messagebox = {
   keys = {
     previous_tool = 'alt+up', next_tool = 'alt+down', toggle_tool = 'ctrl+o',
     previous_thinking = 'alt+p', next_thinking = 'alt+n', toggle_thinking = 'alt+t',
+    toggle_hidden = 'alt+i',
   },
 }
 ```
 
 Each key accepts `false` to disable it. Tool output wrapping affects presentation
 only; it never truncates the durable result or changes provider requests.
+
+### Injected messages (hooks, AGENTS.md, jobs)
+
+Engine-injected user-role messages keep their provenance, so they can be styled or
+hidden separately from what you typed. Options layer
+`user` → `user.sources.<kind>` → `user.sources.hook.tags.<tag>`:
+
+```lua
+rness.ui.messagebox = {
+  user = {
+    label = { text = 'You' },
+    sources = {
+      hook = {                                  -- pre_step / turn_stopping / post_tool
+        display = 'collapsed',
+        tags = {
+          time = { visible = false },           -- hide time-context
+          tmux = { visible = false },
+          lint = { visible = true, label = { text = 'Lint' } },
+        },
+      },
+      instructions = { display = 'collapsed', label = { text = 'AGENTS.md' } },
+      job = { label = { text = 'Job', style = 'tool_name' } },
+      external = { label = { text = 'External' } },   -- scheduled/external prompts
+    },
+  },
+}
+```
+
+`kind` is one of `hook`, `instructions`, `job`, `external`. A hook's `tag` is set
+by the plugin that injected it (see `pre_step` below); untagged hooks use the
+`hook` options. `visible = false` removes the message from the transcript and from
+message selection. The model still receives it. `toggle_hidden` (default `alt+i`)
+temporarily reveals hidden messages.
 
 Compaction summarizes model context, not the visible or durable transcript. A summary
 card appears before the compacted messages and inherits `tool` card options unless

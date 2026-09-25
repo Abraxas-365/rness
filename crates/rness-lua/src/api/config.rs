@@ -330,6 +330,23 @@ mod permission_tests {
             config["tool"]["states"][state] = tool.clone();
         }
         config["keys"]["select_message"] = json!("alt+m");
+        config["keys"]["toggle_hidden"] = json!("alt+i");
+        config["user"]["sources"] = json!({
+            "hook": {"display":"collapsed","label":{"text":"Hook"},"tags":{"time":{"visible":false},"lint":{"label":{"text":"Lint"}}}},
+            "instructions": {"display":"collapsed"},
+            "job": {"label":{"text":"Job","style":"tool_name"}},
+            "external": {"visible": false}
+        });
+        super::validate_messagebox(&config, "messagebox", "root").unwrap();
+        for bad in [
+            json!({"assistant":{"sources":{"hook":{}}}}),        // only under user
+            json!({"user":{"sources":{"bogus":{}}}}),            // unknown kind
+            json!({"user":{"sources":{"job":{"tags":{}}}}}),     // tags only under hook
+            json!({"user":{"sources":{"hook":{"sources":{}}}}}), // no nesting
+            json!({"user":{"sources":{"hook":{"tags":{"x":{"visible":"no"}}}}}}),
+        ] {
+            assert!(super::validate_messagebox(&bad, "messagebox", "root").is_err(), "{bad}");
+        }
         for action in [
             "selection_previous",
             "selection_next",
@@ -630,6 +647,14 @@ fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> 
                 Some(if key == "marker" { "marker" } else { "label" })
             }
             ("message", "markdown") => Some("markdown"),
+            // Per-source overrides for injected user-role messages:
+            // `user.sources.<kind>` and `user.sources.hook.tags.<tag>` only.
+            ("message", "sources") if path.ends_with(".user") && !path.contains(".sources.") => {
+                Some("sources")
+            }
+            ("sources", "hook" | "instructions" | "job" | "external") => Some("message"),
+            ("message", "tags") if path.ends_with(".sources.hook") => Some("tags"),
+            ("tags", _) => Some("message"),
             ("markdown", "code_block") => Some("code"),
             ("tool", "header") => Some("header"),
             ("tool", "arguments" | "output") => Some("output"),
@@ -709,6 +734,7 @@ fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> 
                 | "next_tool"
                 | "previous_tool"
                 | "toggle_tool"
+                | "toggle_hidden"
                 | "toggle_thinking"
                 | "next_thinking"
                 | "previous_thinking",

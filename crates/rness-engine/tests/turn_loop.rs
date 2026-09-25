@@ -1731,7 +1731,10 @@ mod loop_hooks_tests {
         ]);
         let hooks = ScriptedLoop::new();
         hooks.pre_step.lock().unwrap().push(PreStepDecision::EnterWithMessages {
-            messages: vec!["injected context".into()],
+            messages: vec![
+                "injected context".into(),
+                rness_engine::turn::hooks::HookMessage { text: "tagged".into(), tag: Some("time".into()) },
+            ],
         });
         let outcome = run_turn(
             &store, &mut log, &provider, &ToolRegistry::default(),
@@ -1743,6 +1746,16 @@ mod loop_hooks_tests {
         // The injected message should appear in model context.
         let texts = provider.seen_texts.lock().unwrap();
         assert!(texts[0].contains("injected context"), "model should see injected text: {}", texts[0]);
+        assert!(texts[0].contains("tagged"), "tagged hook text reaches the model: {}", texts[0]);
+        drop(texts);
+        // Tags persist on the durable source; untagged stays None.
+        let tags: Vec<_> = store.history(log.session()).unwrap().into_iter().filter_map(|e| match e.event {
+            SessionEvent::UserMessage(UserMessage {
+                source: Some(rness_protocol::events::MessageSource::Hook { tag, .. }), ..
+            }) => Some(tag),
+            _ => None,
+        }).collect();
+        assert_eq!(tags, vec![None, Some("time".to_string())]);
     }
 
     #[tokio::test]

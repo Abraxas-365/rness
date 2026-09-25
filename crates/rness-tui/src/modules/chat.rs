@@ -61,6 +61,38 @@ pub struct Chat {
     cache_theme: Option<crate::theme::Theme>,
     cache_width: u16,
     cache_config: serde_json::Value,
+    /// Temporarily reveal user-role entries whose resolved options say
+    /// `visible = false` (hidden hook/job/instruction messages).
+    show_hidden: bool,
+    cache_show_hidden: bool,
+}
+
+/// Config key for an engine-injected message's provenance.
+fn source_key(source: &rness_protocol::events::MessageSource) -> &'static str {
+    use rness_protocol::events::MessageSource;
+    match source {
+        MessageSource::Hook { .. } => "hook",
+        MessageSource::Instructions { .. } => "instructions",
+        MessageSource::JobCompletion { .. } => "job",
+        MessageSource::ExternalPrompt { .. } => "external",
+    }
+}
+
+/// Layer per-source options over the resolved `user` options:
+/// `user` → `user.sources.<kind>` → `user.sources.hook.tags.<tag>`.
+fn source_options(
+    base: &serde_json::Value,
+    source: Option<&rness_protocol::events::MessageSource>,
+) -> serde_json::Value {
+    let Some(source) = source else {
+        return base.clone();
+    };
+    let specific = &base["sources"][source_key(source)];
+    let mut options = merge_options(base, specific);
+    if let rness_protocol::events::MessageSource::Hook { tag: Some(tag), .. } = source {
+        options = merge_options(&options, &specific["tags"][tag.as_str()]);
+    }
+    options
 }
 
 /// Mount the module (composition-root seam, same as future Lua installs).
@@ -606,7 +638,7 @@ fn panel_body(
 
 fn message_text(entry: &Entry) -> String {
     match entry {
-        Entry::User { content } | Entry::Assistant { content, .. } => content
+        Entry::User { content, .. } | Entry::Assistant { content, .. } => content
             .iter()
             .filter_map(|part| match part {
                 ContentPart::Text { text } => Some(text.clone()),
@@ -636,6 +668,23 @@ const SELECTION_KEYS: &[(&str, &[&str], &str)] = &[
 ];
 
 impl Chat {
+    /// True when a user-role entry resolves to `visible = false` and the
+    /// show-hidden toggle is off. Selection/copy skip such rows.
+    fn entry_hidden(&self, entry: &Entry) -> bool {
+        let Entry::User { source, .. } = entry else {
+            return false;
+        };
+        if self.show_hidden {
+            return false;
+        }
+        let base = merge_options(&self.config["message"], &self.config["user"]);
+        source_options(&base, source.as_ref())["visible"] == false
+    }
+
+    fn selectable(&self, entry: &Entry) -> bool {
+        !message_text(entry).is_empty() && !self.entry_hidden(entry)
+    }
+
     /// Independent interaction state backed by a host-published card cache.
     pub fn with_cards(cards: CardCache) -> Self {
         Self {
@@ -670,6 +719,7 @@ impl Component for Chat {
             ("previous_tool", "alt+up"),
             ("next_tool", "alt+down"),
             ("toggle_tool", "ctrl+o"),
+            ("toggle_hidden", "alt+i"),
         ]
         .into_iter()
         .filter_map(|(action, default)| {
@@ -787,12 +837,7 @@ impl Component for Chat {
                 .entry_ids
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| {
-                    ctx.model
-                        .entries
-                        .get(*i)
-                        .is_some_and(|entry| !message_text(entry).is_empty())
-                })
+                .filter(|(i, _)| ctx.model.entries.get(*i).is_some_and(|entry| self.selectable(entry)))
                 .collect();
             let Some(index) = targets.iter().position(|(_, target)| **target == id) else {
                 self.selected_message = None;
@@ -894,6 +939,26 @@ impl Component for Chat {
             self.focused_thinking = None;
             self.card_rows.clear();
         }
+        if action == "toggle_hidden" {
+            self.show_hidden = !self.show_hidden;
+            // Visibility isn't in the durable stamp; force a re-walk. The
+            // per-entry cache key includes `show_hidden` for user rows.
+            // Drop a selection that just became hidden.
+            self.durable_stamp = None;
+            if let Some(id) = &self.selected_message {
+                let hidden = ctx
+                    .model
+                    .entry_ids
+                    .iter()
+                    .position(|entry_id| entry_id == id)
+                    .and_then(|i| ctx.model.entries.get(i))
+                    .is_some_and(|entry| self.entry_hidden(entry));
+                if hidden {
+                    self.selected_message = None;
+                }
+            }
+            return KeyOutcome::consumed();
+        }
         if action == "select_message" {
             // Selection navigates transcript entries, not temporary live tool IDs.
             // A live call has no entry row and would lose focus on the next redraw.
@@ -903,12 +968,7 @@ impl Component for Chat {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(i, _)| {
-                    ctx.model
-                        .entries
-                        .get(*i)
-                        .is_some_and(|entry| !message_text(entry).is_empty())
-                })
+                .find(|(i, _)| ctx.model.entries.get(*i).is_some_and(|entry| self.selectable(entry)))
                 .map(|(_, id)| id.clone());
             self.message_expanded = true;
             self.message_scroll = 0;
@@ -1222,7 +1282,7 @@ impl Component for Chat {
 
         let card_revision = self.cards.revision();
         let stamp = format!(
-            "{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}",
+            "{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{}",
             ctx.model.session,
             ctx.model.history_revision,
             ctx.model.entries.len(),
@@ -1230,15 +1290,17 @@ impl Component for Chat {
             self.focused_call,
             self.expanded,
             self.focused_thinking,
-            self.thinking_expanded
+            self.thinking_expanded,
+            self.show_hidden
         );
         let view = format!(
-            "{}:{:?}:{:?}:{:?}:{:?}",
+            "{}:{:?}:{:?}:{:?}:{:?}:{}",
             self.cards.revision(),
             self.focused_call,
             self.expanded,
             self.focused_thinking,
-            self.thinking_expanded
+            self.thinking_expanded,
+            self.show_hidden
         );
         let append_only = self.durable_stamp.is_some()
             && ctx.model.history_epoch != 0
@@ -1262,6 +1324,7 @@ impl Component for Chat {
         );
         let selective = self.durable_stamp.is_some()
             && ctx.model.history_revision != 0
+            && self.cache_show_hidden == self.show_hidden
             && self.cache_history_revision == ctx.model.history_revision
             && self.cache_epoch == ctx.model.history_epoch
             && self.entry_cache.len() == ctx.model.entries.len()
@@ -1465,6 +1528,11 @@ impl Component for Chat {
                     Entry::Compaction { .. } => {
                         format!("{:?}", self.expanded.get(&ctx.model.entry_ids[entry_index]))
                     }
+                    Entry::User { .. } => format!(
+                        "{}:{}",
+                        ctx.model.error_entries.contains(&entry_index),
+                        self.show_hidden
+                    ),
                     _ => format!("{}", ctx.model.error_entries.contains(&entry_index)),
                 };
                 if let Entry::ToolResult { call, .. } = entry {
@@ -1563,13 +1631,19 @@ impl Component for Chat {
                                     &merge_options(&defaults, &self.config["message"]),
                                     &self.config[role],
                                 );
-                                if options["visible"] == false {
+                                let options = match entry {
+                                    Entry::User { source, .. } => source_options(&options, source.as_ref()),
+                                    _ => options,
+                                };
+                                if options["visible"] == false
+                                    && !(self.show_hidden && matches!(entry, Entry::User { .. }))
+                                {
                                     return;
                                 }
                                 let inner_width = panel_inner_width(&options, width);
                                 let mut body = Vec::new();
                                 match entry {
-                                    Entry::User { content } | Entry::Assistant { content, .. } => {
+                                    Entry::User { content, .. } | Entry::Assistant { content, .. } => {
                                         for part in content {
                                             match part {
                                 ContentPart::Text { text } if role == "assistant" => body.extend(crate::core::render::render_markdown_configured(text, inner_width, theme, &options["markdown"])),
@@ -1642,7 +1716,7 @@ impl Component for Chat {
                             }
                         }
                         match entry {
-                            Entry::User { content } => {
+                            Entry::User { content, .. } => {
                                 lines.push(Line::default());
                                 for part in content {
                                     if let ContentPart::Image { attachment } = part {
@@ -1986,6 +2060,7 @@ impl Component for Chat {
             self.cache_thinking_expanded = self.thinking_expanded.clone();
             self.cache_epoch = ctx.model.history_epoch;
             self.cache_view = view;
+            self.cache_show_hidden = self.show_hidden;
             self.durable_stamp = Some(stamp);
         }
         lines.clear();
@@ -2697,6 +2772,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn hidden_sources_skip_render_and_selection_until_toggled() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        use rness_protocol::events::MessageSource;
+        let text = |t: &str| vec![ContentPart::Text { text: t.into() }];
+        let mut model = Model::new("hidden".into(), "fake".into());
+        model.entries = vec![
+            Entry::User { content: text("typed prompt"), source: None },
+            Entry::User {
+                content: text("CLOCK-SECRET"),
+                source: Some(MessageSource::Hook { event: "pre_step".into(), call: None, tag: Some("time".into()) }),
+            },
+            Entry::User {
+                content: text("LINT-SHOWN"),
+                source: Some(MessageSource::Hook { event: "pre_step".into(), call: None, tag: Some("lint".into()) }),
+            },
+            Entry::User {
+                content: text("job finished"),
+                source: Some(MessageSource::JobCompletion { id: "j1".into() }),
+            },
+        ];
+        model.entry_ids = vec!["u0".into(), "u1".into(), "u2".into(), "u3".into()];
+        model.history_revision = 1;
+        model.history_epoch = 1;
+        let theme = Theme::default();
+        let ctx = Ctx { model: &model, theme: &theme };
+        let area = Rect::new(0, 0, 80, 30);
+        let mut chat = Chat {
+            config: serde_json::json!({
+                "user": {
+                    "label": {"text": "You"},
+                    "sources": {
+                        "hook": {"visible": false, "tags": {"lint": {"visible": true, "label": {"text": "Lint"}}}},
+                        "job": {"label": {"text": "Job"}}
+                    }
+                }
+            }),
+            ..Default::default()
+        };
+        let screen = |chat: &mut Chat| {
+            let mut buffer = Buffer::empty(area);
+            chat.render(&ctx, area, &mut buffer);
+            buffer.content.iter().map(|cell| cell.symbol()).collect::<String>()
+        };
+        let shown = screen(&mut chat);
+        assert!(!shown.contains("CLOCK-SECRET"), "hook default hidden");
+        assert!(shown.contains("LINT-SHOWN") && shown.contains("Lint"), "tag overrides hook");
+        assert!(shown.contains("Job") && shown.contains("job finished"), "job relabelled");
+        assert!(shown.contains("You") && shown.contains("typed prompt"));
+
+        // Selection walks visible entries only.
+        chat.on_binding(&ctx, "select_message");
+        assert_eq!(chat.selected_message.as_deref(), Some("u3"));
+        for _ in 0..5 {
+            chat.on_key(&ctx, crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('k'),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert_ne!(chat.selected_message.as_deref(), Some("u1"));
+        }
+        assert_eq!(chat.selected_message.as_deref(), Some("u0"));
+        chat.selected_message = None;
+
+        // Toggle reveals, toggle again hides (cache must not go stale).
+        chat.on_binding(&ctx, "toggle_hidden");
+        assert!(screen(&mut chat).contains("CLOCK-SECRET"));
+        chat.on_binding(&ctx, "toggle_hidden");
+        assert!(!screen(&mut chat).contains("CLOCK-SECRET"));
     }
 
     #[test]
@@ -4114,6 +4260,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "abcdefghijk".into(),
             }],
+            source: None,
         });
         let theme = Theme::default();
         let mut chat = Chat {

@@ -838,7 +838,7 @@ impl ToolRegistry {
                             Vec::new()
                         }
                     };
-                    let contexts = contexts.into_iter().filter(|text| !text.trim().is_empty()).map(|text| (session.clone(), HookContext { call: call.call.clone(), text }));
+                    let contexts = contexts.into_iter().filter(|m| !m.text.trim().is_empty()).map(|m| (session.clone(), HookContext { call: call.call.clone(), text: m.text, tag: m.tag }));
                     hook_state.contexts.lock().expect("hook contexts lock").extend(contexts);
                 }
                 // Spill: if the text output exceeds the inline budget, save the
@@ -1022,7 +1022,11 @@ mod tests {
             Ok(if e.args["say"] == "blocked" {
                 PostToolDecision::Block { feedback: vec![ToolResultContentPart::Text { text: "try again".into() }], additional_contexts: vec![] }
             } else {
-                PostToolDecision::Accept { content: None, additional_contexts: vec![format!("saw {}", r.output)] }
+                PostToolDecision::Accept { content: None, additional_contexts: vec![
+                    format!("saw {}", r.output).into(),
+                    hooks::HookMessage { text: "lint ok".into(), tag: Some("lint".into()) },
+                    "   ".into(),
+                ] }
             })
         }
         fn tool_result(&self, _: &ToolHookEvent, r: &ToolResult) {
@@ -1055,7 +1059,10 @@ mod tests {
         assert_eq!((ok.output.as_str(), ok.is_error), ("hi", false));
         assert_eq!(*script.0.lock().unwrap(), ["pre:hi", "guard", "post:hi", "result:false"]);
         let contexts = reg.take_hook_contexts(&"s".into());
-        assert_eq!(contexts, [HookContext { call: "hi".into(), text: "saw hi".into() }]);
+        assert_eq!(contexts, [
+            HookContext { call: "hi".into(), text: "saw hi".into(), tag: None },
+            HookContext { call: "hi".into(), text: "lint ok".into(), tag: Some("lint".into()) },
+        ]);
         assert!(reg.take_hook_contexts(&"s".into()).is_empty());
 
         script.0.lock().unwrap().clear();

@@ -2,7 +2,8 @@
 -- model context so it knows where it's running.
 --
 -- Injected once per turn (step 1 only), re-injected only if state changed.
--- Silent no-op if not running inside tmux.
+-- Silent no-op if not running inside tmux. Tagged "tmux"; the default theme
+-- hides hook messages (show with `user.sources.hook.tags.tmux = { visible = true }`).
 --
 -- Format:
 --   tmux location (turn N):
@@ -99,7 +100,7 @@ rness.hook.on("pre_step", function(ev, next)
   -- Merge into decision.
   local kind = (decision and decision.kind) or "enter"
   local messages = (decision and decision.messages) or {}
-  if type(messages) == "string" then messages = { messages } end
-  messages[#messages + 1] = text
+  if type(messages) == "string" or messages.text then messages = { messages } end
+  messages[#messages + 1] = { text = text, tag = "tmux" }
   return { kind = kind, messages = messages }
 end)

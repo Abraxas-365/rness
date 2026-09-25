@@ -11,7 +11,10 @@ local cursor = 1
 local ids = {}
 
 local function refresh()
-  ids = rness.session.list()
+  -- Top-level sessions only: delegated subagent children (scout, reviewer, …)
+  -- are durable sessions too, but switching into one lands in the child's
+  -- restricted role/tools, so they stay out of the picker.
+  ids = rness.session.list_roots()
   -- newest first (ulids sort lexicographically)
   table.sort(ids, function(a, b) return a > b end)
   if cursor > #ids then cursor = #ids end

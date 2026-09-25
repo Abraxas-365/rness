@@ -1865,3 +1865,93 @@ async fn tree_view_renders_and_navigates() {
         AppKeyOutcome::Pass
     );
 }
+
+#[tokio::test]
+async fn time_context_every_turn_skips_tool_loop_steps() {
+    use rness_engine::turn::hooks::{LoopEvent, LoopHooks, PreStepDecision};
+    let plugin = include_str!("../../../flavors/default/plugins/time-context.lua");
+    let step = |turn, step| LoopEvent { session: "s".into(), turn, step };
+    let cancel = CancellationToken::new();
+    let tagged = |d: &PreStepDecision| match d {
+        PreStepDecision::EnterWithMessages { messages } => {
+            messages.len() == 1
+                && messages[0].tag.as_deref() == Some("time")
+                && messages[0].text.starts_with("Current time: ")
+        }
+        _ => false,
+    };
+
+    // Default: every step.
+    let host = LuaHost::spawn().unwrap();
+    host.load("time", plugin).await.unwrap();
+    for (turn, s) in [(1, 1), (1, 2), (1, 3)] {
+        assert!(tagged(&host.pre_step(&step(turn, s), &cancel).await.unwrap()), "step {s}");
+    }
+
+    // every = "turn": first step only.
+    let host = LuaHost::spawn().unwrap();
+    host.load("cfg", r#"rness.time_context = { every = "turn" }"#).await.unwrap();
+    host.load("time", plugin).await.unwrap();
+    assert!(tagged(&host.pre_step(&step(1, 1), &cancel).await.unwrap()));
+    for s in [2, 3] {
+        assert_eq!(host.pre_step(&step(1, s), &cancel).await.unwrap(), PreStepDecision::Enter);
+    }
+    assert!(tagged(&host.pre_step(&step(2, 1), &cancel).await.unwrap()));
+
+    // Invalid values fail loudly at load.
+    for bad in [
+        r#"rness.time_context = { every = "tunr" }"#,
+        r#"rness.time_context = { resend_after = -1 }"#,
+        r#"rness.time_context = { subagents = "no" }"#,
+    ] {
+        let host = LuaHost::spawn().unwrap();
+        host.load("cfg", bad).await.unwrap();
+        let err = host.load("time", plugin).await.unwrap_err().to_string();
+        assert!(err.contains("must be"), "{bad}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn time_context_resend_after_and_subagent_skip() {
+    use rness_engine::turn::hooks::{LoopEvent, LoopHooks, PreStepDecision};
+    let plugin = include_str!("../../../flavors/default/plugins/time-context.lua");
+    let cancel = CancellationToken::new();
+    let host = LuaHost::spawn().unwrap();
+    // Deterministic clock: os.time() with no args returns a controllable value.
+    host.load("clock", r##"
+        local real = os.time
+        rness.test_now = 1000000
+        os.time = function(...) if select("#", ...) > 0 then return real(...) end return rness.test_now end
+        rness.time_context = { every = "turn", resend_after = 600, subagents = false }
+    "##).await.unwrap();
+    host.load("time", plugin).await.unwrap();
+    let advance = |n: u32, name: String| {
+        let host = host.clone();
+        async move { host.load(&name, &format!("rness.test_now = rness.test_now + {n}")).await.unwrap() }
+    };
+    let pre = |turn, step| {
+        let host = host.clone();
+        let cancel = cancel.clone();
+        async move { host.pre_step(&LoopEvent { session: "root".into(), turn, step }, &cancel).await.unwrap() }
+    };
+    let sent = |d: &PreStepDecision| matches!(d, PreStepDecision::EnterWithMessages { .. });
+
+    assert!(sent(&pre(1, 1).await), "first step of the turn");
+    advance(300, "t1".into()).await;
+    assert!(!sent(&pre(1, 2).await), "5 min into the tool loop: not yet");
+    advance(299, "t2".into()).await;
+    assert!(!sent(&pre(1, 3).await), "9m59s: not yet");
+    advance(1, "t3".into()).await;
+    assert!(sent(&pre(1, 4).await), "10 min: resend mid-turn");
+    advance(60, "t4".into()).await;
+    assert!(!sent(&pre(1, 5).await), "resend timer restarts after the resend");
+    assert!(sent(&pre(2, 1).await), "new turn always sends");
+
+    // Delegated session (the host adds `parent` for subagents): skipped.
+    let child = |parent: serde_json::Value| serde_json::json!({"session": "child", "turn": 1, "step": 1, "parent": parent});
+    let kind = |v: serde_json::Value| v.get("messages").map(|m| !m.is_null() && m != &serde_json::json!({}));
+    let skipped = host.intercept("pre_step", child(serde_json::json!("root")), serde_json::json!({"kind": "enter"}), &cancel).await.unwrap();
+    assert_ne!(kind(skipped.clone()), Some(true), "subagent must not get time: {skipped}");
+    let top = host.intercept("pre_step", child(serde_json::Value::Null), serde_json::json!({"kind": "enter"}), &cancel).await.unwrap();
+    assert_eq!(kind(top.clone()), Some(true), "top-level session still gets time: {top}");
+}

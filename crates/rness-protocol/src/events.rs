@@ -415,6 +415,11 @@ pub enum MessageSource {
         event: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call: Option<ToolCallId>,
+        /// Optional plugin-chosen label (e.g. "time") so renderers can
+        /// style/hide specific hooks. Additive and optional: older readers
+        /// ignore it, older logs omit it — no format bump.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tag: Option<String>,
     },
 }
 

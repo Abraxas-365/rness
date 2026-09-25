@@ -405,7 +405,9 @@ Build order follows the dependency graph:
   baseline is injected as a DURABLE user-role message (`UserMessage`
   gains `source: Option<MessageSource>`, `kind: instructions` with a
   sha1 identity over discovery inputs+content) — it replays, forks and
-  compacts like any history. Before each turn `ensure_instructions`
+  compacts like any history. (Other sources: `hook {event, call?, tag?}`,
+  `job_completion {id}`, `external_prompt {id}`. `tag` is an optional,
+  additive plugin label used only for TUI presentation; no format bump.) Before each turn `ensure_instructions`
   checks the PROJECTED surface for a visible baseline with the current
   identity; absent (first turn, compaction folded it, file changed on
   disk) → re-read disk, append fresh. Config is explicit

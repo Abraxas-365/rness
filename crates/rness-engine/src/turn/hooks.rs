@@ -19,6 +19,26 @@ pub struct LoopEvent {
 
 // ── pre_step ──────────────────────────────────────────────────────────
 
+/// One hook-injected message. `tag` is an optional plugin-chosen label
+/// persisted on `MessageSource::Hook` so renderers can style/hide it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookMessage {
+    pub text: String,
+    pub tag: Option<String>,
+}
+
+impl From<String> for HookMessage {
+    fn from(text: String) -> Self {
+        Self { text, tag: None }
+    }
+}
+
+impl From<&str> for HookMessage {
+    fn from(text: &str) -> Self {
+        Self { text: text.into(), tag: None }
+    }
+}
+
 /// Decision returned by a `pre_step` handler.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreStepDecision {
@@ -27,7 +47,7 @@ pub enum PreStepDecision {
     /// Inject additional context visible to the model this step.
     /// The messages are committed as `UserMessage{intent: Inject}` before
     /// the request is built.
-    EnterWithMessages { messages: Vec<String> },
+    EnterWithMessages { messages: Vec<HookMessage> },
     /// Reject the step — the turn ends as completed (no model call).
     Reject,
 }
@@ -83,7 +103,7 @@ pub enum TurnStoppingAction {
     /// Close the turn normally (default).
     Stop,
     /// Continue the turn with these messages injected.
-    Continue { messages: Vec<String> },
+    Continue { messages: Vec<HookMessage> },
 }
 
 impl Default for TurnStoppingAction {

@@ -205,13 +205,14 @@ async fn drive(
                 }
                 Ok(PreStepDecision::Reject) => return Ok(TurnOutcome::Completed),
                 Ok(PreStepDecision::EnterWithMessages { messages }) => {
-                    for text in messages {
+                    for message in messages {
                         log.append(&SessionEvent::UserMessage(UserMessage {
-                            content: vec![rness_protocol::events::ContentPart::Text { text }],
+                            content: vec![rness_protocol::events::ContentPart::Text { text: message.text }],
                             intent: rness_protocol::events::UserIntent::Inject,
                             source: Some(rness_protocol::events::MessageSource::Hook {
                                 event: "pre_step".into(),
                                 call: None,
+                                tag: message.tag,
                             }),
                         }))?;
                         frames(Frame::HistoryChanged { session: session.clone() });
@@ -468,13 +469,14 @@ async fn drive(
                     Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
                     Err(e) => tracing::warn!(session = %session, "turn_stopping hook failed: {e}"),
                     Ok(TurnStoppingAction::Continue { messages }) if !messages.is_empty() => {
-                        for text in messages {
+                        for message in messages {
                             log.append(&SessionEvent::UserMessage(UserMessage {
-                                content: vec![rness_protocol::events::ContentPart::Text { text }],
+                                content: vec![rness_protocol::events::ContentPart::Text { text: message.text }],
                                 intent: rness_protocol::events::UserIntent::Steer,
                                 source: Some(rness_protocol::events::MessageSource::Hook {
                                     event: "turn_stopping".into(),
                                     call: None,
+                                    tag: message.tag,
                                 }),
                             }))?;
                             frames(Frame::HistoryChanged { session: session.clone() });
@@ -602,6 +604,7 @@ async fn drive(
                         source: Some(rness_protocol::events::MessageSource::Hook {
                             event: "post_tool".into(),
                             call: Some(context.call),
+                            tag: context.tag,
                         }),
                     }))?;
                     frames(Frame::HistoryChanged {

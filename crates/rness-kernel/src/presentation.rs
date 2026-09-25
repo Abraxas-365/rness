@@ -28,6 +28,7 @@ pub fn core_action_scope(name: &str) -> Option<&'static str> {
         | "core.messagebox.previous_tool"
         | "core.messagebox.next_tool"
         | "core.messagebox.toggle_tool"
+        | "core.messagebox.toggle_hidden"
         | "core.messagebox.noop" => Some("messagebox"),
         "core.promptbox.completion_previous"
         | "core.promptbox.completion_next"

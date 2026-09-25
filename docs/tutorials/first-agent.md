@@ -60,7 +60,7 @@ The corresponding model-facing tool input is:
 
 Here `provider` means the child-creation mechanism, not the model connection. `spawn` starts without the parent's conversation. Include enough task context and actual file paths in the prompt. `fork` instead inherits the parent's completed-turn prefix.
 
-A foreground success returns the child's session ID and final assistant text. The child also appears in the session listing.
+A foreground success returns the child's session ID and final assistant text. The child is a durable session, but the session picker (Ctrl+S) and `--list` show only top-level sessions, so it does not appear there; inspect it with `/agents` instead.
 
 ## 4. Understand the permission boundary
 

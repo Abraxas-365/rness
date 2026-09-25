@@ -187,7 +187,7 @@ Core prompt actions (prefix `core.promptbox.`): `submit`, `newline`,
 `close_preview`, `preview_up/down/page_up/page_down/start/end`.
 Core messagebox actions (prefix `core.messagebox.`):
 `previous_thinking`, `next_thinking`, `toggle_thinking`, `previous_tool`,
-`next_tool`, `toggle_tool`, `noop`. Apps support `core.app.close` and
+`next_tool`, `toggle_tool`, `toggle_hidden`, `noop`. Apps support `core.app.close` and
 `core.app.noop` with an explicit `app:<name>` scope.
 
 Prompt user mappings precede ordinary editing; plugin defaults do not steal typed

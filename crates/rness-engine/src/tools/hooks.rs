@@ -45,17 +45,19 @@ pub enum PreToolDecision {
     Ask { reason: Option<String> },
 }
 
+pub use crate::turn::hooks::HookMessage;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PostToolDecision {
     /// Keep the result; optionally replace the model-visible content.
     Accept {
         content: Option<Vec<ToolResultContentPart>>,
-        additional_contexts: Vec<String>,
+        additional_contexts: Vec<HookMessage>,
     },
     /// Replace the result with corrective feedback marked as an error.
     Block {
         feedback: Vec<ToolResultContentPart>,
-        additional_contexts: Vec<String>,
+        additional_contexts: Vec<HookMessage>,
     },
 }
 
@@ -125,4 +127,6 @@ pub trait ToolHooks: Send + Sync {
 pub struct HookContext {
     pub call: ToolCallId,
     pub text: String,
+    /// Optional plugin-chosen label, persisted on `MessageSource::Hook`.
+    pub tag: Option<String>,
 }

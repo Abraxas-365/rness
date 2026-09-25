@@ -106,7 +106,8 @@ For engine operations that must happen after mount, register a callback:
 
 ```lua
 rness.hook.on("ready", function()
-  local sessions = rness.session.list()
+  local sessions = rness.session.list()  -- every session, including subagent children
+  local roots = rness.session.list_roots()  -- top-level sessions only (what the picker shows)
   -- Inspect existing sessions here; do not assume one has been selected.
 end)
 ```

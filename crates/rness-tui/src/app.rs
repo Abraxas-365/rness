@@ -67,6 +67,9 @@ pub trait Backend: Send + Sync {
 pub enum Entry {
     User {
         content: Vec<ContentPart>,
+        /// Provenance of engine-injected messages (hooks, instructions,
+        /// jobs, external prompts). `None` for a prompt the user typed.
+        source: Option<rness_protocol::events::MessageSource>,
     },
     Assistant {
         model: String,
@@ -299,6 +302,7 @@ impl Model {
                 }
                 SessionEvent::UserMessage(m) => self.entries.push(Entry::User {
                     content: m.content.clone(),
+                    source: m.source.clone(),
                 }),
                 SessionEvent::TurnStarted { .. } => *failed_attempts = 0,
                 SessionEvent::TurnEnded {
@@ -1314,7 +1318,7 @@ impl App {
                     content: content.clone(),
                 }) {
                     Ok(None) => {
-                        self.model.entries.push(Entry::User { content });
+                        self.model.entries.push(Entry::User { content, source: None });
                         self.apply(Action::Custom(
                             "input:images-submitted".into(),
                             serde_json::Value::Null,
@@ -1426,7 +1430,7 @@ impl App {
                     intent,
                     content: content.clone(),
                 }) {
-                    Ok(None) => self.model.entries.push(Entry::User { content }),
+                    Ok(None) => self.model.entries.push(Entry::User { content, source: None }),
                     Ok(Some(message)) => self.model.entries.push(Entry::Notice(message)),
                     Err(error) => self.model.entries.push(Entry::Notice(error)),
                 }
@@ -1854,6 +1858,7 @@ mod tests {
             content: vec![ContentPart::Text {
                 text: "**original**\nsecond line".into(),
             }],
+            source: None,
         }];
         app.model.entry_ids = vec!["message-1".into()];
         app.apply(Action::Custom(
@@ -2602,7 +2607,7 @@ mod tests {
         assert!(
             matches!(&model.entries[checkpoint_index], Entry::Compaction { summary, shadowed: 2 } if summary == "# Continuation\n\nKeep this decision.")
         );
-        assert!(model.entries.iter().any(|entry| matches!(entry, Entry::User { content } if matches!(&content[0], ContentPart::Text { text } if text == "crea foo.txt"))));
+        assert!(model.entries.iter().any(|entry| matches!(entry, Entry::User { content, .. } if matches!(&content[0], ContentPart::Text { text } if text == "crea foo.txt"))));
     }
 
     #[test]

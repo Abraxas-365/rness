@@ -122,15 +122,25 @@ fn hook_content(
     }
 }
 
-fn hook_contexts(decision: &serde_json::Value) -> Result<Vec<String>, String> {
+fn hook_contexts(
+    decision: &serde_json::Value,
+) -> Result<Vec<rness_engine::turn::hooks::HookMessage>, String> {
     match decision.get("additional_contexts") {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::String(text)) => Ok(vec![text.clone()]),
         Some(serde_json::Value::Array(items)) => items
             .iter()
-            .map(|item| item.as_str().map(str::to_owned).ok_or_else(|| "additional_contexts must be strings".to_string()))
+            .map(|item| hook_message(item).map_err(|e| format!("additional_contexts: {e}")))
             .collect(),
-        Some(_) => Err("additional_contexts must be a string or an array of strings".into()),
+        Some(single @ (serde_json::Value::String(_) | serde_json::Value::Object(_))) => {
+            // A Lua empty table serializes as {}; treat it as "none".
+            if single.as_object().is_some_and(|m| m.is_empty()) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![hook_message(single).map_err(|e| format!("additional_contexts: {e}"))?])
+        }
+        Some(_) => Err(
+            "additional_contexts must be a string, a {text=, tag=} table, or an array of them".into(),
+        ),
     }
 }
 
@@ -459,19 +469,40 @@ fn loop_payload(event: &rness_engine::turn::hooks::LoopEvent) -> serde_json::Val
     })
 }
 
-fn hook_messages(value: &serde_json::Value) -> Result<Vec<String>, String> {
+fn hook_message(item: &serde_json::Value) -> Result<rness_engine::turn::hooks::HookMessage, String> {
+    use rness_engine::turn::hooks::HookMessage;
+    match item {
+        serde_json::Value::String(s) => Ok(HookMessage::from(s.as_str())),
+        serde_json::Value::Object(map) => {
+            let text = map
+                .get("text")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "message table requires a string 'text'".to_string())?;
+            let tag = match map.get("tag") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(t)) if !t.is_empty() => Some(t.clone()),
+                Some(_) => return Err("message 'tag' must be a non-empty string".into()),
+            };
+            Ok(HookMessage { text: text.into(), tag })
+        }
+        _ => Err("messages must be strings or {text=, tag=} tables".into()),
+    }
+}
+
+fn hook_messages(
+    value: &serde_json::Value,
+) -> Result<Vec<rness_engine::turn::hooks::HookMessage>, String> {
     match value.get("messages") {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::String(s)) => Ok(vec![s.clone()]),
-        Some(serde_json::Value::Array(items)) => items
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "messages must be strings".to_string())
-            })
-            .collect(),
-        Some(_) => Err("messages must be a string or an array of strings".into()),
+        Some(serde_json::Value::Array(items)) => items.iter().map(hook_message).collect(),
+        Some(single @ (serde_json::Value::String(_) | serde_json::Value::Object(_))) => {
+            // A Lua empty table serializes as {}; treat it as "no messages".
+            if single.as_object().is_some_and(|m| m.is_empty()) {
+                return Ok(Vec::new());
+            }
+            Ok(vec![hook_message(single)?])
+        }
+        Some(_) => Err("messages must be a string, a {text=, tag=} table, or an array of them".into()),
     }
 }
 
@@ -2079,6 +2110,23 @@ mod tests {
         assert_eq!(host.call_tool("count", json!({})).await, Ok("2".into()));
     }
 
+    #[test]
+    fn hook_messages_accept_strings_and_tagged_tables() {
+        use rness_engine::turn::hooks::HookMessage;
+        let m = |text: &str, tag: Option<&str>| HookMessage { text: text.into(), tag: tag.map(Into::into) };
+        assert_eq!(hook_messages(&json!({"messages": "a"})).unwrap(), [m("a", None)]);
+        assert_eq!(
+            hook_messages(&json!({"messages": ["a", {"text": "b", "tag": "time"}, {"text": "c"}]})).unwrap(),
+            [m("a", None), m("b", Some("time")), m("c", None)]
+        );
+        assert_eq!(hook_messages(&json!({"messages": {"text": "d", "tag": "t"}})).unwrap(), [m("d", Some("t"))]);
+        assert!(hook_messages(&json!({"messages": {}})).unwrap().is_empty());
+        assert!(hook_messages(&json!({})).unwrap().is_empty());
+        for bad in [json!({"messages": [1]}), json!({"messages": [{"tag": "x"}]}), json!({"messages": [{"text": "x", "tag": 3}]}), json!({"messages": [{"text": "x", "tag": ""}]}), json!({"messages": 5})] {
+            assert!(hook_messages(&bad).is_err(), "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn lua_tool_hooks_drive_engine_dispatch() {
         use rness_engine::tools::{hooks::HookContext, ToolCall, ToolRegistry};
@@ -2096,7 +2144,7 @@ mod tests {
             rness.hook.on("post_tool", function(ev, next)
               local d = next()
               if ev.result.is_error then return d end
-              return {kind = "accept", content = ev.result.output .. "!", additional_contexts = {"checked " .. ev.call}}
+              return {kind = "accept", content = ev.result.output .. "!", additional_contexts = {"checked " .. ev.call, {text = "lint " .. ev.call, tag = "lint"}}}
             end)
             rness.hook.on("tool_result", function(ev) results[#results+1] = ev.call .. "=" .. ev.result.output end)
             rness.tool.register{ name = "seen", run = function() return table.concat(results, ",") end }
@@ -2114,7 +2162,10 @@ mod tests {
         assert_eq!((results[0].output.as_str(), results[0].is_error), ("hi!", false));
         assert_eq!((results[1].output.as_str(), results[1].is_error), ("no secrets", true));
         assert_eq!((results[2].output.as_str(), results[2].is_error), ("guarded", true));
-        assert_eq!(registry.take_hook_contexts(&"s".into()), [HookContext { call: "a".into(), text: "checked a".into() }]);
+        assert_eq!(registry.take_hook_contexts(&"s".into()), [
+            HookContext { call: "a".into(), text: "checked a".into(), tag: None },
+            HookContext { call: "a".into(), text: "lint a".into(), tag: Some("lint".into()) },
+        ]);
         // tool_result is fire-and-forget but ordered before this call.
         assert_eq!(host.call_tool("seen", json!({})).await, Ok("a=hi!,b=no secrets,c=guarded".into()));
     }

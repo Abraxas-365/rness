@@ -30,6 +30,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Let the model set one-shot or recurring reminders | [Scheduled reminders](guides/scheduled-reminders.md) |
 | Run Lua code later or deliver text into a session | [Lua timers and session delivery](reference/lua/timer.md) |
 | Customize messages and tool cards | [Messagebox presentation](guides/plugins/example-recipes.md#messagebox-presentation) |
+| Hide or relabel hook, AGENTS.md, and job messages | [Injected messages](guides/plugins/example-recipes.md#injected-messages-hooks-agentsmd-jobs) |
 | Register commands and use session context | [Lua commands](reference/lua/commands.md) |
 | Write native extensions | [Native extension contracts](contributing/native-extensions.md) |
 | Contribute to the codebase | [Contributor documentation](contributing/README.md) |
