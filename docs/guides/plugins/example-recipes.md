@@ -1196,6 +1196,14 @@ hunks as a complete file diff. Write captures separated changed ranges within it
 Edit merges overlapping complete-line windows; fragment captures remain explicit.
 The original plan is not fully accepted.
 
+## Workflows: scripted multi-agent fan-out
+
+The `workflow` tool is opt-in. `rness.workflow = {}` in `init.lua` registers it. The model then writes a Lua script that calls `agent()`, `parallel()`, and `pipeline()` to run many subagents, and gets back only the script's return value. The recipe has three parts:
+
+- [`examples/workflows/`](../../../examples/workflows/): four scripts (audit, review, adversarial verification, migration) that show the main shapes and how to handle `nil`. A test runs each one against the real scheduler.
+- [`examples/plugins/workflow-card.lua`](../../../examples/plugins/workflow-card.lua): the live progress card (phase, member counts, member rows, `log()` lines).
+- The [workflows guide](../workflows.md): enabling the tool, script semantics, a checklist for writing your own, and troubleshooting.
+
 ## Model capabilities
 
 Copy `examples/lua/models.lua` to `~/.rness/lua/models.lua` and call `require("models")` from `init.lua`. Do not select it with `rness.plugins.setup`: capabilities are startup declarations and changes require restart. The example uses `rness.models.declare { provider=..., model=..., capabilities=... }`, with `max_output_tokens` and structured `reasoning.efforts` / `reasoning.budget_tokens`.

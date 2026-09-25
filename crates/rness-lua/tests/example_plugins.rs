@@ -78,10 +78,27 @@ async fn default_subagent_renderer_bounds_activity_without_nested_dumps() {
 }
 
 #[tokio::test]
-async fn default_workflow_renderer_shows_progress_then_result() {
+async fn default_flavor_has_no_workflow_renderer() {
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
-    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    let (host, config) = LuaHost::spawn_from_init(root).unwrap();
+    assert!(config.workflow.is_none(), "workflow is an opt-in recipe");
+    let running = serde_json::json!({"kind":"workflow_activity", "name":"n", "status":"running"});
+    assert!(host
+        .tool_card_presented("workflow", serde_json::json!({}), "", false, Some(running))
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn workflow_card_example_shows_progress_then_result() {
+    let host = LuaHost::spawn().unwrap();
+    host.load(
+        "workflow-card",
+        include_str!("../../../examples/plugins/workflow-card.lua"),
+    )
+    .await
+    .unwrap();
     let args = serde_json::json!({"meta":{"name":"audit","description":"x"},"script":"RAW-SCRIPT"});
     let running = serde_json::json!({"kind":"workflow_activity", "name":"panic-audit",
         "description":"Audit crates", "phase":"Scan", "status":"running", "elapsed_ms":3000,

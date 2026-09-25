@@ -159,6 +159,14 @@ rness.agents.declare("worker", {
 -- rness.subagents.roster() lists only delegable names and descriptions.
 -- Children cannot exceed the parent's effective tool permissions.
 
+-- Workflows (opt-in): setting rness.workflow registers the `workflow` tool,
+-- which lets the model script many subagents (pipeline/parallel/agent) and
+-- get back only the combined result. Needs delegatable roles (above).
+-- Recipes: examples/workflows/. Live progress card: add
+-- { name = "workflow-card", file = "plugins/workflow-card.lua" } to the setup
+-- list. Guide: docs/guides/workflows.md.
+-- rness.workflow = {} -- or { max_concurrent_agents = 4, max_total_agents = 50 }
+
 -- Usage:
 --   rness --agent architect --profile local-qwen
 --   rness --profile local-qwen

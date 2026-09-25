@@ -80,8 +80,9 @@ pub struct StartupConfig {
     pub sandbox_configured: bool,
     /// Custom skill directories from `rness.skills.roots`.
     pub skill_roots: Vec<std::path::PathBuf>,
-    /// `rness.workflow` limits.
-    pub workflow: rness_tools::workflow::WorkflowConfig,
+    /// `rness.workflow` — the workflow tool is registered only when this is
+    /// set (opt-in; `{}` enables it with default limits).
+    pub workflow: Option<rness_tools::workflow::WorkflowConfig>,
 }
 
 #[cfg(test)]
@@ -1495,7 +1496,7 @@ pub fn evaluate(
         }
     }
     if let Some(workflow) = rness.get::<Option<Table>>("workflow")? {
-        config.workflow = workflow_config(workflow)?;
+        config.workflow = Some(workflow_config(workflow)?);
     }
     Ok(config)
 }
@@ -1930,6 +1931,9 @@ mod tests {
         let path = dir.path().join("init.lua");
         std::fs::write(&path, "").unwrap();
         let defaults = load(&path).unwrap().workflow;
+        assert!(defaults.is_none(), "workflow is opt-in");
+        std::fs::write(&path, "rness.workflow = {}").unwrap();
+        let defaults = load(&path).unwrap().workflow.expect("{} enables it");
         assert_eq!(defaults.limits.max_total_agents, 1000);
         assert_eq!(defaults.max_result_chars, 50_000);
         std::fs::write(
@@ -1938,7 +1942,7 @@ mod tests {
              script_budget_ms = 250, memory_mb = 8, max_script_bytes = 1000, dispose_grace_ms = 10, max_result_chars = 99 }",
         )
         .unwrap();
-        let config = load(&path).unwrap().workflow;
+        let config = load(&path).unwrap().workflow.unwrap();
         assert_eq!(config.limits.max_concurrent_agents, 3);
         assert_eq!(config.limits.max_total_agents, 20);
         assert_eq!(config.limits.max_items_per_call, 7);

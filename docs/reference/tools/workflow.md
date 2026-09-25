@@ -6,7 +6,8 @@ This tool matches the `workflow` package in deepseek-harness. The rness differen
 
 ## Availability
 
-- The tool is registered with `subagent` at startup and needs session-aware dispatch. Calling it without a session fails.
+- The tool is opt-in. It is registered at startup only when `init.lua` sets `rness.workflow` (`rness.workflow = {}` uses the default [limits](#execution-and-limits)). The default flavor does not set it. See the [workflows guide](../../guides/workflows.md#enable-workflows) for the full setup.
+- It needs session-aware dispatch. Calling it without a session fails.
 - When generic children are disabled and no role is enabled for delegation, the description is replaced with a refusal and every call fails with `Workflows are unavailable…`.
 - When generic children are disabled, the description tells the model that each `agent()` call must set `opts.role`. Enabled roles are listed with their descriptions.
 - `ptc` [tool exposure](../../guides/plugins/example-recipes.md#deferred-tools-and-programmatic-tool-calling) omits `workflow`. It is neither listed nor returned by `ToolSearch`. In `native` and `both` modes it is an ordinary tool, and it can be deferred.
@@ -72,7 +73,7 @@ The run itself ends in one of three states:
 
 The tool runs in the foreground: the call returns when the script finishes. Each member is a one-shot child session of the calling session, created through the same runtime as `subagent`. Members inherit the caller's tool ceiling, minus `workflow`. They can be opened from the agent monitor like any other child.
 
-Configure limits at startup in `init.lua`. Every key is optional, each value must be a positive integer, and unknown keys are rejected:
+Configure limits at startup in `init.lua`. Setting the table enables the tool. Every key is optional, each value must be a positive integer, and unknown keys are rejected:
 
 ```lua
 rness.workflow = {
@@ -93,7 +94,9 @@ The budget is enforced every 1000 VM instructions. A single library call can't b
 
 ## Live card
 
-The TUI shows a live card for each running workflow. It displays the name, status, elapsed seconds, the current phase, member counts by status, up to 12 member rows (running members first), and the last six `log` lines. When the run ends, the card is re-rendered from the stored tool result. That result's presentation metadata is the final snapshot, and the card adds up to eight lines of the result. Because it is rebuilt from the stored result, the card reflects any `post_tool` hook or `tool_execute` wrapper that replaced the output. The default renderer is `workflow` in [theme.lua](../../../flavors/default/lua/theme.lua). Its `presentation` has `kind = "workflow_activity"`.
+While a run is active, rness re-renders its tool card about five times a second from a `presentation` snapshot with `kind = "workflow_activity"`. The snapshot holds the name, description, status, `elapsed_ms`, current phase, `total`, `counts` by status, up to 12 `members` (running first, each with `label`, `phase`, `status`, `session`), and the last six `logs` lines. When the run ends, the card is re-rendered from the stored tool result. That result's presentation metadata is the final snapshot, and `output` holds the result text. Because it is rebuilt from the stored result, the card reflects any `post_tool` hook or `tool_execute` wrapper that replaced the output.
+
+No renderer ships in the default flavor. Without one, the call uses the built-in tool card and shows no live progress. [`examples/plugins/workflow-card.lua`](../../../examples/plugins/workflow-card.lua) is a complete renderer (`rness.ui.tool_card("workflow", …)`) that shows the snapshot plus up to eight lines of the result.
 
 ## Example
 

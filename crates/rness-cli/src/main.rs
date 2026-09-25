@@ -802,13 +802,16 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("lua jobs bridge: {e}"))?;
     rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs.clone());
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
+    // Opt-in: `rness.workflow = { … }` in init.lua registers the tool.
     let workflows = Arc::new(rness_engine::workflow::WorkflowActivity::default());
-    rness_tools::register_workflow(
-        &tools,
-        Arc::clone(&subagents),
-        Arc::clone(&workflows),
-        startup.workflow.clone(),
-    );
+    if let Some(config) = startup.workflow.clone() {
+        rness_tools::register_workflow(
+            &tools,
+            Arc::clone(&subagents),
+            Arc::clone(&workflows),
+            config,
+        );
+    }
 
     // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
     let terminals = rness_tools::terminal::TerminalRegistry::new();
