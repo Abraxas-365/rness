@@ -80,6 +80,8 @@ pub struct StartupConfig {
     pub sandbox_configured: bool,
     /// Custom skill directories from `rness.skills.roots`.
     pub skill_roots: Vec<std::path::PathBuf>,
+    /// `rness.workflow` limits.
+    pub workflow: rness_tools::workflow::WorkflowConfig,
 }
 
 #[cfg(test)]
@@ -1492,6 +1494,48 @@ pub fn evaluate(
             config.skill_roots = dirs;
         }
     }
+    if let Some(workflow) = rness.get::<Option<Table>>("workflow")? {
+        config.workflow = workflow_config(workflow)?;
+    }
+    Ok(config)
+}
+
+/// `rness.workflow = { … }`: positive integer limits, unknown keys rejected.
+fn workflow_config(
+    table: Table,
+) -> Result<rness_tools::workflow::WorkflowConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = rness_tools::workflow::WorkflowConfig::default();
+    for pair in table.pairs::<mlua::Value, mlua::Value>() {
+        let (key, value) = pair?;
+        let key = match key {
+            mlua::Value::String(key) => key.to_str()?.to_owned(),
+            _ => return Err("rness.workflow keys must be strings".into()),
+        };
+        let number = match value {
+            mlua::Value::Integer(n) if n > 0 => n as u64,
+            mlua::Value::Number(n) if n.fract() == 0.0 && n >= 1.0 && n <= u64::MAX as f64 => {
+                n as u64
+            }
+            _ => return Err(format!("rness.workflow.{key} must be a positive integer").into()),
+        };
+        let limits = &mut config.limits;
+        match key.as_str() {
+            "max_concurrent_agents" => limits.max_concurrent_agents = number as usize,
+            "max_total_agents" => limits.max_total_agents = number as usize,
+            "max_items_per_call" => limits.max_items_per_call = number as usize,
+            "script_budget_ms" => limits.script_budget = std::time::Duration::from_millis(number),
+            "memory_mb" => limits.memory_bytes = (number as usize).saturating_mul(1024 * 1024),
+            "max_script_bytes" => limits.max_script_bytes = number as usize,
+            "dispose_grace_ms" => limits.dispose_grace = std::time::Duration::from_millis(number),
+            "max_result_chars" => config.max_result_chars = number as usize,
+            _ => {
+                return Err(format!(
+                    "rness.workflow.{key} is not recognized (max_concurrent_agents, max_total_agents, max_items_per_call, script_budget_ms, memory_mb, max_script_bytes, dispose_grace_ms, max_result_chars)"
+                )
+                .into())
+            }
+        }
+    }
     Ok(config)
 }
 
@@ -1877,6 +1921,48 @@ mod tests {
         for invalid in ["'false'", "0", "{}"] {
             std::fs::write(&path, format!("rness.agents.allow_generic = {invalid}")).unwrap();
             assert!(load(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn workflow_limits_are_configurable_and_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        let defaults = load(&path).unwrap().workflow;
+        assert_eq!(defaults.limits.max_total_agents, 1000);
+        assert_eq!(defaults.max_result_chars, 50_000);
+        std::fs::write(
+            &path,
+            "rness.workflow = { max_concurrent_agents = 3, max_total_agents = 20, max_items_per_call = 7, \
+             script_budget_ms = 250, memory_mb = 8, max_script_bytes = 1000, dispose_grace_ms = 10, max_result_chars = 99 }",
+        )
+        .unwrap();
+        let config = load(&path).unwrap().workflow;
+        assert_eq!(config.limits.max_concurrent_agents, 3);
+        assert_eq!(config.limits.max_total_agents, 20);
+        assert_eq!(config.limits.max_items_per_call, 7);
+        assert_eq!(
+            config.limits.script_budget,
+            std::time::Duration::from_millis(250)
+        );
+        assert_eq!(config.limits.memory_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.limits.max_script_bytes, 1000);
+        assert_eq!(
+            config.limits.dispose_grace,
+            std::time::Duration::from_millis(10)
+        );
+        assert_eq!(config.max_result_chars, 99);
+        for invalid in [
+            "{ max_total_agents = 0 }",
+            "{ max_total_agents = -1 }",
+            "{ max_total_agents = 1.5 }",
+            "{ max_total_agents = '5' }",
+            "{ typo = 1 }",
+            "{ 5 }",
+        ] {
+            std::fs::write(&path, format!("rness.workflow = {invalid}")).unwrap();
+            assert!(load(&path).is_err(), "{invalid} should be rejected");
         }
     }
 

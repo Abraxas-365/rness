@@ -78,6 +78,94 @@ async fn default_subagent_renderer_bounds_activity_without_nested_dumps() {
 }
 
 #[tokio::test]
+async fn default_workflow_renderer_shows_progress_then_result() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    let args = serde_json::json!({"meta":{"name":"audit","description":"x"},"script":"RAW-SCRIPT"});
+    let running = serde_json::json!({"kind":"workflow_activity", "name":"panic-audit",
+        "description":"Audit crates", "phase":"Scan", "status":"running", "elapsed_ms":3000,
+        "total":14, "counts":{"running":1,"queued":1,"completed":1,"failed":1,"cancelled":0},
+        "logs":["scanning 4 crates"],
+        "members":[
+            {"seq":10,"label":"engine","phase":"Scan","status":"completed"},
+            {"seq":11,"label":"tools","phase":"Scan","status":"running","session":"s1"},
+            {"seq":12,"label":"lua","status":"failed"},
+            {"seq":13,"label":"tui","status":"queued"}
+        ]});
+    let lines = host
+        .tool_card_presented("workflow", args.clone(), "", false, Some(running))
+        .await
+        .unwrap();
+    let text: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(text[0], "workflow: panic-audit · running · 3s");
+    assert!(lines[0].is_header);
+    assert_eq!(text[1], "Audit crates");
+    assert_eq!(text[2], "Phase: Scan");
+    assert_eq!(
+        text[3],
+        "Agents: 14 · 1 running · 1 queued · 1 done · 1 failed · 0 cancelled"
+    );
+    assert_eq!(lines[3].style, "error");
+    assert_eq!(text[4], "  ✓ engine · Scan");
+    assert_eq!(text[5], "  ● tools · Scan");
+    assert_eq!(text[6], "  ✗ lua");
+    assert_eq!(text[7], "  ○ tui");
+    assert_eq!(text[8], "  … 10 more");
+    assert_eq!(text[9], "› scanning 4 crates");
+    assert!(text.iter().all(|t| !t.contains("RAW-")));
+
+    let done = serde_json::json!({"kind":"workflow_activity", "name":"panic-audit",
+        "status":"completed", "elapsed_ms":9000, "total":0, "counts":{}, "members":[], "logs":[]});
+    let lines = host
+        .tool_card_presented(
+            "workflow",
+            args.clone(),
+            "workflow \"panic-audit\" completed (0 agents).\n[]",
+            false,
+            Some(done),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lines[0].text, "workflow: panic-audit · completed · 9s");
+    assert!(lines
+        .iter()
+        .any(|l| l.text.contains("completed (0 agents)")));
+    // A large durable result is bounded to a few clipped lines.
+    let big = format!("head\n{}\n{}", "x".repeat(5000), "line\n".repeat(100));
+    let done = serde_json::json!({"kind":"workflow_activity", "name":"n", "status":"completed"});
+    let lines = host
+        .tool_card_presented("workflow", args.clone(), &big, false, Some(done))
+        .await
+        .unwrap();
+    assert!(lines.len() <= 12, "{}", lines.len());
+    assert_eq!(lines.last().unwrap().text, "…");
+    assert!(lines.iter().all(|l| l.text.chars().count() <= 201));
+
+    let failed = serde_json::json!({"kind":"workflow_activity", "name":"panic-audit",
+        "status":"error", "elapsed_ms":0, "error":"boom"});
+    let lines = host
+        .tool_card_presented(
+            "workflow",
+            args.clone(),
+            "workflow failed: boom",
+            true,
+            Some(failed),
+        )
+        .await
+        .unwrap();
+    assert_eq!(lines[0].style, "error");
+    assert!(lines
+        .iter()
+        .any(|l| l.text == "workflow failed: boom" && l.style == "error"));
+    // Without workflow metadata the renderer declines (built-in fallback).
+    assert!(host
+        .tool_card_presented("workflow", args, "", false, None)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn default_subagent_renderer_preserves_bounded_old_metadata_fallback() {
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");

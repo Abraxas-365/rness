@@ -249,6 +249,72 @@ rness.ui.messagebox = {
         body = body,
       }
     end },
+    -- Live workflow card: phase, per-status member counts, recent member rows
+    -- and log lines while running; the same view plus the result afterwards.
+    workflow = { display = "preview", preview_lines = 12, render = function(call)
+      local meta = call.presentation
+      if type(meta) ~= "table" or meta.kind ~= "workflow_activity" then return nil end
+      local status = preview(meta.status, 24, "unknown")
+      local failed = call.is_error or status == "error"
+      local elapsed = tonumber(meta.elapsed_ms)
+      local duration = elapsed and elapsed >= 0 and elapsed < math.huge
+        and string.format(" · %ds", math.floor(elapsed / 1000)) or ""
+      local counts = type(meta.counts) == "table" and meta.counts or {}
+      local n = function(key) return tonumber(counts[key]) or 0 end
+      local body = {}
+      local description = preview(meta.description, 200)
+      if description ~= "" then body[#body + 1] = { text = description, style = "dim" } end
+      local phase = preview(meta.phase, 80)
+      if phase ~= "" then body[#body + 1] = { text = "Phase: " .. phase, style = "tool_name" } end
+      body[#body + 1] = {
+        text = string.format("Agents: %d · %d running · %d queued · %d done · %d failed · %d cancelled",
+          tonumber(meta.total) or 0, n("running"), n("queued"), n("completed"), n("failed"), n("cancelled")),
+        style = n("failed") > 0 and "error" or "dim",
+      }
+      local marks = { running = "●", queued = "○", completed = "✓", failed = "✗", cancelled = "–" }
+      local members = type(meta.members) == "table" and meta.members or {}
+      for _, member in ipairs(members) do
+        if type(member) == "table" then
+          local state = type(member.status) == "string" and member.status or "queued"
+          local label = preview(member.label, 72, "agent")
+          local group = preview(member.phase, 24)
+          if group ~= "" then label = label .. " · " .. group end
+          body[#body + 1] = {
+            text = string.format("  %s %s", marks[state] or "?", label),
+            style = state == "failed" and "error" or state == "running" and "tool_name" or "dim",
+          }
+        end
+      end
+      local shown = #members
+      local total = tonumber(meta.total) or shown
+      if total > shown then
+        body[#body + 1] = { text = string.format("  … %d more", total - shown), style = "dim" }
+      end
+      for _, line in ipairs(type(meta.logs) == "table" and meta.logs or {}) do
+        body[#body + 1] = { text = "› " .. preview(line, 160), style = "assistant_text" }
+      end
+      if status ~= "running" and type(call.output) == "string" and call.output ~= "" then
+        -- Bounded: the durable result can be large (max_result_chars).
+        local shown, style = 0, failed and "error" or "tool_output"
+        for line in (call.output .. "\n"):gmatch("(.-)\r?\n") do
+          if shown == 8 then
+            body[#body + 1] = { text = "…", style = "dim" }
+            break
+          end
+          local beyond = utf8.len(line) and utf8.offset(line, 201)
+          if beyond and beyond <= #line then line = line:sub(1, beyond - 1) .. "…" end
+          body[#body + 1] = { text = line, style = style }
+          shown = shown + 1
+        end
+      end
+      return {
+        header = {
+          text = "workflow: " .. preview(meta.name, 48, "workflow") .. " · " .. status .. duration,
+          style = failed and "error" or "tool_name",
+        },
+        body = body,
+      }
+    end },
     send_message = { display = "preview", preview_lines = 4, render = function(call)
       local args = type(call.args) == "table" and call.args or {}
       local meta = type(call.presentation) == "table" and call.presentation or {}

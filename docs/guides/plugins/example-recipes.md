@@ -506,7 +506,7 @@ rness.tool_exposure = {
 ```
 
 - `native` exposes ordinary tool schemas. Names in `deferred` are withheld until discovered.
-- `ptc` exposes only `ToolSearch` and `run_code`; ordinary tools are invoked through programs.
+- `ptc` exposes only `ToolSearch` and `run_code`; ordinary tools are invoked through programs. The [`workflow`](../../reference/tools/workflow.md) tool is omitted entirely in this mode (not listed, not discoverable).
 - `both` exposes `run_code`, `ToolSearch`, and non-deferred or already-discovered native tools.
 - The default flavor remains `native` with no deferred names. Nothing is automatically deferred, including MCP tools.
 
@@ -541,7 +541,7 @@ After discovering its schema, the model can invoke `run_code` with:
 
 Each invocation uses a fresh restricted Lua VM, separate from the configuration/plugin actor. It has table/string/math libraries but no direct filesystem, process, network, package loading, or plugin-global access. Tool implementations retain their usual capabilities; calling Bash is still shell execution governed by its approval policy. This is not an OS process sandbox.
 
-Limits: 64 KiB source, 16 MiB Lua memory, 32 tool calls, and a 60-second cooperative execution budget. Cancellation/time checks occur at Lua instruction hooks and tool boundaries; this is not a hard preemptive deadline for native library operations or non-cooperative tool implementations. Recursive `run_code` and nested `ToolSearch` are rejected. Return values must be JSON-serializable; plugin presentation metadata is not returned to the program.
+Limits: 64 KiB source, 16 MiB Lua memory, 32 tool calls, and a 60-second cooperative execution budget. Cancellation/time checks occur at Lua instruction hooks and tool boundaries; this is not a hard preemptive deadline for native library operations or non-cooperative tool implementations. Recursive `run_code`, nested `ToolSearch` and `workflow` calls are rejected. Return values must be JSON-serializable; plugin presentation metadata is not returned to the program.
 
 Nested call starts are appended before dispatch, and results before returning to Lua, as `tools/program_started` and `tools/program_result` audit events. They are not injected as standalone model tool messages: only the outer program result enters model context. Programs are not resumed after a crash. Tool reload/unload is supported between calls after the plugin registry has been synchronized; no guarantee is made for replacing a plugin during an executing program.
 

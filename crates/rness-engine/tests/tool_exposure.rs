@@ -373,6 +373,44 @@ fn discovery_respects_scope_and_modes() {
         .iter()
         .any(|s| s.name == "Echo"));
 }
+
+/// dsh `ptc-omits-workflow-tool`: in ptc mode the workflow tool is neither
+/// listed nor discoverable; native/both modes discover it normally.
+#[test]
+fn ptc_omits_the_workflow_tool() {
+    struct Named(&'static str);
+    #[async_trait::async_trait]
+    impl Tool for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            Ok(String::new())
+        }
+    }
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(Named("workflow")));
+    tools.register(Arc::new(Named("Echo")));
+    let query = json!({"query":"select:workflow,Echo"});
+    for mode in [Mode::Native, Mode::Both] {
+        let exposure = Exposure {
+            mode,
+            deferred: vec![],
+        };
+        let (_, names) = exposure.search(&tools, &query).unwrap();
+        assert!(names.contains(&"workflow".to_string()));
+    }
+    let ptc = Exposure {
+        mode: Mode::Ptc,
+        deferred: vec![],
+    };
+    assert!(!ptc
+        .specs(&tools, &BTreeSet::new())
+        .iter()
+        .any(|s| s.name == "workflow"));
+    let (_, names) = ptc.search(&tools, &query).unwrap();
+    assert_eq!(names, vec!["Echo".to_string()]);
+}
 #[tokio::test]
 async fn programs_are_isolated_and_budgeted() {
     let tools = Arc::new(ToolRegistry::default());
@@ -383,6 +421,7 @@ async fn programs_are_isolated_and_budgeted() {
         ("return os.execute('true')", true),
         ("return require('socket')", true),
         ("return tools.call('run_code', {})", true),
+        ("return tools.call('workflow', {})", true),
         ("for i=1,33 do tools.call('Echo', {}) end", true),
     ] {
         let (result, _) = program(

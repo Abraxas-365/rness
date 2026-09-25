@@ -58,6 +58,6 @@ Current parsing treats `background_mode = "continuable"` as sufficient to select
 
 Named role selection does not control how context is inherited: `agent` and `provider` are independent choices. Both mechanisms preserve generation settings unless the selected role has a profile. Both enforce the parent's captured tool ceiling.
 
-See [Lua delegation](../lua/subagents.md) and [agent configuration](../configuration/agents.md).
+See [Lua delegation](../lua/subagents.md), [agent configuration](../configuration/agents.md), and the [workflow tool](workflow.md) for scripted fan-out across many children.
 
 Implementation: [tool](../../../crates/rness-tools/src/subagent.rs), [runtime](../../../crates/rness-engine/src/subagent.rs).

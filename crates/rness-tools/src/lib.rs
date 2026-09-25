@@ -26,6 +26,7 @@ pub mod subagent;
 pub mod subagent_control;
 pub mod terminal;
 pub mod web;
+pub mod workflow;
 pub mod write;
 
 /// The observed version of a file: mtime plus length. Comparing both
@@ -162,6 +163,19 @@ pub fn register_subagent(
     jobs: jobs::JobRegistry,
 ) {
     registry.register(Arc::new(subagent::SubagentTool::new(runtime, jobs)));
+}
+
+/// Register the `workflow` tool (late, like [`register_subagent`]). Its
+/// members are subagents of the calling session.
+pub fn register_workflow(
+    registry: &ToolRegistry,
+    runtime: Arc<rness_engine::subagent::SubagentRuntime>,
+    activity: Arc<rness_engine::workflow::WorkflowActivity>,
+    config: workflow::WorkflowConfig,
+) {
+    registry.register(Arc::new(workflow::WorkflowTool::new(
+        runtime, activity, config,
+    )));
 }
 
 /// Pull a required string argument out of tool args.

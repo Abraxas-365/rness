@@ -19,6 +19,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Read images and configure processing limits | [Image reading](guides/image-reading.md) |
 | Opt into filesystem write restrictions | [Sandbox configuration](reference/configuration/sandbox.md) |
 | Call delegation APIs from Lua | [Lua subagents reference](reference/lua/subagents.md) |
+| Let the model orchestrate many subagents with a script | [Workflows guide](guides/workflows.md), [workflow tool reference](reference/tools/workflow.md) |
 | Check which model settings win | [Configuration precedence](reference/configuration-precedence.md) |
 | Monitor or stop background jobs | [Background job controls](guides/background-jobs.md) |
 | Use slash commands and input history | [TUI commands](guides/configuration/tui-commands.md) |

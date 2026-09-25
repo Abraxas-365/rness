@@ -215,6 +215,9 @@ pub struct ToolRegistry {
     /// behaves exactly as if the seam didn't exist.
     pub file_references: Arc<crate::file_references::FileReferences>,
     pub plan_selections: Arc<crate::plan::PlanSelections>,
+    /// In-memory structured-output attachments by child session; shared by
+    /// every scoped/restricted clone (never durable, see `structured`).
+    pub structured: Arc<crate::structured::StructuredOutputs>,
     approvals: Arc<Approvals>,
     hooks: Arc<HookState>,
     /// Root directory for spill files (oversized tool output).
@@ -348,6 +351,7 @@ impl ToolRegistry {
             approvals: Arc::clone(&self.approvals),
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
+            structured: self.structured.clone(),
             file_references: self.file_references.clone(),
             spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
         }
@@ -369,9 +373,22 @@ impl ToolRegistry {
             approvals: Arc::clone(&self.approvals),
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
+            structured: self.structured.clone(),
             file_references: self.file_references.clone(),
             spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
         }
+    }
+
+    /// A clone with one extra (or overriding) scoped tool — used for the
+    /// child-only `structured_output` capture tool.
+    pub fn with_tool(&self, tool: Arc<dyn Tool>) -> Self {
+        let clone = self.restricted(&self.names());
+        clone
+            .tools
+            .write()
+            .expect("registry lock")
+            .insert(tool.name().to_string(), tool);
+        clone
     }
 
     pub fn register(&self, tool: Arc<dyn Tool>) {

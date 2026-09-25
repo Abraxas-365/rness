@@ -153,6 +153,33 @@ impl CardCache {
         true
     }
 
+    /// Insert only if `call`'s revision is still `expected` (0 = never
+    /// cached): lets a live publisher never clobber a card someone else
+    /// (the durable result) wrote meanwhile. Returns the new revision.
+    pub fn insert_if_revision(
+        &self,
+        generation: u64,
+        call: ToolCallId,
+        expected: u64,
+        lines: Vec<CardLine>,
+    ) -> Option<u64> {
+        let mut inner = self.inner.write().expect("card cache lock");
+        if inner.generation != generation
+            || inner.revisions.get(&call).copied().unwrap_or(0) != expected
+        {
+            return None;
+        }
+        inner.revision += 1;
+        let revision = inner.revision;
+        inner.revisions.insert(call.clone(), revision);
+        inner.changes.push_back((revision, call.clone()));
+        if inner.changes.len() > 1024 {
+            inner.changes.pop_front();
+        }
+        inner.cards.insert(call, Arc::new(lines));
+        Some(revision)
+    }
+
     /// Remove a stale live card when a completed renderer declines; readers
     /// must invalidate cached rows and use the built-in completed-result card.
     pub fn remove_if_current(&self, generation: u64, call: &ToolCallId) -> bool {

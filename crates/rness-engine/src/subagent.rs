@@ -49,6 +49,29 @@ pub struct SubagentRequest {
     pub prompt: String,
 }
 
+/// Observer for the child id right after creation.
+pub type OnStart = Box<dyn FnOnce(&SessionId) + Send>;
+
+/// Optional controls for [`SubagentRuntime::start_with`].
+#[derive(Default)]
+pub struct RunOptions {
+    /// `(parent tool call, card args)` linking the child to a tool card.
+    pub presentation: Option<(String, serde_json::Value)>,
+    /// Structured-output schema (object-rooted subset).
+    pub output_schema: Option<serde_json::Value>,
+    /// Cancelling this token cancels the child's turn.
+    pub cancel: Option<tokio_util::sync::CancellationToken>,
+    /// Called with the child id right after creation.
+    pub on_start: Option<OnStart>,
+    /// Parent tool call recorded on the delegation link when there is no
+    /// `presentation` (the child is attributed to that call in `/agents`,
+    /// but gets no subagent card of its own).
+    pub call: Option<String>,
+    /// Tools removed from the child's ceiling (inherited by its own
+    /// delegations). Workflow members use it to forbid nested workflows.
+    pub withhold_tools: Vec<String>,
+}
+
 /// How the child's run ended, mapped from the session's turn-end
 /// vocabulary (dsh stop reasons, minus what we don't produce yet).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +88,9 @@ pub struct SubagentRun {
     pub stop: StopReason,
     /// Last non-empty assistant text after the activation boundary.
     pub output: String,
+    /// Validated `structured_output` value, when a schema was requested
+    /// and the child captured one. Never durable.
+    pub structured: Option<serde_json::Value>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +106,8 @@ pub enum SubagentError {
     },
     #[error("not authorized: {0}")]
     NotAuthorized(String),
+    #[error("unsupported output schema: {0}")]
+    InvalidSchema(String),
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -323,6 +351,43 @@ impl SubagentRuntime {
         request: SubagentRequest,
         presentation: Option<(String, serde_json::Value)>,
     ) -> Result<SubagentRun, SubagentError> {
+        self.start_with(
+            provider,
+            request,
+            RunOptions {
+                presentation,
+                ..RunOptions::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::start_presented`] with the full option set. An
+    /// `output_schema` (dsh `outputSchema`) is checked against the enforced
+    /// subset BEFORE any child exists; the child gets an in-memory
+    /// `structured_output` capture tool for exactly this run, and a child
+    /// that completes without a valid capture settles as
+    /// [`StopReason::Error`]. `cancel` cancels the child's turn (it settles
+    /// as [`StopReason::Aborted`]); `on_start` observes the child id once
+    /// the session exists, before its prompt is sent.
+    pub async fn start_with(
+        &self,
+        provider: &str,
+        request: SubagentRequest,
+        options: RunOptions,
+    ) -> Result<SubagentRun, SubagentError> {
+        let RunOptions {
+            presentation,
+            output_schema,
+            cancel,
+            on_start,
+            call,
+            withhold_tools,
+        } = options;
+        if let Some(schema) = &output_schema {
+            crate::structured::check_object_schema(schema)
+                .map_err(|violations| SubagentError::InvalidSchema(violations.join("; ")))?;
+        }
         self.validate_agent(request.agent.as_deref())?;
         let provider = self
             .providers
@@ -348,16 +413,25 @@ impl SubagentRuntime {
         }
         let delegation = Delegation {
             parent: request.parent.clone(),
-            call: presentation.as_ref().map(|(call, _)| call.clone()),
+            call: presentation.as_ref().map(|(call, _)| call.clone()).or(call),
             depth,
             mode: DelegationMode::OneShot,
         };
 
-        let config = self
+        let mut config = self
             .sessions
             .delegated_config(&request.parent, request.agent.as_deref())?;
+        if let Some(ceiling) = config.tool_ceiling.as_mut() {
+            ceiling.retain(|name| !withhold_tools.contains(name));
+        }
         let child = provider.create_child(&self.sessions, &request, delegation)?;
         self.sessions.set_config(&child, config)?;
+        // Detaches on every exit path (settle, error, cancellation).
+        let attached =
+            output_schema.map(|schema| self.sessions.structured_outputs().attach(&child, schema));
+        if let Some(on_start) = on_start {
+            on_start(&child);
+        }
 
         self.sessions.bus().emit::<crate::service::SubagentStartEv>(
             &crate::service::SubagentStartNotice {
@@ -390,9 +464,28 @@ impl SubagentRuntime {
                 self.activity.failed(&child);
                 error
             })?;
+        // A watcher (not a select over `join`): `join` takes the burst
+        // handle, so abandoning it midway would lose the settle wait.
+        let watcher = cancel.map(|token| {
+            let (sessions, child) = (Arc::clone(&self.sessions), child.clone());
+            tokio::spawn(async move {
+                token.cancelled().await;
+                sessions.cancel(&child);
+            })
+        });
         self.sessions.join(&child).await;
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
 
-        let run = settle(&self.sessions, &child, boundary)?;
+        let mut run = settle(&self.sessions, &child, boundary)?;
+        if let Some(attached) = attached {
+            run.structured = attached.attachment().captured();
+            // dsh readResult: asked for structure, completed without it.
+            if run.structured.is_none() && run.stop == StopReason::Completed {
+                run.stop = StopReason::Error;
+            }
+        }
 
         let outcome = match run.stop {
             StopReason::Completed => "completed",
@@ -782,5 +875,6 @@ fn settle_events(
         session: child.clone(),
         stop,
         output,
+        structured: None,
     })
 }

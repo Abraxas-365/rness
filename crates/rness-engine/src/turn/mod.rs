@@ -146,16 +146,36 @@ async fn drive(
         .and_then(|agent| agent.tools.as_ref())
         .map(|names| tools.restricted(names));
     let tools = restricted.as_ref().unwrap_or(tools);
-    let system = match &active {
+    // Child-scoped structured output (in memory, dsh `attachStructuredRuntime`):
+    // added AFTER ceiling/role restrictions so neither can strip it.
+    let structured = tools.structured.get(&session);
+    let with_capture = structured.as_ref().map(|a| tools.with_tool(a.tool()));
+    let tools = with_capture.as_ref().unwrap_or(tools);
+    let mut system = match &active {
         Some(agent) => format!("{}\n\n{}", config.system, agent.instructions),
         None => config.system.clone(),
     };
+    if structured.is_some() {
+        system.push_str("\n\n");
+        system.push_str(crate::structured::INSTRUCTION);
+    }
     let mut activated =
         crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
     let mut step_no = 0u32;
     loop {
         step_no += 1;
-        let tool_specs = config.tool_exposure.specs(tools, &activated);
+        let mut tool_specs = config.tool_exposure.specs(tools, &activated);
+        // The capture tool is always directly callable (also in ptc mode,
+        // where programs cannot reach it).
+        if let Some(attachment) = &structured {
+            if !tool_specs.iter().any(|s| s.name == crate::structured::TOOL) {
+                tool_specs.push(crate::tools::ToolSpec {
+                    name: crate::structured::TOOL.into(),
+                    description: attachment.tool().description().into(),
+                    input_schema: attachment.schema().clone(),
+                });
+            }
+        }
         if cancel.is_cancelled() {
             log.append(&SessionEvent::AssistantAttempt(AssistantAttempt {
                 model: provider.model().into(),
@@ -505,80 +525,123 @@ async fn drive(
                     });
                 }
                 let exposed: Vec<_> = tool_specs.iter().map(|spec| spec.name.clone()).collect();
-                let results = if calls
-                    .iter()
-                    .all(|call| call.name != "ToolSearch" && call.name != "run_code")
-                {
-                    tools
-                        .dispatch_exposed(
-                            &session,
-                            &calls,
-                            config.max_tool_concurrency,
-                            cancel,
-                            Some(&exposed),
-                        )
-                        .await
-                } else {
-                    let mut results = Vec::new();
-                    for call in &calls {
-                        if !exposed.contains(&call.name) {
-                            results.push(crate::tools::exposure::result(call, Err("tool is not exposed; discover it with ToolSearch first".into())));
-                        } else if call.name == "ToolSearch" {
-                            let output = config.tool_exposure.search(tools, &call.args);
-                            match output {
-                                Ok((output, names)) => {
-                                    log.append(&SessionEvent::ToolsActivated {
-                                        names: names.clone(),
-                                    })?;
-                                    activated.extend(names);
-                                    results.push(crate::tools::exposure::result(call, Ok(output)));
-                                }
-                                Err(error) => {
-                                    results.push(crate::tools::exposure::result(call, Err(error)))
-                                }
-                            }
-                        } else if call.name == "run_code" {
-                            let registry = std::sync::Arc::new(tools.restricted(&tools.names()));
-                            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                            let running = crate::tools::exposure::program(
-                                registry,
-                                session.clone(),
-                                call.clone(),
-                                cancel.clone(),
-                                Some(tx),
-                            );
-                            tokio::pin!(running);
-                            let (result, _) = loop {
-                                tokio::select! {
-                                    finished = &mut running => break finished,
-                                    Some((nested, result, ack)) = rx.recv() => {
-                                        let event = match result {
-                                            Some(result) => SessionEvent::ProgramToolResult { parent:call.call.clone(), args:nested.args, result },
-                                            None => SessionEvent::ProgramToolStarted { parent:call.call.clone(), call:nested.call, name:nested.name, args:nested.args },
-                                        };
-                                        let appended = log.append(&event);
-                                        let _ = ack.send(appended.is_ok());
-                                        appended?;
+                // Without an attachment this is one segment (today's path).
+                // With one, each segment ends at a `structured_output` call so
+                // its authoritative result commits before anything later runs;
+                // after a capture every remaining call is refused (dsh guard).
+                let mut results = Vec::with_capacity(calls.len());
+                let mut rest: &[ToolCall] = &calls;
+                while !rest.is_empty() {
+                    if structured.as_ref().is_some_and(|a| a.is_captured()) {
+                        results.extend(rest.iter().map(|call| {
+                            crate::tools::exposure::result(
+                                call,
+                                Err(crate::structured::guard_message(&call.name)),
+                            )
+                        }));
+                        break;
+                    }
+                    let cut = match &structured {
+                        Some(_) => rest
+                            .iter()
+                            .position(|call| call.name == crate::structured::TOOL)
+                            .map_or(rest.len(), |i| i + 1),
+                        None => rest.len(),
+                    };
+                    let (calls, tail) = rest.split_at(cut);
+                    rest = tail;
+                    let segment = if calls
+                        .iter()
+                        .all(|call| call.name != "ToolSearch" && call.name != "run_code")
+                    {
+                        tools
+                            .dispatch_exposed(
+                                &session,
+                                calls,
+                                config.max_tool_concurrency,
+                                cancel,
+                                Some(&exposed),
+                            )
+                            .await
+                    } else {
+                        let mut results = Vec::new();
+                        for call in calls {
+                            if !exposed.contains(&call.name) {
+                                results.push(crate::tools::exposure::result(call, Err("tool is not exposed; discover it with ToolSearch first".into())));
+                            } else if call.name == "ToolSearch" {
+                                let output = config.tool_exposure.search(tools, &call.args);
+                                match output {
+                                    Ok((output, names)) => {
+                                        log.append(&SessionEvent::ToolsActivated {
+                                            names: names.clone(),
+                                        })?;
+                                        activated.extend(names);
+                                        results.push(crate::tools::exposure::result(call, Ok(output)));
+                                    }
+                                    Err(error) => {
+                                        results.push(crate::tools::exposure::result(call, Err(error)))
                                     }
                                 }
-                            };
-                            results.push(result);
-                        } else {
-                            results.extend(
-                                tools
-                                    .dispatch_exposed(
-                                        &session,
-                                        std::slice::from_ref(call),
-                                        1,
-                                        cancel,
-                                        Some(&exposed),
-                                    )
-                                    .await,
-                            );
+                            } else if call.name == "run_code" {
+                                // The capture tool is top-level only: a nested
+                                // call would never reach the authoritative commit.
+                                let names: Vec<_> = tools
+                                    .names()
+                                    .into_iter()
+                                    .filter(|name| name != crate::structured::TOOL)
+                                    .collect();
+                                let registry = std::sync::Arc::new(tools.restricted(&names));
+                                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+                                let running = crate::tools::exposure::program(
+                                    registry,
+                                    session.clone(),
+                                    call.clone(),
+                                    cancel.clone(),
+                                    Some(tx),
+                                );
+                                tokio::pin!(running);
+                                let (result, _) = loop {
+                                    tokio::select! {
+                                        finished = &mut running => break finished,
+                                        Some((nested, result, ack)) = rx.recv() => {
+                                            let event = match result {
+                                                Some(result) => SessionEvent::ProgramToolResult { parent:call.call.clone(), args:nested.args, result },
+                                                None => SessionEvent::ProgramToolStarted { parent:call.call.clone(), call:nested.call, name:nested.name, args:nested.args },
+                                            };
+                                            let appended = log.append(&event);
+                                            let _ = ack.send(appended.is_ok());
+                                            appended?;
+                                        }
+                                    }
+                                };
+                                results.push(result);
+                            } else {
+                                results.extend(
+                                    tools
+                                        .dispatch_exposed(
+                                            &session,
+                                            std::slice::from_ref(call),
+                                            1,
+                                            cancel,
+                                            Some(&exposed),
+                                        )
+                                        .await,
+                                );
+                            }
+                        }
+                        results
+                    };
+                    // Commit capture from the authoritative (post-hook) result.
+                    if let Some(attachment) = &structured {
+                        for result in &segment {
+                            if result.name == crate::structured::TOOL {
+                                attachment.settle(&result.call, !result.is_error);
+                            }
                         }
                     }
-                    results
-                };
+                    results.extend(segment);
+                }
+                let concluded = structured.as_ref().is_some_and(|a| a.is_captured());
                 let dismissed = results.iter().any(|result| {
                     result.plan_review == Some(rness_protocol::events::PlanReview::Dismissed)
                 });
@@ -612,6 +675,11 @@ async fn drive(
                     });
                 }
                 if dismissed {
+                    return Ok(TurnOutcome::Completed);
+                }
+                // Structured capture concludes the turn (dsh concludeTurn):
+                // no further model step once the result is recorded.
+                if concluded {
                     return Ok(TurnOutcome::Completed);
                 }
                 // Cancellation between steps: commit and stop cleanly.

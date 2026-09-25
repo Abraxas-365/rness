@@ -386,6 +386,11 @@ impl SessionService {
         &self.tools.file_references
     }
 
+    /// In-memory structured-output attachments (child-scoped capture).
+    pub fn structured_outputs(&self) -> &Arc<crate::structured::StructuredOutputs> {
+        &self.tools.structured
+    }
+
     pub fn tasks(
         &self,
         session: &SessionId,

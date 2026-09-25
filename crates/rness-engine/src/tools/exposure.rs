@@ -44,7 +44,7 @@ impl Exposure {
             specs.push(ToolSpec { name: "ToolSearch".into(), description: "Discover permitted tools and their full JSON schemas. query accepts keywords (ranked partial matches, top 20) or select:Name,Other (case-insensitive full names, no result cap). Returns tools, total_matches, truncated, missing names, and guidance. Discovered tools become available next step; in ptc mode call them through run_code.".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}) });
         }
         if self.mode != Mode::Native {
-            specs.push(ToolSpec { name:"run_code".into(), description:"Execute isolated Lua to orchestrate tools. Use tools.call(name, args) to get {output,is_error,content}; return a JSON-serializable value. Discover schemas with ToolSearch first. No filesystem, process, network, imports or config access except through permitted tools. Use tools.parallel({{name=...,args=...},...}) for up to four concurrent calls with results in input order. Shared max 32 calls, 60s execution budget, 16 MiB VM memory. Tools still require normal approvals. Recursive run_code and ToolSearch are forbidden inside programs.".into(), input_schema:json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}) });
+            specs.push(ToolSpec { name:"run_code".into(), description:"Execute isolated Lua to orchestrate tools. Use tools.call(name, args) to get {output,is_error,content}; return a JSON-serializable value. Discover schemas with ToolSearch first. No filesystem, process, network, imports or config access except through permitted tools. Use tools.parallel({{name=...,args=...},...}) for up to four concurrent calls with results in input order. Shared max 32 calls, 60s execution budget, 16 MiB VM memory. Tools still require normal approvals. Recursive run_code, ToolSearch and workflow are forbidden inside programs.".into(), input_schema:json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false}) });
         }
         specs
     }
@@ -93,6 +93,8 @@ impl Exposure {
         let mut matches: Vec<_> = tools
             .specs()
             .into_iter()
+            // ptc omits the workflow tool (dsh): programs cannot host it.
+            .filter(|spec| self.mode != Mode::Ptc || spec.name != crate::workflow::TOOL)
             .filter_map(|spec| {
                 let name = spec.name.to_lowercase();
                 let description = spec.description.to_lowercase();
@@ -220,8 +222,8 @@ pub async fn program(
                 let (name,args): (String,mlua::Value) = mlua::FromLuaMulti::from_lua_multi(values,lua)?;
                 vec![Request { name, args:lua.from_value(args)? }]
             };
-            if requests.len() > 32 || requests.iter().any(|r| matches!(r.name.as_str(), "run_code" | "ToolSearch")) {
-                return Err(mlua::Error::runtime("batch exceeds call budget or contains recursive control-tool calls"));
+            if requests.len() > 32 || requests.iter().any(|r| matches!(r.name.as_str(), "run_code" | "ToolSearch" | crate::workflow::TOOL)) {
+                return Err(mlua::Error::runtime("batch exceeds call budget or contains recursive control-tool calls (run_code, ToolSearch and workflow are not callable from programs)"));
             }
             let index = count.fetch_add(requests.len(), std::sync::atomic::Ordering::Relaxed);
             if index.saturating_add(requests.len()) > 32 || cancel.is_cancelled() || Instant::now() >= deadline { return Err(mlua::Error::runtime("program call budget exceeded or cancelled")); }

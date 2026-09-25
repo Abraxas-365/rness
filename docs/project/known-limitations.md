@@ -48,6 +48,7 @@ If compaction is interrupted, rness records the interruption on resume rather th
 - **The filesystem sandbox has a limited scope.** It confines Bash/process filesystem access, not Lua plugins, non-Bash tools, or network access. Enforced modes currently use the macOS backend and fail with an error on unsupported platforms; they do not silently run unrestricted. Without an explicit sandbox declaration, the compatibility default is full access. See [sandbox configuration](../reference/configuration/sandbox.md) before relying on it.
 - **A blocking plugin can freeze Lua-driven features.** Cancellation cannot forcibly stop every native call or misbehaving cleanup handler. Long-running synchronous delegation can also block callbacks needed by the delegated work.
 - **Invalid agent tool names may produce different errors depending on how you select the agent.** CLI startup and in-session selection do not yet share all validation checks. Use exact registered tool names; see [agent configuration](../reference/configuration/agents.md).
+- **Workflows run in the foreground only and do not resume.** A [`workflow`](../reference/tools/workflow.md) call blocks the parent turn until its script finishes; there is no background mode. The script's CPU budget is cooperative (instruction hooks), and a run interrupted by a crash or restart is not resumed — its members' sessions remain, but the script state is lost.
 
 ## Providers and upgrades
 

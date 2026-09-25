@@ -802,6 +802,13 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("lua jobs bridge: {e}"))?;
     rness_tools::register_subagent(&tools, Arc::clone(&subagents), jobs.clone());
     rness_tools::subagent_control::register_subagent_control(&tools, Arc::clone(&subagents));
+    let workflows = Arc::new(rness_engine::workflow::WorkflowActivity::default());
+    rness_tools::register_workflow(
+        &tools,
+        Arc::clone(&subagents),
+        Arc::clone(&workflows),
+        startup.workflow.clone(),
+    );
 
     // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
     let terminals = rness_tools::terminal::TerminalRegistry::new();
@@ -1106,6 +1113,7 @@ async fn main() -> anyhow::Result<()> {
             kernel,
             sessions,
             subagents,
+            workflows,
             session,
             selection.model.clone(),
             questions,
@@ -1536,6 +1544,7 @@ async fn run_tui(
     kernel: Kernel,
     sessions: Arc<SessionService>,
     subagents: Arc<rness_engine::subagent::SubagentRuntime>,
+    workflows: Arc<rness_engine::workflow::WorkflowActivity>,
     session: SessionId,
     model_name: String,
     questions: Arc<rness_engine::questions::Questions>,
@@ -1800,12 +1809,15 @@ async fn run_tui(
                             }
                         }
                         rness_protocol::events::SessionEvent::ToolResult(r) => {
-                            if cache.contains(&r.call) {
-                                continue;
-                            }
-                            let Some((_name, args)) = calls.get(&r.call) else {
+                            let Some((name, args)) = calls.get(&r.call) else {
                                 continue;
                             };
+                            // A workflow's cached card may be its live
+                            // progress card: the durable result (after
+                            // post-tool hooks) always replaces it.
+                            if cache.contains(&r.call) && name != rness_engine::workflow::TOOL {
+                                continue;
+                            }
                             let generation = cache.generation();
                             if let Some(lines) =
                                 rness_engine::presentation::ToolCards::tool_card_result(
@@ -1816,6 +1828,8 @@ async fn run_tui(
                                 .await
                             {
                                 cache.insert_if_current(generation, r.call.clone(), lines);
+                            } else if name == rness_engine::workflow::TOOL {
+                                cache.remove_if_current(generation, &r.call);
                             }
                         }
                         _ => {}
@@ -1853,10 +1867,12 @@ async fn run_tui(
         let cache = card_cache.clone();
         let sessions = sessions.clone();
         let subagents = subagents.clone();
+        let workflows = workflows.clone();
         let watched = watched.clone();
         tokio::spawn(async move {
             let mut recovery = activity_recovery::ActivityRecovery::default();
             let mut published = std::collections::HashMap::new();
+            let mut workflow_published = std::collections::HashMap::new();
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1889,6 +1905,82 @@ async fn run_tui(
                             if cache.insert_if_current(generation, call, lines) {
                                 published.insert(key, snapshot);
                             }
+                        }
+                    }
+                }
+                // Workflow runs: the same live-card path, keyed by the
+                // workflow tool call. Only running runs have live cards; the
+                // durable tool result renders the finished card. Each live
+                // insert is conditioned on the call's cache revision still
+                // being our own last one, so it never clobbers the durable
+                // card (atomic in the cache, no check-then-insert race).
+                let cards = workflows.cards(&session);
+                // Bounded: only currently live cards are remembered. A run
+                // that just left the live set without its durable card
+                // landing (body dropped, result not committed) gets its
+                // final snapshot once, so the card never stays "running".
+                let mut ended = Vec::new();
+                workflow_published.retain(|call: &String, (s, g, _, revision)| {
+                    let current = *s == session && *g == generation;
+                    let live = cards.iter().any(|c| &c.call == call);
+                    if current && !live {
+                        ended.push((call.clone(), *revision));
+                    }
+                    current && live
+                });
+                if !ended.is_empty() {
+                    for (call, args, presentation) in workflows.card_snapshots(&session) {
+                        let Some(&(_, revision)) = ended.iter().find(|(c, _)| *c == call) else {
+                            continue;
+                        };
+                        if cache.call_revision(&call) != revision {
+                            continue; // the durable card already replaced ours
+                        }
+                        let error = presentation["status"] == "error";
+                        if let Some(lines) =
+                            rness_engine::presentation::ToolCards::tool_card_presented(
+                                &lua,
+                                rness_engine::workflow::TOOL,
+                                args,
+                                "",
+                                error,
+                                Some(presentation),
+                            )
+                            .await
+                        {
+                            if *watched.read().unwrap() == session {
+                                cache.insert_if_revision(generation, call, revision, lines);
+                            }
+                        }
+                    }
+                }
+                for card in cards {
+                    let previous = workflow_published.get(&card.call);
+                    if previous.is_some_and(|(_, _, published, _)| published == &card.presentation)
+                    {
+                        continue;
+                    }
+                    let expected = previous.map_or(0, |(_, _, _, revision)| *revision);
+                    let snapshot = card.presentation.clone();
+                    let call = card.call.clone();
+                    if let Some(lines) = rness_engine::presentation::ToolCards::tool_card_presented(
+                        &lua,
+                        rness_engine::workflow::TOOL,
+                        card.args,
+                        "",
+                        false,
+                        Some(card.presentation),
+                    )
+                    .await
+                    {
+                        if *watched.read().unwrap() != session {
+                            continue;
+                        }
+                        if let Some(revision) =
+                            cache.insert_if_revision(generation, call.clone(), expected, lines)
+                        {
+                            workflow_published
+                                .insert(call, (session.clone(), generation, snapshot, revision));
                         }
                     }
                 }
