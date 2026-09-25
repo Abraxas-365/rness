@@ -38,6 +38,10 @@ successful callback completion and retain the existing stale-context/focus guard
 Submission functions expire when the callback returns and are not exposed to
 non-promptbox actions.
 
+Outside promptbox actions (hooks, timers, commands), `rness.session.send(id, text)`
+queues and `rness.session.steer(id, text)` steers a given session with the same
+semantics. See [Lua timers and session delivery](../reference/lua/timer.md).
+
 The default flavor enables `plugins/delivery.lua`: **F8** queues and **F9**
 steers. Its `plugin.keys` slots can be remapped or disabled in `rness.plugins.setup`.
 Existing installations are not modified automatically; copy

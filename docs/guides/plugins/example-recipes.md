@@ -64,6 +64,8 @@ Remove either entry to disable that context injection. Neither plugin registers 
 
 ## Timers and scheduled reminders
 
+Full references: [Lua timers and session delivery](../../reference/lua/timer.md) and [Scheduled reminders](../scheduled-reminders.md). This section is a summary.
+
 ### `rness.timer` Lua API
 
 Plugins can run code later without a user turn:

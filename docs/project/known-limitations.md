@@ -64,6 +64,13 @@ These details mainly matter if you write your own plugins:
 - Manual region indices are one-based, inclusive positions in the model-message view, not raw log event numbers. Use `session.compaction_view(id)` and pass its source IDs so stale selections can be rejected. Provider failures retain the existing `false`/unchanged result; service errors raise Lua errors.
 - Lua execution and tool-card rendering limits are not hard timeouts. Native calls can block, and plugin code can catch instruction-hook errors. Keep callbacks bounded and provide a useful display fallback for missing or invalid card data.
 - `/agent <name>` works through TUI and HTTP sends, but there is no public `rness.agents.list()` query. `rness.subagents.roster()` lists delegable roles, not every agent role or running child session.
+- `rness.timer` timers are in memory only and do not survive a restart. Their 30-second callback limit counts Lua instructions, not blocking native calls. See [Lua timers](../reference/lua/timer.md).
+
+## Scheduled reminders
+
+- **Reminders fire only while rness is running**, and only for sessions live in that process. Reminders that come due while rness is closed become overdue until you resume the session and start a turn.
+- **Use one rness process per session.** Concurrent processes on the same session can deliver a reminder twice or lose an edit. Delivery is at-least-once, so a crash can repeat one.
+- **Updating rness does not update your copy of `schedule.lua`.** Older copies can drop reminders while a session is busy (compaction, commands). Re-copy it from `flavors/default/plugins/`. See [Scheduled reminders](../guides/scheduled-reminders.md).
 
 ## Documentation and reporting problems
 
