@@ -463,10 +463,10 @@ Declarative command hooks — no Lua required. Place a `hooks.json` in `.rness/h
 Each command hook:
 - Receives the hook payload as JSON on **stdin**.
 - Prints a JSON decision on **stdout** (for interception hooks: `pre_tool`, `guard`, `post_tool`, `tool_execute`, `pre_step`, `request`, `request_error`, `turn_stopping`). Notification hooks ignore stdout. The decision has the same shape as the Lua return value, so `messages` / `additional_contexts` entries may be `{"text": "...", "tag": "name"}` objects to label injected messages (see [Injected messages](#injected-messages-hooks-agentsmd-jobs)).
-- Exit code 0 = success; non-zero = error (logged, default decision applied).
+- Exit code 0 = success; exit 2 = block (stderr is the reason: `pre_tool`/`guard` deny, `post_tool` block, `pre_step` reject, `turn_stopping` continue); any other non-zero = error (logged, default decision applied).
 - `timeout` is in seconds (default 30).
 - `matcher` is optional: when set, only fires for matching `tool`/`source` names (same as `opts.match` in Lua).
-- Only `"type": "command"` hooks are supported; other types are logged and skipped.
+- `type` defaults to `"command"`; other types are logged and skipped.
 
 The bare format (without the `"hooks"` wrapper) is also accepted:
 ```json
@@ -478,6 +478,31 @@ The bare format (without the `"hooks"` wrapper) is also accepted:
 ```
 
 Project hooks (`.rness/hooks.json`) load before user hooks (`~/.rness/hooks.json`). Both files are optional.
+
+### Claude Code and Codex hooks
+
+Existing Claude Code / Codex command hooks run unmodified. Event keys written in their PascalCase form (`PreToolUse`, …) in `.rness/hooks.json` use the Claude Code protocol. To load the tools' own files, opt in from `init.lua` (restart required):
+
+```lua
+rness.hooks = {
+  claude_code = true, -- ~/.claude/settings.json, <project>/.claude/settings{,.local}.json
+  codex = true,       -- ~/.codex/hooks.json, <project>/.codex/hooks.json
+  files = { { path = "ci/hooks.json", dialect = "codex" } }, -- extra files
+  timeout = 600,                 -- default per-hook seconds (Claude Code's default)
+  max_stop_continuations = 8,    -- Stop-hook "block" loops allowed per turn
+}
+```
+
+| Event | When | Effect |
+|---|---|---|
+| `SessionStart` | first run of a session in this process, and after compaction (`matcher` = `startup` / `resume` / `compact`) | stdout/`additionalContext` is added to the first step |
+| `UserPromptSubmit` | a step carrying new user input | exit 2 / `decision:"block"` rejects the step; context is added |
+| `PreToolUse` | before a tool (`matcher` = tool name) | `deny` / `ask` / `allow` (allow = no objection; Lua hooks and permissions still apply) |
+| `PostToolUse` | after a tool | block → the model gets the reason as the tool result; context is added |
+| `Stop` | the turn is about to end | block → the turn continues with the reason (`stop_hook_active` is `true` on repeats) |
+| `SubagentStart` / `SubagentStop` | Claude Code only | context for the child's first step / observe |
+
+The protocol is the tools' own: JSON payload on stdin (`session_id`, `transcript_path`, `cwd`, `hook_event_name`, plus `tool_name`/`tool_input`/`tool_use_id`/`tool_response`, `prompt`, or `stop_hook_active`; Codex adds `model`, `turn_id`, `permission_mode`); exit 2 blocks with stderr as the reason; exit 0 with a JSON object on stdout may set `continue`, `stopReason`, `decision`, `reason`, `systemMessage` (logged) and `hookSpecificOutput.{hookEventName, permissionDecision, permissionDecisionReason, additionalContext}`. When several hooks match, deny beats ask beats allow and every context is kept. Claude Code matchers are exact `|` lists unless they contain regex syntax; Codex matchers are always regexes; an invalid regex skips that file with a warning. Claude Code hooks get `CLAUDE_PROJECT_DIR`, and `tool_input.file_path` mirrors `path` for `Read`/`Edit`/`Write`. `updatedInput` is ignored (rness does not let hooks change tool arguments). Command hooks run before Lua hooks at each point, and appear in the audit log with source `claude-code` or `codex`.
 
 ### Hook audit events
 

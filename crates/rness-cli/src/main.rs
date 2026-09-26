@@ -760,9 +760,37 @@ async fn main() -> anyhow::Result<()> {
         .context("sessions service missing")?;
     sessions.set_images(image_store)?;
     lua.set_bus(Arc::clone(kernel.bus()));
-    sessions.set_loop_hooks(Some(Arc::new(lua.clone())));
-    // Re-set tool hooks so the clone carries the bus reference for audit events.
-    tools.set_hooks(Some(Arc::new(lua.clone())));
+    // Claude Code / Codex command hooks (hooks.json, settings.json), layered
+    // over the Lua host so both run: command hooks first, then Lua chains.
+    let (command_hooks, hook_warnings) = rness_lua::command_hooks::CommandHooks::load(
+        &rness_lua::command_hooks::discover(&startup.hooks, &cwd, dirs::home_dir().as_deref()),
+        &startup.hooks,
+        Arc::clone(&sessions),
+        cwd.clone(),
+    );
+    for warning in hook_warnings {
+        eprintln!("warning: hooks: {warning}");
+    }
+    let _command_hook_subs = command_hooks
+        .as_ref()
+        .map(|cmd| cmd.subscribe(kernel.bus()))
+        .unwrap_or_default();
+    match &command_hooks {
+        Some(cmd) => {
+            let layered = Arc::new(rness_lua::command_hooks::Layered {
+                cmd: Arc::clone(cmd),
+                tools: Arc::new(lua.clone()),
+                loops: Arc::new(lua.clone()),
+            });
+            sessions.set_loop_hooks(Some(layered.clone()));
+            tools.set_hooks(Some(layered));
+        }
+        None => {
+            sessions.set_loop_hooks(Some(Arc::new(lua.clone())));
+            // Re-set tool hooks so the clone carries the bus reference for audit events.
+            tools.set_hooks(Some(Arc::new(lua.clone())));
+        }
+    }
     sessions.set_default_workspace(cwd.to_string_lossy().into_owned())?;
     let custom_skill_roots_for_resolver = startup.skill_roots.clone();
     let legacy_skill_roots =

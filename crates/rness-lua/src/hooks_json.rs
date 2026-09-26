@@ -37,12 +37,17 @@ pub struct MatcherGroup {
 /// A single command hook.
 #[derive(Debug, Deserialize)]
 pub struct CommandHook {
-    #[serde(rename = "type")]
+    /// Only `"command"` is supported; omitted means command (like CC/Codex).
+    #[serde(rename = "type", default = "default_type")]
     pub hook_type: String,
     pub command: String,
     /// Timeout in seconds (default 30).
     #[serde(default = "default_timeout")]
     pub timeout: u64,
+}
+
+fn default_type() -> String {
+    "command".into()
 }
 
 fn default_timeout() -> u64 {
@@ -94,6 +99,11 @@ const KNOWN_HOOK_POINTS: &[&str] = &[
 pub fn generate_lua(config: &HooksConfig) -> String {
     let mut lua = String::new();
     for (point, groups) in &config.hooks {
+        // Claude Code / Codex event names (PascalCase) are run by
+        // `command_hooks`, which speaks their exit-code/JSON protocol.
+        if crate::command_hooks::is_foreign_event(point) {
+            continue;
+        }
         if !KNOWN_HOOK_POINTS.contains(&point.as_str()) {
             tracing::warn!("hooks.json: unknown hook point '{point}', skipping");
             continue;
@@ -107,7 +117,7 @@ pub fn generate_lua(config: &HooksConfig) -> String {
                     );
                     continue;
                 }
-                let cmd_escaped = hook.command.replace('\\', "\\\\").replace('"', "\\\"");
+                let cmd_escaped = hook.command.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
                 let timeout = hook.timeout;
                 // `request` is observe-only (return value ignored), so treat
                 // it as notification even though it goes through intercept().
@@ -121,7 +131,7 @@ pub fn generate_lua(config: &HooksConfig) -> String {
                     if is_interception {
                         lua.push_str(&format!(
                             r#"rness.hook.on("{point}", {{match = "{matcher_escaped}"}}, function(ev, next)
-  local result = __rness_run_command_hook("{cmd_escaped}", {timeout}, ev)
+  local result = __rness_run_command_hook("{cmd_escaped}", {timeout}, ev, "{point}")
   if result == nil then return next() end
   return result
 end)
@@ -130,7 +140,7 @@ end)
                     } else {
                         lua.push_str(&format!(
                             r#"rness.hook.on("{point}", {{match = "{matcher_escaped}"}}, function(ev)
-  __rness_run_command_hook("{cmd_escaped}", {timeout}, ev)
+  __rness_run_command_hook("{cmd_escaped}", {timeout}, ev, "{point}")
 end)
 "#
                         ));
@@ -138,7 +148,7 @@ end)
                 } else if is_interception {
                     lua.push_str(&format!(
                         r#"rness.hook.on("{point}", function(ev, next)
-  local result = __rness_run_command_hook("{cmd_escaped}", {timeout}, ev)
+  local result = __rness_run_command_hook("{cmd_escaped}", {timeout}, ev, "{point}")
   if result == nil then return next() end
   return result
 end)
@@ -147,7 +157,7 @@ end)
                 } else {
                     lua.push_str(&format!(
                         r#"rness.hook.on("{point}", function(ev)
-  __rness_run_command_hook("{cmd_escaped}", {timeout}, ev)
+  __rness_run_command_hook("{cmd_escaped}", {timeout}, ev, "{point}")
 end)
 "#
                     ));
@@ -160,6 +170,20 @@ end)
 
 /// The maximum stderr we capture from a command hook (bytes).
 const STDERR_MAX: usize = 500;
+
+/// The native decision an exit-2 ("block") command hook maps to at
+/// `point`, with stderr as the reason. `None` for points that cannot block.
+pub fn blocking_decision(point: &str, stderr: Option<&str>) -> Option<serde_json::Value> {
+    let reason = stderr.map(str::trim).filter(|s| !s.is_empty());
+    let text = |fallback: &str| reason.map(str::to_owned).unwrap_or_else(|| format!("blocked by {fallback} command hook"));
+    Some(match point {
+        "pre_tool" | "guard" => serde_json::json!({"kind": "deny", "reason": text(point)}),
+        "post_tool" => serde_json::json!({"kind": "block", "feedback": text(point)}),
+        "pre_step" => serde_json::json!({"kind": "reject"}),
+        "turn_stopping" => serde_json::json!({"kind": "continue", "messages": [text(point)]}),
+        _ => return None,
+    })
+}
 
 /// Run a command hook synchronously. Called from the Lua VM thread.
 ///
@@ -342,6 +366,30 @@ mod tests {
         let result = run_command("echo '{\"kind\":\"allow\"}'", 5, "{}");
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.decision.unwrap()["kind"], "allow");
+    }
+
+    #[test]
+    fn claude_code_keys_are_left_to_command_hooks_and_type_defaults() {
+        let config = load_from_str(
+            r#"{"hooks": {
+                "PreToolUse": [{"hooks": [{"command": "cc"}]}],
+                "pre_tool": [{"hooks": [{"command": "native \"q\"\nline2"}]}]
+            }}"#,
+        )
+        .unwrap();
+        let lua = generate_lua(&config);
+        assert!(!lua.contains("\"cc\""), "{lua}");
+        assert!(lua.contains(r#"native \"q\"\nline2"#), "{lua}");
+        assert!(lua.contains(r#"ev, "pre_tool")"#), "{lua}");
+    }
+
+    #[test]
+    fn exit_two_maps_to_native_blocking_decisions() {
+        assert_eq!(blocking_decision("pre_tool", Some(" no \n")).unwrap()["reason"], "no");
+        assert_eq!(blocking_decision("post_tool", None).unwrap()["kind"], "block");
+        assert_eq!(blocking_decision("pre_step", None).unwrap()["kind"], "reject");
+        assert_eq!(blocking_decision("turn_stopping", Some("more")).unwrap()["messages"][0], "more");
+        assert!(blocking_decision("session_start", None).is_none());
     }
 
     #[test]
