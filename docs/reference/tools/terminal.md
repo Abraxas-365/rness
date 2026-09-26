@@ -8,7 +8,7 @@ Source: [`crates/rness-tools/src/terminal.rs`](../../../crates/rness-tools/src/t
 
 - The CLI always registers the six tools, with background jobs enabled on `terminal_send`. There is no opt-in.
 - All terminal state is in-process. It is not persisted and not restored after a restart.
-- Terminals are **owned by the rness session** that opened them. The tools take the owner from the calling session. `rness.terminals` functions take it from their `session` argument, so a plugin can act for any session whose id it passes (plugins are trusted code). Terminals of another session are not listed and can't be used.
+- Terminals are **owned by the rness session** that opened them. The tools take the owner from the calling session. `rness.terminals` functions take it from their `session` argument, so a plugin can act for any session whose id it passes (plugins are trusted code). Terminals of another session are not listed to the model and can't be used by its tools. The user-facing `list_all` and `owner` functions exist so `/terminals` can show and stop them after a session switch.
 - Every tool except `terminal_list` requires the session's sandbox mode to be `danger-full-access` (the default). Otherwise it fails with `terminal tools are disabled in <Mode> sandbox mode (requires DangerFullAccess)`.
 - All tools need session context. Calling them without a session fails with `<tool> requires session context`.
 - Ids are `term-N`, numbered from 1 per rness process and never reused.
@@ -118,8 +118,10 @@ Available to plugins after startup; calling it earlier fails with `rness.termina
 
 | Function | Returns |
 | --- | --- |
-| `count(session)` | `{ open = N, running = M }` |
-| `list(session)` | Array of terminal info tables, ordered by id |
+| `count(session)` | `{ open, running, elsewhere, elsewhere_running }`: `session`'s terminals, and those of all other sessions |
+| `list(session)` | Array of `session`'s terminal info tables, ordered by id |
+| `list_all()` | Array of every open terminal's info, ordered by id. For user-facing views: the model's tools never see other sessions' terminals |
+| `owner(id)` | The session id that owns terminal `id`, or `nil` if it isn't open. Pass it as `session` to act on another session's terminal for the user |
 | `inspect(session, id, lines?)` | Terminal info plus `output`: the last `lines` lines of clean scrollback (default 40, max 500; `0` gives an empty string) |
 | `stop(session, id)` | `true` if a command was running and stopping began, `false` if nothing was running |
 | `close(session, id)` | `true` |
@@ -129,6 +131,7 @@ Terminal info fields:
 | Field | Type | Present | Meaning |
 | --- | --- | --- | --- |
 | `id`, `name` | string | Always | `name` equals `id` when no label was given |
+| `owner` | string | Always | The rness session that opened it |
 | `shell` | string | Always | Shell label, such as `bash, controlled` |
 | `state` | string | Always | `idle at prompt`, `command running`, or `exited (…)` |
 | `running` | boolean | Always | A command, not the shell, owns the terminal |
@@ -179,7 +182,8 @@ Built-in withholding applies regardless of `env_deny`: `API_KEY` and names endin
 | rness exits normally (any path) | Every terminal closed as above, in parallel |
 | Idle for `idle_close_secs` (when set) | That terminal closed as above |
 | One-shot subagent finishes | Its terminals closed as above. Continuable agents keep theirs |
-| rness killed by a signal | No cleanup. Shells get a PTY hangup |
+| rness ended by TERM, HUP, INT or QUIT | Terminal settings restored, every terminal closed as above, then rness exits with that signal |
+| rness killed (KILL) or crashed | The cleanup helper (`rness __rness-terminal-reaper`, started with the first terminal) sees its pipe close and ends every process still in the open terminals' sessions: HUP, 0.5 s, KILL. A session id is only acted on while its leader is the original shell or gone (checked by start time) |
 | Process started its own session (`setsid`, daemons) | Never reached |
 
 ## Related

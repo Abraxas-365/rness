@@ -39,10 +39,13 @@ local function status(t)
   return "idle"
 end
 
-local function summary(t)
+local function summary(t, session)
   local name = t.name ~= t.id and (" " .. t.name) or ""
   local line = t.id .. name .. " [" .. t.shell .. "] " .. status(t)
   if t.command then line = line .. " — " .. shorten(t.command, 80) end
+  if session and t.owner and t.owner ~= session then
+    line = line .. " (session " .. t.owner:sub(-8) .. ")"
+  end
   return line
 end
 
@@ -85,13 +88,32 @@ local function list(session)
   return ok and terms or {}
 end
 
+-- This session's terminals, then every other session's: they keep running
+-- when you switch away, so the user can still see and stop them.
+local function all(session)
+  local ok, terms = pcall(rness.terminals.list_all)
+  if not ok or type(terms) ~= "table" then return list(session) end
+  local mine, others = {}, {}
+  for _, t in ipairs(terms) do
+    if t.owner == session then mine[#mine + 1] = t else others[#others + 1] = t end
+  end
+  for _, t in ipairs(others) do mine[#mine + 1] = t end
+  return mine, #others
+end
+
+-- The session a user command about `id` acts as: the terminal's owner.
+local function owner(session, id)
+  local ok, found = pcall(rness.terminals.owner, id)
+  return ok and found or session
+end
+
 local function view(ctx)
   local s = state(ctx)
   local rows = math.max(1, math.min(512, ctx.rows or HEIGHT))
   local cols = math.max(1, math.min(4096, ctx.cols or 80))
   local lines = {}
   if s.selected then
-    local ok, t = pcall(rness.terminals.inspect, ctx.session, s.selected, 500)
+    local ok, t = pcall(rness.terminals.inspect, owner(ctx.session, s.selected), s.selected, 500)
     if not ok then
       lines[1] = s.selected .. " is closed."
       lines[2] = "esc: list"
@@ -100,7 +122,7 @@ local function view(ctx)
       local page = math.max(1, rows - 3)
       local maximum = math.max(0, #body - page)
       s.offset = s.follow and maximum or math.min(s.offset, maximum)
-      lines[1] = shorten(summary(t), cols)
+      lines[1] = shorten(summary(t, ctx.session), cols)
       lines[2] = shorten((t.cwd and ("cwd " .. t.cwd .. " | ") or "") .. "up " .. duration(t.uptime_secs)
         .. " | " .. (s.follow and "FOLLOW" or "PAUSED"), cols)
       lines[3] = HELP_DETAIL
@@ -108,17 +130,18 @@ local function view(ctx)
       s.page, s.lines = page, #body
     end
   else
-    local terms = list(ctx.session)
+    local terms, others = all(ctx.session)
     s.terms = terms
     for i, t in ipairs(terms) do if t.id == s.cursor_id then s.cursor = i; break end end
     s.cursor = math.max(1, math.min(s.cursor, #terms))
     s.cursor_id = terms[s.cursor] and terms[s.cursor].id
     lines[1] = "Terminals (" .. #terms .. ")"
-    if #terms == 0 then lines[2] = "No terminals open in this session." end
+      .. ((others or 0) > 0 and (", " .. others .. " in other sessions") or "")
+    if #terms == 0 then lines[2] = "No terminals open." end
     local page = math.max(1, rows - 2)
     local first = math.max(1, s.cursor - page + 1)
     for i = first, math.min(#terms, first + page - 1) do
-      lines[#lines + 1] = shorten((i == s.cursor and "> " or "  ") .. summary(terms[i]), cols)
+      lines[#lines + 1] = shorten((i == s.cursor and "> " or "  ") .. summary(terms[i], ctx.session), cols)
     end
     lines[#lines + 1] = HELP_LIST
   end
@@ -145,12 +168,12 @@ local function on_key(key, ctx)
     return "close"
   end
   if key == "s" and target then
-    local ok, err = pcall(rness.terminals.stop, ctx.session, target)
+    local ok, err = pcall(rness.terminals.stop, owner(ctx.session, target), target)
     if not ok then notify(ctx, tostring(err)) end
     return true
   end
   if key == "x" and target then
-    local ok, err = pcall(rness.terminals.close, ctx.session, target)
+    local ok, err = pcall(rness.terminals.close, owner(ctx.session, target), target)
     if not ok then notify(ctx, tostring(err)) end
     s.selected, s.offset, s.follow = nil, 0, true
     return true
@@ -199,14 +222,14 @@ rness.commands.register {
   arguments = { "list", "stop", "close" },
   allow_busy = true,
   complete = function(ctx)
-    local terms = list(ctx.session)
+    local terms = all(ctx.session)
     local raw = ctx.raw_input or ""
     local input = raw:match("^%s*(.-)%s*$")
     local choices = {}
     if input == "" then choices[#choices + 1] = choice(raw:gsub("^%s", "", 1), "Open terminals monitor") end
-    choices[#choices + 1] = choice("list", "List terminals in this session")
+    choices[#choices + 1] = choice("list", "List terminals, this session's first")
     for _, t in ipairs(terms) do
-      local detail = hint(t)
+      local detail = hint(t) .. (t.owner ~= ctx.session and " · other session" or "")
       choices[#choices + 1] = choice(t.id, detail)
       if t.running then choices[#choices + 1] = choice("stop " .. t.id, "Stop: " .. detail) end
       choices[#choices + 1] = choice("close " .. t.id, "Close: " .. detail)
@@ -217,26 +240,31 @@ rness.commands.register {
     local input = ctx.raw_input:match("^%s*(.-)%s*$")
     if input == "" then return open(ctx) end
     if input == "list" then
-      local terms = list(ctx.session)
-      if #terms == 0 then return { message = "No terminals open in this session." } end
-      local lines = { "Terminals in this session:" }
-      for _, t in ipairs(terms) do lines[#lines + 1] = summary(t) end
+      local terms = all(ctx.session)
+      if #terms == 0 then return { message = "No terminals open." } end
+      local lines, header = {}, nil
+      for _, t in ipairs(terms) do
+        local here = t.owner == ctx.session
+        local want = here and "Terminals in this session:" or "In other sessions (still running):"
+        if want ~= header then lines[#lines + 1], header = want, want end
+        lines[#lines + 1] = summary(t, ctx.session)
+      end
       lines[#lines + 1] = "Watch: /terminals <id>   Stop: /terminals stop <id>   Close: /terminals close <id>"
       return { message = table.concat(lines, "\n"), data = terms }
     end
     local verb, id = input:match("^(%a+)%s+(%S+)$")
     if verb == "stop" or verb == "kill" then
-      local stopping = rness.terminals.stop(ctx.session, id)
+      local stopping = rness.terminals.stop(owner(ctx.session, id), id)
       return { message = stopping
         and ("Stopping the command in " .. id .. " (Ctrl-C, then TERM/KILL if it keeps running).")
         or (id .. " has no command running.") }
     end
     if verb == "close" then
-      rness.terminals.close(ctx.session, id)
+      rness.terminals.close(owner(ctx.session, id), id)
       return { message = "Closed " .. id .. "." }
     end
     assert(not input:find("%s"), usage)
-    rness.terminals.inspect(ctx.session, input, 0)
+    rness.terminals.inspect(owner(ctx.session, input), input, 0)
     return open(ctx, input)
   end,
 }

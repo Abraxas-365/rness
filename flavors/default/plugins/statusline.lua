@@ -152,7 +152,8 @@ rness.ui.statusline = {
           style = { fg = "#fabd2f" } }
       end
     end
-    -- Open persistent terminals; bright while a command runs in one.
+    -- Open persistent terminals; bright while a command runs in one. Those
+    -- of other sessions keep running after a switch, so they're shown too.
     if ctx.session and rness.terminals then
       local ok, count = pcall(rness.terminals.count, ctx.session)
       if ok and type(count) == "table" and (count.open or 0) > 0 then
@@ -160,6 +161,14 @@ rness.ui.statusline = {
         if (count.running or 0) > 0 then text = text .. " (" .. count.running .. " running)" end
         parts[#parts + 1] = { text = text,
           style = { fg = (count.running or 0) > 0 and "#8ec07c" or "#928374" } }
+      end
+      if ok and type(count) == "table" and (count.elsewhere or 0) > 0 then
+        local text = "+" .. count.elsewhere .. " term" .. (count.elsewhere == 1 and "" or "s")
+          .. " elsewhere"
+        if (count.elsewhere_running or 0) > 0 then
+          text = text .. " (" .. count.elsewhere_running .. " running)"
+        end
+        parts[#parts + 1] = { text = text, style = { fg = "#928374" } }
       end
     end
     parts[#parts + 1] = { text = ctx.profile or "" }

@@ -261,6 +261,11 @@ enum AuthAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The terminal cleanup helper re-executes this binary (see
+    // rness_tools::terminal::configure_reaper); it does nothing else.
+    if std::env::args().nth(1).as_deref() == Some(TERMINAL_REAPER_ARG) {
+        std::process::exit(rness_tools::terminal::run_reaper());
+    }
     raise_fd_limit();
     let cli = Cli::parse();
     #[cfg(feature = "experimental-control")]
@@ -815,6 +820,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
+    if let Ok(exe) = std::env::current_exe() {
+        let mut helper = std::process::Command::new(exe);
+        helper.arg(TERMINAL_REAPER_ARG);
+        rness_tools::terminal::configure_reaper(helper);
+    }
     let terminals = rness_tools::terminal::TerminalRegistry::with_config(startup.terminal.clone());
     rness_tools::terminal::register_terminal_tools(
         &tools,
@@ -828,6 +838,8 @@ async fn main() -> anyhow::Result<()> {
     // Every exit path (TUI quit, headless end, `?` errors) ends the
     // terminals' processes, including `&` jobs their shells started.
     let _terminals_cleanup = TerminalsCleanup(terminals.clone());
+    #[cfg(unix)]
+    close_terminals_on_signal(&terminals, interactive);
     // A one-shot subagent never runs again once it settles, so nothing
     // could use its terminals: close them (off the bus thread, since
     // closing waits out a short grace).
@@ -1231,6 +1243,51 @@ struct TerminalsCleanup(rness_tools::terminal::TerminalRegistry);
 impl Drop for TerminalsCleanup {
     fn drop(&mut self) {
         self.0.close_all();
+    }
+}
+
+/// argv[1] that runs the terminal cleanup helper instead of rness.
+const TERMINAL_REAPER_ARG: &str = "__rness-terminal-reaper";
+
+/// A TERM, HUP, INT or QUIT would end rness without running any cleanup:
+/// restore the user's terminal, close every terminal, then die of the same
+/// signal (so the exit status still says which).
+#[cfg(unix)]
+fn close_terminals_on_signal(terminals: &rness_tools::terminal::TerminalRegistry, tty: bool) {
+    use tokio::signal::unix::{signal, SignalKind};
+    for (kind, number) in [
+        (SignalKind::terminate(), libc::SIGTERM),
+        (SignalKind::hangup(), libc::SIGHUP),
+        (SignalKind::interrupt(), libc::SIGINT),
+        (SignalKind::quit(), libc::SIGQUIT),
+    ] {
+        let Ok(mut stream) = signal(kind) else {
+            continue;
+        };
+        let terminals = terminals.clone();
+        tokio::spawn(async move {
+            if stream.recv().await.is_none() {
+                return;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                if tty {
+                    let _ = crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::event::DisableMouseCapture,
+                        crossterm::event::DisableBracketedPaste,
+                        crossterm::cursor::Show
+                    );
+                    ratatui::restore();
+                }
+                terminals.close_all();
+                // SAFETY: plain FFI; the default action ends the process.
+                unsafe {
+                    libc::signal(number, libc::SIG_DFL);
+                    libc::raise(number);
+                }
+            })
+            .await;
+        });
     }
 }
 

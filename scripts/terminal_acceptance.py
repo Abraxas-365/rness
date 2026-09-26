@@ -267,6 +267,37 @@ def main():
         survivor = pid_of(f"sleep {quit_fg}")
         check("cancel leaves the command running", alive(survivor))
 
+        # Another session still sees, and can stop, this session's terminal.
+        keys("C-s")
+        time.sleep(0.8)
+        keys("f")
+        check("switched to a forked session", wait_for(r"\+1 term elsewhere \(1 running\)", 15))
+        say("/terminals list")
+        check("/terminals list shows other sessions",
+              wait_for(rf"In other sessions \(still running\):.*\n.*term-1 dev .*sleep {quit_fg} \(session", 10))
+        say("/terminals stop term-1")
+        check("stop from another session", wait_for(r"Stopping the command in term-1", 10))
+        end = time.monotonic() + 5
+        while alive(survivor) and time.monotonic() < end:
+            time.sleep(0.2)
+        check("it ended the command", not alive(survivor))
+        say(f"TS60000 sleep {quit_fg}")
+        check("this session's model can't reach it",
+              wait_for(r"TOOL RESULT: .*term-1.* belongs to another session", 15))
+        # Back to the first session (the picker lists newest first).
+        keys("C-s")
+        time.sleep(0.8)
+        keys("j")
+        time.sleep(0.3)
+        keys("Enter")
+        check("switched back", wait_for(r"1 term ·", 15))
+        say(f"TS60000 sleep {quit_fg}")
+        check("send is waiting again", wait_for(r"1 term \(1 running\)", 20))
+        time.sleep(1)
+        keys("C-c")
+        wait_for(r"cancelled", 10)
+        survivor = pid_of(f"sleep {quit_fg}")
+
         # First quit asks; the second exits and ends everything.
         time.sleep(1)
         keys("C-d")

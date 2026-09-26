@@ -50,7 +50,7 @@ With the default flavor's `terminals` plugin, these commands work even while the
 
 | Command | Action |
 | --- | --- |
-| `/terminals` | Open the terminals monitor: a list of this session's terminals. |
+| `/terminals` | Open the terminals monitor: this session's terminals, then those of other sessions. |
 | `/terminals <term_id>` | Open the monitor on that terminal's live output. |
 | `/terminals list` | Print each terminal's id, name, shell, state, and current command. |
 | `/terminals stop <term_id>` | Stop the command running in that terminal. The shell stays open. `/terminals kill <term_id>` is the same. |
@@ -64,7 +64,11 @@ Completion offers the open ids, with `stop` shown only for terminals that are ru
 Terminals in this session:
 term-1 dev [bash, controlled] running 2m14s — npm run dev
 term-2 [bash, controlled] idle (last exit 1)
+In other sessions (still running):
+term-4 api [bash, controlled] running 12m3s — cargo run (session 3DZ99GQ6)
 ```
+
+Terminals belong to the rness session that opened them, and they keep running when you switch to another session. The user controls here (list, monitor, stop, close, and completion) cover every session, so you can always find and stop a server started in a session you've left. The owning session is shown by the last 8 characters of its id. The model sees only its own session's terminals.
 
 **Stop** sends Ctrl-C (`INT`) to the foreground command. If the command is still running after about a second, rness sends `TERM`, then `KILL`. It only targets the foreground command. The shell survives, and so do jobs that the command line started in the background with `&`. The command returns at once; the escalation happens in the background.
 
@@ -83,7 +87,7 @@ The monitor refreshes every 500 ms and shows the terminal's working directory (m
 
 ### Statusline and tool cards
 
-The default statusline shows `1 term` or `N terms` while terminals are open in the session, and `N terms (M running)` in a brighter colour while any of them is running a command.
+The default statusline shows `1 term` or `N terms` while terminals are open in the session, and `N terms (M running)` in a brighter colour while any of them is running a command. Terminals of other sessions add a dim `+N terms elsewhere (M running)`.
 
 The `terminal_send` card shows the command, the last 12 lines of output, and the outcome on the right: `exit 0` in green, `exit 1` in red, and `still running`, `waiting for input`, or `background` highlighted. `terminal_open`, `terminal_signal`, and `terminal_close` get one-line cards.
 
@@ -105,13 +109,15 @@ If a terminal command is running when you quit (Ctrl-D, or Ctrl-C while no turn 
 1 terminal command is still running (term-1: npm run dev). Quit again within 5s to stop them and exit, or /terminals to manage this session's.
 ```
 
-The list covers terminals in every session of this rness process; `/terminals` shows only the current session's.
+The list covers terminals in every session of this rness process, as does `/terminals`.
 
 Quit again within 5 seconds to exit. On exit, rness closes every terminal and ends every process started in it, including `&` background jobs, even when the shell itself already exited. Closing all terminals runs in parallel, so exit waits at most one 0.5 s grace period. This happens on every normal exit path, including headless runs (which never prompt) and startup errors. Set `confirm_quit = false` to skip the prompt.
 
 Cleanup finds processes by their session id. `nohup` and `disown` don't change it, so those processes are still ended. Programs that start a new session on purpose (`setsid`, self-daemonizing servers) are out of reach, and so are processes started through another service, such as `tmux new -d` or `docker run -d`. rness doesn't stop them.
 
-If rness itself is killed by a signal, it can't clean up; the shells then receive the terminal hangup when their PTY closes, which ends most programs but not ones that ignore `SIGHUP`.
+If rness is ended by `SIGTERM`, `SIGHUP` (its own terminal window closed), `SIGINT`, or `SIGQUIT`, it restores your terminal's settings, closes every terminal the same way, and then exits with that signal's status.
+
+`SIGKILL` and crashes leave no chance to run code. For those, rness starts a small helper process when the first terminal opens: the rness binary again, run as `rness __rness-terminal-reaper`, in its own process group. It holds nothing but the list of open terminals' session ids and a pipe from rness. When the pipe closes, however rness ended, it ends what is still running in those terminals, `nohup` jobs included (`SIGHUP`, 0.5 s, `SIGKILL`). Terminals rness already closed are taken off its list, so after a normal exit it has nothing to do. If the helper can't start, rness logs a warning and runs without it. Your terminal's settings are not restored after `SIGKILL`; run `reset` if the screen is garbled.
 
 ## Shells
 
@@ -162,13 +168,13 @@ The terminal tools, the quit prompt, and cleanup on exit work without the plugin
 4. `/terminals stop term-1` returns the statusline to `1 term`.
 5. Start the server again and quit. The first quit shows the prompt, and the second exits. Afterwards `pgrep -f http.server` finds nothing.
 
-For an automated version, `python3 scripts/terminal_acceptance.py` runs the built binary in tmux with the default flavor, a throwaway HOME, and a scripted local mock model, so it needs no credentials. It needs tmux and bash. It checks the cards, exit codes, input waits, the statusline, `/terminals`, the monitor, stop, cancel, that a one-shot subagent's terminal closes when it finishes, the quit prompt, and that no process survives quitting.
+For an automated version, `python3 scripts/terminal_acceptance.py` runs the built binary in tmux with the default flavor, a throwaway HOME, and a scripted local mock model, so it needs no credentials. It needs tmux and bash. It checks the cards, exit codes, input waits, the statusline, `/terminals`, the monitor, stop, cancel, that a one-shot subagent's terminal closes when it finishes, seeing and stopping a terminal from another session, the quit prompt, and that no process survives quitting. `python3 scripts/terminal_signal_acceptance.py` kills rness with `KILL`, `TERM`, `HUP`, and `INT` while a terminal runs a foreground command, an `&` job, and a `nohup` job. It checks that none survives, the exit status, and that terminal settings come back.
 
 ## Limitations
 
 - **No terminal emulation.** Output is cleaned text, not a screen. Full-screen programs (vim, htop, less, `top`) are detected and reported instead of shown. Programs that redraw with cursor movement can still produce odd text.
 - **Input detection on macOS.** Only Linux can see that a command is blocked reading the terminal. On macOS a silent command reports `still running, no output for 5s; it may be waiting for input`.
 - **Login shells** report no exit codes, and heavily customised prompts (zsh themes, `precmd` hooks) can delay or confuse completion detection.
-- **Not persisted.** Terminals are processes of the running rness. They are not restored after a restart. They close when rness exits, when they're closed explicitly or go idle (`idle_close_secs`), or when the one-shot subagent that opened them finishes. rness has no session deletion, and switching sessions leaves terminals open.
+- **Not persisted.** Terminals are processes of the running rness. They are not restored after a restart. They close when rness exits (even by `SIGKILL`), when they're closed explicitly or go idle (`idle_close_secs`), or when the one-shot subagent that opened them finishes. rness has no session deletion. Switching sessions leaves terminals open, and `/terminals` and the statusline keep showing them.
 - **Scrollback** keeps the latest 256 KiB per terminal. A single send or read returns at most 64 KiB.
 - **Idle timeout is off by default.** Without `idle_close_secs`, terminals stay open until closed. `max_sessions` caps how many one rness session can have open.

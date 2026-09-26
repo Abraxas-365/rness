@@ -19,7 +19,10 @@
 //! code. `shell = "login"` opts into the user's own shell instead, where
 //! completion is inferred from the terminal's foreground process group.
 
+mod reaper;
 mod sanitize;
+
+pub use reaper::{configure as configure_reaper, run as run_reaper};
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -785,6 +788,10 @@ impl TerminalRegistry {
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("failed to spawn shell: {e}"))?;
+        // The shell leads its own session; have it swept even if rness dies.
+        if let Some(sid) = child.process_id().and_then(|pid| i32::try_from(pid).ok()) {
+            reaper::watch(sid);
+        }
 
         let writer = pair
             .master
@@ -1391,20 +1398,33 @@ impl TerminalRegistry {
 
     /// List open terminal sessions owned by the given session.
     pub fn list(&self, owner: &str) -> Vec<TerminalInfo> {
+        let mut list = self.list_where(|s| s.owner == owner);
+        sort_by_number(&mut list);
+        list
+    }
+
+    /// Every open terminal, whichever session owns it (for the user, who
+    /// sees all of rness; the model only ever sees its session's).
+    pub fn list_all(&self) -> Vec<TerminalInfo> {
+        let mut list = self.list_where(|_| true);
+        sort_by_number(&mut list);
+        list
+    }
+
+    /// The session that owns terminal `id`, if it's open.
+    pub fn owner_of(&self, id: &str) -> Option<String> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.sessions.get(id).map(|s| s.owner.clone())
+    }
+
+    fn list_where(&self, keep: impl Fn(&TerminalSession) -> bool) -> Vec<TerminalInfo> {
         let mut inner = self.inner.lock().expect("registry lock");
-        let mut list: Vec<_> = inner
+        inner
             .sessions
             .values_mut()
-            .filter(|s| s.owner == owner)
+            .filter(|s| keep(s))
             .map(TerminalSession::info)
-            .collect();
-        list.sort_by_key(|info| {
-            info.id
-                .strip_prefix("term-")
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(u64::MAX)
-        });
-        list
+            .collect()
     }
 
     /// How many of `owner`'s terminals have a command running.
@@ -1585,6 +1605,9 @@ fn terminate(mut session: TerminalSession) {
         let _ = session.child.kill();
     }
     let _ = session.child.wait();
+    if let Some(sid) = session.shell_pid.and_then(|pid| i32::try_from(pid).ok()) {
+        reaper::unwatch(sid);
+    }
 }
 
 /// Processes whose session id is `sid`: everything started from a
@@ -1662,6 +1685,16 @@ fn all_pids() -> Vec<i32> {
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn all_pids() -> Vec<i32> {
     Vec::new()
+}
+
+/// Numeric order: term-2 before term-10.
+fn sort_by_number(list: &mut [TerminalInfo]) {
+    list.sort_by_key(|info| {
+        info.id
+            .strip_prefix("term-")
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    });
 }
 
 /// `owner` may open another terminal, or the error that says what to do.
@@ -1860,6 +1893,8 @@ impl Drop for RegistryInner {
 pub struct TerminalInfo {
     pub id: String,
     pub name: String,
+    /// The rness session that owns it.
+    pub owner: String,
     /// "bash, controlled", "zsh, login", ...
     pub shell: String,
     /// "idle at prompt", "command running", "exited (exit code 1)".
@@ -1907,6 +1942,7 @@ impl TerminalSession {
         TerminalInfo {
             id: self.id.clone(),
             name: self.name.clone(),
+            owner: self.owner.clone(),
             shell: self.shell.clone(),
             state: state.to_string(),
             running,

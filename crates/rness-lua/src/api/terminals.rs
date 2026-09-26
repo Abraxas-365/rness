@@ -4,7 +4,9 @@
 use mlua::{Lua, LuaSerdeExt, Table};
 use rness_tools::terminal::TerminalRegistry;
 
-const FUNCTIONS: [&str; 5] = ["count", "list", "inspect", "stop", "close"];
+const FUNCTIONS: [&str; 7] = [
+    "count", "list", "list_all", "owner", "inspect", "stop", "close",
+];
 /// Scrollback lines `inspect` returns unless asked otherwise.
 const DEFAULT_LINES: usize = 40;
 const MAX_LINES: usize = 500;
@@ -28,10 +30,18 @@ pub fn install(lua: &Lua, rness: &Table, registry: TerminalRegistry) -> mlua::Re
     terminals.set(
         "count",
         lua.create_function(move |lua, session: String| {
-            let list = r.list(&session);
+            let all = r.list_all();
+            let (mine, others): (Vec<_>, Vec<_>) = all.iter().partition(|t| t.owner == session);
             let out = lua.create_table()?;
-            out.set("open", list.len())?;
-            out.set("running", list.iter().filter(|t| t.running).count())?;
+            out.set("open", mine.len())?;
+            out.set("running", mine.iter().filter(|t| t.running).count())?;
+            // Open in other rness sessions (their terminals keep running
+            // when you switch away).
+            out.set("elsewhere", others.len())?;
+            out.set(
+                "elsewhere_running",
+                others.iter().filter(|t| t.running).count(),
+            )?;
             Ok(out)
         })?,
     )?;
@@ -45,6 +55,22 @@ pub fn install(lua: &Lua, rness: &Table, registry: TerminalRegistry) -> mlua::Re
             }
             Ok(out)
         })?,
+    )?;
+    let r = registry.clone();
+    terminals.set(
+        "list_all",
+        lua.create_function(move |lua, ()| {
+            let out = lua.create_table()?;
+            for (i, terminal) in r.list_all().into_iter().enumerate() {
+                out.set(i + 1, lua.to_value(&terminal)?)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+    let r = registry.clone();
+    terminals.set(
+        "owner",
+        lua.create_function(move |_, id: String| Ok(r.owner_of(&id)))?,
     )?;
     let r = registry.clone();
     terminals.set(

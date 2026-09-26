@@ -190,6 +190,19 @@ async fn plugin_monitor_card_and_statusline() {
 
     let host = LuaHost::spawn().unwrap();
     host.install_terminals(terminals.clone()).await.unwrap();
+    // Capture /terminals so it can be run from another session below.
+    host.load(
+        "capture",
+        r#"
+        local register = rness.commands.register
+        rness.commands.register = function(spec)
+            if spec.name == 'terminals' then _G.terminals_command = spec end
+            return register(spec)
+        end
+    "#,
+    )
+    .await
+    .unwrap();
     host.load("terminals", PLUGIN).await.unwrap();
 
     let ctx = json!({"session":"one","rows":10,"cols":100});
@@ -213,18 +226,49 @@ async fn plugin_monitor_card_and_statusline() {
         .join("\n");
     assert!(detail.contains("monitor-line"), "{detail}");
     assert!(detail.contains("FOLLOW"), "{detail}");
-    // Other sessions see nothing.
-    let other = host
-        .app_view("terminals", json!({"session":"two","rows":10,"cols":100}))
-        .await
-        .unwrap();
-    assert!(other[1].contains("No terminals"), "{other:?}");
+    // Another session sees it too, marked with its owner.
+    let other_ctx = json!({"session":"two","rows":10,"cols":100});
+    let other = host.app_view("terminals", other_ctx.clone()).await.unwrap();
+    assert!(other[0].contains("(1), 1 in other sessions"), "{other:?}");
+    assert!(
+        other[1].starts_with("> term-1 server") && other[1].contains("(session one)"),
+        "{other:?}"
+    );
+    host.load(
+        "list-from-two",
+        r#"
+        local r = _G.terminals_command.run({session = 'two', raw_input = 'list'})
+        assert(r.message:find('In other sessions (still running):\nterm-1 server', 1, true), r.message)
+        assert(rness.terminals.owner('term-1') == 'one')
+        assert(rness.terminals.owner('term-99') == nil)
+        local c = rness.terminals.count('two')
+        assert(c.open == 0 and c.elsewhere == 1 and c.elsewhere_running == 1, 'count')
+        assert(#rness.terminals.list_all() == 1 and rness.terminals.list_all()[1].owner == 'one')
+    "#,
+    )
+    .await
+    .unwrap();
 
-    // `s` in the detail view stops the command without blocking.
+    // `s` in the detail view stops the command without blocking, also from
+    // a session that doesn't own the terminal.
     assert_eq!(
-        host.app_key("terminals", "s", ctx.clone()).await.unwrap(),
+        host.app_key("terminals", "enter", other_ctx.clone())
+            .await
+            .unwrap(),
         Consumed
     );
+    assert_eq!(
+        host.app_key("terminals", "s", other_ctx.clone())
+            .await
+            .unwrap(),
+        Consumed
+    );
+    let notice = host
+        .app_view("terminals", other_ctx.clone())
+        .await
+        .unwrap()
+        .join("\n");
+    assert!(!notice.contains("! "), "{notice}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     while terminals.running_count("one") > 0 {
         assert!(std::time::Instant::now() < deadline, "stop never finished");
@@ -283,8 +327,9 @@ async fn statusline_counts_terminals() {
         r#"
         rness.session = {usage=function() return {input=0} end, config=function() return {} end}
         rness.terminals.count = function(session)
-            if session == 'one' then return {open=2, running=1} end
-            if session == 'two' then return {open=1, running=0} end
+            if session == 'one' then return {open=2, running=1, elsewhere=0} end
+            if session == 'two' then return {open=1, running=0, elsewhere=0} end
+            if session == 'four' then return {open=0, running=0, elsewhere=3, elsewhere_running=1} end
             return {open=0, running=0}
         end
     "#,
@@ -318,4 +363,13 @@ async fn statusline_counts_terminals() {
         .unwrap()
         .to_string();
     assert!(!text.contains("term"), "{text}");
+    let text = host
+        .status(json!({"session":"four"}))
+        .await
+        .unwrap()
+        .to_string();
+    assert!(
+        text.contains("+3 terms elsewhere (1 running)") && !text.contains("\"0 term"),
+        "{text}"
+    );
 }
