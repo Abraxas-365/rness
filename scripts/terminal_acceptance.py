@@ -10,6 +10,8 @@ PASS/FAIL per check and exits with the failure count.
 The mock model maps each user prompt to one tool call:
     TO            -> terminal_open {name: "dev"}
     TS[ms] <cmd>  -> terminal_send {session_id: "term-1", text: <cmd>, wait_ms: ms}
+    SUB <cmd>     -> subagent (spawn) whose child opens a terminal, starts
+                     <cmd> there, and finishes while it still runs
 and answers a tool result with "TOOL RESULT: <text>".
 """
 import json
@@ -38,16 +40,31 @@ def text_of(msg):
 
 def decide(messages):
     last = messages[-1]
-    if last.get("role") == "tool":
-        return {"text": "TOOL RESULT: " + text_of(last)[:300].replace("\n", " | ")}
     users = [m for m in messages if m.get("role") == "user"]
     prompt = text_of(users[-1]).strip() if users else ""
+    child = re.match(r"CHILD (.*)", prompt, re.S)
+    if child:
+        # The one-shot child: open a terminal, start the command, finish.
+        results = [text_of(m) for m in messages if m.get("role") == "tool"]
+        if not results:
+            return {"tool": "terminal_open", "args": {"name": "child"}}
+        if len(results) == 1:
+            term = re.search(r"term-\d+", results[0])
+            return {"tool": "terminal_send", "args": {
+                "session_id": term.group(0) if term else "term-2",
+                "text": child.group(1), "wait_ms": 1000}}
+        return {"text": "child done"}
+    if last.get("role") == "tool":
+        return {"text": "TOOL RESULT: " + text_of(last)[:300].replace("\n", " | ")}
     if prompt == "TO":
         return {"tool": "terminal_open", "args": {"name": "dev"}}
     m = re.match(r"TS(\d*) (.*)", prompt, re.S)
     if m:
         return {"tool": "terminal_send", "args": {
             "session_id": "term-1", "text": m.group(2), "wait_ms": int(m.group(1) or 1500)}}
+    sub = re.match(r"SUB (.*)", prompt, re.S)
+    if sub:
+        return {"tool": "subagent", "args": {"provider": "spawn", "prompt": "CHILD " + sub.group(1)}}
     return {"text": "ok"}
 
 
@@ -158,9 +175,13 @@ def main():
     work = home / "work"
     work.mkdir()
     shutil.copytree(REPO / "flavors/default", home / ".rness")
+    # Generic children, so the one-shot subagent gets the terminal tools.
+    agents = home / ".rness/lua/agents.lua"
+    agents.write_text(agents.read_text().replace(
+        "rness.agents.allow_generic = false", "rness.agents.allow_generic = true"))
     # Unique sleep durations so the pids we look up are ours.
     stamp = 700 + os.getpid() % 200
-    long_bg, long_fg, quit_fg = stamp, stamp + 1, stamp + 2
+    long_bg, long_fg, quit_fg, child_fg = stamp, stamp + 1, stamp + 2, stamp + 3
 
     failures = 0
 
@@ -224,6 +245,19 @@ def main():
         check("stop keeps the & job", alive(bg))
         check("statusline back to idle", wait_for(r"1 term ·", 10))
 
+        # A one-shot subagent's terminals close when it finishes.
+        say(f"SUB sleep {child_fg}")
+        seen_child, end = None, time.monotonic() + 30
+        while time.monotonic() < end and not re.search(r"TOOL RESULT: .*child done", pane()):
+            seen_child = seen_child or pid_of(f"sleep {child_fg}")
+            time.sleep(0.1)
+        check("subagent ran its command", bool(seen_child) and "child done" in pane())
+        end = time.monotonic() + 5
+        while alive(seen_child) and time.monotonic() < end:
+            time.sleep(0.2)
+        check("subagent's terminal closed with it", seen_child and not alive(seen_child))
+        check("parent's terminal kept", wait_for(r"1 term ·", 5))
+
         # Cancel stops waiting but leaves the command running.
         say(f"TS60000 sleep {quit_fg}")
         check("send is waiting", wait_for(r"1 term \(1 running\)", 20))
@@ -246,7 +280,7 @@ def main():
     finally:
         tmux("kill-session", "-t", TMUX)
         server.shutdown()
-        for n in (long_bg, long_fg, quit_fg):
+        for n in (long_bg, long_fg, quit_fg, child_fg):
             pid = pid_of(f"sleep {n}")
             if pid:
                 os.kill(pid, signal.SIGKILL)

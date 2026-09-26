@@ -2094,7 +2094,7 @@ mod tests {
         std::fs::write(
             &path,
             "rness.terminal = { shell = 'login', env_deny = { '*_TOKEN', 'AWS_*', 'GH_PAT' }, \
-             max_sessions = 3, confirm_quit = false }",
+             max_sessions = 3, confirm_quit = false, idle_close_secs = 600 }",
         )
         .unwrap();
         let config = load(&path).unwrap().terminal;
@@ -2102,9 +2102,12 @@ mod tests {
         assert_eq!(config.env_deny, ["*_TOKEN", "AWS_*", "GH_PAT"]);
         assert_eq!(config.max_sessions, 3);
         assert!(!config.confirm_quit);
+        assert_eq!(config.idle_close_secs, 600);
         for invalid in [
             "{ typo = 1 }",
             "{ shell = 'fish' }",
+            "{ idle_close_secs = 10 }",
+            "{ idle_close_secs = -1 }",
             "{ max_sessions = 0 }",
             "{ max_sessions = 1000 }",
             "{ max_sessions = 'many' }",

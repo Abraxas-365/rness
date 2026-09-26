@@ -63,6 +63,11 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(500);
 /// Holds a terminal's job slot between typing a background command and
 /// learning its job id.
 const JOB_STARTING: &str = "(starting)";
+/// Shortest `idle_close_secs`: a minute, so a terminal isn't closed
+/// between two model turns.
+const MIN_IDLE_CLOSE_SECS: u64 = 60;
+/// Closed ids remembered to explain a later "not found".
+const MAX_RETIRED: usize = 64;
 
 /// Signals `terminal_signal` may deliver. Numbers come from libc because
 /// they differ between platforms (SIGSTOP is 19 on Linux, 17 on macOS).
@@ -206,6 +211,9 @@ struct TerminalSession {
     /// Background job (id) whose command currently owns this terminal.
     job: Option<String>,
     started: Instant,
+    /// Last explicit use by id (send, read, signal, inspect); with the
+    /// latest output, the idle clock for `idle_close_secs`.
+    touched: Instant,
     /// The latest command typed at the prompt, and when.
     last_command: Option<(String, Instant)>,
 }
@@ -294,6 +302,16 @@ impl TerminalSession {
             (None, None) => TerminalState::Unknown,
         }
     }
+
+    /// How long nothing has happened here, or `None` while a command or
+    /// background job keeps it busy.
+    fn idle_for(&mut self) -> Option<Duration> {
+        if self.job.is_some() || self.state() == TerminalState::Running {
+            return None;
+        }
+        let output = self.output.lock().expect("output lock").last_output;
+        Some(output.max(self.touched).elapsed())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,6 +370,19 @@ struct RegistryInner {
     sessions: HashMap<String, TerminalSession>,
     next_id: u64,
     config: TerminalConfig,
+    /// Terminals rness closed on its own (idle, owner finished), with the
+    /// reason, so using one later says why it's gone. Bounded.
+    retired: HashMap<String, (String, String)>,
+}
+
+impl RegistryInner {
+    fn retire(&mut self, id: &str, owner: &str, reason: String) {
+        if self.retired.len() >= MAX_RETIRED {
+            self.retired.clear();
+        }
+        self.retired
+            .insert(id.to_string(), (owner.to_string(), reason));
+    }
 }
 
 /// `rness.terminal = { … }` in init.lua. Unknown keys are rejected.
@@ -369,6 +400,10 @@ pub struct TerminalConfig {
     pub max_sessions: usize,
     /// Ask before quitting while a terminal command is running.
     pub confirm_quit: bool,
+    /// Close a terminal after this many seconds with no command running,
+    /// no background job, and no input or output. `0` (the default) never
+    /// closes terminals on its own.
+    pub idle_close_secs: u64,
 }
 
 impl Default for TerminalConfig {
@@ -378,6 +413,7 @@ impl Default for TerminalConfig {
             env_deny: Vec::new(),
             max_sessions: 8,
             confirm_quit: true,
+            idle_close_secs: 0,
         }
     }
 }
@@ -392,6 +428,11 @@ impl TerminalConfig {
         }
         if self.max_sessions == 0 || self.max_sessions > 64 {
             return Err("rness.terminal.max_sessions must be between 1 and 64".into());
+        }
+        if self.idle_close_secs != 0 && self.idle_close_secs < MIN_IDLE_CLOSE_SECS {
+            return Err(format!(
+                "rness.terminal.idle_close_secs must be 0 (off) or at least {MIN_IDLE_CLOSE_SECS}"
+            ));
         }
         if let Some(bad) = self.env_deny.iter().find(|p| {
             let core = p.strip_prefix('*').unwrap_or(p);
@@ -513,13 +554,89 @@ impl TerminalRegistry {
     }
 
     pub fn with_config(config: TerminalConfig) -> Self {
-        Self {
+        let idle = config.idle_close_secs;
+        let registry = Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 sessions: HashMap::new(),
                 next_id: 1,
                 config,
+                retired: HashMap::new(),
             })),
+        };
+        if idle > 0 {
+            registry.spawn_idle_sweeper(Duration::from_secs(idle));
         }
+        registry
+    }
+
+    /// Close terminals idle for `limit`, checking every few seconds. Holds
+    /// only a weak reference: the thread ends with the registry.
+    fn spawn_idle_sweeper(&self, limit: Duration) {
+        let weak = Arc::downgrade(&self.inner);
+        let every = (limit / 4).clamp(Duration::from_millis(50), Duration::from_secs(15));
+        let _ = std::thread::Builder::new()
+            .name("terminal-idle".into())
+            .spawn(move || loop {
+                std::thread::sleep(every);
+                let Some(inner) = weak.upgrade() else { return };
+                TerminalRegistry { inner }.close_idle(limit);
+            });
+    }
+
+    /// Close every terminal with no activity for `limit`: no command
+    /// running, no background job, no output and nothing typed. Returns the
+    /// closed ids.
+    pub fn close_idle(&self, limit: Duration) -> Vec<String> {
+        let idle: Vec<TerminalSession> = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let ids: Vec<String> = inner
+                .sessions
+                .values_mut()
+                .filter_map(|s| s.idle_for().filter(|d| *d >= limit).map(|_| s.id.clone()))
+                .collect();
+            let secs = limit.as_secs();
+            ids.iter()
+                .filter_map(|id| {
+                    let session = inner.sessions.remove(id)?;
+                    let owner = session.owner.clone();
+                    inner.retire(
+                        id,
+                        &owner,
+                        format!(
+                            "it was closed after {secs}s idle (rness.terminal.idle_close_secs)"
+                        ),
+                    );
+                    Some(session)
+                })
+                .collect()
+        };
+        let ids = idle.iter().map(|s| s.id.clone()).collect();
+        terminate_all(idle);
+        ids
+    }
+
+    /// Close every terminal `owner` has open, e.g. when a one-shot
+    /// subagent finishes: nobody can use them afterwards. Returns the ids.
+    pub fn close_owned_by(&self, owner: &str, reason: &str) -> Vec<String> {
+        let closed: Vec<TerminalSession> = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let ids: Vec<String> = inner
+                .sessions
+                .values()
+                .filter(|s| s.owner == owner)
+                .map(|s| s.id.clone())
+                .collect();
+            ids.iter()
+                .filter_map(|id| {
+                    let session = inner.sessions.remove(id)?;
+                    inner.retire(id, owner, reason.to_string());
+                    Some(session)
+                })
+                .collect()
+        };
+        let ids = closed.iter().map(|s| s.id.clone()).collect();
+        terminate_all(closed);
+        ids
     }
 
     pub fn config(&self) -> TerminalConfig {
@@ -708,6 +825,7 @@ impl TerminalRegistry {
             exit: None,
             job: None,
             started: Instant::now(),
+            touched: Instant::now(),
             last_command: None,
         };
         // Checked again under the insert lock: a concurrent open may have
@@ -1377,32 +1495,37 @@ impl TerminalRegistry {
             let mut inner = self.inner.lock().expect("registry lock");
             inner.sessions.drain().map(|(_, session)| session).collect()
         };
-        // In parallel: each may spend TERMINATE_GRACE waiting on its
-        // processes, and quitting shouldn't pay that once per terminal.
-        let mut handles = Vec::new();
-        for session in sessions {
-            let slot = Arc::new(Mutex::new(Some(session)));
-            let theirs = Arc::clone(&slot);
-            let spawned = std::thread::Builder::new()
-                .name("terminal-close".into())
-                .spawn(move || {
-                    if let Some(session) = theirs.lock().expect("close slot").take() {
-                        terminate(session);
-                    }
-                });
-            match spawned {
-                Ok(handle) => handles.push(handle),
-                // No thread: close it here rather than skip it.
-                Err(_) => {
-                    if let Some(session) = slot.lock().expect("close slot").take() {
-                        terminate(session);
-                    }
+        terminate_all(sessions);
+    }
+}
+
+/// [`terminate`] each session, in parallel: each may spend
+/// TERMINATE_GRACE waiting on its processes, and quitting shouldn't pay
+/// that once per terminal.
+fn terminate_all(sessions: Vec<TerminalSession>) {
+    let mut handles = Vec::new();
+    for session in sessions {
+        let slot = Arc::new(Mutex::new(Some(session)));
+        let theirs = Arc::clone(&slot);
+        let spawned = std::thread::Builder::new()
+            .name("terminal-close".into())
+            .spawn(move || {
+                if let Some(session) = theirs.lock().expect("close slot").take() {
+                    terminate(session);
+                }
+            });
+        match spawned {
+            Ok(handle) => handles.push(handle),
+            // No thread: close it here rather than skip it.
+            Err(_) => {
+                if let Some(session) = slot.lock().expect("close slot").take() {
+                    terminate(session);
                 }
             }
         }
-        for handle in handles {
-            let _ = handle.join();
-        }
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 
@@ -1574,6 +1697,11 @@ fn owned<'a>(
         }
         Some(_) => {}
         None => {
+            if let Some((_, reason)) = inner.retired.get(id).filter(|(o, _)| o == owner) {
+                return Err(format!(
+                    "terminal session '{id}' is closed: {reason}; open a new one with terminal_open"
+                ));
+            }
             let mut open: Vec<_> = inner
                 .sessions
                 .values()
@@ -1597,7 +1725,9 @@ fn owned<'a>(
             });
         }
     }
-    Ok(inner.sessions.get_mut(id).expect("checked above"))
+    let session = inner.sessions.get_mut(id).expect("checked above");
+    session.touched = Instant::now();
+    Ok(session)
 }
 
 /// The terminal's foreground process group, if the platform reports it.
@@ -2828,6 +2958,68 @@ mod tests {
     }
 
     #[test]
+    fn idle_terminals_close_and_say_why() {
+        let registry = TerminalRegistry::new();
+        let idle = ready(&registry);
+        let busy = ready(&registry);
+        run(&registry, &busy, "sleep 30");
+        wait_for_foreground_command(&registry, &busy);
+        std::thread::sleep(Duration::from_millis(400));
+        // `busy` is quiet too, but its command keeps it open.
+        assert_eq!(
+            registry.close_idle(Duration::from_millis(300)),
+            [idle.as_str()]
+        );
+        let err = registry.read(&idle, None, OWNER).unwrap_err();
+        assert!(
+            err.contains("is closed: it was closed after 0s idle"),
+            "{err}"
+        );
+        assert!(err.contains("open a new one with terminal_open"), "{err}");
+        // Only the owner learns the reason; others get the plain error.
+        let other = registry.read(&idle, None, "other").unwrap_err();
+        assert!(other.contains("not found"), "{other}");
+        // Any use by id resets the clock.
+        std::thread::sleep(Duration::from_millis(400));
+        let _ = registry.stop(&busy, OWNER);
+        std::thread::sleep(Duration::from_millis(400));
+        registry.read(&busy, None, OWNER).unwrap();
+        assert!(registry.close_idle(Duration::from_millis(300)).is_empty());
+        registry.close_all();
+    }
+
+    #[test]
+    fn idle_sweeper_runs_when_configured() {
+        let registry = TerminalRegistry::new();
+        registry.spawn_idle_sweeper(Duration::from_millis(200));
+        let id = ready(&registry);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry.list(OWNER).is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(registry.list(OWNER).is_empty(), "{id} not closed when idle");
+    }
+
+    #[test]
+    fn close_owned_by_closes_only_that_owners_terminals() {
+        let registry = TerminalRegistry::new();
+        let dir = std::env::temp_dir();
+        let mine = ready(&registry);
+        let theirs = registry
+            .open(None, ShellChoice::Controlled, dir, "child".into())
+            .unwrap()
+            .id;
+        assert_eq!(
+            registry.close_owned_by("child", "its subagent finished"),
+            [theirs.as_str()]
+        );
+        assert_eq!(registry.list(OWNER).len(), 1);
+        let err = registry.read(&theirs, None, "child").unwrap_err();
+        assert!(err.contains("is closed: its subagent finished"), "{err}");
+        registry.close(&mine, OWNER).unwrap();
+    }
+
+    #[test]
     fn env_deny_withholds_configured_names() {
         let registry = TerminalRegistry::with_config(TerminalConfig {
             env_deny: vec!["RNESS_TEST_DENY_*".into(), "*_PRIVATE_THING".into()],
@@ -2961,9 +3153,19 @@ mod tests {
                 env_deny: vec!["*A*".into()],
                 ..Default::default()
             },
+            TerminalConfig {
+                idle_close_secs: 5,
+                ..Default::default()
+            },
         ] {
             assert!(bad.validate().is_err(), "{bad:?}");
         }
+        assert!(TerminalConfig {
+            idle_close_secs: 60,
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
         assert!(TerminalConfig {
             env_deny: vec!["A".into(), "*_KEY".into(), "AWS_*".into()],
             ..Default::default()

@@ -140,12 +140,14 @@ impl Event for SubagentStartEv {
     type Payload = SubagentStartNotice;
 }
 
-/// Fired when a continuable subagent settles (idles after a turn).
+/// Fired when a subagent settles: a one-shot child once, when its run ends
+/// (it never runs again); a continuable child on every idle after a turn.
 #[derive(Debug, Clone)]
 pub struct SubagentStopNotice {
     pub parent: SessionId,
     pub child: SessionId,
     pub outcome: String,
+    pub mode: rness_protocol::branch::DelegationMode,
 }
 pub struct SubagentStopEv;
 impl Event for SubagentStopEv {

@@ -251,6 +251,7 @@ impl SubagentRuntime {
                         parent: d.parent.clone(),
                         child: child.clone(),
                         outcome: stop.to_string(),
+                        mode: DelegationMode::Continuable,
                     },
                 );
 
@@ -497,6 +498,7 @@ impl SubagentRuntime {
                 parent: request.parent.clone(),
                 child: child.clone(),
                 outcome: outcome.to_string(),
+                mode: DelegationMode::OneShot,
             },
         );
 

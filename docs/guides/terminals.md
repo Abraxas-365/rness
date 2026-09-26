@@ -131,8 +131,13 @@ rness.terminal = {
   env_deny = { "AWS_*", "*_TOKEN", "DATABASE_URL" },
   max_sessions = 8,                   -- per rness session, 1..64
   confirm_quit = true,
+  idle_close_secs = 0,                -- 0 = never; else at least 60
 }
 ```
+
+With `idle_close_secs` set, a terminal closes on its own once it has gone that long with no command running, no background job, no output, and no use by id (`terminal_send`, `terminal_read`, `terminal_signal`, or the `/terminals` stop, close, and monitor views). The model gets `terminal session 'term-N' is closed: it was closed after 600s idle (rness.terminal.idle_close_secs)` if it uses one later.
+
+Terminals opened by a one-shot subagent close when the subagent finishes, since nothing can use them afterwards. A continuable agent keeps its terminals between turns.
 
 Every field is optional. Unknown keys and invalid values stop startup with an error naming the field. See the [reference](../reference/tools/terminal.md#configuration) for exact rules.
 
@@ -157,13 +162,13 @@ The terminal tools, the quit prompt, and cleanup on exit work without the plugin
 4. `/terminals stop term-1` returns the statusline to `1 term`.
 5. Start the server again and quit. The first quit shows the prompt, and the second exits. Afterwards `pgrep -f http.server` finds nothing.
 
-For an automated version, `python3 scripts/terminal_acceptance.py` runs the built binary in tmux with the default flavor, a throwaway HOME, and a scripted local mock model, so it needs no credentials. It needs tmux and bash. It checks the cards, exit codes, input waits, the statusline, `/terminals`, the monitor, stop, cancel, the quit prompt, and that no process survives quitting.
+For an automated version, `python3 scripts/terminal_acceptance.py` runs the built binary in tmux with the default flavor, a throwaway HOME, and a scripted local mock model, so it needs no credentials. It needs tmux and bash. It checks the cards, exit codes, input waits, the statusline, `/terminals`, the monitor, stop, cancel, that a one-shot subagent's terminal closes when it finishes, the quit prompt, and that no process survives quitting.
 
 ## Limitations
 
 - **No terminal emulation.** Output is cleaned text, not a screen. Full-screen programs (vim, htop, less, `top`) are detected and reported instead of shown. Programs that redraw with cursor movement can still produce odd text.
 - **Input detection on macOS.** Only Linux can see that a command is blocked reading the terminal. On macOS a silent command reports `still running, no output for 5s; it may be waiting for input`.
 - **Login shells** report no exit codes, and heavily customised prompts (zsh themes, `precmd` hooks) can delay or confuse completion detection.
-- **Not persisted.** Terminals are processes of the running rness. They are not restored after a restart, and they close only when rness exits or they're closed explicitly, not when you switch or delete sessions.
+- **Not persisted.** Terminals are processes of the running rness. They are not restored after a restart. They close when rness exits, when they're closed explicitly or go idle (`idle_close_secs`), or when the one-shot subagent that opened them finishes. rness has no session deletion, and switching sessions leaves terminals open.
 - **Scrollback** keeps the latest 256 KiB per terminal. A single send or read returns at most 64 KiB.
-- **No idle timeout.** Terminals stay open until closed. `max_sessions` caps how many one rness session can have open.
+- **Idle timeout is off by default.** Without `idle_close_secs`, terminals stay open until closed. `max_sessions` caps how many one rness session can have open.

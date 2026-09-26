@@ -110,7 +110,7 @@ Ends every process in the shell's session (the foreground command, `&` jobs, the
 
 ### Errors
 
-An unknown id fails with `terminal session 'term-9' not found; open: term-1 (work), term-2` or `…; none are open, start one with terminal_open`. A terminal owned by another session fails with `terminal session 'term-N' belongs to another session`, and `terminal_list` and `rness.terminals.list` never show it.
+An unknown id fails with `terminal session 'term-9' not found; open: term-1 (work), term-2` or `…; none are open, start one with terminal_open`. A terminal owned by another session fails with `terminal session 'term-N' belongs to another session`, and `terminal_list` and `rness.terminals.list` never show it. A terminal rness closed on its own fails, for its owner, with `terminal session 'term-N' is closed: <reason>; open a new one with terminal_open`, where the reason is `it was closed after Ns idle (rness.terminal.idle_close_secs)` or `its subagent finished`. The most recent 64 such ids are remembered; older ones get the not-found error.
 
 ## Lua API: `rness.terminals`
 
@@ -160,8 +160,9 @@ end
 | `env_deny` | array of strings | `{}` | Extra variables to withhold, case-insensitive. Each entry is an exact name, `"PREFIX*"`, or `"*SUFFIX"`. |
 | `max_sessions` | integer | `8` | Open terminals per rness session, `1`–`64`. |
 | `confirm_quit` | boolean | `true` | Quitting the TUI while a terminal command runs needs a second quit within 5 seconds. |
+| `idle_close_secs` | integer | `0` | `0` never closes terminals on their own. Otherwise at least `60`: a terminal closes after that many seconds with no command running, no background job, no output, and no use by id. Checked every `min(limit/4, 15 s)`. |
 
-Validation errors stop startup, for example `rness.terminal.max_sessions must be between 1 and 64` or `rness.terminal.env_deny entry "*X*" must be a name, "PREFIX*" or "*SUFFIX"`.
+Validation errors stop startup, for example `rness.terminal.max_sessions must be between 1 and 64`, `rness.terminal.idle_close_secs must be 0 (off) or at least 60`, or `rness.terminal.env_deny entry "*X*" must be a name, "PREFIX*" or "*SUFFIX"`.
 
 Built-in withholding applies regardless of `env_deny`: `API_KEY` and names ending in `_API_KEY`, `_SECRET`, `_SECRET_KEY`, `_ACCESS_KEY`, or `_PASSWORD`.
 
@@ -176,6 +177,8 @@ Built-in withholding applies regardless of `env_deny`: `API_KEY` and names endin
 | `terminal_close`, `rness.terminals.close`, `/terminals close` | Whole terminal session, even after the shell exited: HUP, 0.5 s, KILL |
 | `/terminals stop`, `rness.terminals.stop`, `job_kill` on a terminal job | Foreground group only: INT, TERM, KILL, about 1 s apart |
 | rness exits normally (any path) | Every terminal closed as above, in parallel |
+| Idle for `idle_close_secs` (when set) | That terminal closed as above |
+| One-shot subagent finishes | Its terminals closed as above. Continuable agents keep theirs |
 | rness killed by a signal | No cleanup. Shells get a PTY hangup |
 | Process started its own session (`setsid`, daemons) | Never reached |
 

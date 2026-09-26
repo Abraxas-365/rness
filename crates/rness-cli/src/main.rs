@@ -828,6 +828,26 @@ async fn main() -> anyhow::Result<()> {
     // Every exit path (TUI quit, headless end, `?` errors) ends the
     // terminals' processes, including `&` jobs their shells started.
     let _terminals_cleanup = TerminalsCleanup(terminals.clone());
+    // A one-shot subagent never runs again once it settles, so nothing
+    // could use its terminals: close them (off the bus thread, since
+    // closing waits out a short grace).
+    let _subagent_terminals = {
+        let terminals = terminals.clone();
+        kernel
+            .bus()
+            .on::<rness_engine::service::SubagentStopEv>(move |n| {
+                if n.mode != rness_protocol::branch::DelegationMode::OneShot {
+                    return;
+                }
+                let terminals = terminals.clone();
+                let child = n.child.to_string();
+                let _ = std::thread::Builder::new()
+                    .name("terminal-owner-close".into())
+                    .spawn(move || {
+                        terminals.close_owned_by(&child, "its subagent finished");
+                    });
+            })
+    };
 
     // Skills: filesystem catalogs, project shadowing user on name
     // conflicts. The catalog lives in the tool's description.

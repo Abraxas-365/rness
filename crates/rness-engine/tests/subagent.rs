@@ -633,6 +633,57 @@ async fn continuable_child_starts_and_accepts_messages() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn stop_notices_carry_the_delegation_mode() {
+    use rness_engine::service::SubagentStopEv;
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let _sub = sessions.bus().on::<SubagentStopEv>(move |n| {
+        sink.lock().unwrap().push((n.child.clone(), n.mode));
+    });
+
+    let run = rt
+        .start(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "una vez".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let child = rt
+        .start_continuable(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "sigue".into(),
+            },
+        )
+        .unwrap();
+    sessions.join(&child).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while seen.lock().unwrap().len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.contains(&(run.session.clone(), DelegationMode::OneShot)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.contains(&(child.clone(), DelegationMode::Continuable)),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn settle_notice_reaches_the_parent() {
     let dir = tempfile::tempdir().unwrap();
     let sessions = service(dir.path());
