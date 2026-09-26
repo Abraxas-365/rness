@@ -525,7 +525,14 @@ fn visual_rows_limited(
             if cells > width {
                 continue;
             }
-            spans.push(Span::styled(grapheme.symbol.to_owned(), grapheme.style));
+            // Coalesce same-style graphemes: one Span per grapheme multiplies
+            // allocations and per-span render work by the row width.
+            match spans.last_mut() {
+                Some(last) if last.style == grapheme.style => {
+                    last.content.to_mut().push_str(grapheme.symbol);
+                }
+                _ => spans.push(Span::styled(grapheme.symbol.to_owned(), grapheme.style)),
+            }
             used += cells;
         }
     }
@@ -621,7 +628,7 @@ fn panel_body(
                 ));
             }
             spans.extend(row);
-            let used = Line::from(spans.clone()).width();
+            let used: usize = spans.iter().map(Span::width).sum();
             spans.push(Span::styled(
                 " ".repeat(usize::from(width).saturating_sub(used)),
                 style,
@@ -2771,6 +2778,108 @@ mod tests {
                     false,
                 );
             }
+        }
+    }
+
+    /// Resize cost on a real session log. Run with
+    /// RNESS_PERF_LOG=~/.rness/sessions/<id>/session.v1.jsonl \
+    ///   cargo test --release -p rness-tui diagnostic_real_session -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic; needs RNESS_PERF_LOG"]
+    fn diagnostic_real_session_resize() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        use std::time::Instant;
+        let Ok(path) = std::env::var("RNESS_PERF_LOG") else {
+            eprintln!("RNESS_PERF_LOG unset");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        let envelopes: Vec<rness_protocol::events::Envelope> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let session = match &envelopes[0].event {
+            rness_protocol::events::SessionEvent::Header(h) => h.session.clone(),
+            _ => panic!("no header"),
+        };
+        let mut model = Model::new(session.clone(), "m".into());
+        let start = Instant::now();
+        model.load_history(&rness_protocol::api::History { session, envelopes });
+        eprintln!(
+            "project: {} entries in {:.1}ms",
+            model.entries.len(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        let theme = Theme::default();
+        let mut chat = Chat {
+            config: serde_json::json!({
+                "assistant": {"style":"assistant_text", "marker":false},
+                "thinking": {"display":"collapsed", "style":"thinking"},
+                "tool": {"border":{"kind":"rounded"}, "padding":{"left":1,"right":1},
+                         "display":"collapsed", "preview_lines":8}
+            }),
+            ..Default::default()
+        };
+        if std::env::var("RNESS_PERF_CARDS").is_ok() {
+            // Approximate the default flavor's structured cards: a header
+            // plus the tool output as a highlighted code block.
+            for entry in &model.entries {
+                if let Entry::ToolResult { call, output, .. } = entry {
+                    chat.cards.insert(
+                        call.clone(),
+                        vec![
+                            crate::modules::tool_cards::CardLine {
+                                text: "Tool · done".into(),
+                                structured: true,
+                                is_header: true,
+                                ..Default::default()
+                            },
+                            crate::modules::tool_cards::CardLine {
+                                structured: true,
+                                block: Some(serde_json::json!({
+                                    "kind":"code", "text":output, "language":"rust",
+                                    "syntax_highlight":true, "line_numbers":true
+                                })),
+                                ..Default::default()
+                            },
+                        ],
+                    );
+                }
+            }
+        }
+        for (label, w, h) in [
+            ("initial", 169, 46),
+            ("warm", 169, 46),
+            ("shrink", 86, 46),
+            ("grow-back", 169, 46),
+            ("grow-new", 200, 46),
+        ]
+        .into_iter()
+        .chain(
+            (0..std::env::var("RNESS_PERF_LOOPS")
+                .ok()
+                .and_then(|n| n.parse::<u16>().ok())
+                .unwrap_or(0))
+                .map(|i| ("loop", 100 + i % 50, 46)),
+        ) {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            let start = Instant::now();
+            chat.render(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            eprintln!(
+                "  {label:10} {w}x{h} {:.1}ms visits={}",
+                start.elapsed().as_secs_f64() * 1000.0,
+                chat.entry_visits
+            );
         }
     }
 

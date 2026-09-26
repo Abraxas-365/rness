@@ -759,12 +759,16 @@ impl SubagentRuntime {
         descendants: bool,
         include_one_shot: bool,
     ) -> Result<Vec<ChildAgent>, SubagentError> {
-        // Walk the tree by querying only the children of each node
-        // instead of scanning the entire session store.
+        // One directory scan for the whole tree, then walk it in memory.
+        let mut by_parent: std::collections::HashMap<SessionId, Vec<(SessionId, Delegation)>> =
+            std::collections::HashMap::new();
+        for (id, d) in self.sessions.store().delegations()? {
+            by_parent.entry(d.parent.clone()).or_default().push((id, d));
+        }
         let mut out = Vec::new();
         let mut stack: Vec<SessionId> = vec![root.clone()];
         while let Some(node) = stack.pop() {
-            let children = self.sessions.store().delegated_children(&node)?;
+            let children = by_parent.remove(&node).unwrap_or_default();
             let mut node_children: Vec<(SessionId, Delegation)> = children
                 .into_iter()
                 .filter(|(_, d)| include_one_shot || d.mode == DelegationMode::Continuable)

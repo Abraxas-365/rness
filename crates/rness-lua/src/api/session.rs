@@ -456,36 +456,16 @@ pub fn install(
     session.set(
         "usage",
         lua.create_function(move |lua, id: String| {
-            let replayed = s.replay(&id).map_err(err)?;
+            // Incremental: folds only new log lines, never copies the history
+            // (this runs after every step from the statusline).
+            let usage = s.store().usage_summary(&id).map_err(err)?;
             let t = lua.create_table()?;
-            let latest = replayed
-                .history
-                .iter()
-                .rev()
-                .find_map(|event| match &event.event {
-                    rness_protocol::events::SessionEvent::AssistantMessage(message) => {
-                        Some(message.usage)
-                    }
-                    _ => None,
-                })
-                .unwrap_or_default();
+            let latest = usage.latest;
             t.set("input", latest.input_tokens)?;
             t.set("output", latest.output_tokens)?;
             t.set("cache_read", latest.cache_read_tokens)?;
             t.set("cache_write", latest.cache_write_tokens)?;
-            t.set(
-                "turns",
-                replayed
-                    .history
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event.event,
-                            rness_protocol::events::SessionEvent::TurnStarted { .. }
-                        )
-                    })
-                    .count(),
-            )?;
+            t.set("turns", usage.turns)?;
             Ok(t)
         })?,
     )?;

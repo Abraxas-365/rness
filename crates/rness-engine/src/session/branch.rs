@@ -29,6 +29,51 @@ pub enum BranchError {
 /// Maximum number of cached session readers (bounded LRU).
 const MAX_CACHED_READERS: usize = 8;
 
+/// What `rness.session.usage` reports: the latest assistant message's usage
+/// and the durable turn count, across the session's full fork ancestry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageSummary {
+    pub latest: rness_protocol::events::Usage,
+    pub turns: usize,
+}
+
+/// Running usage fold over a contiguous run of log events.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageFold {
+    latest: Option<rness_protocol::events::Usage>,
+    turns: usize,
+}
+
+impl UsageFold {
+    fn then(self, later: UsageFold) -> UsageFold {
+        UsageFold {
+            latest: later.latest.or(self.latest),
+            turns: self.turns + later.turns,
+        }
+    }
+}
+
+/// Incremental usage scan state for one session.
+#[derive(Debug, Clone, Copy, Default)]
+struct UsageCursor {
+    /// Bytes of the queried session's own log already folded in.
+    offset: u64,
+    lines: usize,
+    /// Ancestor prefixes end at committed fork points, so they never change.
+    base: UsageFold,
+    own: UsageFold,
+}
+
+/// Just the fields usage needs; content is skipped without allocating.
+#[derive(serde::Deserialize)]
+struct UsageLine {
+    id: EventId,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    usage: Option<rness_protocol::events::Usage>,
+}
+
 /// Root directory holding one subdirectory per session.
 pub struct SessionStore {
     root: PathBuf,
@@ -37,6 +82,16 @@ pub struct SessionStore {
     /// entry is evicted, closing its file handle.
     reader_order: std::sync::Mutex<VecDeque<SessionId>>,
     readers: std::sync::Mutex<std::collections::HashMap<SessionId, super::log::SessionReader>>,
+    /// Committed headers are immutable (the log is append-only and torn-tail
+    /// healing never reaches line one), so a validated header is cached for
+    /// the store's lifetime. Pollers (statusline agent counts, activity
+    /// recovery) scan every session header several times a second; without
+    /// this each scan re-opens and re-parses hundreds of files.
+    headers: std::sync::Mutex<std::collections::HashMap<SessionId, Header>>,
+    /// Per-session usage cursors. Kept apart from the reader LRU so the
+    /// statusline's per-step usage query never copies or re-parses a whole
+    /// history, even after the reader was evicted.
+    usage: std::sync::Mutex<std::collections::HashMap<SessionId, UsageCursor>>,
 }
 
 impl SessionStore {
@@ -45,6 +100,8 @@ impl SessionStore {
             root: root.into(),
             reader_order: Default::default(),
             readers: Default::default(),
+            headers: Default::default(),
+            usage: Default::default(),
         }
     }
 
@@ -80,7 +137,21 @@ impl SessionStore {
 
     /// Read through the first committed event only, without touching the
     /// history cache. Like SessionReader, skip blank lines and ignore torn tails.
+    /// Failures are not cached: a session being created may not have its
+    /// header line committed yet.
     fn read_header(&self, session: &SessionId) -> Result<Header, LogError> {
+        if let Some(header) = self.headers.lock().unwrap().get(session) {
+            return Ok(header.clone());
+        }
+        let header = self.read_header_uncached(session)?;
+        self.headers
+            .lock()
+            .unwrap()
+            .insert(session.clone(), header.clone());
+        Ok(header)
+    }
+
+    fn read_header_uncached(&self, session: &SessionId) -> Result<Header, LogError> {
         let path = super::log::log_file(&self.root.join(session));
         let file = std::fs::File::open(path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -159,6 +230,15 @@ impl SessionStore {
             None,
             Some(delegation),
         )?)
+    }
+
+    /// Byte length of a session's committed log, or None if it has none.
+    /// A cheap change probe: logs are append-only, so an unchanged length
+    /// means no new events (torn-tail heals only shrink it).
+    pub fn log_len(&self, session: &SessionId) -> Option<u64> {
+        std::fs::metadata(super::log::log_file(&self.root.join(session)))
+            .ok()
+            .map(|meta| meta.len())
     }
 
     pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
@@ -322,6 +402,104 @@ impl SessionStore {
             }
         }
         Ok(out)
+    }
+
+    /// Latest assistant usage and turn count over the full history, without
+    /// assembling it. Folds only log bytes appended since the last call;
+    /// ancestor prefixes are folded once (they end at committed fork points).
+    /// Equivalent to scanning `history(session)`.
+    pub fn usage_summary(&self, session: &SessionId) -> Result<UsageSummary, BranchError> {
+        let mut cursors = self.usage.lock().unwrap();
+        let mut cursor = match cursors.get(session) {
+            Some(cursor) => *cursor,
+            None => {
+                let mut base = UsageFold::default();
+                let chain = self.ancestry(session)?;
+                for hop in &chain[..chain.len() - 1] {
+                    let (fold, ..) =
+                        self.fold_usage(&hop.session, 0, 0, hop.forked_at.as_deref())?;
+                    base = base.then(fold);
+                }
+                UsageCursor {
+                    base,
+                    ..Default::default()
+                }
+            }
+        };
+        if self.log_len(session).is_some_and(|len| len < cursor.offset) {
+            // Torn-tail heal shrank the log: refold the session's own events.
+            cursor.offset = 0;
+            cursor.lines = 0;
+            cursor.own = UsageFold::default();
+        }
+        let (fold, offset, lines) = self.fold_usage(session, cursor.offset, cursor.lines, None)?;
+        if lines == 0 {
+            return Err(LogError::Corrupt {
+                line: 0,
+                reason: "empty log".into(),
+            }
+            .into());
+        }
+        cursor.own = cursor.own.then(fold);
+        cursor.offset = offset;
+        cursor.lines = lines;
+        cursors.insert(session.clone(), cursor);
+        let total = cursor.base.then(cursor.own);
+        Ok(UsageSummary {
+            latest: total.latest.unwrap_or_default(),
+            turns: total.turns,
+        })
+    }
+
+    /// Fold complete log lines from `offset`, stopping after event `bound`.
+    /// Returns the fold and the new byte offset / line count. Like
+    /// SessionReader, a torn tail is left for the next call.
+    fn fold_usage(
+        &self,
+        session: &SessionId,
+        mut offset: u64,
+        mut line: usize,
+        bound: Option<&str>,
+    ) -> Result<(UsageFold, u64, usize), LogError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = super::log::log_file(&self.root.join(session));
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                LogError::NotFound(session.clone())
+            } else {
+                LogError::Io(error)
+            }
+        })?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut reader = std::io::BufReader::new(file.by_ref());
+        let mut fold = UsageFold::default();
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            let n = reader.read_until(b'\n', &mut bytes)?;
+            if n == 0 || !bytes.ends_with(b"\n") {
+                break;
+            }
+            offset += n as u64;
+            line += 1;
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let event: UsageLine =
+                serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
+                    line,
+                    reason: error.to_string(),
+                })?;
+            match event.kind.as_str() {
+                "assistant/message" => fold.latest = event.usage.or(fold.latest),
+                "turn/started" => fold.turns += 1,
+                _ => {}
+            }
+            if bound == Some(event.id.as_str()) {
+                break;
+            }
+        }
+        Ok((fold, offset, line))
     }
 
     /// Resolve search scope from a trusted execution session and authorize an
@@ -655,6 +833,19 @@ impl SessionStore {
         &self,
         parent: &SessionId,
     ) -> Result<Vec<(SessionId, Delegation)>, BranchError> {
+        let mut out: Vec<_> = self
+            .delegations()?
+            .into_iter()
+            .filter(|(_, delegation)| delegation.parent == *parent)
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Every delegated session with its lineage, from one directory scan.
+    /// Headers come from the immutable-header cache, so repeated calls cost
+    /// a `read_dir` plus one open per session not seen before.
+    pub fn delegations(&self) -> Result<Vec<(SessionId, Delegation)>, BranchError> {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&self.root).map_err(LogError::from)? {
             let entry = entry.map_err(LogError::from)?;
@@ -666,12 +857,9 @@ impl SessionStore {
                 continue;
             };
             if let Some(delegation) = header.delegation {
-                if delegation.parent == *parent {
-                    out.push((child_id, delegation));
-                }
+                out.push((child_id, delegation));
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
     }
 }
@@ -1055,5 +1243,107 @@ mod tests {
             outcome: TurnOutcome::Completed,
         })
         .unwrap();
+    }
+
+    fn reply(input: u64) -> SessionEvent {
+        SessionEvent::AssistantMessage(rness_protocol::events::AssistantMessage {
+            model: "fake".into(),
+            content: vec![],
+            stop: rness_protocol::events::StopReason::EndTurn,
+            usage: rness_protocol::events::Usage {
+                input_tokens: input,
+                output_tokens: 1,
+                cache_read_tokens: input / 2,
+                ..Default::default()
+            },
+            estimated_input: 0,
+            chunks: vec![],
+        })
+    }
+
+    /// The reference: what `rness.session.usage` computed before (full scan).
+    fn scanned(store: &SessionStore, session: &SessionId) -> UsageSummary {
+        let history = store.history(session).unwrap();
+        UsageSummary {
+            latest: history
+                .iter()
+                .rev()
+                .find_map(|env| match &env.event {
+                    SessionEvent::AssistantMessage(m) => Some(m.usage),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+            turns: history
+                .iter()
+                .filter(|env| matches!(env.event, SessionEvent::TurnStarted { .. }))
+                .count(),
+        }
+    }
+
+    #[test]
+    fn usage_summary_matches_full_history_scan_incrementally_and_across_forks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut root = store.create(None).unwrap();
+        let root_id = root.session().clone();
+        let usage = |id: &SessionId| store.usage_summary(id).unwrap();
+        let same = |id: &SessionId| assert_eq!(usage(id), scanned(&store, id));
+        // Header only: zero usage, zero turns (matches the old default).
+        assert_eq!(usage(&root_id), UsageSummary::default());
+        root.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
+        let fork_at = root.append(&reply(100)).unwrap().id;
+        root.append(&SessionEvent::TurnStarted { turn: 2 }).unwrap();
+        root.append(&reply(200)).unwrap();
+        same(&root_id);
+        assert_eq!(usage(&root_id).latest.input_tokens, 200);
+
+        // Fork before the second turn: ancestor prefix stops at the fork point.
+        let mut child = store.fork(&root_id, Some(fork_at)).unwrap();
+        let child_id = child.session().clone();
+        same(&child_id);
+        let summary = usage(&child_id);
+        assert_eq!((summary.latest.input_tokens, summary.turns), (100, 1));
+        // Child with no own assistant message yet inherits the ancestor's usage;
+        // an own message later wins; a turn without a reply keeps the latest.
+        child
+            .append(&SessionEvent::TurnStarted { turn: 2 })
+            .unwrap();
+        same(&child_id);
+        child.append(&reply(300)).unwrap();
+        child
+            .append(&SessionEvent::TurnStarted { turn: 3 })
+            .unwrap();
+        child.append(&msg("still working")).unwrap();
+        same(&child_id);
+        assert_eq!(usage(&child_id).latest.input_tokens, 300);
+        drop(child);
+
+        // The parent kept growing after the fork: unaffected either way.
+        root.append(&reply(400)).unwrap();
+        same(&child_id);
+        same(&root_id);
+        drop(root);
+
+        // A torn tail is not counted until it is completed.
+        let path = super::super::log::log_file(&dir.path().join(&root_id));
+        let before = usage(&root_id);
+        let line = serde_json::to_string(&Envelope {
+            id: "zz-torn".into(),
+            at: "2026-01-01T00:00:00.000Z".parse().unwrap(),
+            event: SessionEvent::TurnStarted { turn: 9 },
+        })
+        .unwrap();
+        let (head, tail) = line.split_at(line.len() / 2);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, head.as_bytes()).unwrap();
+        assert_eq!(usage(&root_id), before);
+        std::io::Write::write_all(&mut file, format!("{tail}\n").as_bytes()).unwrap();
+        assert_eq!(usage(&root_id).turns, before.turns + 1);
+
+        // Missing sessions still error like replay did.
+        assert!(store.usage_summary(&"missing".to_string()).is_err());
     }
 }

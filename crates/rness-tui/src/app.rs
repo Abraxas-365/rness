@@ -1731,19 +1731,40 @@ pub async fn run(
         }
     });
 
-    let tick = Duration::from_millis(33); // ~30fps redraw budget
+    // ~30fps redraw budget while something animates.
+    let tick = Duration::from_millis(33);
+    // Idle redraws only pick up host-published state (statusline text, cards,
+    // app views) that arrives without waking the loop; 5fps is plenty.
+    let idle_tick = Duration::from_millis(200);
+    let mut last_activity = std::time::Instant::now();
+    let mut resized: Option<(u16, u16)> = None;
     let result = loop {
+        let app_active = app
+            .apps
+            .as_ref()
+            .is_some_and(|apps| apps.active().is_some());
+        let animating = app.model.busy
+            || app.model.live.is_some()
+            || app.model.compaction.is_some()
+            || app_active
+            || last_activity.elapsed() < Duration::from_secs(1);
+        let tick = if animating { tick } else { idle_tick };
         // Coalesce: drain everything pending, then draw once.
         tokio::select! {
             ev = term_events.recv() => {
                 let Some(ev) = ev else { break Ok(()) };
-                app.on_term_event(ev);
-                while let Ok(ev) = term_events.try_recv() {
+                last_activity = std::time::Instant::now();
+                let mut next = Some(ev);
+                while let Some(ev) = next.take().or_else(|| term_events.try_recv().ok()) {
+                    if let TermEvent::Resize(width, height) = ev {
+                        resized = Some((width, height));
+                    }
                     app.on_term_event(ev);
                 }
             }
             frame = frames.recv() => {
                 if let Some(frame) = frame {
+                    last_activity = std::time::Instant::now();
                     app.apply_frame(&frame);
                     while let Ok(frame) = frames.try_recv() {
                         app.apply_frame(&frame);
@@ -1837,6 +1858,15 @@ pub async fn run(
         }
         if app.model.should_quit {
             break Ok(());
+        }
+        // ratatui's autoresize clears the screen inside draw() before our
+        // render runs; a width change forces a full transcript rebuild, so
+        // the screen would stay blank for the whole rebuild. Warm the caches
+        // at the new size first so clear and flush happen back-to-back.
+        if let Some((width, height)) = resized.take() {
+            let area = Rect::new(0, 0, width, height);
+            let mut scratch = Buffer::empty(area);
+            app.render(area, &mut scratch);
         }
         let draw = terminal.draw(|f| {
             let area = f.area();

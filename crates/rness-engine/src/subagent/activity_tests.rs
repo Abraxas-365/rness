@@ -21,6 +21,7 @@ fn run(recovered: bool) -> Run {
         tools: vec![],
         recovered,
         start_ms: None,
+        synced_len: None,
     }
 }
 

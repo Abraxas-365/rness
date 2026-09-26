@@ -57,6 +57,8 @@ struct Run {
     tools: Vec<Value>,
     recovered: bool,
     start_ms: Option<u64>,
+    /// Child log length at the last history sync; None forces a sync.
+    synced_len: Option<u64>,
 }
 
 impl Run {
@@ -244,6 +246,7 @@ impl SubagentActivity {
                 tools: Vec::new(),
                 recovered: false,
                 start_ms: None,
+                synced_len: None,
             },
         );
     }
@@ -338,6 +341,7 @@ impl SubagentActivity {
                     tools: Vec::new(),
                     recovered: true,
                     start_ms: None,
+                    synced_len: None,
                 },
             );
         }
@@ -390,6 +394,25 @@ impl SubagentActivity {
 
     /// Sync a Run with its child session's latest history.
     fn refresh_run(run: &mut Run, sessions: &SessionService) {
+        // Probe before reading: an append racing the read changes the length
+        // again, so it is picked up next tick. Finished children stop growing,
+        // so polling them costs one stat instead of a history clone+parse.
+        let len = sessions.store().log_len(&run.child);
+        if len.is_none() || len != run.synced_len {
+            Self::sync_history(run, sessions);
+            run.synced_len = len;
+        }
+        // A live ToolStarted can precede the first history refresh for this turn.
+        if run.status == "running" && run.activity == "Thinking" {
+            if let Some(name) = run.tools.iter().rev()
+                .find(|tool| tool["status"] == "running")
+                .and_then(|tool| tool["name"].as_str()).filter(|name| !name.is_empty()) {
+                run.activity = tail(name, MAX_ACTIVITY_BYTES).into();
+            }
+        }
+    }
+
+    fn sync_history(run: &mut Run, sessions: &SessionService) {
         let history = match &run.after {
             Some(after) => sessions.store().history_after(&run.child, after).ok().flatten().unwrap_or_else(|| {
                 sessions.store().history(&run.child).unwrap_or_default().into_iter()
@@ -403,14 +426,6 @@ impl SubagentActivity {
                 .or_else(|| event.id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms()));
             run.after = Some(event.id);
             run.apply_event(event.event, event_ms);
-        }
-        // A live ToolStarted can precede the first history refresh for this turn.
-        if run.status == "running" && run.activity == "Thinking" {
-            if let Some(name) = run.tools.iter().rev()
-                .find(|tool| tool["status"] == "running")
-                .and_then(|tool| tool["name"].as_str()).filter(|name| !name.is_empty()) {
-                run.activity = tail(name, MAX_ACTIVITY_BYTES).into();
-            }
         }
     }
 
