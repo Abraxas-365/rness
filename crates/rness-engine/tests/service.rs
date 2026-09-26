@@ -1870,7 +1870,7 @@ struct Titler {
     title: String,
     gate: Arc<tokio::sync::Semaphore>,
     turn_gate: Option<Arc<tokio::sync::Semaphore>>,
-    title_prompts: Mutex<Vec<String>>,
+    title_prompts: Mutex<Vec<(String, Option<u32>)>>,
 }
 
 #[async_trait]
@@ -1887,7 +1887,10 @@ impl Provider for Titler {
                 },
                 _ => String::new(),
             };
-            self.title_prompts.lock().unwrap().push(framed);
+            self.title_prompts
+                .lock()
+                .unwrap()
+                .push((framed, request.context.config.max_output_tokens));
             self.gate.acquire().await.unwrap().forget();
             return StepOutcome::Committed(assistant(&self.title, StopReason::EndTurn, vec![]));
         }
@@ -1984,12 +1987,8 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
         svc.title_with_source(&sid).unwrap(),
         Some(("My name".into(), TitleSource::User))
     );
-    // A model title generated during the turn is rejected by the pin.
-    provider.gate.add_permits(1);
-    let request = rness_engine::titles::TitleRequest::default();
-    let title = svc.generate_title(&sid, &request, &CancellationToken::new()).await.unwrap();
-    assert_eq!(title, "Model title");
-    assert!(!svc.offer_title(&sid, title, TitleSource::Model, 80).unwrap());
+    // A model title arriving during the turn is rejected by the pin.
+    assert!(!svc.offer_title(&sid, "Model title".into(), TitleSource::Model, 80).unwrap());
     provider.turn_gate.as_ref().unwrap().add_permits(1);
     svc.join(&sid).await;
     assert_eq!(
@@ -2007,50 +2006,43 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
     assert!(svc.set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User).is_err());
 }
 
+/// The pieces a Lua title plugin builds on: human prompts (own log, no
+/// injected context) and a bounded, profile-aware completion.
 #[tokio::test]
-async fn generate_title_frames_first_or_all_prompts_and_cancels() {
+async fn human_prompts_and_llm_complete_for_title_plugins() {
     let dir = tempfile::tempdir().unwrap();
-    let provider = titler("  \u{1b}[1mRefactor\u{1b}[0m the\nparser ", false);
+    let provider = titler("Refactor the parser", false);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
-    let first = rness_engine::titles::TitleRequest::default();
-    let none = svc.generate_title(&sid, &first, &CancellationToken::new()).await;
-    assert!(none.unwrap_err().to_string().contains("no prompt"));
+    assert!(svc.human_prompts(&sid).unwrap().is_empty());
     svc.send(&sid, UserIntent::Followup, text("alpha prompt")).unwrap();
     svc.join(&sid).await;
     svc.send(&sid, UserIntent::Inject, text("injected context")).unwrap();
     svc.send(&sid, UserIntent::Followup, text("beta prompt")).unwrap();
     svc.join(&sid).await;
+    assert_eq!(svc.human_prompts(&sid).unwrap(), vec!["alpha prompt", "beta prompt"]);
+    let fork = svc.fork(&sid, None).unwrap();
+    assert!(svc.human_prompts(&fork).unwrap().is_empty(), "forks do not inherit prompts");
 
     provider.gate.add_permits(1);
-    let title = svc.generate_title(&sid, &first, &CancellationToken::new()).await.unwrap();
-    assert_eq!(title, "Refactor the parser");
-    let all = rness_engine::titles::TitleRequest {
-        prompts: rness_engine::titles::TitlePrompts::All,
-        max_bytes: 8,
-        ..Default::default()
-    };
-    provider.gate.add_permits(1);
-    assert_eq!(svc.generate_title(&sid, &all, &CancellationToken::new()).await.unwrap(), "Refactor");
-    let framed = provider.title_prompts.lock().unwrap().clone();
-    assert!(framed[0].contains("alpha prompt") && !framed[0].contains("beta prompt"));
-    assert!(framed[1].contains("alpha prompt") && framed[1].contains("beta prompt"));
-    assert!(!framed[1].contains("injected context"));
-    // Nothing is committed by generation itself.
+    let reply = svc
+        .llm_complete(
+            &sid,
+            "Create a concise title",
+            "alpha prompt",
+            None,
+            Some(64),
+            std::time::Duration::from_secs(5),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply, "Refactor the parser");
+    assert_eq!(provider.title_prompts.lock().unwrap()[0], ("alpha prompt".into(), Some(64)));
+    // Completion commits nothing.
     assert!(titles(&svc, &sid).is_empty());
-
-    // Cancellation aborts an in-flight request.
-    let cancel = CancellationToken::new();
-    let pending = svc.generate_title(&sid, &first, &cancel);
-    let canceller = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        canceller.cancel();
-    });
-    assert!(pending.await.is_err());
-    let bad = rness_engine::titles::TitleRequest { timeout: 0, ..Default::default() };
-    assert!(svc.generate_title(&sid, &bad, &CancellationToken::new()).await.is_err());
 }
+
 
 #[tokio::test]
 async fn human_prompts_are_announced_with_their_index() {

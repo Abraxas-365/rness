@@ -3580,18 +3580,22 @@ mod tests {
         let mut rt = LuaRuntime::new().unwrap();
         let prepare = rt
             .lua()
-            .create_function(|_, _id: String| {
+            .create_function(|_, _opts: Table| {
                 Ok(crate::api::session::CommandYield(Box::pin(async {
                     Ok(serde_json::Value::Null)
                 })))
             })
             .unwrap();
-        let generate = crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap();
-        rt.load("fixture", "rness.session = { title = function(_, text) return text end }").unwrap();
-        let session: Table = rt.lua().globals().get::<Table>("rness").unwrap().get("session").unwrap();
-        session.set("generate_title", generate).unwrap();
+        let complete = crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap();
+        rt.load(
+            "fixture",
+            "rness.session = { title = function(_, text) return text end, prompts = function() return { 'fix it' } end }\nrness.llm = {}",
+        )
+        .unwrap();
+        let llm: Table = rt.lua().globals().get::<Table>("rness").unwrap().get("llm").unwrap();
+        llm.set("complete", complete).unwrap();
         let setup = format!(
-            "local setup = (function() {} end)()\nsetup({{}})",
+            "local setup = (function() {} end)()\nsetup({{ auto = 'off', fallback = false }})",
             include_str!("../../../flavors/default/plugins/title.lua")
         );
         rt.load("title", &setup).unwrap();

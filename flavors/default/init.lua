@@ -79,11 +79,11 @@ rness.plugins.setup({
   -- step (delivery = "steer"): rness.schedule = { delivery = "steer" }.
   -- { name = "schedule", file = "plugins/schedule.lua" },
   { name = "commands", file = "plugins/commands.lua" },
-  { name = "title", file = "plugins/title.lua" },
-  -- Automatic titles: a fallback at once, then a model title from the first
-  -- prompt. mode = "all" retitles on every prompt; set profile to a cheap
-  -- model profile to keep titling off your main model. `/title <text>` pins.
-  { name = "session-title", file = "plugins/session-title.lua", opts = { mode = "first" } },
+  -- /title plus automatic titles (pure Lua): a fallback at once, then a model
+  -- title from the first prompt. auto = "all" retitles on every prompt,
+  -- "off" disables it; set profile (and system for a custom prompt) to keep
+  -- titling off your main model. `/title <text>` pins.
+  { name = "title", file = "plugins/title.lua", opts = { auto = "first" } },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },
   { name = "models", file = "plugins/models.lua" },
 })

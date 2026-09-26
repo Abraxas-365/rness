@@ -67,6 +67,16 @@ async fn host() -> (LuaHost, Arc<SessionService>, Arc<GatedTitle>, tempfile::Tem
     )
     .await
     .unwrap();
+    // The async call every test task awaits (the gated provider recognises
+    // the title system prompt). A global so every plugin can use it.
+    host.load(
+        "helpers",
+        r#"function title_of(session)
+          return rness.llm.complete { session = session, system = "Create a concise title", prompt = "x" }
+        end"#,
+    )
+    .await
+    .unwrap();
     (host, sessions, provider, dir)
 }
 
@@ -90,7 +100,7 @@ async fn session_with_prompt(sessions: &SessionService) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_awaits_generate_title_from_a_hook_and_keeps_vm_free() {
+async fn task_awaits_llm_complete_from_a_hook_and_keeps_vm_free() {
     let (host, sessions, provider, _dir) = host().await;
     let sid = session_with_prompt(&sessions).await;
     host.load(
@@ -98,8 +108,8 @@ async fn task_awaits_generate_title_from_a_hook_and_keeps_vm_free() {
         r#"
         rness.hook.on("go", function(ev)
           rness.task.spawn(function(session)
-            local title = rness.session.generate_title(session, { max_bytes = 6 })
-            rness.session.offer_title(session, title, "model", 80)
+            local title = title_of(session)
+            rness.session.offer_title(session, title, "model", 6)
           end, ev.session)
         end)
         "#,
@@ -125,13 +135,13 @@ async fn unload_and_cancel_stop_parked_tasks_and_errors_are_contained() {
         r#"
         rness.hook.on("go", function(ev)
           rness.task.spawn(function()
-            local title = rness.session.generate_title(ev.session)
+            local title = title_of(ev.session)
             rness.session.offer_title(ev.session, title, "model")
           end)
         end)
         rness.hook.on("cancel", function(ev)
           local id = rness.task.spawn(function()
-            local title = rness.session.generate_title(ev.session)
+            local title = title_of(ev.session)
             rness.session.offer_title(ev.session, "cancelled " .. title, "model")
           end)
           assert(rness.task.cancel(id) == true)
@@ -161,7 +171,7 @@ async fn unload_and_cancel_stop_parked_tasks_and_errors_are_contained() {
         r#"
         rness.hook.on("go", function(ev)
           rness.task.spawn(function()
-            rness.session.offer_title(ev.session, rness.session.generate_title(ev.session), "model")
+            rness.session.offer_title(ev.session, title_of(ev.session), "model")
           end)
         end)
         "#,
@@ -201,9 +211,9 @@ async fn session_title_plugin_titles_root_sessions_through_a_live_host() {
         .unwrap();
     let plugin = format!(
         "local setup = (function() {} end)()\nsetup({{}})",
-        include_str!("../../../flavors/default/plugins/session-title.lua")
+        include_str!("../../../flavors/default/plugins/title.lua")
     );
-    host.load("session-title", &plugin).await.unwrap();
+    host.load("title", &plugin).await.unwrap();
     host.fire_hook(
         "prompt",
         serde_json::json!({ "session": child, "index": 1, "text": "child work" }),

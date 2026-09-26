@@ -1,6 +1,6 @@
 # Lua background tasks reference
 
-`rness.task` runs Lua work in the background that can wait on async APIs such as `rness.llm.complete` and `rness.session.generate_title`. Hooks, timers and statusline renderers are synchronous and cannot yield. A task is how they start work that takes seconds without blocking other plugins. The default [session-title plugin](../../guides/configuration/tui-commands.md#session-titles) is built on it.
+`rness.task` runs Lua work in the background that can wait on async APIs such as `rness.llm.complete` and session search. Hooks, timers and statusline renderers are synchronous and cannot yield. A task is how they start work that takes seconds without blocking other plugins. The default [title plugin](../../guides/configuration/tui-commands.md#session-titles) is built on it.
 
 Implementation: [`crates/rness-lua/src/api/task.rs`](../../../crates/rness-lua/src/api/task.rs).
 
@@ -8,10 +8,12 @@ Implementation: [`crates/rness-lua/src/api/task.rs`](../../../crates/rness-lua/s
 
 ```lua
 rness.hook.on("prompt", function(ev)
-  rness.task.spawn(function(session)
-    local ok, title = pcall(rness.session.generate_title, session)
+  rness.task.spawn(function(session, text)
+    local ok, title = pcall(rness.llm.complete, {
+      session = session, system = "Title this session in 5 words.", prompt = text,
+    })
     if ok then rness.session.offer_title(session, title, "model") end
-  end, ev.session)
+  end, ev.session, ev.text)
 end)
 ```
 

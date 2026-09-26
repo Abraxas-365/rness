@@ -349,54 +349,6 @@ fn drain_titles(log: &mut crate::session::log::SessionLog, live: &Live) {
     }
 }
 
-/// One bounded title request over `prompts`; returns the raw model text.
-async fn title_completion(
-    request: &crate::titles::TitleRequest,
-    prompts: &[String],
-    provider: Arc<dyn Provider>,
-    call: CallConfig,
-    cancel: &CancellationToken,
-) -> Result<String, ServiceError> {
-    use crate::turn::provider::StepOutcome;
-    use rness_protocol::events::StopReason;
-    let context = crate::session::projection::ModelContext {
-        turns: vec![crate::session::projection::ModelTurn::User {
-            content: vec![ContentPart::Text { text: request.frame(prompts) }],
-        }],
-        config: call,
-        ..Default::default()
-    };
-    let system = request.system_prompt();
-    let step = crate::turn::provider::StepRequest { context: &context, system: &system, tools: &[], on_delta: None };
-    let outcome = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return Err(ServiceError::Summarizer("title generation cancelled".into())),
-        outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(request.timeout),
-            provider.summarize_step(step, cancel),
-        ) => outcome,
-    };
-    let fail = |m: String| Err(ServiceError::Summarizer(m));
-    match outcome {
-        Ok(StepOutcome::Committed(msg)) if msg.stop == StopReason::EndTurn => Ok(msg
-            .content
-            .iter()
-            .filter_map(|p| match p {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ")),
-        Ok(StepOutcome::Committed(msg)) if msg.stop == StopReason::MaxTokens => {
-            fail("title output reached max_output_tokens".into())
-        }
-        Ok(StepOutcome::Committed(_)) => fail("title model unexpectedly requested a tool".into()),
-        Ok(StepOutcome::Failed { error, .. }) => fail(error.message),
-        Ok(StepOutcome::Cancelled { .. }) => fail("cancelled".into()),
-        Err(_) => fail(format!("title generation timed out after {}s", request.timeout)),
-    }
-}
-
 /// An admitted command holds session and extension reservations even before execution.
 /// Dropping it (including during unwinding) releases both reservations.
 struct CommandReservation {
@@ -1247,6 +1199,18 @@ impl SessionService {
         effective_title(&self.store, &self.live(session), session)
     }
 
+    /// The session's human-typed prompts, oldest first — own log only, so a
+    /// fork does not inherit its parent's (injected context, hook messages
+    /// and job notices excluded; same filter as the `prompt` event index).
+    pub fn human_prompts(&self, session: &SessionId) -> Result<Vec<String>, ServiceError> {
+        Ok(self
+            .store
+            .read_session(session)?
+            .iter()
+            .filter_map(|e| crate::titles::human_text(&e.event))
+            .collect())
+    }
+
     /// Set a session title explicitly (a rename, `/title unpin`, `/title
     /// auto`): pin rules are bypassed. Normalized to one terminal-safe line
     /// within the default byte cap. A `user` title pins against
@@ -1291,69 +1255,20 @@ impl SessionService {
         Ok(rness_protocol::events::SessionTitle { title, source })
     }
 
-    /// Generate a model title from the session's human prompts (first or
-    /// all, per `request`) and return it normalized. Nothing is committed:
-    /// the caller decides (`set_title` to pin, `offer_title` to respect a pin).
-    pub async fn generate_title(
-        &self,
-        session: &SessionId,
-        request: &crate::titles::TitleRequest,
-        cancel: &CancellationToken,
-    ) -> Result<String, ServiceError> {
-        request.validate().map_err(ServiceError::InvalidConfig)?;
-        // Own log only: titles, prompt indices and fallbacks are leaf-local.
-        let history = self.store.read_session(session)?;
-        let mut prompts = history.iter().filter_map(|e| crate::titles::human_text(&e.event));
-        let prompts: Vec<String> = match request.prompts {
-            crate::titles::TitlePrompts::First => prompts.next().into_iter().collect(),
-            crate::titles::TitlePrompts::All => prompts.collect(),
-        };
-        if prompts.is_empty() {
-            return Err(ServiceError::InvalidConfig("no prompt to title yet".into()));
-        }
-        let (provider, call) = self.title_provider(session, request)?;
-        let text = title_completion(request, &prompts, provider, call, cancel).await?;
-        let title = crate::titles::normalize(&text, request.max_bytes);
-        if title.is_empty() {
-            return Err(ServiceError::Summarizer("title model produced no text".into()));
-        }
-        Ok(title)
-    }
-
-    /// Provider + request config for title generation.
-    fn title_provider(
-        &self,
-        session: &SessionId,
-        config: &crate::titles::TitleRequest,
-    ) -> Result<(Arc<dyn Provider>, CallConfig), ServiceError> {
-        let current = self.config(session)?;
-        let mut call = match &config.profile {
-            Some(name) => self
-                .models
-                .resolve_profile_for(name, current.selection.as_ref().map(|s| s.route.as_str()))
-                .map_err(ServiceError::InvalidConfig)?,
-            None => current,
-        };
-        let provider = self.provider_for(&call)?;
-        // A title needs no reasoning budget; keep output tight.
-        call.reasoning = None;
-        call.max_output_tokens = provider.supports_max_output_tokens().then_some(config.max_output_tokens);
-        call.tool_ceiling = None;
-        call.agent = None;
-        Ok((provider, call))
-    }
-
     /// Profile-aware LLM completion for plugins.
     ///
     /// Resolves `profile` (or falls back to `session`'s current model when
     /// `None`), builds a one-shot `summarize_step` call, and returns the
-    /// text response.  The call is bounded by `timeout`.
+    /// text response.  The call is bounded by `timeout`; `max_output_tokens`
+    /// caps the reply where the provider supports it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn llm_complete(
         &self,
         session: &SessionId,
         system: &str,
         prompt: &str,
         profile: Option<&str>,
+        max_output_tokens: Option<u32>,
         timeout: std::time::Duration,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<String, ServiceError> {
@@ -1378,6 +1293,11 @@ impl SessionService {
                     text: prompt.to_string(),
                 }],
             }],
+            config: CallConfig {
+                max_output_tokens: max_output_tokens
+                    .filter(|_| provider.supports_max_output_tokens()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let result = tokio::time::timeout(

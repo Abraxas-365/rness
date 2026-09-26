@@ -2,7 +2,7 @@
 //!
 //! ```lua
 //! local id = rness.task.spawn(function(session)
-//!   local title = rness.session.generate_title(session)   -- yields; VM stays free
+//!   local title = rness.llm.complete { session = session, prompt = "…" } -- yields; VM stays free
 //!   rness.session.offer_title(session, title, "model")
 //! end, ev.session)
 //! rness.task.cancel(id)   -- idempotent
@@ -10,7 +10,7 @@
 //!
 //! Hooks, timers and statusline renderers are synchronous: they cannot
 //! yield. A task is a coroutine run on the VM thread whose yielding calls
-//! (`rness.llm.complete`, `rness.session.generate_title`, …) run on the
+//! (`rness.llm.complete`, session search, …) run on the
 //! async runtime while other plugins keep the VM. Spawning only queues the
 //! task, so it is safe from inside any callback. A task belongs to the
 //! plugin that spawned it and is cancelled when that plugin unloads or

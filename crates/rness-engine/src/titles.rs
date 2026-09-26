@@ -1,121 +1,12 @@
-//! Session title mechanism: terminal-safe normalization, human-prompt
-//! extraction, and a single bounded model request (dsh `session-title` +
-//! `session-title-llm`). *When* to title — fallback, first prompt, every
-//! prompt — is plugin policy (`flavors/default/plugins/session-title.lua`).
+//! Session title mechanism: terminal-safe normalization and human-prompt
+//! extraction. Everything else — when to title, the fallback, the model
+//! call and its prompt — is Lua policy (`flavors/default/plugins/title.lua`).
 
 use rness_protocol::events::{ContentPart, MessageSource, SessionEvent, TitleSource, UserIntent};
-use serde::Deserialize;
 
 /// Default and hard cap on a stored title, in bytes (dsh `maxTitleBytes`).
 pub const DEFAULT_MAX_BYTES: usize = 80;
 pub const MAX_BYTES_LIMIT: usize = 200;
-
-/// Which human prompts a title request is generated from.
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum TitlePrompts {
-    /// The session's first human prompt (dsh `first-prompt`).
-    #[default]
-    First,
-    /// Every human prompt, oldest first (dsh `all-prompts`).
-    All,
-}
-
-/// One title request — all fields optional (dsh base defaults).
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, default)]
-pub struct TitleRequest {
-    pub prompts: TitlePrompts,
-    /// Model profile (default: the session's model).
-    pub profile: Option<String>,
-    /// Seconds before the request is abandoned.
-    pub timeout: u64,
-    pub target_words: u32,
-    pub target_cjk_characters: u32,
-    /// Framed-input cap; oldest prompts are dropped, then the rest trimmed
-    /// to fit (dsh rejects oversized input instead).
-    pub max_input_bytes: usize,
-    pub max_output_tokens: u32,
-    /// Cap on the returned title.
-    pub max_bytes: usize,
-}
-
-impl Default for TitleRequest {
-    fn default() -> Self {
-        Self {
-            prompts: TitlePrompts::First,
-            profile: None,
-            timeout: 60,
-            target_words: 5,
-            target_cjk_characters: 10,
-            max_input_bytes: 4096,
-            max_output_tokens: 64,
-            max_bytes: DEFAULT_MAX_BYTES,
-        }
-    }
-}
-
-impl TitleRequest {
-    pub fn validate(&self) -> Result<(), String> {
-        let positive = [
-            ("timeout", self.timeout as usize),
-            ("target_words", self.target_words as usize),
-            ("target_cjk_characters", self.target_cjk_characters as usize),
-            ("max_input_bytes", self.max_input_bytes),
-            ("max_output_tokens", self.max_output_tokens as usize),
-            ("max_bytes", self.max_bytes),
-        ];
-        for (name, value) in positive {
-            if value == 0 {
-                return Err(format!("title {name} must be positive"));
-            }
-        }
-        validate_max_bytes(self.max_bytes)
-    }
-
-    pub fn system_prompt(&self) -> String {
-        format!(
-            "Create a concise title for an AI coding-assistant session from the supplied human messages.\n\
-             Return only the title on one line, **in plain text of natural language**, with no quotes, prefix, explanation, Markdown, XML, or terminal control codes. No code is allowed.\n\
-             Use the language of the messages.\n\
-             Aim for about {} words in non-CJK languages or {} CJK characters.",
-            self.target_words, self.target_cjk_characters
-        )
-    }
-
-    /// The user message for the title request, within `max_input_bytes`:
-    /// the oldest prompts are dropped first, then the oldest kept one is
-    /// trimmed (JSON escaping can grow text, so shrink until it fits).
-    pub fn frame(&self, prompts: &[String]) -> String {
-        const HEAD: &str = "Generate the session title from this JSON array of human messages:\n";
-        let render = |texts: &[&str]| {
-            let messages: Vec<_> = texts.iter().map(|t| serde_json::json!({ "text": t })).collect();
-            format!("{HEAD}{}", serde_json::Value::Array(messages))
-        };
-        let mut texts: Vec<&str> = prompts.iter().map(String::as_str).collect();
-        while texts.len() > 1 && render(&texts).len() > self.max_input_bytes {
-            texts.remove(0);
-        }
-        let full = render(&texts);
-        if full.len() <= self.max_input_bytes || texts.is_empty() {
-            return full;
-        }
-        let prompt = texts[0];
-        let mut keep = self
-            .max_input_bytes
-            .saturating_sub(HEAD.len() + 16)
-            .min(prompt.len());
-        loop {
-            let cut = &prompt[..prompt.floor_char_boundary(keep)];
-            texts[0] = cut;
-            let framed = render(&texts);
-            if framed.len() <= self.max_input_bytes || cut.is_empty() {
-                return framed;
-            }
-            keep = cut.len() * 3 / 4;
-        }
-    }
-}
 
 pub fn validate_max_bytes(max_bytes: usize) -> Result<(), String> {
     if max_bytes == 0 || max_bytes > MAX_BYTES_LIMIT {
@@ -197,13 +88,6 @@ pub fn normalize(input: &str, max_bytes: usize) -> String {
     truncate(&clean(input), max_bytes).trim_end().to_owned()
 }
 
-/// The first `words` words of `prompt`, within `max_bytes`.
-pub fn fallback(prompt: &str, words: usize, max_bytes: usize) -> String {
-    let cleaned = clean(prompt);
-    let head = cleaned.split(' ').take(words).collect::<Vec<_>>().join(" ");
-    truncate(&head, max_bytes).trim_end().to_owned()
-}
-
 /// Text of a human-typed prompt (not injected context, job notices, …).
 pub fn human_text(event: &SessionEvent) -> Option<String> {
     let SessionEvent::UserMessage(m) = event else {
@@ -250,48 +134,9 @@ mod tests {
     }
 
     #[test]
-    fn fallback_takes_words_within_bytes() {
-        assert_eq!(
-            fallback("one two three four five six", 5, 40),
-            "one two three four five"
-        );
-        assert_eq!(fallback("abcdefghij klmnop", 5, 12), "abcdefghij k");
-        assert_eq!(fallback("a\n\nb", 5, 40), "a b");
-    }
-
-    #[test]
-    fn frame_fits_the_input_budget() {
-        let config = TitleRequest {
-            max_input_bytes: 200,
-            ..TitleRequest::default()
-        };
-        let long = "\"quoted\" ".repeat(100);
-        let framed = config.frame(&[long]);
-        assert!(framed.len() <= 200, "{}", framed.len());
-        assert!(framed.contains("\\\"quoted\\\""));
-        assert!(config.frame(&["short".into()]).ends_with(r#"[{"text":"short"}]"#));
-        // All-prompts: the oldest prompts are dropped first.
-        let many: Vec<String> = (0..20).map(|i| format!("prompt number {i}")).collect();
-        let framed = config.frame(&many);
-        assert!(framed.len() <= 200, "{}", framed.len());
-        assert!(framed.contains("prompt number 19") && !framed.contains("prompt number 0\""));
-        assert!(config.frame(&["a".into(), "b".into()]).ends_with(r#"[{"text":"a"},{"text":"b"}]"#));
-    }
-
-    #[test]
-    fn request_validation() {
-        assert!(TitleRequest::default().validate().is_ok());
-        assert!(TitleRequest {
-            max_bytes: 201,
-            ..TitleRequest::default()
-        }
-        .validate()
-        .is_err());
-        assert!(TitleRequest {
-            timeout: 0,
-            ..TitleRequest::default()
-        }
-        .validate()
-        .is_err());
+    fn max_bytes_validation() {
+        assert!(validate_max_bytes(80).is_ok());
+        assert!(validate_max_bytes(0).is_err());
+        assert!(validate_max_bytes(201).is_err());
     }
 }

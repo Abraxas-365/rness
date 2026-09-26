@@ -6,6 +6,7 @@
 //!   system   = "You are a ...",            -- optional system prompt
 //!   session  = ctx.session,                -- optional; auto-detected in commands
 //!   profile  = "title-gen",                -- optional; defaults to session model
+//!   max_output_tokens = 64,                -- optional reply cap (where supported)
 //!   timeout  = 15,                         -- seconds; default 30
 //! }
 //! ```
@@ -34,6 +35,10 @@ pub fn install(
             .get("prompt")
             .map_err(|_| err("rness.llm.complete: 'prompt' is required"))?;
         let profile: Option<String> = opts.get("profile")?;
+        let max_output_tokens: Option<u32> = opts.get("max_output_tokens")?;
+        if max_output_tokens == Some(0) {
+            return Err(err("rness.llm.complete: 'max_output_tokens' must be positive"));
+        }
         let timeout_secs: Option<u64> = opts.get("timeout")?;
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
 
@@ -66,6 +71,7 @@ pub fn install(
                     &system,
                     &prompt,
                     profile.as_deref(),
+                    max_output_tokens,
                     timeout,
                     cancel,
                 )
