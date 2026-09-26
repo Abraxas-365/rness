@@ -1626,6 +1626,16 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Inject the shared terminal registry as `rness.terminals`.
+    pub fn install_terminals(
+        &self,
+        terminals: rness_tools::terminal::TerminalRegistry,
+    ) -> Result<(), LuaError> {
+        let rness: Table = self.lua.globals().get("rness")?;
+        crate::api::terminals::install(&self.lua, &rness, terminals)?;
+        Ok(())
+    }
+
     /// Surface the engine's SessionService as `rness.session`. Called
     /// after mount and again on every fresh VM (hot reload).
     pub fn install_session(
@@ -3437,6 +3447,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     rness.set("json", json)?;
 
     crate::api::jobs::install_unmounted(lua, &rness)?;
+    crate::api::terminals::install_unmounted(lua, &rness)?;
     crate::api::fs::install(lua, &rness)?;
     crate::api::http::install(lua, &rness)?;
     crate::api::process::install(lua, &rness)?;

@@ -619,7 +619,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
         "the optional worker role stays disabled by default"
     );
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 14);
+    assert_eq!(config.plugin_specs.len(), 15);
     assert_eq!(config.images.max_input_dimension, 8192);
     assert_eq!(config.image_reader.processing_concurrency, 2);
     assert_eq!(config.images.max_pixels, 2048 * 2048);

@@ -23,6 +23,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Let the model orchestrate many subagents with a script (opt-in) | [Workflows guide](guides/workflows.md), [recipes](../examples/workflows/), [workflow tool reference](reference/tools/workflow.md) |
 | Check which model settings win | [Configuration precedence](reference/configuration-precedence.md) |
 | Monitor or stop background jobs | [Background job controls](guides/background-jobs.md) |
+| Run dev servers, REPLs, and interactive programs the model keeps using; watch and stop them | [Persistent terminals](guides/terminals.md), [terminal tools reference](reference/tools/terminal.md) |
 | Use slash commands and input history | [TUI commands](guides/configuration/tui-commands.md) |
 | Configure and switch colors | [Colorschemes](guides/configuration/colorschemes.md) |
 | Install Lua packages | [Plugin packages](guides/plugins/packages.md) |

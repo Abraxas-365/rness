@@ -815,8 +815,19 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Persistent terminal sessions (PTY-backed, stay alive across tool calls).
-    let terminals = rness_tools::terminal::TerminalRegistry::new();
-    rness_tools::terminal::register_terminal_tools(&tools, terminals.clone(), ws);
+    let terminals = rness_tools::terminal::TerminalRegistry::with_config(startup.terminal.clone());
+    rness_tools::terminal::register_terminal_tools(
+        &tools,
+        terminals.clone(),
+        ws,
+        Some(jobs.clone()),
+    );
+    lua.install_terminals(terminals.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("lua terminals bridge: {e}"))?;
+    // Every exit path (TUI quit, headless end, `?` errors) ends the
+    // terminals' processes, including `&` jobs their shells started.
+    let _terminals_cleanup = TerminalsCleanup(terminals.clone());
 
     // Skills: filesystem catalogs, project shadowing user on name
     // conflicts. The catalog lives in the tool's description.
@@ -1131,6 +1142,7 @@ async fn main() -> anyhow::Result<()> {
             startup.messagebox.clone(),
             control_path,
             startup.skill_roots.clone(),
+            terminals.clone(),
         )
         .await;
     };
@@ -1190,6 +1202,16 @@ struct LocalBackend {
     reference_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
+    terminals: rness_tools::terminal::TerminalRegistry,
+}
+
+/// Closes every terminal when dropped (process exit paths).
+struct TerminalsCleanup(rness_tools::terminal::TerminalRegistry);
+
+impl Drop for TerminalsCleanup {
+    fn drop(&mut self) {
+        self.0.close_all();
+    }
 }
 
 /// Bridges engine approval checks to the TUI overlay: sends the pending
@@ -1436,6 +1458,20 @@ impl rness_tui::app::Backend for LocalBackend {
         self.sessions.command_running(session)
     }
 
+    fn quit_blockers(&self) -> Vec<String> {
+        if !self.terminals.config().confirm_quit {
+            return Vec::new();
+        }
+        self.terminals
+            .running_all()
+            .into_iter()
+            .map(|t| match t.command {
+                Some(command) if !command.is_empty() => format!("{}: {command}", t.id),
+                _ => t.id,
+            })
+            .collect()
+    }
+
     fn submit(&self, request: ClientRequest) -> Result<Option<String>, String> {
         match request {
             ClientRequest::Send {
@@ -1564,6 +1600,7 @@ async fn run_tui(
     messagebox_config: serde_json::Value,
     control_path: Option<std::path::PathBuf>,
     custom_skill_roots: Vec<std::path::PathBuf>,
+    terminals: rness_tools::terminal::TerminalRegistry,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -2086,6 +2123,7 @@ async fn run_tui(
         reference_cancel: Default::default(),
         sessions: Arc::clone(&sessions),
         results: host_tx.clone(),
+        terminals,
     });
 
     // Drive view/key round-trips for the mounted apps from a host task.

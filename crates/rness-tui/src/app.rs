@@ -44,6 +44,11 @@ pub trait Backend: Send + Sync {
     fn command_running(&self, _session: &SessionId) -> bool {
         false
     }
+    /// Work that quitting would stop (e.g. running terminal commands),
+    /// one short description each. Non-empty makes the first quit ask.
+    fn quit_blockers(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn history(&self, session: &SessionId) -> History;
     /// None requests a full reload (unsupported cursor or backend).
     fn history_after(
@@ -581,7 +586,12 @@ pub struct App {
     command_results: std::collections::HashMap<SessionId, Vec<String>>,
     background_models: std::collections::HashMap<SessionId, Model>,
     backend: Arc<dyn Backend>,
+    /// When a quit was held back to confirm running work.
+    quit_armed: Option<std::time::Instant>,
 }
+
+/// How long a second quit confirms the first.
+const QUIT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl App {
     pub fn new(model: Model, slots: Slots, backend: Arc<dyn Backend>) -> Self {
@@ -601,6 +611,7 @@ impl App {
             command_results: Default::default(),
             background_models: Default::default(),
             backend,
+            quit_armed: None,
         }
     }
 
@@ -1443,7 +1454,40 @@ impl App {
                     session: self.model.session.clone(),
                 });
             }
-            Action::Quit => self.model.should_quit = true,
+            Action::Quit => {
+                let confirmed = self
+                    .quit_armed
+                    .is_some_and(|at| at.elapsed() < QUIT_CONFIRM);
+                let blockers = if confirmed {
+                    Vec::new()
+                } else {
+                    self.backend.quit_blockers()
+                };
+                if blockers.is_empty() {
+                    self.model.should_quit = true;
+                } else {
+                    self.quit_armed = Some(std::time::Instant::now());
+                    let shown: Vec<_> = blockers.iter().take(3).cloned().collect();
+                    let more = blockers.len().saturating_sub(shown.len());
+                    let noun = if blockers.len() == 1 {
+                        "terminal command is"
+                    } else {
+                        "terminal commands are"
+                    };
+                    self.model.entries.push(Entry::Notice(format!(
+                        "{} {noun} still running ({}{}). Quit again within {}s to stop \
+                         them and exit, or /terminals to manage this session's.",
+                        blockers.len(),
+                        shown.join(", "),
+                        if more > 0 {
+                            format!(", +{more} more")
+                        } else {
+                            String::new()
+                        },
+                        QUIT_CONFIRM.as_secs()
+                    )));
+                }
+            }
             Action::ScrollUp(n) => {
                 self.model.scroll_from_bottom = self.model.scroll_from_bottom.saturating_add(n)
             }
@@ -1832,6 +1876,51 @@ mod tests {
         fn history(&self, _session: &SessionId) -> History {
             self.history.clone()
         }
+    }
+
+    #[test]
+    fn quit_asks_once_while_terminal_commands_run() {
+        struct Busy(std::sync::Mutex<Vec<String>>);
+        impl Backend for Busy {
+            fn request(&self, _request: ClientRequest) {}
+            fn history(&self, _session: &SessionId) -> History {
+                prior_history("s")
+            }
+            fn quit_blockers(&self) -> Vec<String> {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let backend = Arc::new(Busy(std::sync::Mutex::new(vec![
+            "term-1: cargo watch".into()
+        ])));
+        let mut app = App::new(
+            Model::new("s".into(), "m".into()),
+            Slots::default(),
+            backend.clone(),
+        );
+        app.apply(Action::Quit);
+        assert!(!app.model.should_quit);
+        let Some(Entry::Notice(notice)) = app.model.entries.last() else {
+            panic!("no notice: {:?}", app.model.entries.last());
+        };
+        assert!(
+            notice.contains("1 terminal command is still running"),
+            "{notice}"
+        );
+        assert!(notice.contains("term-1: cargo watch"), "{notice}");
+        // The second quit confirms.
+        app.apply(Action::Quit);
+        assert!(app.model.should_quit);
+
+        // Nothing running: quits at once.
+        backend.0.lock().unwrap().clear();
+        let mut app = App::new(
+            Model::new("s".into(), "m".into()),
+            Slots::default(),
+            backend,
+        );
+        app.apply(Action::Quit);
+        assert!(app.model.should_quit);
     }
 
     #[cfg(unix)]

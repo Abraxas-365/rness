@@ -826,6 +826,10 @@ enum Cmd {
         jobs: rness_tools::jobs::JobRegistry,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    InstallTerminals {
+        terminals: rness_tools::terminal::TerminalRegistry,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
     /// Inject the shared questions broker so plugins can dynamically
     /// enable/disable the AskUser tool via `rness.questions.enable()`.
     InstallQuestions {
@@ -1450,6 +1454,9 @@ impl LuaHost {
                         Cmd::InstallJobs { jobs, reply } => {
                             let _ = reply.send(rt.install_jobs(jobs).map_err(|e| e.to_string()));
                         }
+                        Cmd::InstallTerminals { terminals, reply } => {
+                            let _ = reply.send(rt.install_terminals(terminals).map_err(|e| e.to_string()));
+                        }
                         Cmd::InstallQuestions { questions, reply } => {
                             questions_ref = Some(questions.clone());
                             let r = rt.install_questions(questions).map_err(|e| e.to_string());
@@ -1891,6 +1898,18 @@ impl LuaHost {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::InstallJobs { jobs, reply })
+            .map_err(|_| "lua vm gone")?;
+        rx.await.map_err(|_| "lua vm gone")?
+    }
+
+    /// Inject the shared terminal registry. Sticky across hot reloads.
+    pub async fn install_terminals(
+        &self,
+        terminals: rness_tools::terminal::TerminalRegistry,
+    ) -> Result<(), String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(Cmd::InstallTerminals { terminals, reply })
             .map_err(|_| "lua vm gone")?;
         rx.await.map_err(|_| "lua vm gone")?
     }

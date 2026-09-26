@@ -83,6 +83,8 @@ pub struct StartupConfig {
     /// `rness.workflow` — the workflow tool is registered only when this is
     /// set (opt-in; `{}` enables it with default limits).
     pub workflow: Option<rness_tools::workflow::WorkflowConfig>,
+    /// `rness.terminal` — persistent terminal defaults and limits.
+    pub terminal: rness_tools::terminal::TerminalConfig,
     /// `rness.system_prompt.base` — sent first in every request, before the
     /// active role's instructions. Empty (unset) sends no base text.
     pub system_prompt: String,
@@ -1542,6 +1544,17 @@ pub fn evaluate(
     if let Some(workflow) = rness.get::<Option<Table>>("workflow")? {
         config.workflow = Some(workflow_config(workflow)?);
     }
+    // `rness.terminal = { … }`: serde rejects unknown keys and bad types.
+    match rness.get::<mlua::Value>("terminal")? {
+        mlua::Value::Nil => {}
+        mlua::Value::Table(table) => {
+            config.terminal = lua
+                .from_value(mlua::Value::Table(table))
+                .map_err(|e| format!("rness.terminal: {e}"))?;
+            config.terminal.validate()?;
+        }
+        _ => return Err("rness.terminal must be a table".into()),
+    }
     config.system_prompt = system_prompt_config(rness.get("system_prompt")?)?;
     Ok(config)
 }
@@ -2065,6 +2078,44 @@ mod tests {
             std::fs::write(&path, invalid).unwrap();
             let error = load(&path).err().expect(invalid).to_string();
             assert!(error.contains(needle), "{invalid}: {error}");
+        }
+    }
+
+    #[test]
+    fn terminal_config_is_validated_and_rejects_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        let defaults = load(&path).unwrap().terminal;
+        assert_eq!(defaults, rness_tools::terminal::TerminalConfig::default());
+        assert_eq!(defaults.shell, "controlled");
+        assert_eq!(defaults.max_sessions, 8);
+        assert!(defaults.confirm_quit);
+        std::fs::write(
+            &path,
+            "rness.terminal = { shell = 'login', env_deny = { '*_TOKEN', 'AWS_*', 'GH_PAT' }, \
+             max_sessions = 3, confirm_quit = false }",
+        )
+        .unwrap();
+        let config = load(&path).unwrap().terminal;
+        assert_eq!(config.shell, "login");
+        assert_eq!(config.env_deny, ["*_TOKEN", "AWS_*", "GH_PAT"]);
+        assert_eq!(config.max_sessions, 3);
+        assert!(!config.confirm_quit);
+        for invalid in [
+            "{ typo = 1 }",
+            "{ shell = 'fish' }",
+            "{ max_sessions = 0 }",
+            "{ max_sessions = 1000 }",
+            "{ max_sessions = 'many' }",
+            "{ confirm_quit = 'yes' }",
+            "{ env_deny = { '*' } }",
+            "{ env_deny = { 'A*B' } }",
+            "{ env_deny = { '*MID*' } }",
+            "true",
+        ] {
+            std::fs::write(&path, format!("rness.terminal = {invalid}")).unwrap();
+            assert!(load(&path).is_err(), "{invalid} should be rejected");
         }
     }
 

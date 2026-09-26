@@ -152,6 +152,16 @@ rness.ui.statusline = {
           style = { fg = "#fabd2f" } }
       end
     end
+    -- Open persistent terminals; bright while a command runs in one.
+    if ctx.session and rness.terminals then
+      local ok, count = pcall(rness.terminals.count, ctx.session)
+      if ok and type(count) == "table" and (count.open or 0) > 0 then
+        local text = count.open .. " term" .. (count.open == 1 and "" or "s")
+        if (count.running or 0) > 0 then text = text .. " (" .. count.running .. " running)" end
+        parts[#parts + 1] = { text = text,
+          style = { fg = (count.running or 0) > 0 and "#8ec07c" or "#928374" } }
+      end
+    end
     parts[#parts + 1] = { text = ctx.profile or "" }
     parts[#parts + 1] = { text = ctx.agent or "" }
     return parts

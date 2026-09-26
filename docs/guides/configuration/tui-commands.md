@@ -8,6 +8,8 @@ Type `/` at the beginning of the input to open completion above the editor. Matc
 | --- | --- |
 | `/jobs`, `/jobs <job_id>` | With the default jobs plugin: open the live monitor or a job's non-consuming output, including retained finished jobs, even while busy. See [background jobs](../background-jobs.md). |
 | `/jobs list`, `/jobs stop <job_id>` | Print active jobs or request cancellation of an explicit job. |
+| `/terminals`, `/terminals <term_id>` | With the default terminals plugin: open the terminals monitor, or a terminal's live, non-consuming output, even while busy. See [persistent terminals](../terminals.md). |
+| `/terminals list`, `/terminals stop <term_id>`, `/terminals close <term_id>` | Print this session's terminals, interrupt a terminal's running command (INT, then TERM/KILL; the shell stays), or close the terminal and everything started in it. |
 | `/agents`, `/agents steer <id> <message>`, `/agents stop <id> [confirm]` | With agent controls: inspect descendants, steer, or request a confirmed stop. ID-first forms are also supported. See [subagent commands](../subagent-commands.md). |
 | `/agent <name>` | Select a declared role in an idle session, persisting its configuration without a model turn. |
 | `/skill <name> <input>` | Append skill instructions to the submitted content while preserving the original text. |

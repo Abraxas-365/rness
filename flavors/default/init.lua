@@ -51,6 +51,7 @@ rness.plugins.setup({
   { name = "references", file = "plugins/references.lua", opts = { max_results = 20, allow_parent = false, allow_home = false, allow_absolute = false } },
   { name = "statusline", file = "plugins/statusline.lua" },
   { name = "jobs", file = "plugins/jobs.lua" },
+  { name = "terminals", file = "plugins/terminals.lua" },
   { name = "sessions", file = "plugins/sessions.lua" },
   -- Optional session-history search: uncomment BOTH entries to enable all five tools.
   -- SQLite indexing is lazy; no index is opened until the first search.
