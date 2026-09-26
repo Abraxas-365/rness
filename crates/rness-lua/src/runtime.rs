@@ -3576,46 +3576,6 @@ mod tests {
     }
 
     #[test]
-    fn title_command_catches_generation_failure_across_the_yield() {
-        let mut rt = LuaRuntime::new().unwrap();
-        let prepare = rt
-            .lua()
-            .create_function(|_, _opts: Table| {
-                Ok(crate::api::session::CommandYield(Box::pin(async {
-                    Ok(serde_json::Value::Null)
-                })))
-            })
-            .unwrap();
-        let complete = crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap();
-        rt.load(
-            "fixture",
-            "rness.session = { title = function(_, text) return text end, prompts = function() return { 'fix it' } end }\nrness.llm = {}",
-        )
-        .unwrap();
-        let llm: Table = rt.lua().globals().get::<Table>("rness").unwrap().get("llm").unwrap();
-        llm.set("complete", complete).unwrap();
-        let setup = format!(
-            "local setup = (function() {} end)()\nsetup({{ auto = 'off', fallback = false }})",
-            include_str!("../../../flavors/default/plugins/title.lua")
-        );
-        rt.load("title", &setup).unwrap();
-        for (resume, expected) in [
-            ((true, LuaValue::String(rt.lua().create_string("Named").unwrap())), "Title: Named"),
-            ((false, LuaValue::String(rt.lua().create_string("provider down").unwrap())), "Title generation failed: provider down"),
-        ] {
-            let command = rt.command_thread("title").unwrap();
-            let request: mlua::AnyUserData = command
-                .thread
-                .resume(rt.lua().to_value(&json!({"session":"s1","raw_input":"auto"})).unwrap())
-                .unwrap();
-            assert!(request.is::<crate::api::session::CommandYield>());
-            let returned = command.thread.resume::<LuaValue>(resume).unwrap();
-            assert_eq!(command.thread.status(), mlua::ThreadStatus::Finished);
-            assert_eq!(rt.command_result(returned).unwrap().message, expected);
-        }
-    }
-
-    #[test]
     fn compaction_wrapper_raises_failure_in_command_coroutine() {
         let mut rt = LuaRuntime::new().unwrap();
         let prepare = rt

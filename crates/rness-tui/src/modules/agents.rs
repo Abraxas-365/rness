@@ -319,7 +319,8 @@ impl AgentMonitorState {
             | Frame::HistoryChanged { session }
             | Frame::ApprovalRequested { session, .. }
             | Frame::ApprovalResolved { session, .. }
-            | Frame::TitleChanged { session, .. } => session,
+            | Frame::TitleChanged { session, .. }
+            | Frame::Notice { session, .. } => session,
         };
         let mut state = self.0.lock().expect("agent monitor lock");
         let target = state.session(session);

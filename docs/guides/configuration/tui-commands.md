@@ -16,7 +16,7 @@ Type `/` at the beginning of the input to open completion above the editor. Matc
 | `/<skill-name> <input>` | Shorthand for a discovered skill; use `/skill` when a name conflicts with a command. |
 | `/unload <name>` | Unload a named plugin under engine maintenance. Does not uninstall it. |
 | `/colorscheme <name>` | Change the local TUI palette immediately. Does not modify startup configuration. |
-| `/title`, `/title <text>`, `/title auto`, `/title unpin` | With the default title plugin: show the session title (`(pinned)` when you set it), rename and pin it, regenerate it with the model now (also pins), or release a pin so automatic titles may replace it. Works while a turn runs; the title is committed at the next step boundary. See [session titles](#session-titles). |
+| `/title`, `/title <text>`, `/title auto`, `/title unpin` | With the default title plugin: show the session title (`(pinned)` when you set it), rename and pin it, regenerate it with the model in the background (also pins; the result arrives as a notice, and a rename cancels it), or release a pin so automatic titles may replace it. Works while a turn runs and never makes the session busy; a mid-turn title is committed at the next step boundary. See [session titles](#session-titles). |
 
 ## Session titles
 
@@ -54,7 +54,11 @@ rness.hook.on("prompt", function(ev)
       session = ev.session, profile = "fast", max_output_tokens = 32,
       system = "Name this coding session in 3 words.", prompt = ev.text,
     })
-    if ok then rness.session.offer_title(ev.session, title, "model") end
+    if ok then
+      rness.session.offer_title(ev.session, title, "model")
+    else
+      rness.session.notify(ev.session, "Title failed: " .. tostring(title))
+    end
   end)
 end)
 ```
@@ -63,6 +67,7 @@ end)
 | --- | --- |
 | `rness.hook.on("prompt", fn)` | A human prompt was committed: `{ session, text, index, parent, lineage }`. `index` is 1-based within the session. `parent` is the parent session id for delegated sessions and JSON null (not `nil`) for roots, so test `type(ev.parent) == "string"`. |
 | `rness.session.prompts(id)` | The session's human prompts, oldest first (own log; a fork does not inherit its parent's). |
+| `rness.session.notify(id, text)` | Show a notice to whoever is viewing the session (TUI transcript notice, SSE `notice` frame). Works from tasks, hooks and timers. Ephemeral: not logged, never sent to the model; control characters are removed. |
 | `rness.llm.complete{ session, prompt, system?, profile?, max_output_tokens?, timeout? }` | One bounded model call. It yields, so call it from a command, a tool or a [`rness.task`](../../reference/lua/task.md). |
 | `rness.session.offer_title(id, text, "model"\|"fallback"[, max_bytes])` | Automatic title under the pin rules (`model` never replaces a pinned title; `fallback` only fills an untitled session). Returns whether it was accepted. |
 | `rness.session.title(id[, text[, source]])`, `title_info(id)` | Get the title; set it explicitly (`user` pins, `model` unpins); `{ title, source }`. |

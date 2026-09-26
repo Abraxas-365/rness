@@ -21,7 +21,8 @@ This queues `fn(...)` to run on the Lua host thread and returns a numeric task i
 
 - `fn` may call yielding rness APIs. While one is in flight, the VM keeps serving hooks, tools, commands and other tasks. When the call completes, the task resumes with the result, or with a Lua error you can catch with `pcall`.
 - Plain `coroutine.yield` is an error: tasks may only yield through async rness APIs.
-- An error in `fn` is logged (target `lua`, `task failed: ...`). It never reaches the caller of `spawn`.
+- An error in `fn` is logged (target `lua`, `task failed: ...`). It never reaches the caller of `spawn`. To tell the user, call `rness.session.notify(session, text)`: it shows a notice in the TUI (and an SSE `notice` frame) for that session.
+- A command can start a task and return at once, so a slow operation never keeps the session busy. The default `/title auto` works this way.
 - Between two awaits, a task gets a Lua instruction budget of about 30 million instructions. Exceeding it aborts the task.
 - At most 256 tasks can be live at once. Beyond that, `spawn` raises an error.
 - `spawn` raises an error in a host without a task runner, such as a bare `LuaRuntime`. Awaiting also needs the engine to be mounted. In a normal `rness` process both are always true.

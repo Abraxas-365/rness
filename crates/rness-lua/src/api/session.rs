@@ -15,6 +15,8 @@
 //!   rness.session.offer_title(id, text, "model"|"fallback"[, max_bytes])
 //!     -> bool (automatic title under pin rules; normalized)
 //!   rness.session.prompts(id)       -> { text, ... } (human prompts)
+//!   rness.session.notify(id, text)  -> nil (ephemeral notice to viewers;
+//!     works from tasks, hooks and timers; not logged)
 //!   rness.session.send(id, text)    -> "started"|"queued"|"logged"
 //!   rness.session.steer(id, text)   -> "started"|"queued" (joins the running
 //!     turn at its next step boundary; starts a turn when idle)
@@ -314,6 +316,16 @@ pub fn install(
     session.set(
         "prompts",
         lua.create_function(move |_, id: String| s.human_prompts(&id).map_err(err))?,
+    )?;
+
+    // `rness.session.notify(id, text)`: an ephemeral notice for whoever is
+    // viewing the session (TUI notice, SSE `notice` frame). Not logged.
+    let s = Arc::clone(&sessions);
+    session.set(
+        "notify",
+        lua.create_function(move |_, (id, text): (String, String)| {
+            s.notify(&id, &text).map_err(err)
+        })?,
     )?;
 
     // `rness.session.offer_title(id, text, source[, max_bytes])` → accepted:

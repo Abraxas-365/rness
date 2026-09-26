@@ -70,6 +70,7 @@ fn frame_session(frame: &Frame) -> &str {
         | Frame::HistoryChanged { session }
         | Frame::ApprovalRequested { session, .. }
         | Frame::ApprovalResolved { session, .. }
-        | Frame::TitleChanged { session, .. } => session,
+        | Frame::TitleChanged { session, .. }
+        | Frame::Notice { session, .. } => session,
     }
 }

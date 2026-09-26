@@ -13,9 +13,10 @@
 --       max_input_bytes = 4096, max_bytes = 80,
 --   } }
 --
--- /title [text | auto | unpin]: show, rename (pins), regenerate now (pins),
--- or release a pin so automatic titles may replace it. Automatic titles only
--- title root sessions and never replace a pinned title.
+-- /title [text | auto | unpin]: show, rename (pins), regenerate in the
+-- background (pins; the result arrives as a notice), or release a pin so
+-- automatic titles may replace it. Works while a turn runs. Automatic
+-- titles only title root sessions and never replace a pinned title.
 --
 -- Want a different title entirely? Call rness.llm.complete yourself and
 -- store the result with rness.session.title(id, text) (pins) or
@@ -98,15 +99,49 @@ return function(opts)
     }
   end
 
+  -- One title request per session; a newer one supersedes it. `explicit`
+  -- marks a /title auto request, which automatic titling never cancels.
+  local inflight = {}
+
+  local function cancel_inflight(session)
+    local current = inflight[session]
+    if current then
+      rness.task.cancel(current.id)
+      inflight[session] = nil
+    end
+  end
+
+  -- Generate in the background; `done(ok, title_or_error)` runs after.
+  local function start(session, explicit, done)
+    cancel_inflight(session)
+    local entry = { explicit = explicit }
+    entry.id = rness.task.spawn(function()
+      local ok, result = pcall(generate, session, auto == "all")
+      if inflight[session] == entry then
+        inflight[session] = nil
+      end
+      done(ok, result)
+    end)
+    inflight[session] = entry
+  end
+
+  local function tell(session, text)
+    pcall(rness.session.notify, session, text)
+  end
+
   rness.commands.register {
     name = "title",
     description = "View, rename, or auto-generate session title",
     usage = "[text | auto | unpin]",
+    -- Titles are committed at the next step boundary, so /title works while
+    -- a turn runs; /title auto returns at once and reports back later.
+    allow_busy = true,
     run = function(ctx)
+      local session = ctx.session
       local text = ctx.raw_input:match("^%s*(.-)%s*$")
 
       if text == "" then
-        local info = rness.session.title_info(ctx.session)
+        local info = rness.session.title_info(session)
         if not info then
           return { message = "(no title)" }
         end
@@ -115,34 +150,39 @@ return function(opts)
       end
 
       if text == "auto" then
-        local ok, result = pcall(generate, ctx.session, auto == "all")
-        if ok then
-          ok, result = pcall(rness.session.title, ctx.session, utf8_prefix(result, max_bytes))
+        if #rness.session.prompts(session) == 0 then
+          return { message = "Title generation failed: no prompt to title yet" }
         end
-        if not ok then
-          return { message = "Title generation failed: " .. tostring(result) }
-        end
-        return { message = "Title: " .. result }
+        start(session, true, function(ok, result)
+          if ok then
+            ok, result = pcall(rness.session.title, session, utf8_prefix(result, max_bytes))
+          end
+          if ok then
+            tell(session, "Title: " .. result)
+          else
+            tell(session, "Title generation failed: " .. tostring(result))
+          end
+        end)
+        return { message = "Generating title…" }
       end
 
       if text == "unpin" then
-        local info = rness.session.title_info(ctx.session)
+        local info = rness.session.title_info(session)
         if not info or info.source ~= "user" then
           return { message = "Title is not pinned" }
         end
-        rness.session.title(ctx.session, info.title, "model")
+        cancel_inflight(session)
+        rness.session.title(session, info.title, "model")
         return { message = "Title unpinned" }
       end
 
-      local title = rness.session.title(ctx.session, text)
+      cancel_inflight(session)
+      local title = rness.session.title(session, text)
       return { message = "Title set: " .. title }
     end,
   }
 
   if auto == "off" and not fallback then return end
-
-  -- Latest prompt wins: a newer request supersedes one still in flight.
-  local inflight = {}
 
   local function pinned(session)
     local info = rness.session.title_info(session)
@@ -165,15 +205,10 @@ return function(opts)
     if auto == "off" or (auto == "first" and ev.index ~= 1) or pinned(session) then
       return
     end
-    if inflight[session] then
-      rness.task.cancel(inflight[session])
+    if inflight[session] and inflight[session].explicit then
+      return
     end
-    local id
-    id = rness.task.spawn(function()
-      local ok, title = pcall(generate, session, auto == "all")
-      if inflight[session] == id then
-        inflight[session] = nil
-      end
+    start(session, false, function(ok, title)
       if ok then
         ok, title = pcall(rness.session.offer_title, session, title, "model", max_bytes)
       end
@@ -181,6 +216,5 @@ return function(opts)
         rness.log.warn("title: " .. tostring(title))
       end
     end)
-    inflight[session] = id
   end)
 end

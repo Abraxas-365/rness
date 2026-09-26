@@ -73,4 +73,7 @@ pub enum Frame {
     /// The session's title changed (the durable `session/title` event is
     /// already committed); frontends refresh labels / the terminal title.
     TitleChanged { session: SessionId, title: String },
+    /// A plugin message for whoever is viewing the session (e.g. a
+    /// background task's result). Shown like a command result; never logged.
+    Notice { session: SessionId, text: String },
 }

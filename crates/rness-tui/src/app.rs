@@ -496,6 +496,8 @@ impl Model {
                 self.title = Some(title.clone());
                 FrameEffect::None
             }
+            // Routed by the App into the session's command results.
+            Frame::Notice { .. } => FrameEffect::None,
         }
     }
 }
@@ -670,8 +672,13 @@ impl App {
             | Frame::HistoryChanged { session }
             | Frame::ApprovalRequested { session, .. }
             | Frame::ApprovalResolved { session, .. }
-            | Frame::TitleChanged { session, .. } => session,
+            | Frame::TitleChanged { session, .. }
+            | Frame::Notice { session, .. } => session,
         };
+        if let Frame::Notice { session, text } = frame {
+            self.apply(Action::CommandResult(session.clone(), text.clone()));
+            return;
+        }
         if matches!(frame, Frame::StepStarted { .. }) {
             self.command_results.remove(session);
             if session == &self.model.session {
@@ -2432,6 +2439,25 @@ mod tests {
             .model
             .entries
             .contains(&Entry::Notice("saved result".into())));
+    }
+
+    #[test]
+    fn notice_frames_show_now_or_when_their_session_is_viewed() {
+        let backend = Arc::new(FakeBackend {
+            history: prior_history("s"),
+        });
+        let mut app = App::new(
+            Model::new("s".into(), "m".into()),
+            Slots::default(),
+            backend,
+        );
+        app.apply_frame(&Frame::Notice { session: "s".into(), text: "Title: A".into() });
+        assert!(app.model.entries.contains(&Entry::Notice("Title: A".into())));
+        app.apply_frame(&Frame::Notice { session: "other".into(), text: "Title: B".into() });
+        assert!(!app.model.entries.contains(&Entry::Notice("Title: B".into())));
+        app.apply(Action::SwitchSession("other".into()));
+        app.reconcile();
+        assert!(app.model.entries.contains(&Entry::Notice("Title: B".into())));
     }
 
     #[test]

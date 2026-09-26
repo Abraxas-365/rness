@@ -1040,7 +1040,7 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
         use rness_protocol::frames::Frame;
         f.lock().unwrap().push(match frame {
             // Usage telemetry and titles are independent of the lifecycle ordering checked here.
-            Frame::ContextUsage { .. } | Frame::TitleChanged { .. } => return,
+            Frame::ContextUsage { .. } | Frame::TitleChanged { .. } | Frame::Notice { .. } => return,
             Frame::StepStarted { .. } => "step".into(),
             Frame::Delta { chunk, .. } => match chunk {
                 ChunkDelta::Text { t } => format!("delta:{t}"),

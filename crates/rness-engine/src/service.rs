@@ -1184,6 +1184,25 @@ impl SessionService {
         self.live(session).inbox.lock().unwrap().phase()
     }
 
+    /// Show `text` to whoever is viewing `session` (TUI notice, SSE frame).
+    /// Ephemeral: nothing is logged and the model never sees it. Control
+    /// characters are removed so a plugin cannot inject terminal codes.
+    pub fn notify(&self, session: &SessionId, text: &str) -> Result<(), ServiceError> {
+        self.store.workspace(session)?;
+        let text: String = text
+            .chars()
+            .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+            .collect();
+        if text.trim().is_empty() {
+            return Err(ServiceError::InvalidConfig("notice text is empty".into()));
+        }
+        self.bus.emit::<FrameEv>(&Frame::Notice {
+            session: session.clone(),
+            text,
+        });
+        Ok(())
+    }
+
     /// Get the current title for a session (last `session/title` event
     /// wins, including one queued for the running turn). Reads only the
     /// session's own log (not fork ancestors), since titles are leaf-local.
