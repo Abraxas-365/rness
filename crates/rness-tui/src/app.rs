@@ -1863,10 +1863,19 @@ pub async fn run(
         // render runs; a width change forces a full transcript rebuild, so
         // the screen would stay blank for the whole rebuild. Warm the caches
         // at the new size first so clear and flush happen back-to-back.
-        if let Some((width, height)) = resized.take() {
+        // While dragging, more resizes arrive during the rebuild: fold them
+        // in and rebuild again instead of drawing an already-stale size.
+        while let Some((width, height)) = resized.take() {
             let area = Rect::new(0, 0, width, height);
             let mut scratch = Buffer::empty(area);
             app.render(area, &mut scratch);
+            while let Ok(ev) = term_events.try_recv() {
+                if let TermEvent::Resize(width, height) = ev {
+                    let same = (width, height) == (area.width, area.height);
+                    resized = (!same).then_some((width, height));
+                }
+                app.on_term_event(ev);
+            }
         }
         let draw = terminal.draw(|f| {
             let area = f.area();

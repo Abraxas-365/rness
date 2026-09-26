@@ -506,6 +506,22 @@ fn visual_rows_limited(
     let mut spans = Vec::new();
     let mut used = 0;
     for span in line.spans {
+        let style = line.style.patch(span.style);
+        // Fast path: a printable-ASCII span that fits whole needs no
+        // grapheme split (one cell per byte).
+        let content = span.content.as_ref();
+        let printable = content.bytes().all(|b| (0x20..0x7f).contains(&b));
+        if printable && used + content.len() <= width {
+            used += content.len();
+            match spans.last_mut() {
+                Some(Span {
+                    style: last,
+                    content: text,
+                }) if *last == style => text.to_mut().push_str(content),
+                _ => spans.push(Span::styled(span.content, style)),
+            }
+            continue;
+        }
         // Ratatui's grapheme iterator keeps combining marks and joined glyphs together.
         for grapheme in span.styled_graphemes(line.style) {
             let cells = unicode_width::UnicodeWidthStr::width(grapheme.symbol);
