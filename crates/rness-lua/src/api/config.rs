@@ -92,6 +92,8 @@ pub struct StartupConfig {
     pub sections: Vec<rness_engine::prompt::PromptSection>,
     /// `rness.hooks` — Claude Code / Codex command-hook compatibility.
     pub hooks: crate::command_hooks::HooksConfig,
+    /// `rness.terminal_title` — set the terminal window title (None = on).
+    pub terminal_title: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1568,6 +1570,11 @@ pub fn evaluate(
         }
         _ => return Err("rness.hooks must be a table".into()),
     }
+    config.terminal_title = match rness.get::<mlua::Value>("terminal_title")? {
+        mlua::Value::Nil => None,
+        mlua::Value::Boolean(b) => Some(b),
+        _ => return Err("rness.terminal_title must be a boolean".into()),
+    };
     config.system_prompt = system_prompt_config(rness.get("system_prompt")?)?;
     Ok(config)
 }
@@ -2027,6 +2034,18 @@ mod tests {
             std::fs::write(&path, format!("rness.agents.allow_generic = {invalid}")).unwrap();
             assert!(load(&path).is_err());
         }
+    }
+
+    #[test]
+    fn terminal_title_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load(&path).unwrap().terminal_title, None);
+        std::fs::write(&path, "rness.terminal_title = false").unwrap();
+        assert_eq!(load(&path).unwrap().terminal_title, Some(false));
+        std::fs::write(&path, "rness.terminal_title = 'no'").unwrap();
+        assert!(load(&path).is_err());
     }
 
     #[test]

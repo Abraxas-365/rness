@@ -95,6 +95,56 @@ impl Event for SessionIdleEv {
     type Payload = SessionId;
 }
 
+/// A session's title changed (durably appended).
+#[derive(Debug, Clone)]
+pub struct TitleNotice {
+    pub session: SessionId,
+    pub title: String,
+    pub source: rness_protocol::events::TitleSource,
+}
+pub struct TitleChangedEv;
+impl Event for TitleChangedEv {
+    const NAME: &'static str = "session/title";
+    type Payload = TitleNotice;
+}
+
+/// A human-typed prompt was committed (not injected context, hook or job
+/// messages). `index` is its 1-based position among the human prompts in
+/// the session's own log (a fork counts from its own first prompt, as
+/// titles are leaf-local). Steers are announced when their step starts.
+#[derive(Debug, Clone)]
+pub struct PromptNotice {
+    pub session: SessionId,
+    pub text: String,
+    pub index: usize,
+}
+pub struct PromptCommittedEv;
+impl Event for PromptCommittedEv {
+    const NAME: &'static str = "session/prompt";
+    type Payload = PromptNotice;
+}
+
+fn human_prompts<'a>(events: impl Iterator<Item = &'a rness_protocol::events::Envelope>) -> usize {
+    events.filter(|e| crate::titles::human_text(&e.event).is_some()).count()
+}
+
+/// Announce human prompts just committed at the end of `events`.
+fn announce_prompts(
+    bus: &EventBus,
+    session: &SessionId,
+    events: &[rness_protocol::events::Envelope],
+    committed: usize,
+) {
+    let tail = &events[events.len().saturating_sub(committed)..];
+    let mut index = human_prompts(events[..events.len() - tail.len()].iter());
+    for e in tail {
+        if let Some(text) = crate::titles::human_text(&e.event) {
+            index += 1;
+            bus.emit::<PromptCommittedEv>(&PromptNotice { session: session.clone(), text, index });
+        }
+    }
+}
+
 /// Fired when a brand-new session is created (not resumed).
 #[derive(Debug, Clone)]
 pub struct SessionCreatedNotice {
@@ -194,6 +244,9 @@ struct Live {
     cancel: Mutex<CancellationToken>,
     /// Handle of the current burst task, for [`SessionService::join`].
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Titles set while a burst owns the log; it appends them at its next
+    /// boundary (under the inbox lock, so none is stranded at idle).
+    titles: Mutex<Vec<rness_protocol::events::SessionTitle>>,
 }
 
 impl Default for Live {
@@ -205,7 +258,142 @@ impl Default for Live {
             job_pending: Default::default(),
             cancel: Mutex::new(CancellationToken::new()),
             handle: Mutex::new(None),
+            titles: Mutex::new(Vec::new()),
         }
+    }
+}
+
+/// Pin rules: may `title` replace `current`? A user title pins against
+/// automatic ones; the fallback only fills an untitled session. Explicit
+/// titles (rename, `/title unpin`, `/title auto`) always apply.
+fn title_admitted(
+    current: Option<&(String, rness_protocol::events::TitleSource)>,
+    title: &rness_protocol::events::SessionTitle,
+    explicit: bool,
+) -> bool {
+    use rness_protocol::events::TitleSource;
+    match (current, title.source) {
+        (Some((text, source)), _) if *text == title.title && *source == title.source => false,
+        _ if explicit => true,
+        (Some((_, TitleSource::User)), TitleSource::Model | TitleSource::Fallback) => false,
+        (Some(_), TitleSource::Fallback) => false,
+        _ => true,
+    }
+}
+
+/// Latest title including ones queued for the running burst.
+fn effective_title(
+    store: &SessionStore,
+    live: &Live,
+    session: &SessionId,
+) -> Result<Option<(String, rness_protocol::events::TitleSource)>, ServiceError> {
+    if let Some(t) = live.titles.lock().unwrap().last() {
+        return Ok(Some((t.title.clone(), t.source)));
+    }
+    let events = store.read_session(session)?;
+    Ok(crate::titles::current(events.iter().map(|e| &e.event)))
+}
+
+fn announce_title(bus: &EventBus, session: &SessionId, title: &rness_protocol::events::SessionTitle) {
+    bus.emit::<TitleChangedEv>(&TitleNotice {
+        session: session.clone(),
+        title: title.title.clone(),
+        source: title.source,
+    });
+    bus.emit::<FrameEv>(&rness_protocol::frames::Frame::TitleChanged {
+        session: session.clone(),
+        title: title.title.clone(),
+    });
+}
+
+/// Commit a title (pin rules applied), or queue it for the running burst,
+/// which persists it at its next boundary. Readers see queued titles at
+/// once. Returns whether the title was accepted.
+fn commit_title(
+    store: &SessionStore,
+    live: &Live,
+    bus: &EventBus,
+    session: &SessionId,
+    title: rness_protocol::events::SessionTitle,
+    explicit: bool,
+) -> Result<bool, ServiceError> {
+    let inbox = live.inbox.lock().unwrap();
+    if !title_admitted(effective_title(store, live, session)?.as_ref(), &title, explicit) {
+        return Ok(false);
+    }
+    if inbox.phase() == Phase::Running {
+        live.titles.lock().unwrap().push(title.clone());
+    } else {
+        // Hold the inbox across the append: a concurrent send() must see
+        // us as busy rather than hit the writer lock.
+        let mut log = store.open(session)?;
+        log.append(&SessionEvent::Title(title.clone()))?;
+        drop(log);
+        drop(inbox);
+    }
+    announce_title(bus, session, &title);
+    Ok(true)
+}
+
+/// Persist titles queued while the burst owned the log (already admitted
+/// and announced). Callers hold the inbox lock, so `commit_title` cannot
+/// judge a new title against a half-drained queue; each title leaves the
+/// queue only once it is durable.
+fn drain_titles(log: &mut crate::session::log::SessionLog, live: &Live) {
+    loop {
+        let Some(title) = live.titles.lock().unwrap().first().cloned() else { return };
+        if let Err(e) = log.append(&SessionEvent::Title(title)) {
+            tracing::warn!(session = %log.session(), "title append failed: {e}");
+        }
+        live.titles.lock().unwrap().remove(0);
+    }
+}
+
+/// One bounded title request over `prompts`; returns the raw model text.
+async fn title_completion(
+    request: &crate::titles::TitleRequest,
+    prompts: &[String],
+    provider: Arc<dyn Provider>,
+    call: CallConfig,
+    cancel: &CancellationToken,
+) -> Result<String, ServiceError> {
+    use crate::turn::provider::StepOutcome;
+    use rness_protocol::events::StopReason;
+    let context = crate::session::projection::ModelContext {
+        turns: vec![crate::session::projection::ModelTurn::User {
+            content: vec![ContentPart::Text { text: request.frame(prompts) }],
+        }],
+        config: call,
+        ..Default::default()
+    };
+    let system = request.system_prompt();
+    let step = crate::turn::provider::StepRequest { context: &context, system: &system, tools: &[], on_delta: None };
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(ServiceError::Summarizer("title generation cancelled".into())),
+        outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(request.timeout),
+            provider.summarize_step(step, cancel),
+        ) => outcome,
+    };
+    let fail = |m: String| Err(ServiceError::Summarizer(m));
+    match outcome {
+        Ok(StepOutcome::Committed(msg)) if msg.stop == StopReason::EndTurn => Ok(msg
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")),
+        Ok(StepOutcome::Committed(msg)) if msg.stop == StopReason::MaxTokens => {
+            fail("title output reached max_output_tokens".into())
+        }
+        Ok(StepOutcome::Committed(_)) => fail("title model unexpectedly requested a tool".into()),
+        Ok(StepOutcome::Failed { error, .. }) => fail(error.message),
+        Ok(StepOutcome::Cancelled { .. }) => fail("cancelled".into()),
+        Err(_) => fail(format!("title generation timed out after {}s", request.timeout)),
     }
 }
 
@@ -1044,38 +1232,115 @@ impl SessionService {
         self.live(session).inbox.lock().unwrap().phase()
     }
 
-    /// Get the current title for a session (last `session/title` event wins).
-    /// Reads only the session's own log (not fork ancestors), since titles
-    /// are always leaf-local.
+    /// Get the current title for a session (last `session/title` event
+    /// wins, including one queued for the running turn). Reads only the
+    /// session's own log (not fork ancestors), since titles are leaf-local.
     pub fn title(&self, session: &SessionId) -> Result<Option<String>, ServiceError> {
-        let events = self.store.read_session(session)?;
-        // Last-wins: scan from the end.
-        for envelope in events.iter().rev() {
-            if let rness_protocol::events::SessionEvent::Title(t) = &envelope.event {
-                return Ok(Some(t.title.clone()));
-            }
-        }
-        Ok(None)
+        Ok(self.title_with_source(session)?.map(|(t, _)| t))
     }
 
-    /// Set a session title (appends a `session/title` event).
-    /// Fails with `Busy` if the session's log is locked (e.g. during a turn).
+    /// Current title and how it was produced (`user` = pinned).
+    pub fn title_with_source(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<(String, rness_protocol::events::TitleSource)>, ServiceError> {
+        effective_title(&self.store, &self.live(session), session)
+    }
+
+    /// Set a session title explicitly (a rename, `/title unpin`, `/title
+    /// auto`): pin rules are bypassed. Normalized to one terminal-safe line
+    /// within the default byte cap. A `user` title pins against
+    /// [`Self::offer_title`]. During a turn the title is queued and committed
+    /// at the next boundary; readers see it at once.
     pub fn set_title(
         &self,
         session: &SessionId,
         title: String,
         source: rness_protocol::events::TitleSource,
     ) -> Result<(), ServiceError> {
-        if title.len() > 200 {
-            return Err(ServiceError::InvalidConfig(
-                "title exceeds 200 bytes".into(),
-            ));
-        }
-        let mut log = self.store.open(session)?;
-        log.append(&rness_protocol::events::SessionEvent::Title(
-            rness_protocol::events::SessionTitle { title, source },
-        ))?;
+        let title = self.title_event(title, source, crate::titles::DEFAULT_MAX_BYTES)?;
+        commit_title(&self.store, &self.live(session), &self.bus, session, title, true)?;
         Ok(())
+    }
+
+    /// Offer an automatic title under the pin rules: a `user` title is
+    /// never replaced, and a `fallback` only fills an untitled session.
+    /// Returns whether it was accepted.
+    pub fn offer_title(
+        &self,
+        session: &SessionId,
+        title: String,
+        source: rness_protocol::events::TitleSource,
+        max_bytes: usize,
+    ) -> Result<bool, ServiceError> {
+        let title = self.title_event(title, source, max_bytes)?;
+        commit_title(&self.store, &self.live(session), &self.bus, session, title, false)
+    }
+
+    fn title_event(
+        &self,
+        title: String,
+        source: rness_protocol::events::TitleSource,
+        max_bytes: usize,
+    ) -> Result<rness_protocol::events::SessionTitle, ServiceError> {
+        crate::titles::validate_max_bytes(max_bytes).map_err(ServiceError::InvalidConfig)?;
+        let title = crate::titles::normalize(&title, max_bytes);
+        if title.is_empty() {
+            return Err(ServiceError::InvalidConfig("title is empty".into()));
+        }
+        Ok(rness_protocol::events::SessionTitle { title, source })
+    }
+
+    /// Generate a model title from the session's human prompts (first or
+    /// all, per `request`) and return it normalized. Nothing is committed:
+    /// the caller decides (`set_title` to pin, `offer_title` to respect a pin).
+    pub async fn generate_title(
+        &self,
+        session: &SessionId,
+        request: &crate::titles::TitleRequest,
+        cancel: &CancellationToken,
+    ) -> Result<String, ServiceError> {
+        request.validate().map_err(ServiceError::InvalidConfig)?;
+        // Own log only: titles, prompt indices and fallbacks are leaf-local.
+        let history = self.store.read_session(session)?;
+        let mut prompts = history.iter().filter_map(|e| crate::titles::human_text(&e.event));
+        let prompts: Vec<String> = match request.prompts {
+            crate::titles::TitlePrompts::First => prompts.next().into_iter().collect(),
+            crate::titles::TitlePrompts::All => prompts.collect(),
+        };
+        if prompts.is_empty() {
+            return Err(ServiceError::InvalidConfig("no prompt to title yet".into()));
+        }
+        let (provider, call) = self.title_provider(session, request)?;
+        let text = title_completion(request, &prompts, provider, call, cancel).await?;
+        let title = crate::titles::normalize(&text, request.max_bytes);
+        if title.is_empty() {
+            return Err(ServiceError::Summarizer("title model produced no text".into()));
+        }
+        Ok(title)
+    }
+
+    /// Provider + request config for title generation.
+    fn title_provider(
+        &self,
+        session: &SessionId,
+        config: &crate::titles::TitleRequest,
+    ) -> Result<(Arc<dyn Provider>, CallConfig), ServiceError> {
+        let current = self.config(session)?;
+        let mut call = match &config.profile {
+            Some(name) => self
+                .models
+                .resolve_profile_for(name, current.selection.as_ref().map(|s| s.route.as_str()))
+                .map_err(ServiceError::InvalidConfig)?,
+            None => current,
+        };
+        let provider = self.provider_for(&call)?;
+        // A title needs no reasoning budget; keep output tight.
+        call.reasoning = None;
+        call.max_output_tokens = provider.supports_max_output_tokens().then_some(config.max_output_tokens);
+        call.tool_ceiling = None;
+        call.agent = None;
+        Ok((provider, call))
     }
 
     /// Profile-aware LLM completion for plugins.
@@ -1583,11 +1848,7 @@ impl SessionService {
                 // the turn (dsh baseline order).
                 self.ensure_instructions(&mut log, session)?;
                 if !retry {
-                    log.append(&SessionEvent::UserMessage(UserMessage {
-                        intent,
-                        content,
-                        source,
-                    }))?;
+                    log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
                 }
                 let all_events = log.read_all()?;
                 let turns_so_far = all_events
@@ -1608,6 +1869,12 @@ impl SessionService {
                 }.into();
                 inbox.set_phase(Phase::Running);
                 drop(inbox);
+                // Announced once Running, so titles set in response queue
+                // for the burst rather than racing it for the log.
+                if !retry {
+                    announce_prompts(&self.bus, session, &all_events, 1);
+                }
+                let prompts_so_far = human_prompts(all_events.iter());
 
                 let token = CancellationToken::new();
                 *live.cancel.lock().unwrap() = token.clone();
@@ -1623,6 +1890,7 @@ impl SessionService {
                     turns_so_far,
                     start_source,
                     self.loop_hooks(),
+                    prompts_so_far,
                 );
                 let handle = tokio::spawn(async move {
                     let _activity = activity;
@@ -2300,70 +2568,6 @@ async fn summarize(
     }
 }
 
-/// Generate a deterministic session title after the first turn.
-///
-/// Writes the first ~8 words of the user message as a fallback title.
-/// Plugins can override this via `rness.session.title(id, text)` or by
-/// hooking `turn_end` to generate an LLM-based title.
-fn auto_title(
-    log: &mut crate::session::log::SessionLog,
-    session: &SessionId,
-    store: &SessionStore,
-) -> Result<(), ServiceError> {
-    // Already titled in this session's own log? (Not fork ancestry.)
-    let own_events = store.read_session(session)?;
-    if own_events
-        .iter()
-        .any(|e| matches!(e.event, SessionEvent::Title(_)))
-    {
-        return Ok(());
-    }
-    // Extract first user message text (from full history, including fork ancestors).
-    let history = store.history(session)?;
-    let first_user_text = history
-        .iter()
-        .find_map(|e| match &e.event {
-            SessionEvent::UserMessage(m) => {
-                let text: String = m
-                    .content
-                    .iter()
-                    .filter_map(|p| match p {
-                        ContentPart::Text { text } => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if text.trim().is_empty() {
-                    None
-                } else {
-                    Some(text)
-                }
-            }
-            _ => None,
-        });
-    let first_user_text = match first_user_text {
-        Some(t) => t,
-        None => return Ok(()), // no user message — nothing to title
-    };
-
-    // Deterministic fallback: first ~8 words, max 60 chars.
-    let fallback: String = first_user_text
-        .split_whitespace()
-        .take(8)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let fallback = if fallback.len() > 60 {
-        format!("{}…", &fallback[..fallback.floor_char_boundary(57)])
-    } else {
-        fallback
-    };
-    log.append(&SessionEvent::Title(rness_protocol::events::SessionTitle {
-        title: fallback,
-        source: rness_protocol::events::TitleSource::Fallback,
-    }))?;
-    Ok(())
-}
-
 /// One burst: the initial turn plus any followups queued while running.
 /// Owns the writer log for its whole lifetime.
 #[allow(clippy::too_many_arguments)]
@@ -2379,10 +2583,29 @@ async fn burst(
     turns_so_far: u32,
     start_source: String,
     loop_hooks: Option<Arc<dyn crate::turn::hooks::LoopHooks>>,
+    prompts_so_far: usize,
 ) {
     let session = log.session().clone();
     let mut log = Some(log);
     let mut turn_no = turns_so_far;
+    // Human-prompt ordinal for `PromptCommittedEv` across this burst.
+    let prompt_count = Arc::new(std::sync::atomic::AtomicUsize::new(prompts_so_far));
+    let announce = {
+        let bus = Arc::clone(&bus);
+        let session = session.clone();
+        let count = Arc::clone(&prompt_count);
+        move |pending: &crate::inbox::Pending| {
+            let message = SessionEvent::UserMessage(UserMessage {
+                intent: pending.intent,
+                content: pending.content.clone(),
+                source: pending.source.clone(),
+            });
+            if let Some(text) = crate::titles::human_text(&message) {
+                let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                bus.emit::<PromptCommittedEv>(&PromptNotice { session: session.clone(), text, index });
+            }
+        }
+    };
 
     // Fire session_start once per burst (i.e. when the session transitions
     // from idle to running).
@@ -2432,10 +2655,31 @@ async fn burst(
             turn: turn_no,
         });
 
+        // Human steers are announced once durable: run_turn appends them
+        // before emitting that step's StepStarted frame.
+        let taken: Arc<Mutex<Vec<crate::inbox::Pending>>> = Arc::default();
         let steer_live = Arc::clone(&live);
-        let mut steers = move || steer_live.inbox.lock().unwrap().drain_steers();
+        let steer_taken = Arc::clone(&taken);
+        let mut steers = move || {
+            let drained = steer_live.inbox.lock().unwrap().drain_steers();
+            steer_taken.lock().unwrap().extend(drained.iter().cloned());
+            drained
+        };
+        let flush = {
+            let taken = Arc::clone(&taken);
+            let announce = announce.clone();
+            move || {
+                for pending in std::mem::take(&mut *taken.lock().unwrap()) {
+                    announce(&pending);
+                }
+            }
+        };
         let frame_bus = Arc::clone(&bus);
+        let frame_flush = flush;
         let frames = move |frame: rness_protocol::frames::Frame| {
+            if matches!(frame, rness_protocol::frames::Frame::StepStarted { .. }) {
+                frame_flush();
+            }
             frame_bus.emit::<FrameEv>(&frame);
         };
         let result = run_turn(
@@ -2451,6 +2695,31 @@ async fn burst(
             loop_hooks.as_deref(),
         )
         .await;
+        // Steers taken for a step that never started (pre_step reject, an
+        // error after the append) may already be durable: announce exactly
+        // those, keeping the prompt ordinal in step with the log.
+        let taken_now = std::mem::take(&mut *taken.lock().unwrap());
+        if !taken_now.is_empty() {
+            let durable = store
+                .read_session(&session)
+                .map(|events| human_prompts(events.iter()))
+                .unwrap_or(0);
+            let mut missing = durable.saturating_sub(prompt_count.load(std::sync::atomic::Ordering::SeqCst));
+            for pending in taken_now {
+                let message = SessionEvent::UserMessage(UserMessage {
+                    intent: pending.intent,
+                    content: pending.content.clone(),
+                    source: pending.source.clone(),
+                });
+                if crate::titles::human_text(&message).is_some() {
+                    if missing == 0 {
+                        break;
+                    }
+                    missing -= 1;
+                }
+                announce(&pending);
+            }
+        }
 
         let outcome = match result {
             Ok(o) => o,
@@ -2465,15 +2734,11 @@ async fn burst(
             outcome,
         });
 
-        // Auto-generate a session title after the first successful turn.
-        if turn_no == 1 && outcome == TurnOutcome::Completed {
-            if let Some(log_ref) = log.as_mut() {
-                if let Err(e) =
-                    auto_title(log_ref, &session, &store)
-                {
-                    tracing::debug!(session = %session, "auto-title: {e}");
-                }
-            }
+        // Persist titles queued during the turn (under the inbox lock, see
+        // drain_titles). The phase stays Running, so offers keep queueing.
+        if let Some(log_ref) = log.as_mut() {
+            let _inbox = live.inbox.lock().unwrap();
+            drain_titles(log_ref, &live);
         }
 
         // Continuation decision under the inbox lock: a followup queued
@@ -2488,17 +2753,24 @@ async fn burst(
         match next {
             Some(pending) => {
                 drop(inbox);
+                let pending = crate::inbox::Pending { intent: UserIntent::Followup, ..pending };
                 let append =
                     log.as_mut()
                         .expect("burst owns the log")
                         .append(&SessionEvent::UserMessage(UserMessage {
                             intent: UserIntent::Followup,
-                            content: pending.content,
-                            source: pending.source,
+                            content: pending.content.clone(),
+                            source: pending.source.clone(),
                         }));
+                if append.is_ok() {
+                    announce(&pending);
+                }
                 if let Err(e) = append {
                     tracing::error!(session = %session, error = %e, "followup commit failed");
                     let mut inbox = live.inbox.lock().unwrap();
+                    if let Some(log_ref) = log.as_mut() {
+                        drain_titles(log_ref, &live);
+                    }
                     drop(log.take()); // release the writer lock first
                     inbox.set_phase(Phase::Idle);
                     drop(inbox);
@@ -2534,11 +2806,12 @@ async fn burst(
                             }
                             other => other,
                         };
+                        let pending = crate::inbox::Pending { intent, ..pending };
                         let append = log.as_mut().expect("burst owns the log").append(
                             &SessionEvent::UserMessage(UserMessage {
                                 intent,
-                                content: pending.content,
-                                source: pending.source,
+                                content: pending.content.clone(),
+                                source: pending.source.clone(),
                             }),
                         );
                         if let Err(e) = append {
@@ -2546,6 +2819,7 @@ async fn burst(
                             append_failed = true;
                             break;
                         }
+                        announce(&pending);
                     }
                     if start_turn && !append_failed {
                         continue; // the degraded followup runs as its own turn
@@ -2557,6 +2831,9 @@ async fn burst(
                         }
                     }
                     let mut inbox = live.inbox.lock().unwrap();
+                    if let Some(log_ref) = log.as_mut() {
+                        drain_titles(log_ref, &live);
+                    }
                     drop(log.take());
                     inbox.set_phase(Phase::Idle);
                     drop(inbox);
@@ -2571,6 +2848,9 @@ async fn burst(
                     while let Ok(event) = audit_rx.try_recv() {
                         let _ = log_ref.append(&event);
                     }
+                }
+                if let Some(log_ref) = log.as_mut() {
+                    drain_titles(log_ref, &live);
                 }
                 drop(log.take()); // release the writer lock before going idle
                 inbox.set_phase(Phase::Idle);

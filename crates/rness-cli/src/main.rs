@@ -1065,7 +1065,15 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::json!({"session": session}),
             );
         });
-        (s1, s2, s3, s4, s5, s6, s7, s8)
+        // A human prompt was committed (title policy, prompt logging).
+        let l9: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
+        let s9 = kernel.bus().on::<rness_engine::service::PromptCommittedEv>(move |n| {
+            l9.fire_hook(
+                "prompt",
+                serde_json::json!({"session": n.session, "text": n.text, "index": n.index}),
+            );
+        });
+        (s1, s2, s3, s4, s5, s6, s7, s8, s9)
     };
 
     if cli.list {
@@ -1203,6 +1211,7 @@ async fn main() -> anyhow::Result<()> {
             control_path,
             startup.skill_roots.clone(),
             terminals.clone(),
+            startup.terminal_title.unwrap_or(true),
         )
         .await;
     };
@@ -1706,6 +1715,7 @@ async fn run_tui(
     control_path: Option<std::path::PathBuf>,
     custom_skill_roots: Vec<std::path::PathBuf>,
     terminals: rness_tools::terminal::TerminalRegistry,
+    terminal_title: bool,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -2477,6 +2487,7 @@ async fn run_tui(
     };
 
     let mut app = App::new(Model::new(session.clone(), model_name), slots, backend);
+    app.terminal_title = terminal_title;
     let displayed = Arc::new(std::sync::RwLock::new(session.clone()));
     app.displayed_session = Some(displayed.clone());
     app.apply(rness_tui::app::Action::Custom(

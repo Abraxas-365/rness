@@ -142,8 +142,8 @@ pub enum SessionEvent {
     #[serde(rename = "hook/result")]
     HookResult(HookResult),
 
-    /// A human-readable session title (last-wins). Written by
-    /// auto-generation after the first turn or by explicit user rename.
+    /// A human-readable session title (last-wins). Written by a title
+    /// plugin (automatic: `fallback`/`model`) or by an explicit rename.
     #[serde(rename = "session/title")]
     Title(SessionTitle),
 }

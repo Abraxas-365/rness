@@ -1,47 +1,48 @@
--- /title [text|auto] — view, set, or auto-generate the session title.
+-- /title [text | auto | unpin] — view, rename, or regenerate the session title.
 --
--- Configure LLM title generation via init.lua:
---   rness.title_gen = {
---     profile = "title-gen",  -- optional; defaults to session model
---     timeout = 15,           -- seconds; default 15
---   }
+-- A title set here pins: automatic titles (plugins/session-title.lua) never
+-- overwrite it until `/title unpin`. `/title auto` generates a model title
+-- from the first prompt now and pins it.
 
-local config = rness.title_gen or {}
+return function(opts)
+  opts = opts or {}
+  local request = { profile = opts.profile, timeout = opts.timeout }
 
-rness.commands.register {
-  name = "title",
-  description = "View, rename, or auto-generate session title",
-  usage = "[text | auto]",
-  run = function(ctx)
-    local text = ctx.raw_input:match("^%s*(.-)%s*$")
+  rness.commands.register {
+    name = "title",
+    description = "View, rename, or auto-generate session title",
+    usage = "[text | auto | unpin]",
+    run = function(ctx)
+      local text = ctx.raw_input:match("^%s*(.-)%s*$")
 
-    -- /title — show current
-    if text == "" then
-      local title = rness.session.title(ctx.session)
-      return { message = title or "(no title)" }
-    end
-
-    -- /title auto — generate via LLM
-    if text == "auto" then
-      local existing = rness.session.title(ctx.session) or "New session"
-      local title = rness.llm.complete {
-        system = "Create a concise title for an AI coding-assistant session from "
-          .. "the supplied human message. Return only the title on one line, in "
-          .. "plain text of natural language, no quotes, no prefix, no markdown, "
-          .. "no code. Use the language of the message. Aim for 4-8 words.",
-        prompt = existing,
-        profile = config.profile,
-        timeout = config.timeout or 15,
-      }
-      if title and #title > 0 and #title <= 200 then
-        rness.session.title(ctx.session, title)
-        return { message = "Title: " .. title }
+      if text == "" then
+        local info = rness.session.title_info(ctx.session)
+        if not info then
+          return { message = "(no title)" }
+        end
+        local pinned = info.source == "user" and " (pinned)" or ""
+        return { message = info.title .. pinned }
       end
-      return { message = "LLM title generation failed" }
-    end
 
-    -- /title <text> — manual set
-    rness.session.title(ctx.session, text)
-    return { message = "Title set: " .. text }
-  end,
-}
+      if text == "auto" then
+        local ok, result = pcall(rness.session.generate_title, ctx.session, request)
+        if not ok then
+          return { message = "Title generation failed: " .. tostring(result) }
+        end
+        return { message = "Title: " .. rness.session.title(ctx.session, result) }
+      end
+
+      if text == "unpin" then
+        local info = rness.session.title_info(ctx.session)
+        if not info or info.source ~= "user" then
+          return { message = "Title is not pinned" }
+        end
+        rness.session.title(ctx.session, info.title, "model")
+        return { message = "Title unpinned" }
+      end
+
+      local title = rness.session.title(ctx.session, text)
+      return { message = "Title set: " .. title }
+    end,
+  }
+end

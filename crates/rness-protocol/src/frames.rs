@@ -70,4 +70,7 @@ pub enum Frame {
         session: SessionId,
         call: ToolCallId,
     },
+    /// The session's title changed (the durable `session/title` event is
+    /// already committed); frontends refresh labels / the terminal title.
+    TitleChanged { session: SessionId, title: String },
 }

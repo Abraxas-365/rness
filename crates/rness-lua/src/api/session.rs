@@ -9,7 +9,14 @@
 //!   rness.session.list()            -> { id, ... }
 //!   rness.session.phase(id)         -> "idle" | "running"
 //!   rness.session.title(id)         -> string|nil (get current title)
-//!   rness.session.title(id, text)   -> string (set title, returns it)
+//!   rness.session.title(id, text[, source]) -> string (set; "user" pins,
+//!     "model" unpins)
+//!   rness.session.title_info(id)    -> { title=, source= } | nil
+//!   rness.session.offer_title(id, text, "model"|"fallback"[, max_bytes])
+//!     -> bool (automatic title under pin rules)
+//!   rness.session.title_fallback(text[, words[, max_bytes]]) -> string
+//!   rness.session.generate_title(id[, opts]) -> string (yields; commits
+//!     nothing)
 //!   rness.session.send(id, text)    -> "started"|"queued"|"logged"
 //!   rness.session.steer(id, text)   -> "started"|"queued" (joins the running
 //!     turn at its next step boundary; starts a turn when idle)
@@ -275,19 +282,90 @@ pub fn install(
         })?,
     )?;
 
+    // `rness.session.title(id, text[, source])` — source defaults to "user"
+    // (pinned); "model" re-lets automatic titles replace it (unpin).
     let s = Arc::clone(&sessions);
     session.set(
         "title",
-        lua.create_function(move |_, (id, new_title): (String, Option<String>)| {
+        lua.create_function(move |_, (id, new_title, source): (String, Option<String>, Option<String>)| {
             if let Some(title) = new_title {
-                s.set_title(
-                    &id,
-                    title,
-                    rness_protocol::events::TitleSource::User,
-                )
-                .map_err(err)?;
+                let source = match source.as_deref() {
+                    None | Some("user") => rness_protocol::events::TitleSource::User,
+                    Some("model") => rness_protocol::events::TitleSource::Model,
+                    Some(other) => return Err(err(format!("unknown title source '{other}' (user|model)"))),
+                };
+                s.set_title(&id, title, source).map_err(err)?;
             }
-            Ok(s.title(&id).map_err(err)?)
+            s.title(&id).map_err(err)
+        })?,
+    )?;
+
+    // `rness.session.title_info(id)` → `{ title, source }` or nil.
+    let s = Arc::clone(&sessions);
+    session.set(
+        "title_info",
+        lua.create_function(move |lua, id: String| {
+            let info = s.title_with_source(&id).map_err(err)?;
+            lua.to_value(&info.map(|(title, source)| serde_json::json!({ "title": title, "source": source })))
+        })?,
+    )?;
+
+    // `rness.session.generate_title(id[, opts])` → title: a normalized LLM
+    // title from the human prompts; nothing is committed. `opts` is a
+    // title request (`prompts = "first"|"all"`, `profile`, `timeout`,
+    // `max_bytes`, …). Yields: call it from a command, tool or rness.task.
+    let s = Arc::clone(&sessions);
+    let prepare = lua.create_function(move |lua, (id, options): (String, Option<Table>)| {
+        let request: rness_engine::titles::TitleRequest = match options {
+            Some(options) => lua.from_value(mlua::Value::Table(options))?,
+            None => Default::default(),
+        };
+        request.validate().map_err(err)?;
+        let s = Arc::clone(&s);
+        Ok(CommandYield(Box::pin(async move {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let _guard = cancel.clone().drop_guard();
+            let title = s.generate_title(&id, &request, &cancel).await.map_err(|e| e.to_string())?;
+            Ok(serde_json::Value::String(title))
+        })))
+    })?;
+    session.set("generate_title", command_yield_wrapper(lua, prepare)?)?;
+
+    // `rness.session.offer_title(id, text, source[, max_bytes])` → accepted:
+    // an automatic title under the pin rules ("model" never replaces a
+    // user title; "fallback" only fills an untitled session).
+    let s = Arc::clone(&sessions);
+    session.set(
+        "offer_title",
+        lua.create_function(
+            move |_, (id, title, source, max_bytes): (String, String, String, Option<usize>)| {
+                let source = match source.as_str() {
+                    "model" => rness_protocol::events::TitleSource::Model,
+                    "fallback" => rness_protocol::events::TitleSource::Fallback,
+                    other => {
+                        return Err(err(format!(
+                            "offer_title source must be model|fallback, got '{other}'"
+                        )))
+                    }
+                };
+                let max = max_bytes.unwrap_or(rness_engine::titles::DEFAULT_MAX_BYTES);
+                s.offer_title(&id, title, source, max).map_err(err)
+            },
+        )?,
+    )?;
+
+    // `rness.session.title_fallback(text[, words[, max_bytes]])` → the
+    // deterministic first-words title (dsh fallback: 5 words, 64 bytes).
+    session.set(
+        "title_fallback",
+        lua.create_function(|_, (text, words, max_bytes): (String, Option<usize>, Option<usize>)| {
+            let words = words.unwrap_or(5);
+            let max = max_bytes.unwrap_or(64);
+            if words == 0 {
+                return Err(err("title_fallback words must be positive"));
+            }
+            rness_engine::titles::validate_max_bytes(max).map_err(err)?;
+            Ok(rness_engine::titles::fallback(&text, words, max))
         })?,
     )?;
 

@@ -45,6 +45,8 @@ rness.images = {
   quality = 85,
 }
 
+-- rness.terminal_title = false -- keep the terminal window title unchanged
+
 rness.plugins.setup({
   { name = "read-image", file = "plugins/read-image.lua" },
   { name = "delivery", file = "plugins/delivery.lua", keys = { queue = "<F8>", steer = "<F9>" } },
@@ -78,6 +80,10 @@ rness.plugins.setup({
   -- { name = "schedule", file = "plugins/schedule.lua" },
   { name = "commands", file = "plugins/commands.lua" },
   { name = "title", file = "plugins/title.lua" },
+  -- Automatic titles: a fallback at once, then a model title from the first
+  -- prompt. mode = "all" retitles on every prompt; set profile to a cheap
+  -- model profile to keep titling off your main model. `/title <text>` pins.
+  { name = "session-title", file = "plugins/session-title.lua", opts = { mode = "first" } },
   { name = "agent-controls", file = "plugins/agent-controls.lua" },
   { name = "models", file = "plugins/models.lua" },
 })

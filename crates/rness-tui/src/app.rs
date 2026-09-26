@@ -146,6 +146,8 @@ pub struct Model {
     /// no shell-driven mount/unmount).
     pub pending_approval: Option<crate::modules::approval::PendingApproval>,
     pub should_quit: bool,
+    /// Latest `session/title` of the displayed session.
+    pub title: Option<String>,
 }
 
 impl Model {
@@ -181,6 +183,7 @@ impl Model {
             scroll_from_bottom: 0,
             pending_approval: None,
             should_quit: false,
+            title: None,
         }
     }
 
@@ -202,6 +205,7 @@ impl Model {
         }
         self.history_epoch = self.history_epoch.wrapping_add(1);
         self.cancelled_tools.clear();
+        self.title = None;
         let old_entries = std::mem::take(&mut self.entries);
         let old_ids = std::mem::take(&mut self.entry_ids);
         let old_durations = std::mem::take(&mut self.tool_durations);
@@ -413,6 +417,7 @@ impl Model {
                         is_error: r.is_error,
                     });
                 }
+                SessionEvent::Title(t) => self.title = Some(t.title.clone()),
                 _ => {}
             }
             if self.entries.len() > previous_len {
@@ -487,6 +492,10 @@ impl Model {
             // Remote-approval announcements: the in-process TUI gets its
             // questions over the answerer channel, not from frames.
             Frame::ApprovalRequested { .. } | Frame::ApprovalResolved { .. } => FrameEffect::None,
+            Frame::TitleChanged { title, .. } => {
+                self.title = Some(title.clone());
+                FrameEffect::None
+            }
         }
     }
 }
@@ -588,6 +597,8 @@ pub struct App {
     backend: Arc<dyn Backend>,
     /// When a quit was held back to confirm running work.
     quit_armed: Option<std::time::Instant>,
+    /// Set the terminal window title (OSC 0) from the session title.
+    pub terminal_title: bool,
 }
 
 /// How long a second quit confirms the first.
@@ -612,6 +623,7 @@ impl App {
             background_models: Default::default(),
             backend,
             quit_armed: None,
+            terminal_title: false,
         }
     }
 
@@ -657,7 +669,8 @@ impl App {
             | Frame::CompactionFinished { session, .. }
             | Frame::HistoryChanged { session }
             | Frame::ApprovalRequested { session, .. }
-            | Frame::ApprovalResolved { session, .. } => session,
+            | Frame::ApprovalResolved { session, .. }
+            | Frame::TitleChanged { session, .. } => session,
         };
         if matches!(frame, Frame::StepStarted { .. }) {
             self.command_results.remove(session);
@@ -1681,6 +1694,16 @@ fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
     std::fs::read_to_string(file.path()).map_err(|e| e.to_string())
 }
 
+/// Terminal window title for a session title. Titles are already
+/// normalized on write; control characters are stripped again because the
+/// log is a file anyone could edit.
+pub fn terminal_title_text(title: Option<&str>) -> String {
+    match title.map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>()) {
+        Some(t) if !t.trim().is_empty() => format!("{} — rness", t.trim()),
+        _ => "rness".into(),
+    }
+}
+
 /// Run the full-screen TUI until quit. Owns the terminal.
 /// `host_actions`: actions injected by the composition root (e.g. a Lua
 /// app driver applying "session:switch") — same apply path as key-borne
@@ -1692,6 +1715,7 @@ pub async fn run(
     mut host_actions: mpsc::UnboundedReceiver<Action>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    let mut shown_title: Option<String> = None;
     // Wheel scroll for the transcript. Best-effort: a terminal without
     // mouse support just keeps keyboard scrolling.
     let _ = crossterm::execute!(
@@ -1884,10 +1908,21 @@ pub async fn run(
         if let Err(e) = draw {
             break Err(e);
         }
+        if app.terminal_title {
+            let wanted = terminal_title_text(app.model.title.as_deref());
+            if shown_title.as_deref() != Some(wanted.as_str()) {
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(&wanted));
+                shown_title = Some(wanted);
+            }
+        }
     };
 
     reader_done.store(true, std::sync::atomic::Ordering::Relaxed);
     let _guard = terminal_input.lock().await;
+    if shown_title.is_some() {
+        // No portable way to restore the previous title; clear ours.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::SetTitle(""));
+    }
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableBracketedPaste,
@@ -1904,6 +1939,15 @@ mod tests {
         AssistantMessage, Envelope, Header, StopReason, ToolResult, Usage, UserMessage,
         FORMAT_VERSION,
     };
+
+    #[test]
+    fn titles_fold_from_history_and_frames_into_terminal_title() {
+        let mut model = Model::new("s".into(), "m".into());
+        assert_eq!(terminal_title_text(model.title.as_deref()), "rness");
+        model.apply_frame(&Frame::TitleChanged { session: "s".into(), title: "Fix \u{1b}parser".into() });
+        assert_eq!(terminal_title_text(model.title.as_deref()), "Fix parser — rness");
+        assert_eq!(terminal_title_text(Some("  ")), "rness");
+    }
 
     /// Backend that serves a canned history — the `-s` reopen case.
     struct FakeBackend {

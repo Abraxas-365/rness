@@ -781,6 +781,8 @@ enum Cmd {
     },
     /// A `rness.timer` deadline elapsed; run its callback on the VM thread.
     FireTimer { id: u64 },
+    /// Start or resume a `rness.task` background coroutine.
+    Task { wake: crate::api::task::TaskWake },
     StatusView {
         context: serde_json::Value,
         reply: tokio::sync::oneshot::Sender<Option<serde_json::Value>>,
@@ -1136,6 +1138,12 @@ impl LuaHost {
                                 let _ = tx.send(Cmd::FireTimer { id });
                             }
                         }));
+                        let task_tx = command_tx.clone();
+                        rt.set_task_sink(Box::new(move |wake| {
+                            if let Some(tx) = task_tx.upgrade() {
+                                let _ = tx.send(Cmd::Task { wake });
+                            }
+                        }));
                         if let Some(path) = &init {
                             match rt.startup(path) {
                                 Ok(startup) => config = startup,
@@ -1383,6 +1391,11 @@ impl LuaHost {
                             add_lineage(session_binding.as_ref(), &mut payload);
                             for err in rt.fire_hook(&event, &payload) {
                                 tracing::warn!(target: "lua", "hook '{event}' failed: {err}");
+                            }
+                        }
+                        Cmd::Task { wake } => {
+                            if let Err(err) = rt.wake_task(wake) {
+                                tracing::warn!(target: "lua", "task failed: {err}");
                             }
                         }
                         Cmd::FireTimer { id } => {

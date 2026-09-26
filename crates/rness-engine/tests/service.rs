@@ -1039,8 +1039,8 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
     let _d = bus.on::<rness_engine::service::FrameEv>(move |frame| {
         use rness_protocol::frames::Frame;
         f.lock().unwrap().push(match frame {
-            // Usage telemetry is independent of the lifecycle ordering checked here.
-            Frame::ContextUsage { .. } => return,
+            // Usage telemetry and titles are independent of the lifecycle ordering checked here.
+            Frame::ContextUsage { .. } | Frame::TitleChanged { .. } => return,
             Frame::StepStarted { .. } => "step".into(),
             Frame::Delta { chunk, .. } => match chunk {
                 ChunkDelta::Text { t } => format!("delta:{t}"),
@@ -1860,4 +1860,226 @@ async fn request_config_survives_compaction() {
         svc.config(&sid).unwrap().reasoning,
         Some(Reasoning::BudgetTokens { tokens: 8192 })
     );
+}
+
+// -- session titles ----------------------------------------------------------
+
+/// Answers turn requests immediately; title requests (recognised by the
+/// title system prompt) wait on `gate` and then return `title`.
+struct Titler {
+    title: String,
+    gate: Arc<tokio::sync::Semaphore>,
+    turn_gate: Option<Arc<tokio::sync::Semaphore>>,
+    title_prompts: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Provider for Titler {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
+        if request.system.starts_with("Create a concise title") {
+            let framed = match &request.context.turns[0] {
+                rness_engine::session::projection::ModelTurn::User { content } => match &content[0] {
+                    ContentPart::Text { text } => text.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            self.title_prompts.lock().unwrap().push(framed);
+            self.gate.acquire().await.unwrap().forget();
+            return StepOutcome::Committed(assistant(&self.title, StopReason::EndTurn, vec![]));
+        }
+        if let Some(gate) = &self.turn_gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        StepOutcome::Committed(assistant("done", StopReason::EndTurn, vec![]))
+    }
+}
+
+fn titler(title: &str, turn_gate: bool) -> Arc<Titler> {
+    Arc::new(Titler {
+        title: title.into(),
+        gate: Arc::new(tokio::sync::Semaphore::new(0)),
+        turn_gate: turn_gate.then(|| Arc::new(tokio::sync::Semaphore::new(0))),
+        title_prompts: Mutex::new(vec![]),
+    })
+}
+
+fn titles(svc: &SessionService, sid: &SessionId) -> Vec<(String, TitleSource)> {
+    svc.store()
+        .read_session(sid)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.event {
+            SessionEvent::Title(t) => Some((t.title, t.source)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn prompts_seen(svc: &SessionService) -> (Arc<Mutex<Vec<(String, usize)>>>, rness_kernel::Disposer) {
+    let seen: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
+    let s = Arc::clone(&seen);
+    let sub = svc.bus().on::<rness_engine::service::PromptCommittedEv>(move |n| {
+        s.lock().unwrap().push((n.text.clone(), n.index));
+    });
+    (seen, sub)
+}
+
+#[tokio::test]
+async fn offered_titles_follow_pin_rules_and_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = titler("unused", false);
+    let svc = service(dir.path(), provider.clone());
+    let frames: Arc<Mutex<Vec<String>>> = Arc::default();
+    let f = Arc::clone(&frames);
+    let _sub = svc.bus().on::<rness_engine::service::FrameEv>(move |frame| {
+        if let rness_protocol::frames::Frame::TitleChanged { title, .. } = frame {
+            f.lock().unwrap().push(title.clone());
+        }
+    });
+    let sid = svc.create(None).unwrap();
+    // The engine sets no title on its own: that is plugin policy.
+    svc.send(&sid, UserIntent::Followup, text("please refactor the parser module")).unwrap();
+    svc.join(&sid).await;
+    assert!(titles(&svc, &sid).is_empty());
+
+    // A fallback fills an untitled session only.
+    assert!(svc.offer_title(&sid, "please refactor".into(), TitleSource::Fallback, 80).unwrap());
+    assert!(!svc.offer_title(&sid, "other".into(), TitleSource::Fallback, 80).unwrap());
+    // A model title replaces a fallback and another model title.
+    assert!(svc.offer_title(&sid, "  \u{1b}[1mRefactor\u{1b}[0m the\nparser ".into(), TitleSource::Model, 80).unwrap());
+    assert!(svc.offer_title(&sid, "Parser refactor".into(), TitleSource::Model, 8).unwrap());
+    // A user title pins against automatic offers.
+    svc.set_title(&sid, "Mine".into(), TitleSource::User).unwrap();
+    assert!(!svc.offer_title(&sid, "Model again".into(), TitleSource::Model, 80).unwrap());
+    assert_eq!(
+        titles(&svc, &sid),
+        vec![
+            ("please refactor".into(), TitleSource::Fallback),
+            ("Refactor the parser".into(), TitleSource::Model),
+            ("Parser r".into(), TitleSource::Model),
+            ("Mine".into(), TitleSource::User),
+        ]
+    );
+    assert_eq!(*frames.lock().unwrap(), vec!["please refactor", "Refactor the parser", "Parser r", "Mine"]);
+    assert!(svc.offer_title(&sid, "x".into(), TitleSource::Model, 201).is_err());
+    assert!(svc.offer_title(&sid, " \u{7} ".into(), TitleSource::Model, 80).is_err());
+}
+
+#[tokio::test]
+async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = titler("Model title", true);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("first prompt")).unwrap();
+    assert_eq!(svc.phase(&sid), Phase::Running);
+    // Offers and renames mid-turn are queued and visible at once.
+    assert!(svc.offer_title(&sid, "first prompt".into(), TitleSource::Fallback, 80).unwrap());
+    svc.set_title(&sid, "My \u{7}name".into(), TitleSource::User).unwrap();
+    assert_eq!(
+        svc.title_with_source(&sid).unwrap(),
+        Some(("My name".into(), TitleSource::User))
+    );
+    // A model title generated during the turn is rejected by the pin.
+    provider.gate.add_permits(1);
+    let request = rness_engine::titles::TitleRequest::default();
+    let title = svc.generate_title(&sid, &request, &CancellationToken::new()).await.unwrap();
+    assert_eq!(title, "Model title");
+    assert!(!svc.offer_title(&sid, title, TitleSource::Model, 80).unwrap());
+    provider.turn_gate.as_ref().unwrap().add_permits(1);
+    svc.join(&sid).await;
+    assert_eq!(
+        titles(&svc, &sid),
+        vec![
+            ("first prompt".into(), TitleSource::Fallback),
+            ("My name".into(), TitleSource::User),
+        ]
+    );
+
+    // Unpinning (explicit model-sourced title) lets automatic titles apply.
+    svc.set_title(&sid, "My name".into(), TitleSource::Model).unwrap();
+    assert_eq!(svc.title_with_source(&sid).unwrap().unwrap().1, TitleSource::Model);
+    assert!(svc.offer_title(&sid, "Model title".into(), TitleSource::Model, 80).unwrap());
+    assert!(svc.set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User).is_err());
+}
+
+#[tokio::test]
+async fn generate_title_frames_first_or_all_prompts_and_cancels() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = titler("  \u{1b}[1mRefactor\u{1b}[0m the\nparser ", false);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    let first = rness_engine::titles::TitleRequest::default();
+    let none = svc.generate_title(&sid, &first, &CancellationToken::new()).await;
+    assert!(none.unwrap_err().to_string().contains("no prompt"));
+    svc.send(&sid, UserIntent::Followup, text("alpha prompt")).unwrap();
+    svc.join(&sid).await;
+    svc.send(&sid, UserIntent::Inject, text("injected context")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("beta prompt")).unwrap();
+    svc.join(&sid).await;
+
+    provider.gate.add_permits(1);
+    let title = svc.generate_title(&sid, &first, &CancellationToken::new()).await.unwrap();
+    assert_eq!(title, "Refactor the parser");
+    let all = rness_engine::titles::TitleRequest {
+        prompts: rness_engine::titles::TitlePrompts::All,
+        max_bytes: 8,
+        ..Default::default()
+    };
+    provider.gate.add_permits(1);
+    assert_eq!(svc.generate_title(&sid, &all, &CancellationToken::new()).await.unwrap(), "Refactor");
+    let framed = provider.title_prompts.lock().unwrap().clone();
+    assert!(framed[0].contains("alpha prompt") && !framed[0].contains("beta prompt"));
+    assert!(framed[1].contains("alpha prompt") && framed[1].contains("beta prompt"));
+    assert!(!framed[1].contains("injected context"));
+    // Nothing is committed by generation itself.
+    assert!(titles(&svc, &sid).is_empty());
+
+    // Cancellation aborts an in-flight request.
+    let cancel = CancellationToken::new();
+    let pending = svc.generate_title(&sid, &first, &cancel);
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        canceller.cancel();
+    });
+    assert!(pending.await.is_err());
+    let bad = rness_engine::titles::TitleRequest { timeout: 0, ..Default::default() };
+    assert!(svc.generate_title(&sid, &bad, &CancellationToken::new()).await.is_err());
+}
+
+#[tokio::test]
+async fn human_prompts_are_announced_with_their_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = titler("unused", true);
+    let svc = service(dir.path(), provider.clone());
+    let (seen, _sub) = prompts_seen(&svc);
+    let sid = svc.create(None).unwrap();
+    // Injected context is not a human prompt.
+    svc.send(&sid, UserIntent::Inject, text("background context")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("one")).unwrap();
+    // Queued followup + steer during the running turn.
+    svc.send(&sid, UserIntent::Followup, text("two")).unwrap();
+    svc.send(&sid, UserIntent::Steer, text("three")).unwrap();
+    assert_eq!(*seen.lock().unwrap(), vec![("one".into(), 1)]);
+    let gate = provider.turn_gate.as_ref().unwrap();
+    gate.add_permits(10);
+    svc.join(&sid).await;
+    let mut got = seen.lock().unwrap().clone();
+    assert_eq!(got.len(), 3, "{got:?}");
+    assert_eq!(got.iter().map(|(_, i)| *i).collect::<Vec<_>>(), vec![1, 2, 3]);
+    got.sort();
+    assert_eq!(
+        got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
+        vec!["one", "three", "two"]
+    );
+    // A fresh burst resumes counting from the log.
+    svc.send(&sid, UserIntent::Followup, text("four")).unwrap();
+    svc.join(&sid).await;
+    assert_eq!(seen.lock().unwrap().last().unwrap(), &("four".into(), 4));
+    assert!(titles(&svc, &sid).is_empty());
 }

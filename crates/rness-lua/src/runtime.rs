@@ -1619,6 +1619,17 @@ impl LuaRuntime {
         crate::api::timer::fire(&self.lua, id).map_err(|e| user_message(&e))
     }
 
+    /// Route `rness.task` wake-ups to `sink` (the host forwards them back
+    /// to the VM thread, which calls [`Self::wake_task`]).
+    pub fn set_task_sink(&self, sink: crate::api::task::TaskSink) {
+        crate::api::task::set_sink(&self.lua, sink);
+    }
+
+    /// Step one background task until it finishes or awaits.
+    pub fn wake_task(&self, wake: crate::api::task::TaskWake) -> Result<(), String> {
+        crate::api::task::wake(&self.lua, wake)
+    }
+
     /// Inject shared background jobs independently of the session binding.
     pub fn install_jobs(&self, jobs: rness_tools::jobs::JobRegistry) -> Result<(), LuaError> {
         let rness: Table = self.lua.globals().get("rness")?;
@@ -1654,6 +1665,7 @@ impl LuaRuntime {
         // key plugins pass to rness.models.get. Composition-root fact.
         rness.set("model", model)?;
         crate::api::session::install(&self.lua, &rness, sessions.clone(), rt.clone())?;
+        crate::api::task::set_runtime(&self.lua, rt.clone());
         crate::api::llm::install(&self.lua, &rness, sessions.clone())?;
         crate::api::subagents::install(&self.lua, &rness, subagents, sessions, rt.clone())?;
         crate::api::mcp::install(&self.lua, &rness, registry, mcp, rt)?;
@@ -3461,6 +3473,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     crate::api::http::install(lua, &rness)?;
     crate::api::process::install(lua, &rness)?;
     crate::api::timer::install(lua, &rness)?;
+    crate::api::task::install(lua, &rness)?;
 
     lua.globals().set("rness", rness)?;
     Ok(())
@@ -3480,7 +3493,7 @@ fn lua_display(lua: &Lua, v: LuaValue) -> Result<String, LuaError> {
 }
 
 /// A Lua error's message without the Rust wrapper noise.
-fn user_message(e: &mlua::Error) -> String {
+pub(crate) fn user_message(e: &mlua::Error) -> String {
     let raw = match e {
         mlua::Error::RuntimeError(m) => m.clone(),
         other => other.to_string(),
@@ -3560,6 +3573,42 @@ mod tests {
             .get::<Option<usize>>("__rness_callback_depth")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn title_command_catches_generation_failure_across_the_yield() {
+        let mut rt = LuaRuntime::new().unwrap();
+        let prepare = rt
+            .lua()
+            .create_function(|_, _id: String| {
+                Ok(crate::api::session::CommandYield(Box::pin(async {
+                    Ok(serde_json::Value::Null)
+                })))
+            })
+            .unwrap();
+        let generate = crate::api::session::command_yield_wrapper(rt.lua(), prepare).unwrap();
+        rt.load("fixture", "rness.session = { title = function(_, text) return text end }").unwrap();
+        let session: Table = rt.lua().globals().get::<Table>("rness").unwrap().get("session").unwrap();
+        session.set("generate_title", generate).unwrap();
+        let setup = format!(
+            "local setup = (function() {} end)()\nsetup({{}})",
+            include_str!("../../../flavors/default/plugins/title.lua")
+        );
+        rt.load("title", &setup).unwrap();
+        for (resume, expected) in [
+            ((true, LuaValue::String(rt.lua().create_string("Named").unwrap())), "Title: Named"),
+            ((false, LuaValue::String(rt.lua().create_string("provider down").unwrap())), "Title generation failed: provider down"),
+        ] {
+            let command = rt.command_thread("title").unwrap();
+            let request: mlua::AnyUserData = command
+                .thread
+                .resume(rt.lua().to_value(&json!({"session":"s1","raw_input":"auto"})).unwrap())
+                .unwrap();
+            assert!(request.is::<crate::api::session::CommandYield>());
+            let returned = command.thread.resume::<LuaValue>(resume).unwrap();
+            assert_eq!(command.thread.status(), mlua::ThreadStatus::Finished);
+            assert_eq!(rt.command_result(returned).unwrap().message, expected);
+        }
     }
 
     #[test]

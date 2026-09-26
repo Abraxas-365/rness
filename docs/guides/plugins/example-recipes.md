@@ -428,6 +428,14 @@ end)
 rness.hook.on("session_idle", function(ev)
   print("session idle:", ev.session)
 end)
+
+-- Fires when a human prompt is committed (not injected context or hook
+-- messages). ev.index is 1-based per session; ev.parent is the parent id for
+-- delegated sessions (JSON null — not nil — for roots: test type(ev.parent)).
+-- Hooks cannot yield: start async work with rness.task.spawn.
+rness.hook.on("prompt", function(ev)
+  print("prompt", ev.index, "in", ev.session, ":", ev.text)
+end)
 ```
 
 **`rness.session.inject(session, text)`** — Queue context into a session's next step without waking an idle session or starting a turn. The message is committed as `UserMessage{intent: Inject}`. Useful inside `session_start` to seed model context. Returns `"queued"`, `"started"`, or `"logged"`.

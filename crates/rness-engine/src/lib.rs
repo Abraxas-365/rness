@@ -31,6 +31,7 @@ pub mod session_search;
 pub mod structured;
 pub mod subagent;
 pub mod tasks;
+pub mod titles;
 pub mod tools;
 pub mod turn;
 pub mod workflow;
