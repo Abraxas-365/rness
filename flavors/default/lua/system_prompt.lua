@@ -41,7 +41,7 @@ section({ name = "tool:Edit", order = 1300, tools = { "Edit" },
 section({ name = "tool:jobs", order = 1600, tools = { "job_output" },
   text = "Track every background job id you start. Completion is delivered to this session automatically, so do not busy-poll or sleep on a job; keep working on independent steps and do not duplicate a running job's work. Before a final answer, collect every still-relevant job with job_output and job_kill jobs that stopped mattering." })
 section({ name = "tool:terminal", order = 1700, tools = { "terminal_open" },
-  text = "Use a persistent terminal only when work needs terminal state that survives between calls or interactive input; prefer Bash for bounded one-shot commands. Track terminal session ids and close sessions that no longer matter. A quiet or timed-out read does not prove the foreground command exited." })
+  text = "Use a persistent terminal only when work needs terminal state that survives between calls or interactive input; prefer Bash for bounded one-shot commands. Track terminal session ids and close sessions that no longer matter. A quiet or timed-out read does not prove the foreground command exited. To stop a stuck command, use terminal_signal (INT, then TERM, then KILL); it never kills the shell." })
 
 -- External information -----------------------------------------------------------
 -- Split by topic, not by tool: the safety/citation rule applies to either web
