@@ -1268,6 +1268,8 @@ mod questions;
 struct LocalBackend {
     completion_lock: Arc<tokio::sync::Mutex<()>>,
     completion_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Slash commands waiting for a completion to release the command slot.
+    deferred: Arc<std::sync::Mutex<std::collections::HashMap<SessionId, DeferredQueue>>>,
     reference_cancel: std::sync::Mutex<tokio_util::sync::CancellationToken>,
     results: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
     sessions: Arc<SessionService>,
@@ -1444,6 +1446,157 @@ mod permission_integration {
     }
 }
 
+#[cfg(test)]
+mod command_admission_tests {
+    use super::*;
+    use rness_engine::interaction::{Command, CommandInvocation, CommandResult};
+    use rness_engine::service::ServiceError;
+    use std::sync::Mutex;
+
+    struct NoModel;
+    #[async_trait::async_trait]
+    impl rness_engine::turn::provider::Provider for NoModel {
+        fn model(&self) -> &str {
+            "none"
+        }
+        async fn step(
+            &self,
+            _: rness_engine::turn::provider::StepRequest<'_>,
+            _: &tokio_util::sync::CancellationToken,
+        ) -> rness_engine::turn::provider::StepOutcome {
+            unreachable!("commands only")
+        }
+    }
+
+    /// Completions block on `release`; executions record their input.
+    struct Probe {
+        name: &'static str,
+        release: Arc<tokio::sync::Semaphore>,
+        ran: Arc<Mutex<Vec<String>>>,
+    }
+    impl Command for Probe {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "probe"
+        }
+        fn complete(
+            &self,
+            _: &SessionService,
+            _: CommandInvocation<'_>,
+        ) -> Result<Vec<String>, ServiceError> {
+            // Consume the permit: one release lets exactly one completion end.
+            tokio::runtime::Handle::current()
+                .block_on(self.release.acquire())
+                .unwrap()
+                .forget();
+            Ok(vec![])
+        }
+        fn execute(
+            &self,
+            _: &SessionService,
+            input: CommandInvocation<'_>,
+        ) -> Result<CommandResult, ServiceError> {
+            let line = format!("{} {}", self.name, input.raw_input.trim());
+            self.ran.lock().unwrap().push(line.clone());
+            Ok(CommandResult { message: line, data: serde_json::Value::Null })
+        }
+    }
+
+    fn send(session: &SessionId, text: &str) -> ClientRequest {
+        ClientRequest::Send {
+            session: session.clone(),
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: text.into() }],
+        }
+    }
+
+    /// Enter while a per-keystroke completion holds the command slot must
+    /// run the command (in submission order), not report "session busy";
+    /// text that is not a command is never deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commands_submitted_during_a_completion_run_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = Arc::new(SessionService::new(
+            rness_engine::session::branch::SessionStore::new(dir.path()),
+            Arc::new(NoModel),
+            Arc::new(rness_engine::tools::ToolRegistry::default()),
+            rness_engine::turn::TurnConfig::default(),
+            Arc::new(rness_kernel::EventBus::default()),
+        ));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let ran: Arc<Mutex<Vec<String>>> = Arc::default();
+        for name in ["alpha", "beta"] {
+            sessions
+                .commands()
+                .register(Arc::new(Probe { name, release: release.clone(), ran: ran.clone() }))
+                .unwrap();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let backend = LocalBackend {
+            completion_lock: Default::default(),
+            completion_generation: Default::default(),
+            deferred: Default::default(),
+            reference_cancel: Default::default(),
+            results: tx,
+            sessions: sessions.clone(),
+            terminals: Default::default(),
+        };
+        let sid = sessions.create(None).unwrap();
+        use rness_tui::app::Backend;
+        backend.complete(&sid, "/alpha x".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sessions.command_running(&sid) {
+            assert!(std::time::Instant::now() < deadline, "completion never started");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(backend.submit(send(&sid, "/alpha one")).unwrap().as_deref(), Some("Command running"));
+        assert_eq!(backend.submit(send(&sid, "/beta two")).unwrap().as_deref(), Some("Command running"));
+        assert!(ran.lock().unwrap().is_empty(), "deferred until the completion ends");
+        // Not a command: "/usr/bin/foo" is a prompt and must not be deferred
+        // (it is refused now rather than silently queued behind the slot).
+        assert!(backend.submit(send(&sid, "/usr/bin/foo crashes")).is_err());
+        release.add_permits(1);
+
+        let mut messages = Vec::new();
+        while messages.len() < 2 {
+            let action = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("command result")
+                .unwrap();
+            if let rness_tui::app::Action::CommandResult(_, message) = action {
+                messages.push(message);
+            }
+        }
+        assert_eq!(messages, ["alpha one", "beta two"]);
+        assert_eq!(*ran.lock().unwrap(), ["alpha one", "beta two"]);
+
+        // Ctrl-C drops a command still waiting for the slot.
+        backend.complete(&sid, "/alpha y".into());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !sessions.command_running(&sid) {
+            assert!(std::time::Instant::now() < deadline, "second completion never started");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        backend.submit(send(&sid, "/beta three")).unwrap();
+        assert!(backend.command_running(&sid));
+        backend.submit(ClientRequest::Cancel { session: sid.clone() }).unwrap();
+        release.add_permits(1);
+        loop {
+            let action = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("cancel result")
+                .unwrap();
+            if let rness_tui::app::Action::CommandResult(_, message) = action {
+                assert_eq!(message, "Command cancelled");
+                break;
+            }
+        }
+        assert_eq!(ran.lock().unwrap().len(), 2, "cancelled command never ran");
+    }
+}
+
 struct TuiAnswerer {
     tx: tokio::sync::mpsc::UnboundedSender<rness_tui::modules::approval::PendingApproval>,
 }
@@ -1469,6 +1622,156 @@ impl rness_engine::approval::Answerer for TuiAnswerer {
             Err(_) => Decision::Cancelled, // overlay dropped unanswered
         }
     }
+}
+
+/// Execute an admitted command off the UI thread; its message (or error)
+/// arrives as a command result.
+fn run_prepared(
+    command: rness_engine::service::PreparedCommand,
+    sessions: Arc<SessionService>,
+    tx: tokio::sync::mpsc::UnboundedSender<rness_tui::app::Action>,
+    session: SessionId,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || command.execute(&sessions)).await;
+        let message = match result {
+            Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => {
+                if let Some(action) = command_app_action(&result.data, &session) {
+                    let _ = tx.send(action);
+                }
+                result.message
+            }
+            Ok(Ok(_)) => unreachable!("prepared command always returns a command result"),
+            Ok(Err(error)) => error.to_string(),
+            Err(error) => format!("Command failed: {error}"),
+        };
+        let _ = tx.send(rness_tui::app::Action::CommandResult(session, message));
+    })
+}
+
+impl LocalBackend {
+    /// A submitted command found the command slot held by an argument
+    /// completion (fired per keystroke). Invalidate pending completions,
+    /// wait behind earlier deferred commands of this session (order is
+    /// fixed here, at submit) and the running completion, then admit while
+    /// holding the completion lock so no new completion can take the slot
+    /// first. Runs at most once; any error is reported as a result.
+    fn submit_after_completion(&self, session: SessionId, text: String) {
+        self.completion_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (done, next) = tokio::sync::oneshot::channel::<()>();
+        let (previous, cancel) = {
+            let mut deferred = self.deferred.lock().unwrap();
+            let queue = deferred.entry(session.clone()).or_default();
+            queue.pending += 1;
+            (queue.tail.replace(next), queue.cancel.clone())
+        };
+        let lock = self.completion_lock.clone();
+        let deferred = self.deferred.clone();
+        let sessions = self.sessions.clone();
+        let tx = self.results.clone();
+        tokio::spawn(async move {
+            if let Some(previous) = previous {
+                // Resolves (Err) once the earlier command's sender drops.
+                let _ = previous.await;
+            }
+            let guard = lock.lock().await;
+            let prepared = if cancel.is_cancelled() {
+                drop(guard);
+                let _ = tx.send(rness_tui::app::Action::CommandResult(
+                    session.clone(),
+                    "Command cancelled".into(),
+                ));
+                finish_deferred(&deferred, &session);
+                drop(done);
+                return;
+            } else {
+                sessions.prepare_command(&session, &text)
+            };
+            drop(guard);
+            match prepared {
+                Ok(Some(command)) => {
+                    let _ = run_prepared(command, sessions, tx, session.clone()).await;
+                }
+                Ok(None) => {
+                    let _ = tx.send(rness_tui::app::Action::CommandResult(
+                        session.clone(),
+                        "Command is no longer available".into(),
+                    ));
+                }
+                Err(error) => {
+                    let _ = tx.send(rness_tui::app::Action::CommandResult(
+                        session.clone(),
+                        error.to_string(),
+                    ));
+                }
+            }
+            finish_deferred(&deferred, &session);
+            drop(done);
+        });
+    }
+
+    /// Admit a submitted slash command, deferring it (see
+    /// `submit_after_completion`) when only a completion holds the slot or
+    /// an earlier command of this session is still deferred.
+    fn admit_command(
+        &self,
+        session: &SessionId,
+        text: &str,
+    ) -> Result<Admission, rness_engine::service::ServiceError> {
+        let is_command = self.sessions.commands().resolve(text).is_some();
+        if is_command && self.deferred.lock().unwrap().contains_key(session) {
+            self.submit_after_completion(session.clone(), text.to_owned());
+            return Ok(Admission::Deferred);
+        }
+        match self.sessions.prepare_command(session, text) {
+            Ok(Some(command)) => Ok(Admission::Ready(command)),
+            Ok(None) => Ok(Admission::NotCommand),
+            // The command slot is taken and a completion is in flight: it
+            // is that completion's (a real command would not hold the
+            // completion lock). Lifecycle/turn busy stays an error.
+            Err(rness_engine::service::ServiceError::Busy)
+                if is_command
+                    && self.sessions.command_running(session)
+                    && self.completion_lock.try_lock().is_err() =>
+            {
+                self.submit_after_completion(session.clone(), text.to_owned());
+                Ok(Admission::Deferred)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Slash commands of one session waiting for the command slot.
+#[derive(Default)]
+struct DeferredQueue {
+    pending: usize,
+    /// Resolves when the most recently deferred command has finished.
+    tail: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Ctrl-C: queued commands not yet admitted are dropped.
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+/// One deferred command is done: drop the session's queue once it is empty
+/// (a later deferral then starts with a fresh, uncancelled token).
+fn finish_deferred(
+    deferred: &std::sync::Mutex<std::collections::HashMap<SessionId, DeferredQueue>>,
+    session: &SessionId,
+) {
+    let mut deferred = deferred.lock().unwrap();
+    if let Some(queue) = deferred.get_mut(session) {
+        queue.pending -= 1;
+        if queue.pending == 0 {
+            deferred.remove(session);
+        }
+    }
+}
+
+enum Admission {
+    Ready(rness_engine::service::PreparedCommand),
+    Deferred,
+    NotCommand,
 }
 
 impl rness_tui::app::Backend for LocalBackend {
@@ -1569,7 +1872,8 @@ impl rness_tui::app::Backend for LocalBackend {
     }
 
     fn command_running(&self, session: &SessionId) -> bool {
-        self.sessions.command_running(session)
+        // A deferred command counts: Ctrl-C must not quit under it.
+        self.sessions.command_running(session) || self.deferred.lock().unwrap().contains_key(session)
     }
 
     fn quit_blockers(&self) -> Vec<String> {
@@ -1594,33 +1898,17 @@ impl rness_tui::app::Backend for LocalBackend {
                 content,
             } => {
                 let prepared = match content.as_slice() {
-                    [ContentPart::Text { text }] => self
-                        .sessions
-                        .prepare_command(&session, text)
-                        .map_err(|e| e.to_string())?,
+                    [ContentPart::Text { text }] => {
+                        match self.admit_command(&session, text).map_err(|e| e.to_string())? {
+                            Admission::Ready(command) => Some(command),
+                            Admission::Deferred => return Ok(Some("Command running".into())),
+                            Admission::NotCommand => None,
+                        }
+                    }
                     _ => None,
                 };
                 if let Some(command) = prepared {
-                    let sessions = self.sessions.clone();
-                    let tx = self.results.clone();
-                    tokio::spawn(async move {
-                        let result =
-                            tokio::task::spawn_blocking(move || command.execute(&sessions)).await;
-                        let message = match result {
-                            Ok(Ok(rness_engine::inbox::Disposition::Command(result))) => {
-                                if let Some(action) = command_app_action(&result.data, &session) {
-                                    let _ = tx.send(action);
-                                }
-                                result.message
-                            }
-                            Ok(Ok(_)) => {
-                                unreachable!("prepared command always returns a command result")
-                            }
-                            Ok(Err(error)) => error.to_string(),
-                            Err(error) => format!("Command failed: {error}"),
-                        };
-                        let _ = tx.send(rness_tui::app::Action::CommandResult(session, message));
-                    });
+                    run_prepared(command, self.sessions.clone(), self.results.clone(), session);
                     return Ok(Some("Command running".into()));
                 }
                 match self
@@ -1647,6 +1935,9 @@ impl rness_tui::app::Backend for LocalBackend {
                 .map(|_| None)
                 .map_err(|e| e.to_string()),
             ClientRequest::Cancel { session } => {
+                if let Some(queue) = self.deferred.lock().unwrap().get(&session) {
+                    queue.cancel.cancel();
+                }
                 self.sessions.cancel(&session);
                 Ok(Some("Cancelled".into()))
             }
@@ -1669,7 +1960,12 @@ impl rness_tui::app::Backend for LocalBackend {
                     tracing::error!(error = %e, "retry failed");
                 }
             }
-            ClientRequest::Cancel { session } => self.sessions.cancel(&session),
+            ClientRequest::Cancel { session } => {
+                if let Some(queue) = self.deferred.lock().unwrap().get(&session) {
+                    queue.cancel.cancel();
+                }
+                self.sessions.cancel(&session)
+            }
         }
     }
 
@@ -2235,6 +2531,7 @@ async fn run_tui(
     let backend = Arc::new(LocalBackend {
         completion_lock: Default::default(),
         completion_generation: Default::default(),
+        deferred: Default::default(),
         reference_cancel: Default::default(),
         sessions: Arc::clone(&sessions),
         results: host_tx.clone(),

@@ -282,22 +282,26 @@ pub fn install(
         })?,
     )?;
 
-    // `rness.session.title(id, text[, source])` — source defaults to "user"
-    // (pinned); "model" re-lets automatic titles replace it (unpin).
+    // `rness.session.title(id, text[, source[, max_bytes]])` — source
+    // defaults to "user" (pinned); "model" re-lets automatic titles replace
+    // it (unpin). `max_bytes` caps the stored title (default 80, ≤ 200).
     let s = Arc::clone(&sessions);
     session.set(
         "title",
-        lua.create_function(move |_, (id, new_title, source): (String, Option<String>, Option<String>)| {
-            if let Some(title) = new_title {
-                let source = match source.as_deref() {
-                    None | Some("user") => rness_protocol::events::TitleSource::User,
-                    Some("model") => rness_protocol::events::TitleSource::Model,
-                    Some(other) => return Err(err(format!("unknown title source '{other}' (user|model)"))),
-                };
-                s.set_title(&id, title, source).map_err(err)?;
-            }
-            s.title(&id).map_err(err)
-        })?,
+        lua.create_function(
+            move |_, (id, new_title, source, max_bytes): (String, Option<String>, Option<String>, Option<usize>)| {
+                if let Some(title) = new_title {
+                    let source = match source.as_deref() {
+                        None | Some("user") => rness_protocol::events::TitleSource::User,
+                        Some("model") => rness_protocol::events::TitleSource::Model,
+                        Some(other) => return Err(err(format!("unknown title source '{other}' (user|model)"))),
+                    };
+                    let max_bytes = max_bytes.unwrap_or(rness_engine::titles::DEFAULT_MAX_BYTES);
+                    s.set_title(&id, title, source, max_bytes).map_err(err)?;
+                }
+                s.title(&id).map_err(err)
+            },
+        )?,
     )?;
 
     // `rness.session.title_info(id)` → `{ title, source }` or nil.

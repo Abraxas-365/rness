@@ -1550,10 +1550,13 @@ impl App {
                 if message.is_empty() {
                     return;
                 }
-                self.command_results
-                    .entry(session.clone())
-                    .or_default()
-                    .push(message.clone());
+                let results = self.command_results.entry(session.clone()).or_default();
+                results.push(message.clone());
+                // Sessions that never step would otherwise grow without bound.
+                const KEEP: usize = 50;
+                if results.len() > KEEP {
+                    results.drain(..results.len() - KEEP);
+                }
                 if session == self.model.session {
                     self.model.entries.push(Entry::Notice(message));
                 }

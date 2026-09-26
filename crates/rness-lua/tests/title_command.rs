@@ -156,25 +156,25 @@ fn auto_first_prompt_mode() {
 
 #[test]
 fn auto_all_prompts_mode_frames_every_prompt_and_supersedes() {
-    let mut host = host("{ auto = 'all', fallback = false, max_input_bytes = 120 }");
+    let mut host = host("{ auto = 'all', fallback = false, max_input_bytes = 140 }");
     host.load(
         "assertions",
         r#"
-        prompts.s1 = { 'alpha one', 'beta two', 'gamma three' }
+        prompts.s1 = { 'alpha one', 'beta two', 'gamma three ' .. string.rep('x', 30) }
         prompt('s1', 1)
         prompt('s1', 2)            -- supersedes the first request
         assert(cancelled[1] == 1, 'older request cancelled')
         drain()
         assert(#calls == 1 and #offers == 1 and offers[1] == 's1|model|Model s1|80')
         local framed = calls[1].prompt
-        assert(framed:find('gamma three', 1, true) and #framed <= 120, framed)
+        assert(framed:find('gamma three', 1, true) and #framed <= 140, framed)
         assert(not framed:find('alpha one', 1, true), 'oldest prompt dropped to fit')
         -- A single oversized prompt is trimmed on a UTF-8 boundary.
         prompts.s1 = { string.rep('é', 200) }
         prompt('s1', 3)
         drain()
         framed = calls[2].prompt
-        assert(#framed <= 120 and utf8.len(framed), framed)
+        assert(#framed <= 140 and utf8.len(framed), framed)
     "#,
     )
     .unwrap();

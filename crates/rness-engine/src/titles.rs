@@ -15,7 +15,7 @@ pub fn validate_max_bytes(max_bytes: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn is_control(c: char) -> bool {
+pub(crate) fn is_control(c: char) -> bool {
     // C0/C1 controls (whitespace is collapsed separately) and invisible /
     // directional marks that can make a displayed title deceptive.
     (c.is_control() && !c.is_whitespace())

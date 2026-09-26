@@ -196,7 +196,7 @@ async fn unload_and_cancel_stop_parked_tasks_and_errors_are_contained() {
     assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Parser refactor"));
 
     // A hot reload cancels the old generation's parked tasks too.
-    sessions.set_title(&sid, "Before reload".into(), TitleSource::Model).unwrap();
+    sessions.set_title(&sid, "Before reload".into(), TitleSource::Model, 80).unwrap();
     host.fire_hook("go", serde_json::json!({ "session": sid }));
     tokio::time::sleep(Duration::from_millis(50)).await;
     host.reload(vec![]).await.unwrap();

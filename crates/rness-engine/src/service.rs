@@ -323,14 +323,26 @@ fn commit_title(
     }
     if inbox.phase() == Phase::Running {
         live.titles.lock().unwrap().push(title.clone());
+        drop(inbox);
     } else {
         // Hold the inbox across the append: a concurrent send() must see
         // us as busy rather than hit the writer lock.
-        let mut log = store.open(session)?;
-        log.append(&SessionEvent::Title(title.clone()))?;
-        drop(log);
+        match store.open(session) {
+            Ok(mut log) => {
+                // Anything a burst left queued goes first, keeping order.
+                drain_titles(&mut log, live);
+                log.append(&SessionEvent::Title(title.clone()))?;
+            }
+            // An idle compaction/prune holds the writer: queue the title;
+            // it is persisted with the next writer's first drain.
+            Err(BranchError::Log(crate::session::log::LogError::Locked(_))) => {
+                live.titles.lock().unwrap().push(title.clone());
+            }
+            Err(e) => return Err(e.into()),
+        }
         drop(inbox);
     }
+    // Announce outside the inbox lock: subscribers may call back in.
     announce_title(bus, session, &title);
     Ok(true)
 }
@@ -1188,11 +1200,22 @@ impl SessionService {
     /// Ephemeral: nothing is logged and the model never sees it. Control
     /// characters are removed so a plugin cannot inject terminal codes.
     pub fn notify(&self, session: &SessionId, text: &str) -> Result<(), ServiceError> {
+        /// Notices are one-line-ish status messages, not documents.
+        const MAX_NOTICE_BYTES: usize = 4096;
         self.store.workspace(session)?;
-        let text: String = text
+        // Same deceptive/escape set as titles, but newlines and tabs stay.
+        let mut text: String = text
             .chars()
-            .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+            .filter(|c| *c == '\n' || *c == '\t' || !crate::titles::is_control(*c))
             .collect();
+        if text.len() > MAX_NOTICE_BYTES {
+            let mut end = MAX_NOTICE_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push('…');
+        }
         if text.trim().is_empty() {
             return Err(ServiceError::InvalidConfig("notice text is empty".into()));
         }
@@ -1240,8 +1263,9 @@ impl SessionService {
         session: &SessionId,
         title: String,
         source: rness_protocol::events::TitleSource,
+        max_bytes: usize,
     ) -> Result<(), ServiceError> {
-        let title = self.title_event(title, source, crate::titles::DEFAULT_MAX_BYTES)?;
+        let title = self.title_event(title, source, max_bytes)?;
         commit_title(&self.store, &self.live(session), &self.bus, session, title, true)?;
         Ok(())
     }
@@ -1258,6 +1282,14 @@ impl SessionService {
     ) -> Result<bool, ServiceError> {
         let title = self.title_event(title, source, max_bytes)?;
         commit_title(&self.store, &self.live(session), &self.bus, session, title, false)
+    }
+
+    /// Persist titles queued while an idle writer (compaction, prune) held
+    /// the log (see `commit_title`).
+    fn drain_queued_titles(&self, log: &mut crate::session::log::SessionLog, session: &SessionId) {
+        let live = self.live(session);
+        let _inbox = live.inbox.lock().unwrap();
+        drain_titles(log, &live);
     }
 
     fn title_event(
@@ -2043,6 +2075,7 @@ impl SessionService {
             summary: summary.clone(),
             model: provider.summary_model().to_string(),
         }))?;
+        self.drain_queued_titles(&mut log, session);
         drop(log);
 
         self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
@@ -2148,6 +2181,8 @@ impl SessionService {
         )
         .await
         .map_err(|e| ServiceError::Summarizer(e.to_string()));
+        self.drain_queued_titles(&mut log, session);
+        drop(log);
         self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
             session: session.clone(),
             changed: matches!(changed, Ok(true)),
@@ -2257,6 +2292,9 @@ impl SessionService {
                 result,
             }))?;
             pruned += 1;
+        }
+        if let Some(log) = log.as_mut() {
+            self.drain_queued_titles(log, session);
         }
         drop(log);
 

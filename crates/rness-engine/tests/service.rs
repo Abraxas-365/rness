@@ -1956,7 +1956,7 @@ async fn offered_titles_follow_pin_rules_and_frames() {
     assert!(svc.offer_title(&sid, "  \u{1b}[1mRefactor\u{1b}[0m the\nparser ".into(), TitleSource::Model, 80).unwrap());
     assert!(svc.offer_title(&sid, "Parser refactor".into(), TitleSource::Model, 8).unwrap());
     // A user title pins against automatic offers.
-    svc.set_title(&sid, "Mine".into(), TitleSource::User).unwrap();
+    svc.set_title(&sid, "Mine".into(), TitleSource::User, 80).unwrap();
     assert!(!svc.offer_title(&sid, "Model again".into(), TitleSource::Model, 80).unwrap());
     assert_eq!(
         titles(&svc, &sid),
@@ -1982,7 +1982,7 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
     assert_eq!(svc.phase(&sid), Phase::Running);
     // Offers and renames mid-turn are queued and visible at once.
     assert!(svc.offer_title(&sid, "first prompt".into(), TitleSource::Fallback, 80).unwrap());
-    svc.set_title(&sid, "My \u{7}name".into(), TitleSource::User).unwrap();
+    svc.set_title(&sid, "My \u{7}name".into(), TitleSource::User, 80).unwrap();
     assert_eq!(
         svc.title_with_source(&sid).unwrap(),
         Some(("My name".into(), TitleSource::User))
@@ -2000,10 +2000,57 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
     );
 
     // Unpinning (explicit model-sourced title) lets automatic titles apply.
-    svc.set_title(&sid, "My name".into(), TitleSource::Model).unwrap();
+    svc.set_title(&sid, "My name".into(), TitleSource::Model, 80).unwrap();
     assert_eq!(svc.title_with_source(&sid).unwrap().unwrap().1, TitleSource::Model);
     assert!(svc.offer_title(&sid, "Model title".into(), TitleSource::Model, 80).unwrap());
-    assert!(svc.set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User).is_err());
+    assert!(svc.set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User, 80).is_err());
+
+    // Explicit titles honour a larger cap too (not only offers).
+    let long = "word ".repeat(30);
+    svc.set_title(&sid, long.clone(), TitleSource::User, 120).unwrap();
+    let stored = svc.title(&sid).unwrap().unwrap();
+    assert!(stored.len() > 80 && stored.len() <= 120, "{}", stored.len());
+}
+
+/// A title offered while an idle compaction holds the writer is queued, not
+/// dropped, and persisted when that writer finishes.
+#[tokio::test]
+async fn idle_title_waits_for_a_writer_instead_of_dropping() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = titler("Model title", false);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    let writer = svc.store().open(&sid).unwrap();
+    assert!(svc.offer_title(&sid, "While locked".into(), TitleSource::Model, 80).unwrap());
+    assert_eq!(svc.title(&sid).unwrap().as_deref(), Some("While locked"));
+    drop(writer);
+    // The next commit drains the queue first, keeping order.
+    svc.set_title(&sid, "After".into(), TitleSource::User, 80).unwrap();
+    assert_eq!(
+        titles(&svc, &sid),
+        vec![("While locked".into(), TitleSource::Model), ("After".into(), TitleSource::User)]
+    );
+}
+
+#[tokio::test]
+async fn notices_strip_deceptive_controls_and_are_capped() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = service(dir.path(), titler("x", false));
+    let sid = svc.create(None).unwrap();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let sink = frames.clone();
+    let _sub = svc.bus().on::<rness_engine::service::FrameEv>(move |frame| {
+        if let rness_protocol::frames::Frame::Notice { text, .. } = frame {
+            sink.lock().unwrap().push(text.clone());
+        }
+    });
+    svc.notify(&sid, "a\u{202E}b\u{7}c\nd").unwrap();
+    svc.notify(&sid, &"é".repeat(5000)).unwrap();
+    assert!(svc.notify(&sid, "\u{200B}\u{1}").is_err());
+    let got = frames.lock().unwrap().clone();
+    assert_eq!(got[0], "abc\nd");
+    assert!(got[1].len() <= 4096 + '…'.len_utf8() && got[1].ends_with('…'));
+    assert_eq!(got.len(), 2);
 }
 
 /// The pieces a Lua title plugin builds on: human prompts (own log, no

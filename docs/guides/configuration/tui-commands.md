@@ -67,10 +67,10 @@ end)
 | --- | --- |
 | `rness.hook.on("prompt", fn)` | A human prompt was committed: `{ session, text, index, parent, lineage }`. `index` is 1-based within the session. `parent` is the parent session id for delegated sessions and JSON null (not `nil`) for roots, so test `type(ev.parent) == "string"`. |
 | `rness.session.prompts(id)` | The session's human prompts, oldest first (own log; a fork does not inherit its parent's). |
-| `rness.session.notify(id, text)` | Show a notice to whoever is viewing the session (TUI transcript notice, SSE `notice` frame). Works from tasks, hooks and timers. Ephemeral: not logged, never sent to the model; control characters are removed. |
+| `rness.session.notify(id, text)` | Show a notice to whoever is viewing the session (TUI transcript notice, SSE `notice` frame). Works from tasks, hooks and timers. Ephemeral: not logged, never sent to the model; control characters and bidirectional/invisible marks are removed and the text is capped at 4 KiB. |
 | `rness.llm.complete{ session, prompt, system?, profile?, max_output_tokens?, timeout? }` | One bounded model call. It yields, so call it from a command, a tool or a [`rness.task`](../../reference/lua/task.md). |
 | `rness.session.offer_title(id, text, "model"\|"fallback"[, max_bytes])` | Automatic title under the pin rules (`model` never replaces a pinned title; `fallback` only fills an untitled session). Returns whether it was accepted. |
-| `rness.session.title(id[, text[, source]])`, `title_info(id)` | Get the title; set it explicitly (`user` pins, `model` unpins); `{ title, source }`. |
+| `rness.session.title(id[, text[, source[, max_bytes]]])`, `title_info(id)` | Get the title; set it explicitly (`user` pins, `model` unpins; capped at `max_bytes`, default 80, ≤ 200); `{ title, source }`. |
 
 All titles — model, fallback, and user — are normalized to a single line with escape sequences, control characters, and bidirectional/invisible marks removed, so a title cannot inject terminal control codes. A title you set (`/title <text>`, `/title auto`, or `rness.session.title(id, text)`) is **pinned**: an in-flight automatic title that finishes later is discarded. `rness.session.title(id, text, "model")` or `/title unpin` stores an unpinned title. Title changes are durable `session/title` events and are broadcast as a `title_changed` frame (TUI, SSE) and the `session/title` bus event. The TUI shows the displayed session's title in the terminal window title as `<title> — rness`, clearing it on exit.
 

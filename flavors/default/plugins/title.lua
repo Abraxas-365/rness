@@ -82,6 +82,9 @@ return function(opts)
   local fallback = opts.fallback ~= false
   local max_bytes = opts.max_bytes or 80
   local max_input = opts.max_input_bytes or 4096
+  if max_input < #HEAD + 64 then
+    error("title: max_input_bytes must be at least " .. (#HEAD + 64))
+  end
 
   -- Ask the model for a title from `session`'s first (or all) prompts.
   -- Yields: call from a command, tool or rness.task.
@@ -155,7 +158,7 @@ return function(opts)
         end
         start(session, true, function(ok, result)
           if ok then
-            ok, result = pcall(rness.session.title, session, utf8_prefix(result, max_bytes))
+            ok, result = pcall(rness.session.title, session, result, "user", max_bytes)
           end
           if ok then
             tell(session, "Title: " .. result)
@@ -172,12 +175,12 @@ return function(opts)
           return { message = "Title is not pinned" }
         end
         cancel_inflight(session)
-        rness.session.title(session, info.title, "model")
+        rness.session.title(session, info.title, "model", max_bytes)
         return { message = "Title unpinned" }
       end
 
       cancel_inflight(session)
-      local title = rness.session.title(session, text)
+      local title = rness.session.title(session, text, "user", max_bytes)
       return { message = "Title set: " .. title }
     end,
   }
