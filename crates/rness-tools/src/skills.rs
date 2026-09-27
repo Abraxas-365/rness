@@ -16,10 +16,12 @@
 //! Invalid files are skipped, not fatal — a broken skill never takes
 //! discovery down.
 //!
-//! The catalog lives in the `skill` tool's description (specs are sent
-//! to the model every step), and `execute` re-discovers, so a skill
-//! added mid-session is loadable by name even before the description
-//! refreshes at next compose/reload.
+//! Live reload: the catalog lives in the `skill` tool's description
+//! (specs are sent to the model every step). Each turn binds the tool to
+//! the session workspace (`for_workspace`), which re-discovers, so the
+//! model sees added/edited/removed skills from the next turn on; `execute`
+//! also re-discovers, so a skill is loadable by name the moment it lands.
+//! Hosts refresh UI catalogs by polling [`catalog_fingerprint`].
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,6 +210,36 @@ pub fn load(roots: &[SkillRoot], name: &str) -> Option<(Skill, String)> {
     let raw = std::fs::read_to_string(&skill.path).ok()?;
     let (_, body) = split_frontmatter(&raw)?;
     Some((skill, body))
+}
+
+/// Cheap change detector for the catalog: every candidate skill file
+/// under `roots` with its size and mtime, from directory listings and
+/// `stat` only (no file reads). Equal fingerprints mean `discover` would
+/// return the same catalog, so a host can poll this and re-discover only
+/// on change — adds, edits (incl. atomic-rename saves), deletes, and roots
+/// appearing or vanishing all show up.
+pub fn catalog_fingerprint(roots: &[SkillRoot]) -> Vec<(PathBuf, u64, Option<std::time::SystemTime>)> {
+    let mut entries = Vec::new();
+    for root in roots {
+        let Ok(dir) = std::fs::read_dir(&root.path) else {
+            continue;
+        };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            let file = if path.is_dir() {
+                path.join("SKILL.md")
+            } else if path.extension().is_some_and(|e| e == "md") {
+                path
+            } else {
+                continue;
+            };
+            if let Ok(meta) = std::fs::metadata(&file) {
+                entries.push((file, meta.len(), meta.modified().ok()));
+            }
+        }
+    }
+    entries.sort();
+    entries
 }
 
 pub fn resolve_input(

@@ -2531,26 +2531,40 @@ async fn run_tui(
         let sessions = sessions.clone();
         let watched = watched.clone();
         let workspace_fallback = std::env::current_dir()?;
+        let custom_skill_roots = custom_skill_roots.clone();
         tokio::spawn(async move {
             let mut previous = None;
             let mut previous_references = None;
             let mut previous_commands = None;
             let mut previous_session = None;
+            // Skill folders are re-checked ~1s (cheap stat fingerprint) so
+            // added/edited/removed skills reach completion without a restart.
+            let mut previous_skills = None;
+            let mut skill_roots = Vec::new();
+            let mut ticks: u64 = 0;
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
             loop {
                 tick.tick().await;
+                ticks += 1;
                 let session = watched.read().unwrap().clone();
                 if previous_session.as_ref() != Some(&session) {
                     if let Ok(workspace) = sessions.store().workspace(&session) {
                         let root = workspace
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|| workspace_fallback.clone());
-                        let skills: Vec<_> = rness_tools::skills::discover(
-                            &rness_tools::skills::default_roots(&root),
-                        )
-                        .into_iter()
-                        .map(|s| (s.name, s.description))
-                        .collect();
+                        skill_roots =
+                            rness_tools::skills::default_roots_with_custom(&root, &custom_skill_roots);
+                        previous_skills = None;
+                    }
+                    previous_session = Some(session);
+                }
+                if previous_skills.is_none() || ticks.is_multiple_of(10) {
+                    let fingerprint = rness_tools::skills::catalog_fingerprint(&skill_roots);
+                    if previous_skills.as_ref() != Some(&fingerprint) {
+                        let skills: Vec<_> = rness_tools::skills::discover(&skill_roots)
+                            .into_iter()
+                            .map(|s| (s.name, s.description))
+                            .collect();
                         if tx
                             .send(rness_tui::app::Action::Custom(
                                 "input:skills".into(),
@@ -2560,8 +2574,8 @@ async fn run_tui(
                         {
                             break;
                         }
+                        previous_skills = Some(fingerprint);
                     }
-                    previous_session = Some(session);
                 }
                 let generation = sessions.reference_service().generation();
                 if previous_references != Some(generation) {

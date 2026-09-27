@@ -5,7 +5,7 @@
 use std::path::Path;
 
 use rness_engine::tools::Tool;
-use rness_tools::skills::{discover, load, SkillRoot, SkillTool};
+use rness_tools::skills::{catalog_fingerprint, discover, load, SkillRoot, SkillTool};
 
 fn write_skill(dir: &Path, file: &str, name: &str, description: &str, body: &str) {
     let path = dir.join(file);
@@ -205,4 +205,48 @@ async fn skill_added_after_registration_is_loadable() {
         .await
         .unwrap();
     assert!(out.contains("still works"));
+}
+
+#[test]
+fn catalog_fingerprint_tracks_add_edit_and_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    // Root does not exist yet: empty, and appears later.
+    let root = dir.path().join("skills");
+    let roots = vec![SkillRoot { path: root.clone(), rank: 0 }];
+    let empty = catalog_fingerprint(&roots);
+    assert!(empty.is_empty());
+
+    write_skill(&root, "a.md", "alpha", "first", "body");
+    write_skill(&root, "b/SKILL.md", "beta", "second", "body");
+    std::fs::write(root.join("notes.txt"), "ignored").unwrap();
+    let added = catalog_fingerprint(&roots);
+    assert_eq!(added.len(), 2, "{added:?}");
+    assert_eq!(catalog_fingerprint(&roots), added, "stable without changes");
+
+    // Edit that changes size (mtime granularity is not relied on).
+    write_skill(&root, "a.md", "alpha", "first, now longer", "body");
+    let edited = catalog_fingerprint(&roots);
+    assert_ne!(edited, added);
+
+    std::fs::remove_dir_all(root.join("b")).unwrap();
+    let removed = catalog_fingerprint(&roots);
+    assert_eq!(removed.len(), 1);
+    assert_ne!(removed, edited);
+}
+
+/// Each turn rebinds the tool to the session workspace; the rebound tool
+/// advertises skills added since startup (the model sees them next turn).
+#[test]
+fn workspace_rebinding_refreshes_the_advertised_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let skills = dir.path().join(".rness/skills");
+    let tool = SkillTool::new(rness_tools::skills::default_roots(dir.path()));
+    assert!(!tool.description().contains("fresh-skill"));
+    write_skill(&skills, "fresh.md", "fresh-skill", "added mid-session", "body");
+    let bound = tool.for_workspace(&"s".into(), dir.path()).unwrap();
+    assert!(bound.description().contains("- fresh-skill: added mid-session"));
+    std::fs::remove_file(skills.join("fresh.md")).unwrap();
+    let bound = tool.for_workspace(&"s".into(), dir.path()).unwrap();
+    assert!(!bound.description().contains("fresh-skill"));
 }
