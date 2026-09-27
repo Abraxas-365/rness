@@ -2194,3 +2194,83 @@ async fn time_context_resend_after_and_subagent_skip() {
     let top = host.intercept("pre_step", child(serde_json::Value::Null), serde_json::json!({"kind": "enter"}), &cancel).await.unwrap();
     assert_eq!(kind(top.clone()), Some(true), "top-level session still gets time: {top}");
 }
+
+/// tmux-context runs its real shell query against fake `tmux`/`ps` on PATH:
+/// the pane must own our controlling tty (an inherited `$TMUX_PANE` is not
+/// trusted), the layout is included, and a layout change re-injects.
+#[cfg(unix)]
+#[tokio::test]
+async fn tmux_context_verifies_pane_tty_and_reports_layout() {
+    use rness_engine::turn::hooks::{LoopEvent, LoopHooks, PreStepDecision};
+    use std::os::unix::fs::PermissionsExt;
+    let plugin = include_str!("../../../flavors/default/plugins/tmux-context.lua");
+    let bin = tempfile::tempdir().unwrap();
+    let script = |name: &str, body: &str| {
+        let path = bin.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script("ps", r#"echo " $FAKE_SELF_TTY""#);
+    script(
+        "tmux",
+        r#"case "$*" in
+  *pane_tty*) echo "$FAKE_PANE_TTY" ;;
+  *) printf 'main\t2\tcode\t1\t%%42\t1\t1\t%s\n' "$FAKE_LAYOUT" ;;
+esac"#,
+    );
+    let host = LuaHost::spawn().unwrap();
+    // Route the plugin's popen through the fake bin with Lua-controlled env.
+    host.load("fake", &format!(r#"
+        rness.fake = {{ self_tty = "ttys003", pane_tty = "/dev/ttys003", layout = "aaaa,80x24,0,0,42" }}
+        local getenv, popen = os.getenv, io.popen
+        os.getenv = function(k) if k == "TMUX_PANE" then return "%42" end return getenv(k) end
+        io.popen = function(cmd, mode)
+          local f = rness.fake
+          local env = string.format("export PATH=%q:\"$PATH\" TMUX_PANE='%%42' FAKE_SELF_TTY=%q FAKE_PANE_TTY=%q FAKE_LAYOUT=%q\n",
+            {bin:?}, f.self_tty, f.pane_tty, f.layout)
+          return popen(env .. cmd, mode)
+        end
+    "#, bin = bin.path().display().to_string())).await.unwrap();
+    host.load("tmux", plugin).await.unwrap();
+    let cancel = CancellationToken::new();
+    let pre = |turn| {
+        let host = host.clone();
+        let cancel = cancel.clone();
+        async move { host.pre_step(&LoopEvent { session: "s".into(), turn, step: 1 }, &cancel).await.unwrap() }
+    };
+    let set = |lua: &'static str, name: &'static str| {
+        let host = host.clone();
+        async move { host.load(name, lua).await.unwrap() }
+    };
+    let text = |d: PreStepDecision| match d {
+        PreStepDecision::EnterWithMessages { messages } => {
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].tag.as_deref(), Some("tmux"));
+            Some(messages[0].text.clone())
+        }
+        PreStepDecision::Enter => None,
+        other => panic!("unexpected {other:?}"),
+    };
+
+    let first = text(pre(1).await).expect("genuine pane injects");
+    assert_eq!(
+        first,
+        "tmux location (turn 1):\nsession \"main\", window 2 \"code\", pane 1 (%42)\nwindow active, pane active\nlayout aaaa,80x24,0,0,42"
+    );
+    assert_eq!(text(pre(2).await), None, "unchanged state is suppressed");
+    set(r#"rness.fake.layout = "bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}""#, "split").await;
+    let relaid = text(pre(3).await).expect("layout change re-injects");
+    assert!(relaid.starts_with("tmux location (turn 3):") && relaid.ends_with("layout bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}"), "{relaid}");
+
+    // Inherited $TMUX_PANE: the pane's tty is some other terminal → nothing.
+    set(r#"rness.fake.pane_tty = "/dev/ttys009"; rness.fake.layout = "cccc""#, "inherited").await;
+    assert_eq!(text(pre(4).await), None, "inherited env must not inject");
+    // No controlling tty at all (daemon/CI): nothing.
+    set(r#"rness.fake.pane_tty = "/dev/ttys003"; rness.fake.self_tty = "??""#, "notty").await;
+    assert_eq!(text(pre(5).await), None);
+
+    // Invalid config fails at load.
+    let bad = LuaHost::spawn().unwrap();
+    bad.load("cfg", "rness.tmux_context = { refresh_interval = -1 }").await.unwrap();
+    assert!(bad.load("tmux", plugin).await.unwrap_err().to_string().contains("must be"));
+}
