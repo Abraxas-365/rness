@@ -44,7 +44,8 @@ fn visible_events(events: Vec<Envelope>) -> Vec<Envelope> {
         .filter(|event| {
             !matches!(&event.event,
         SessionEvent::UserMessage(message) if matches!(message.source,
-            Some(rness_protocol::events::MessageSource::Instructions { .. })))
+            Some(rness_protocol::events::MessageSource::Instructions { .. }
+                | rness_protocol::events::MessageSource::Context { .. })))
         })
         .collect()
 }

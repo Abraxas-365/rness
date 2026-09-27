@@ -409,6 +409,14 @@ pub enum MessageSource {
     Instructions {
         identity: String,
     },
+    /// Plugin-maintained context block (`rness.context.ensure`), e.g. a
+    /// memory index. Same contract as `Instructions`: `name` identifies the
+    /// renderer, `identity` fingerprints the content; the engine re-injects
+    /// when no visible block matches (first turn, compaction fold, change).
+    Context {
+        name: String,
+        identity: String,
+    },
     /// Context a tool-pipeline hook attached to a call (`post_tool`
     /// `additional_contexts`). Committed after the step's tool results.
     Hook {

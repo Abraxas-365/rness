@@ -164,6 +164,99 @@ fn floor_char_boundary(s: &str, mut i: usize) -> usize {
     i
 }
 
+/// Stable content fingerprint (SHA-1 hex) — the default identity of a
+/// plugin context block that does not supply one.
+pub fn fingerprint(text: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(text.as_bytes());
+    hasher.hex()
+}
+
+/// Whether an injected message matching `source` is visible in the
+/// projected model context (cited by it, not folded by a compaction).
+pub fn visible(
+    replayed: &crate::session::replay::Replayed,
+    source: &rness_protocol::events::MessageSource,
+) -> bool {
+    use rness_protocol::events::{SessionEvent, UserMessage};
+    let cited: std::collections::HashSet<&str> = replayed
+        .context
+        .sources
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    replayed.history.iter().any(|e| {
+        cited.contains(e.id.as_str())
+            && matches!(
+                &e.event,
+                SessionEvent::UserMessage(UserMessage { source: Some(s), .. }) if s == source
+            )
+    })
+}
+
+/// Failure of an [`ensure`] check: reading the session or appending to it.
+#[derive(Debug, thiserror::Error)]
+pub enum EnsureError {
+    #[error(transparent)]
+    Replay(#[from] crate::session::replay::ReplayError),
+    #[error(transparent)]
+    Log(#[from] crate::session::log::LogError),
+}
+
+/// dsh baseline check: is an instructions baseline with the CURRENT
+/// identity visible in the projected context? If not (first turn,
+/// compaction fold — between turns or mid-turn — or files changed),
+/// append a fresh one, re-read from disk, as a durable sourced user
+/// message. `cwd` is overridden by the session workspace when it has one.
+/// Returns whether a baseline was appended.
+pub fn ensure(
+    store: &crate::session::branch::SessionStore,
+    log: &mut crate::session::log::SessionLog,
+    config: &InstructionsConfig,
+) -> Result<bool, EnsureError> {
+    let mut config = config.clone();
+    if let Some(workspace) = store
+        .workspace(log.session())
+        .map_err(crate::session::replay::ReplayError::from)?
+    {
+        config.cwd = workspace.into();
+    }
+    let Some(baseline) = render(&config) else {
+        return Ok(false);
+    };
+    ensure_source(
+        store,
+        log,
+        rness_protocol::events::MessageSource::Instructions {
+            identity: baseline.identity,
+        },
+        baseline.text,
+    )
+}
+
+/// Append `text` as a durable `Inject` message with `source` unless a
+/// message with exactly that source is already visible to the model.
+/// Shared by the AGENTS.md baseline and plugin context blocks. Returns
+/// whether it appended.
+pub fn ensure_source(
+    store: &crate::session::branch::SessionStore,
+    log: &mut crate::session::log::SessionLog,
+    source: rness_protocol::events::MessageSource,
+    text: String,
+) -> Result<bool, EnsureError> {
+    use rness_protocol::events::{ContentPart, SessionEvent, UserIntent, UserMessage};
+    let replayed = crate::session::replay::replay(store, log.session())?;
+    if visible(&replayed, &source) {
+        return Ok(false);
+    }
+    log.append(&SessionEvent::UserMessage(UserMessage {
+        intent: UserIntent::Inject,
+        content: vec![ContentPart::Text { text }],
+        source: Some(source),
+    }))?;
+    Ok(true)
+}
+
 // -- minimal SHA-1 (identity fingerprint only, not security) ---------------
 
 struct Sha1 {

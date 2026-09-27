@@ -123,6 +123,8 @@ rness.ui.messagebox = {
       },
       -- Same for the AGENTS.md / CLAUDE.md baseline: hidden entirely unless revealed.
       instructions = { visible = false, display = "collapsed", label = { text = "AGENTS.md", style = "dim" } },
+      -- Plugin context blocks (rness.context.ensure); per block: names.<name> = {...}.
+      context = { visible = false, display = "collapsed", label = { text = "Context", style = "dim" } },
       job = { display = "preview", preview_lines = 6, label = { text = "Job", style = "tool_name" } },
       external = { label = { text = "External", style = "tool_name" } },
     },

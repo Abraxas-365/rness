@@ -388,6 +388,47 @@ end)
 - `turn_stopping` fires when the model says "end turn" (EndTurn or truncation with no tool calls). Return `{kind="continue", messages={"..."}}` to inject a steer and continue; `{kind="stop"}` (default) closes the turn. Messages are committed as `UserMessage{intent: Steer, source: Hook}` and accept the same `{text, tag}` form.
 - Failure semantics: a throwing `pre_step` is logged and treated as Enter (step proceeds); other hook errors are logged and the default applies. No loop hook failure is fatal to the turn.
 
+### Durable context blocks (`rness.context.ensure`)
+
+`pre_step` messages are one-off: once a compaction folds them, they are gone.
+For context the model should *always* have (a memory index, project facts),
+register a renderer instead. The engine keeps the block visible with the same
+guarantee as the AGENTS.md baseline:
+
+```lua
+local off = rness.context.ensure({
+  name = "memory",                    -- [A-Za-z0-9._-]; also the TUI style key
+  render = function(ev)               -- ev: session, turn, step, workspace, parent, lineage
+    local text = read_index(ev.workspace)
+    return text                       -- or: return text, identity
+  end,
+})
+-- off() unregisters; unloading the plugin does too.
+```
+
+- `render` runs on the first step of every turn and again after any mid-turn
+  compaction (pre-step pressure or provider context overflow), before the next
+  model request.
+- The block is appended as `UserMessage{intent: Inject, source: Context{name, identity}}`
+  only when no block with that name **and** identity is visible in the model
+  context. Unchanged text costs nothing; changed text (a new identity) appends a
+  fresh block; a block folded by compaction is re-rendered.
+- `identity` defaults to a hash of the text. Return your own (e.g. a version or
+  mtime) to control when the block counts as changed. A new identity appends a
+  fresh block *next to* the old one (the old one leaves context at the next
+  compaction), so keep the text stable: no timestamps or turn numbers.
+- Returning `nil` or `""` injects nothing this time. A throwing renderer, or a
+  non-string result, is logged and skipped; it never fails the turn. Keep
+  `render` cheap: it shares the hook timeout, and a timeout stops the whole chain.
+- Blocks larger than 32 KiB are truncated (with a marker).
+- A name registered twice keeps the first registration, even when it renders
+  nothing. `context` is reserved: `rness.hook.on("context", …)` is rejected.
+- Blocks are injected on the user-message side, after the prompt that opened the turn.
+- Subagent sessions render and receive blocks too. Filter on `ev.parent` (nil
+  for top-level sessions) to skip them. Subagent monitors hide context blocks
+  like the AGENTS.md baseline, and the default theme hides them in the
+  transcript (`user.sources.context`; `alt+i` reveals).
+
 ### Lifecycle hooks
 
 Notification-only hooks for session and subagent lifecycle events. These fire via `rness.hook.on()` but are not waterfall chains — there is no `next()` or return value.
@@ -685,6 +726,10 @@ rness.ui.messagebox = {
         },
       },
       instructions = { display = 'collapsed', label = { text = 'AGENTS.md' } },
+      context = {                               -- rness.context.ensure blocks
+        label = { text = 'Context' },
+        names = { memory = { visible = true, label = { text = 'Memory' } } },
+      },
       job = { label = { text = 'Job', style = 'tool_name' } },
       external = { label = { text = 'External' } },   -- scheduled/external prompts
     },
@@ -692,9 +737,10 @@ rness.ui.messagebox = {
 }
 ```
 
-`kind` is one of `hook`, `instructions`, `job`, `external`. A hook's `tag` is set
+`kind` is one of `hook`, `instructions`, `context`, `job`, `external`. A hook's `tag` is set
 by the plugin that injected it (see `pre_step` below); untagged hooks use the
-`hook` options. `visible = false` removes the message from the transcript and from
+`hook` options. A context block's `name` selects `context.names.<name>`.
+`visible = false` removes the message from the transcript and from
 message selection. The model still receives it. `toggle_hidden` (default `alt+i`)
 temporarily reveals hidden messages.
 

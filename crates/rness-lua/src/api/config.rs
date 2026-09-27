@@ -660,12 +660,16 @@ fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> 
             }
             ("message", "markdown") => Some("markdown"),
             // Per-source overrides for injected user-role messages:
-            // `user.sources.<kind>` and `user.sources.hook.tags.<tag>` only.
+            // `user.sources.<kind>`, `user.sources.hook.tags.<tag>` and
+            // `user.sources.context.names.<name>` only.
             ("message", "sources") if path.ends_with(".user") && !path.contains(".sources.") => {
                 Some("sources")
             }
-            ("sources", "hook" | "instructions" | "job" | "external") => Some("message"),
+            ("sources", "hook" | "instructions" | "context" | "job" | "external") => {
+                Some("message")
+            }
             ("message", "tags") if path.ends_with(".sources.hook") => Some("tags"),
+            ("message", "names") if path.ends_with(".sources.context") => Some("tags"),
             ("tags", _) => Some("message"),
             ("markdown", "code_block") => Some("code"),
             ("tool", "header") => Some("header"),

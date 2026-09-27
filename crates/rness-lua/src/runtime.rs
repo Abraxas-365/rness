@@ -2169,6 +2169,8 @@ impl LuaRuntime {
 pub(crate) const GUARD_EVENT: &str = "guard";
 /// Around-execution wrapper chain (dsh `tools/execute`).
 pub(crate) const EXECUTE_EVENT: &str = "tool_execute";
+/// `rness.context.ensure` renderers, collected as one chain.
+pub(crate) const CONTEXT_EVENT: &str = "context";
 
 /// A `tool_execute` chain parked on the VM actor. Its `next()` yields
 /// `sentinel` to request one tool-body run.
@@ -3075,6 +3077,11 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     hook.set(
         "on",
         lua.create_function(|lua, (event, second, third): (String, LuaValue, Option<Function>)| {
+            if event == CONTEXT_EVENT {
+                return Err(mlua::Error::runtime(
+                    "'context' is reserved: use rness.context.ensure{name, render}",
+                ));
+            }
             register_hook(lua, event, second, third)
         })?,
     )?;
@@ -3088,6 +3095,66 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     )?;
     rness.set("hook", hook)?;
 
+    // rness.context.ensure{name, render} — a plugin-maintained context
+    // block (e.g. a memory index). render(ev) -> text[, identity] runs on
+    // each turn's first step and after mid-turn compaction; the engine
+    // injects the block only when no visible block with that name and
+    // identity exists (identity defaults to a hash of text). nil/"" text
+    // injects nothing. Errors are logged and skip the block. Returns a
+    // disposer; plugin-owned like hooks (removed on unload).
+    let context = lua.create_table()?;
+    context.set(
+        "ensure",
+        lua.create_function(|lua, spec: Table| {
+            let name: String = spec
+                .get::<Option<String>>("name")?
+                .ok_or_else(|| mlua::Error::runtime("rness.context.ensure: 'name' is required"))?;
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+            {
+                return Err(mlua::Error::runtime(
+                    "rness.context.ensure: 'name' must be non-empty [A-Za-z0-9._-]",
+                ));
+            }
+            let render: Function = spec
+                .get::<Option<Function>>("render")?
+                .ok_or_else(|| mlua::Error::runtime("rness.context.ensure: 'render' function is required"))?;
+            let wrapper: Function = lua
+                .load(
+                    r#"
+                    local name, render = ...
+                    return function(ev, next)
+                      local ok, text, identity = pcall(render, ev)
+                      -- A skipped render still claims its name, so the first
+                      -- registration wins whatever it returns.
+                      local own = { name = name, skip = true }
+                      if not ok then
+                        -- Timeout/cancel interrupts the whole chain, not one renderer.
+                        if tostring(text):find("cancelled or timed out", 1, true) then error(text, 0) end
+                        rness.log.warn("context '" .. name .. "' render failed: " .. tostring(text))
+                      elseif text ~= nil and (type(text) ~= "string" or (identity ~= nil and type(identity) ~= "string")) then
+                        rness.log.warn("context '" .. name .. "' render must return string[, string]")
+                      elseif text ~= nil and text ~= "" then
+                        own = { name = name, text = text, identity = identity }
+                      end
+                      local blocks = { own }
+                      local rest = next and next(ev) or nil
+                      if type(rest) == "table" then
+                        for _, b in ipairs(rest) do blocks[#blocks + 1] = b end
+                      end
+                      return blocks
+                    end
+                    "#,
+                )
+                .set_name("=rness.context")
+                .call((name, render))?;
+            register_hook(lua, CONTEXT_EVENT.into(), LuaValue::Function(wrapper), None)
+        })?,
+    )?;
+    rness.set("context", context)?;
+
     // rness.events.emit(event, payload) — dispatch to every rness.hook.on
     // listener of `event`, in-VM. Same table the host fires into: Lua
     // plugins talk to each other through the exact seam the engine uses.
@@ -3095,6 +3162,9 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     events.set(
         "emit",
         lua.create_function(|lua, (event, payload): (String, Option<LuaValue>)| {
+            if event == CONTEXT_EVENT {
+                return Err(mlua::Error::runtime("'context' is reserved for the engine"));
+            }
             let hooks: Table = lua.globals().get("__rness_hooks")?;
             let Some(handlers) = hooks.get::<Option<Table>>(&*event)? else {
                 return Ok(());

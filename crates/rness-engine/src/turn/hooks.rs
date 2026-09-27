@@ -112,6 +112,18 @@ impl Default for TurnStoppingAction {
     }
 }
 
+// ── context ───────────────────────────────────────────────────────────
+
+/// One plugin-maintained context block (`rness.context.ensure`). The
+/// engine appends it as `MessageSource::Context{name, identity}` unless a
+/// block with the same name and identity is already visible to the model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContextBlock {
+    pub name: String,
+    pub identity: String,
+    pub text: String,
+}
+
 // ── trait ──────────────────────────────────────────────────────────────
 
 /// Loop-level hook implementation. Supplied by the composition root
@@ -119,6 +131,18 @@ impl Default for TurnStoppingAction {
 /// callers can provide a partial implementation.
 #[async_trait]
 pub trait LoopHooks: Send + Sync {
+    /// Current context blocks. Asked on the first step of a turn and after
+    /// any mid-turn compaction; the engine injects only missing or changed
+    /// blocks, so rendering should be cheap and deterministic.
+    async fn context(
+        &self,
+        event: &LoopEvent,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<ContextBlock>, String> {
+        let _ = (event, cancel);
+        Ok(Vec::new())
+    }
+
     /// Called before each step's model request is built.
     async fn pre_step(
         &self,

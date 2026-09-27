@@ -1709,6 +1709,372 @@ async fn instructions_change_on_disk_reinjects_with_new_identity() {
     assert!(last_seen.contains("version-uno"), "history is append-only");
 }
 
+/// Tool whose output alone crosses the mid-turn compaction threshold.
+struct Huge;
+#[async_trait::async_trait]
+impl Tool for Huge {
+    fn name(&self) -> &str {
+        "Huge"
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<String, String> {
+        Ok("y".repeat(20_000))
+    }
+}
+
+fn midturn_policy(threshold: u64) -> rness_engine::turn::compaction::Policy {
+    rness_engine::turn::compaction::Policy {
+        meter: Default::default(),
+        summary_profile: None,
+        threshold_tokens: threshold,
+        retain_tokens: 1,
+        summary_tokens: 100,
+        system_prompt: "Summarize without tools.".into(),
+        prompt: "Create a continuation briefing.".into(),
+        max_overflow_retries: 1,
+        max_compactions: 1,
+        prune_threshold: 1_000_000,
+        prune_head: 10,
+        prune_tail: 10,
+    }
+}
+
+/// A turn whose tool loop compacts mid-turn (pre-step pressure, or a
+/// provider CONTEXT_OVERFLOW) must not continue without the AGENTS.md
+/// baseline: the very next request after the fold carries it again.
+#[tokio::test]
+async fn instructions_reinjected_after_mid_turn_compaction() {
+    for overflow in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+        std::fs::write(ws.path().join("AGENTS.md"), "REGLA: se conciso").unwrap();
+
+        let mut steps = vec![StepOutcome::Committed(assistant(
+            "calling",
+            StopReason::ToolUse,
+            vec![("c1", "Huge")],
+        ))];
+        if overflow {
+            steps.push(StepOutcome::Failed {
+                error: rness_engine::turn::provider::ProviderError {
+                    code: "CONTEXT_OVERFLOW",
+                    retryable: false,
+                    retry_after: None,
+                    message: "too long".into(),
+                },
+                partial: vec![],
+            });
+        }
+        steps.push(StepOutcome::Committed(assistant(
+            "SUMMARY",
+            StopReason::EndTurn,
+            vec![],
+        )));
+        steps.push(StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        )));
+        let provider = Scripted::new(steps);
+        let tools = ToolRegistry::default();
+        tools.register(Arc::new(Huge));
+        // Pre-step path: the first request is small, the step after the
+        // tool result is far over. Overflow path: never over by estimate.
+        let threshold = if overflow { 1_000_000 } else { 1_000 };
+        let svc = SessionService::new(
+            SessionStore::new(dir.path()),
+            provider.clone(),
+            Arc::new(tools),
+            TurnConfig {
+                compaction: [("default".into(), midturn_policy(threshold))].into(),
+                ..Default::default()
+            },
+            Arc::new(EventBus::default()),
+        );
+        enable_instructions(&svc, ws.path(), 4096);
+        let sid = svc.create(None).unwrap();
+        svc.send(&sid, UserIntent::Followup, text("m1")).unwrap();
+        svc.join(&sid).await;
+
+        let history = svc.store().history(&sid).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::Compaction(_))),
+            "overflow={overflow}: fixture must compact mid-turn"
+        );
+        let seen = provider.seen();
+        let last = seen.last().unwrap();
+        assert!(
+            last.contains("REGLA"),
+            "overflow={overflow}: post-compaction request lost AGENTS.md: {last}"
+        );
+        let baselines = history
+            .iter()
+            .filter(|e| {
+                matches!(
+                    &e.event,
+                    SessionEvent::UserMessage(UserMessage {
+                        source: Some(MessageSource::Instructions { .. }),
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(baselines, 2, "overflow={overflow}: one folded + one fresh");
+    }
+}
+
+/// Fake plugin renderer: returns whatever blocks the test sets; counts
+/// how many times the engine asked.
+struct ContextHooks {
+    blocks: Mutex<Vec<rness_engine::turn::hooks::ContextBlock>>,
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl ContextHooks {
+    fn new(name: &str, identity: &str, text: &str) -> Arc<Self> {
+        let hooks = Arc::new(Self {
+            blocks: Mutex::default(),
+            asked: Default::default(),
+        });
+        hooks.set(name, identity, text);
+        hooks
+    }
+    fn set(&self, name: &str, identity: &str, text: &str) {
+        *self.blocks.lock().unwrap() = vec![rness_engine::turn::hooks::ContextBlock {
+            name: name.into(),
+            identity: identity.into(),
+            text: text.into(),
+        }];
+    }
+}
+
+#[async_trait]
+impl rness_engine::turn::hooks::LoopHooks for ContextHooks {
+    async fn context(
+        &self,
+        _event: &rness_engine::turn::hooks::LoopEvent,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<rness_engine::turn::hooks::ContextBlock>, String> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.blocks.lock().unwrap().clone())
+    }
+}
+
+fn context_blocks(svc: &SessionService, sid: &SessionId) -> Vec<(String, String)> {
+    svc.store()
+        .history(sid)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(UserMessage {
+                source: Some(MessageSource::Context { name, identity }),
+                ..
+            }) => Some((name.clone(), identity.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Plugin context is injected before the first request of a turn, only
+/// once while visible, again when its identity changes.
+#[tokio::test]
+async fn plugin_context_injected_at_turn_start_and_on_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(scripted_answers(3));
+    let svc = service(dir.path(), provider.clone());
+    let hooks = ContextHooks::new("memory", "v1", "MEMORIA-uno");
+    svc.set_loop_hooks(Some(hooks.clone()));
+    let sid = svc.create(None).unwrap();
+
+    run_turns(&svc, &sid, 2).await;
+    let seen = provider.seen();
+    // First step of the turn: the prompt is durable, then context is ensured.
+    assert_eq!(seen[0], "m1|MEMORIA-uno");
+    assert_eq!(
+        context_blocks(&svc, &sid),
+        vec![("memory".into(), "v1".into())]
+    );
+
+    hooks.set("memory", "v2", "MEMORIA-dos");
+    run_turns(&svc, &sid, 1).await;
+    assert!(provider.seen()[2].contains("MEMORIA-dos"));
+    assert_eq!(
+        context_blocks(&svc, &sid),
+        vec![
+            ("memory".into(), "v1".into()),
+            ("memory".into(), "v2".into())
+        ]
+    );
+}
+
+/// Same guarantee as AGENTS.md: a mid-turn compaction (pre-step or
+/// overflow) folding a plugin's block re-renders it before the next request.
+#[tokio::test]
+async fn plugin_context_reinjected_after_mid_turn_compaction() {
+    for overflow in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut steps = vec![StepOutcome::Committed(assistant(
+            "calling",
+            StopReason::ToolUse,
+            vec![("c1", "Huge")],
+        ))];
+        if overflow {
+            steps.push(StepOutcome::Failed {
+                error: rness_engine::turn::provider::ProviderError {
+                    code: "CONTEXT_OVERFLOW",
+                    retryable: false,
+                    retry_after: None,
+                    message: "too long".into(),
+                },
+                partial: vec![],
+            });
+        }
+        steps.push(StepOutcome::Committed(assistant(
+            "SUMMARY",
+            StopReason::EndTurn,
+            vec![],
+        )));
+        steps.push(StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        )));
+        let provider = Scripted::new(steps);
+        let tools = ToolRegistry::default();
+        tools.register(Arc::new(Huge));
+        let threshold = if overflow { 1_000_000 } else { 1_000 };
+        let svc = SessionService::new(
+            SessionStore::new(dir.path()),
+            provider.clone(),
+            Arc::new(tools),
+            TurnConfig {
+                compaction: [("default".into(), midturn_policy(threshold))].into(),
+                ..Default::default()
+            },
+            Arc::new(EventBus::default()),
+        );
+        let hooks = ContextHooks::new("memory", "v1", "MEMORIA");
+        svc.set_loop_hooks(Some(hooks.clone()));
+        let sid = svc.create(None).unwrap();
+        svc.send(&sid, UserIntent::Followup, text("m1")).unwrap();
+        svc.join(&sid).await;
+
+        let history = svc.store().history(&sid).unwrap();
+        assert!(
+            history
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::Compaction(_))),
+            "overflow={overflow}: fixture must compact mid-turn"
+        );
+        let last = provider.seen().last().unwrap().clone();
+        assert!(
+            last.contains("MEMORIA"),
+            "overflow={overflow}: post-compaction request lost plugin context: {last}"
+        );
+        assert_eq!(
+            context_blocks(&svc, &sid).len(),
+            2,
+            "overflow={overflow}: one folded + one fresh"
+        );
+        // Step 1 plus once per compaction; not once per step.
+        assert_eq!(
+            hooks.asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "overflow={overflow}: renders only at turn start and after compaction"
+        );
+    }
+}
+
+/// A context hook that fails never fails the turn; oversized blocks are
+/// capped so they cannot force a compaction on every step.
+#[tokio::test]
+async fn plugin_context_errors_are_skipped_and_blocks_capped() {
+    struct Failing;
+    #[async_trait]
+    impl rness_engine::turn::hooks::LoopHooks for Failing {
+        async fn context(
+            &self,
+            _: &rness_engine::turn::hooks::LoopEvent,
+            _: &CancellationToken,
+        ) -> Result<Vec<rness_engine::turn::hooks::ContextBlock>, String> {
+            Err("render exploded".into())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(scripted_answers(2));
+    let svc = service(dir.path(), provider.clone());
+    svc.set_loop_hooks(Some(Arc::new(Failing)));
+    let sid = svc.create(None).unwrap();
+    run_turns(&svc, &sid, 1).await;
+    assert_eq!(provider.seen(), ["m1"]);
+    assert!(context_blocks(&svc, &sid).is_empty());
+
+    let max = rness_engine::turn::MAX_CONTEXT_BLOCK_BYTES;
+    svc.set_loop_hooks(Some(ContextHooks::new("big", "v1", &"é".repeat(max))));
+    run_turns(&svc, &sid, 1).await;
+    let history = svc.store().history(&sid).unwrap();
+    let text = history
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::UserMessage(UserMessage {
+                source: Some(MessageSource::Context { .. }),
+                content,
+                ..
+            }) => match &content[0] {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap();
+    assert!(text.ends_with("[context block truncated]"));
+    assert!(text.len() <= max + 64, "{}", text.len());
+}
+
+/// Queued followups start turns inside the running burst, never passing
+/// through `send`'s idle path: they get the same pre-prompt check, so a
+/// baseline changed during the previous turn precedes the followup (the
+/// step-1 re-check alone would land it after the prompt).
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_followup_rechecks_instructions() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+    std::fs::write(ws.path().join("AGENTS.md"), "version-uno").unwrap();
+
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Scripted::gated(scripted_answers(2), gate.clone());
+    let svc = service(dir.path(), provider.clone());
+    enable_instructions(&svc, ws.path(), 4096);
+    let sid = svc.create(None).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("m1")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("m2")).unwrap();
+    // Change the files only once turn 1 is past its step-1 check.
+    while provider.seen().is_empty() {
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    std::fs::write(ws.path().join("AGENTS.md"), "version-dos").unwrap();
+    gate.add_permits(2);
+    svc.join(&sid).await;
+
+    let seen = provider.seen();
+    assert_eq!(seen.len(), 2);
+    let order = |s: &str, marks: &[&str]| {
+        let at: Vec<_> = marks.iter().map(|m| s.find(m)).collect();
+        at.iter().all(Option::is_some) && at.windows(2).all(|w| w[0] < w[1])
+    };
+    assert!(order(&seen[0], &["version-uno", "|m1"]), "{}", seen[0]);
+    assert!(!seen[0].contains("version-dos"), "{}", seen[0]);
+    assert!(
+        order(&seen[1], &["version-uno", "|m1", "version-dos", "|m2"]),
+        "fresh baseline must sit between m1 and the followup: {}",
+        seen[1]
+    );
+    assert_eq!(seen[1].matches("version-dos").count(), 1, "{}", seen[1]);
+}
+
 #[tokio::test]
 async fn no_instruction_files_means_no_injection() {
     let dir = tempfile::tempdir().unwrap();

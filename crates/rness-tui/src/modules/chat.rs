@@ -73,13 +73,15 @@ fn source_key(source: &rness_protocol::events::MessageSource) -> &'static str {
     match source {
         MessageSource::Hook { .. } => "hook",
         MessageSource::Instructions { .. } => "instructions",
+        MessageSource::Context { .. } => "context",
         MessageSource::JobCompletion { .. } => "job",
         MessageSource::ExternalPrompt { .. } => "external",
     }
 }
 
 /// Layer per-source options over the resolved `user` options:
-/// `user` → `user.sources.<kind>` → `user.sources.hook.tags.<tag>`.
+/// `user` → `user.sources.<kind>` → `user.sources.hook.tags.<tag>` /
+/// `user.sources.context.names.<name>`.
 fn source_options(
     base: &serde_json::Value,
     source: Option<&rness_protocol::events::MessageSource>,
@@ -89,8 +91,14 @@ fn source_options(
     };
     let specific = &base["sources"][source_key(source)];
     let mut options = merge_options(base, specific);
-    if let rness_protocol::events::MessageSource::Hook { tag: Some(tag), .. } = source {
-        options = merge_options(&options, &specific["tags"][tag.as_str()]);
+    match source {
+        rness_protocol::events::MessageSource::Hook { tag: Some(tag), .. } => {
+            options = merge_options(&options, &specific["tags"][tag.as_str()]);
+        }
+        rness_protocol::events::MessageSource::Context { name, .. } => {
+            options = merge_options(&options, &specific["names"][name.as_str()]);
+        }
+        _ => {}
     }
     options
 }

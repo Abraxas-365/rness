@@ -60,6 +60,10 @@ pub struct TurnConfig {
     pub sections: Vec<crate::prompt::PromptSection>,
     /// Explicit route-keyed budgets supplied by the composition root.
     pub compaction: std::collections::BTreeMap<String, compaction::Policy>,
+    /// Workspace-instructions baseline policy. When set, the loop re-checks
+    /// the baseline after any mid-turn compaction (and the service before
+    /// each queued followup), so a fold never leaves a request without it.
+    pub instructions: Option<crate::instructions::InstructionsConfig>,
 }
 
 impl Default for TurnConfig {
@@ -71,8 +75,93 @@ impl Default for TurnConfig {
             system: String::new(),
             sections: Vec::new(),
             compaction: Default::default(),
+            instructions: None,
         }
     }
+}
+
+impl From<crate::instructions::EnsureError> for TurnError {
+    fn from(e: crate::instructions::EnsureError) -> Self {
+        match e {
+            crate::instructions::EnsureError::Replay(e) => Self::Replay(e),
+            crate::instructions::EnsureError::Log(e) => Self::Log(e),
+        }
+    }
+}
+
+/// Largest plugin context block, in bytes. Longer text is cut on a char
+/// boundary with a marker: a block the size of the compaction budget would
+/// otherwise force a compaction on every step.
+pub const MAX_CONTEXT_BLOCK_BYTES: usize = 32 * 1024;
+
+fn cap_block(mut text: String, name: &str) -> String {
+    if text.len() > MAX_CONTEXT_BLOCK_BYTES {
+        let mut cut = MAX_CONTEXT_BLOCK_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        tracing::warn!(context = name, bytes = text.len(), "context block truncated");
+        text.truncate(cut);
+        text.push_str("\n[context block truncated]");
+    }
+    text
+}
+
+/// Re-establish baseline context: the AGENTS.md baseline and plugin
+/// context blocks. Runs on a turn's first step and after any mid-turn
+/// compaction, so no request goes out with that context folded away.
+/// Each piece is appended only if missing or changed. A failing or
+/// cancelled context hook is logged and skipped, never fatal to the turn.
+/// Returns whether anything was appended.
+#[allow(clippy::too_many_arguments)]
+async fn restore_context(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    config: &TurnConfig,
+    loop_hooks: Option<&dyn LoopHooks>,
+    event: &LoopEvent,
+    cancel: &CancellationToken,
+    frames: &FrameSink<'_>,
+) -> Result<bool, TurnError> {
+    let mut appended = false;
+    if let Some(instructions) = &config.instructions {
+        appended |= crate::instructions::ensure(store, log, instructions)?;
+    }
+    if let Some(hooks) = loop_hooks {
+        let blocks = tokio::select! {
+            biased;
+            blocks = hooks.context(event, cancel) => blocks,
+            _ = cancel.cancelled() => Err("cancelled".into()),
+        };
+        match blocks {
+            Err(_) if cancel.is_cancelled() => {}
+            Err(e) => tracing::warn!(session = %event.session, "context hook failed: {e}"),
+            Ok(blocks) => {
+                let mut seen = std::collections::HashSet::new();
+                for block in blocks {
+                    if block.text.trim().is_empty() || !seen.insert(block.name.clone()) {
+                        continue;
+                    }
+                    let text = cap_block(block.text, &block.name);
+                    appended |= crate::instructions::ensure_source(
+                        store,
+                        log,
+                        rness_protocol::events::MessageSource::Context {
+                            name: block.name,
+                            identity: block.identity,
+                        },
+                        text,
+                    )?;
+                }
+            }
+        }
+    }
+    if appended {
+        frames(Frame::HistoryChanged {
+            session: log.session().clone(),
+        });
+    }
+    Ok(appended)
 }
 
 /// Steers pulled at step boundaries. Supplied by the service layer;
@@ -211,6 +300,17 @@ async fn drive(
             }))?;
         }
 
+        // Plugin context (and a baseline re-check) once per turn, before
+        // pre_step: later steps only re-check after a compaction.
+        if step_no == 1 {
+            let event = LoopEvent {
+                session: session.clone(),
+                turn: turn_no,
+                step: step_no,
+            };
+            restore_context(store, log, config, loop_hooks, &event, cancel, frames).await?;
+        }
+
         // Loop hook: pre_step — may inject messages or reject the step.
         if let Some(hooks) = loop_hooks {
             let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
@@ -324,6 +424,20 @@ async fn drive(
                 frames(Frame::HistoryChanged {
                     session: session.clone(),
                 });
+                restore_context(
+                    store,
+                    log,
+                    config,
+                    loop_hooks,
+                    &LoopEvent {
+                        session: session.clone(),
+                        turn: turn_no,
+                        step: step_no,
+                    },
+                    cancel,
+                    frames,
+                )
+                .await?;
                 replayed = replay(store, log.session())?;
             }
         }
@@ -459,6 +573,20 @@ async fn drive(
                             }
                             if changed {
                                 overflow_retries += 1;
+                                restore_context(
+                                    store,
+                                    log,
+                                    config,
+                                    loop_hooks,
+                                    &LoopEvent {
+                                        session: session.clone(),
+                                        turn: turn_no,
+                                        step: step_no,
+                                    },
+                                    cancel,
+                                    frames,
+                                )
+                                .await?;
                                 replayed = replay(store, log.session())?;
                                 frames(Frame::HistoryChanged {
                                     session: session.clone(),
@@ -606,11 +734,11 @@ async fn drive(
                                             names: names.clone(),
                                         })?;
                                         activated.extend(names);
-                                        results.push(crate::tools::exposure::result(call, Ok(output)));
+                                        results
+                                            .push(crate::tools::exposure::result(call, Ok(output)));
                                     }
-                                    Err(error) => {
-                                        results.push(crate::tools::exposure::result(call, Err(error)))
-                                    }
+                                    Err(error) => results
+                                        .push(crate::tools::exposure::result(call, Err(error))),
                                 }
                             } else if call.name == "run_code" {
                                 // The capture tool is top-level only: a nested

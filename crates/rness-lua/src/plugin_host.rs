@@ -88,6 +88,21 @@ fn add_lineage(binding: Option<&SessionBinding>, payload: &mut serde_json::Value
     payload["lineage"] = serde_json::json!(lineage);
 }
 
+fn add_workspace(binding: Option<&SessionBinding>, payload: &mut serde_json::Value) {
+    let Some(binding) = binding else { return };
+    let Some(session) = payload.get("session").and_then(|s| s.as_str()) else {
+        return;
+    };
+    let workspace = match binding.sessions.store().workspace(&session.into()) {
+        Ok(workspace) => workspace,
+        Err(e) => {
+            tracing::warn!(target: "lua", session, "context: workspace lookup failed: {e}");
+            None
+        }
+    };
+    payload["workspace"] = workspace.map_or(serde_json::Value::Null, serde_json::Value::String);
+}
+
 fn hook_payload(event: &rness_engine::tools::hooks::ToolHookEvent) -> serde_json::Value {
     serde_json::json!({
         "session": event.session,
@@ -469,7 +484,51 @@ fn loop_payload(event: &rness_engine::turn::hooks::LoopEvent) -> serde_json::Val
     })
 }
 
-fn hook_message(item: &serde_json::Value) -> Result<rness_engine::turn::hooks::HookMessage, String> {
+/// Parse the `context` chain result: `{ {name, text, identity?}, ... }`.
+/// Missing identity defaults to a content hash; a repeated name keeps the
+/// first block (the earliest registration) and drops the rest.
+fn context_blocks(
+    value: &serde_json::Value,
+) -> Result<Vec<rness_engine::turn::hooks::ContextBlock>, String> {
+    let items = match value {
+        serde_json::Value::Null => return Ok(Vec::new()),
+        serde_json::Value::Array(items) => items,
+        // An empty Lua table serializes as an object.
+        serde_json::Value::Object(map) if map.is_empty() => return Ok(Vec::new()),
+        _ => return Err("context: chain must return an array of blocks".into()),
+    };
+    let mut blocks: Vec<rness_engine::turn::hooks::ContextBlock> = Vec::new();
+    let mut claimed = std::collections::HashSet::new();
+    for item in items {
+        let field = |key: &str| item.get(key).and_then(|v| v.as_str());
+        let Some(name) = field("name") else {
+            return Err("context: each block needs a string 'name'".into());
+        };
+        if !claimed.insert(name.to_owned()) {
+            tracing::warn!(target: "lua", "context '{name}' registered more than once; keeping the first");
+            continue;
+        }
+        // A skipped render (nil, "", error) still claims its name.
+        if item.get("skip").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
+        let Some(text) = field("text") else {
+            return Err(format!("context '{name}': block needs string 'text'"));
+        };
+        blocks.push(rness_engine::turn::hooks::ContextBlock {
+            name: name.into(),
+            identity: field("identity")
+                .map(str::to_owned)
+                .unwrap_or_else(|| rness_engine::instructions::fingerprint(text)),
+            text: text.into(),
+        });
+    }
+    Ok(blocks)
+}
+
+fn hook_message(
+    item: &serde_json::Value,
+) -> Result<rness_engine::turn::hooks::HookMessage, String> {
     use rness_engine::turn::hooks::HookMessage;
     match item {
         serde_json::Value::String(s) => Ok(HookMessage::from(s.as_str())),
@@ -508,6 +567,25 @@ fn hook_messages(
 
 #[async_trait::async_trait]
 impl rness_engine::turn::hooks::LoopHooks for LuaHost {
+    async fn context(
+        &self,
+        event: &rness_engine::turn::hooks::LoopEvent,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<Vec<rness_engine::turn::hooks::ContextBlock>, String> {
+        if !self.has_hook(crate::runtime::CONTEXT_EVENT) {
+            return Ok(Vec::new());
+        }
+        let value = self
+            .intercept(
+                crate::runtime::CONTEXT_EVENT,
+                loop_payload(event),
+                serde_json::json!([]),
+                cancel,
+            )
+            .await?;
+        context_blocks(&value)
+    }
+
     async fn pre_step(
         &self,
         event: &rness_engine::turn::hooks::LoopEvent,
@@ -1298,6 +1376,10 @@ impl LuaHost {
                         }
                         Cmd::Intercept { event, mut payload, default, cancel, reply } => {
                             add_lineage(session_binding.as_ref(), &mut payload);
+                            // Context renderers locate per-project data by workspace.
+                            if event == crate::runtime::CONTEXT_EVENT {
+                                add_workspace(session_binding.as_ref(), &mut payload);
+                            }
                             let token = cancel.clone();
                             let deadline = std::time::Instant::now() + HOOK_TIMEOUT;
                             rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {

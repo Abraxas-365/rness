@@ -974,55 +974,19 @@ impl SessionService {
         *self.instructions.lock().unwrap() = Some(config);
     }
 
-    /// dsh baseline check: is an instructions baseline with the CURRENT
-    /// identity visible in the projected context? If not (first turn,
-    /// post-compaction fold, files changed), append a fresh one —
-    /// re-read from disk — as a durable sourced user message.
+    /// Turn-start baseline check ([`crate::instructions::ensure`]); the
+    /// turn loop repeats it after any mid-turn compaction.
     fn ensure_instructions(
         &self,
         log: &mut crate::session::log::SessionLog,
-        session: &SessionId,
     ) -> Result<(), ServiceError> {
-        let Some(mut config) = self.instructions.lock().unwrap().clone() else {
+        let Some(config) = self.instructions.lock().unwrap().clone() else {
             return Ok(());
         };
-        if let Some(workspace) = self.store.workspace(session)? {
-            config.cwd = workspace.into();
-        }
-        let Some(baseline) = crate::instructions::render(&config) else {
-            return Ok(());
-        };
-
-        let replayed = replay(&self.store, session)?;
-        let cited: std::collections::HashSet<&str> = replayed
-            .context
-            .sources
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        let visible_current = replayed.history.iter().any(|e| {
-            cited.contains(e.id.as_str())
-                && matches!(
-                    &e.event,
-                    SessionEvent::UserMessage(UserMessage {
-                        source: Some(MessageSource::Instructions { identity }),
-                        ..
-                    }) if *identity == baseline.identity
-                )
-        });
-        if visible_current {
-            return Ok(());
-        }
-
-        log.append(&SessionEvent::UserMessage(UserMessage {
-            intent: UserIntent::Inject,
-            content: vec![ContentPart::Text {
-                text: baseline.text,
-            }],
-            source: Some(MessageSource::Instructions {
-                identity: baseline.identity,
-            }),
-        }))?;
+        crate::instructions::ensure(&self.store, log, &config).map_err(|e| match e {
+            crate::instructions::EnsureError::Replay(e) => ServiceError::Replay(e),
+            crate::instructions::EnsureError::Log(e) => ServiceError::Log(e),
+        })?;
         Ok(())
     }
 
@@ -1817,7 +1781,7 @@ impl SessionService {
                 crate::turn::compaction::recover(&mut log)?;
                 // Workspace instructions precede the prompt that opens
                 // the turn (dsh baseline order).
-                self.ensure_instructions(&mut log, session)?;
+                self.ensure_instructions(&mut log)?;
                 if !retry {
                     log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
                 }
@@ -1855,7 +1819,10 @@ impl SessionService {
                     Arc::clone(&self.bus),
                     provider,
                     Arc::clone(&self.tools),
-                    self.config.clone(),
+                    TurnConfig {
+                        instructions: self.instructions.lock().unwrap().clone(),
+                        ..self.config.clone()
+                    },
                     log,
                     token,
                     turns_so_far,
@@ -2730,7 +2697,21 @@ async fn burst(
         match next {
             Some(pending) => {
                 drop(inbox);
-                let pending = crate::inbox::Pending { intent: UserIntent::Followup, ..pending };
+                let pending = crate::inbox::Pending {
+                    intent: UserIntent::Followup,
+                    ..pending
+                };
+                // Same pre-prompt baseline check as `send` from idle: the
+                // previous turn may have compacted it away or the files changed.
+                if let Some(instructions) = &config.instructions {
+                    if let Err(e) = crate::instructions::ensure(
+                        &store,
+                        log.as_mut().expect("burst owns the log"),
+                        instructions,
+                    ) {
+                        tracing::warn!(session = %session, error = %e, "instructions baseline check failed");
+                    }
+                }
                 let append =
                     log.as_mut()
                         .expect("burst owns the log")
