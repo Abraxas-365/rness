@@ -39,6 +39,8 @@ const DEFAULT_WAIT_MS: u64 = 10_000;
 const MAX_WAIT_MS: u64 = 60_000;
 /// Max bytes returned per read.
 const MAX_READ_BYTES: usize = 64 * 1024;
+/// Cap on one line-windowed `terminal_read`.
+const MAX_READ_LINES: usize = 2000;
 /// A running command silent this long settles the send as "still running;
 /// may be waiting for input" (where the platform can't see tty reads).
 const QUIET: Duration = Duration::from_secs(5);
@@ -1286,6 +1288,59 @@ impl TerminalRegistry {
         Ok((text, next_offset))
     }
 
+    /// Line-windowed read of the retained output (dsh `offset`/`count`):
+    /// `count` lines ending `skip` lines before the newest, rendered as
+    /// clean text. Line numbers count from the oldest retained line
+    /// (1-based); a line cut by scrollback eviction is dropped. Capped at
+    /// `MAX_READ_LINES` lines and `MAX_READ_BYTES` (oldest lines go first).
+    /// `next_offset` is the stream end, for incremental reads afterwards.
+    pub fn read_lines(
+        &self,
+        id: &str,
+        count: usize,
+        skip: usize,
+        owner: &str,
+    ) -> Result<(String, usize), String> {
+        let mut inner = self.inner.lock().expect("registry lock");
+        let session = owned(&mut inner, id, owner)?;
+        let state = session.state();
+        let buf = session.output.lock().expect("output lock");
+        let total_written = buf.total_written();
+        let evicted = buf.base_offset > 0;
+        let rendered = sanitize::render(&buf.data);
+        drop(buf);
+        let mut lines: Vec<&str> = rendered.split('\n').collect();
+        if lines.last() == Some(&"") {
+            lines.pop();
+        }
+        if evicted && !lines.is_empty() {
+            lines.remove(0);
+        }
+        let total = lines.len();
+        let end = total.saturating_sub(skip);
+        let mut begin = end.saturating_sub(count.clamp(1, MAX_READ_LINES));
+        let mut bytes: usize = lines[begin..end].iter().map(|l| l.len() + 1).sum();
+        while bytes > MAX_READ_BYTES && begin < end {
+            bytes -= lines[begin].len() + 1;
+            begin += 1;
+        }
+        let mut text = lines[begin..end].join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        let range = if begin == end {
+            format!("no lines in range; {total} retained")
+        } else {
+            format!("lines {}-{} of {total}", begin + 1, end)
+        };
+        if end == total {
+            text.push_str(&format!("[{id}: {state}; {range}]"));
+        } else {
+            text.push_str(&format!("[{id}: {range}; {} newer]", total - end));
+        }
+        Ok((text, total_written))
+    }
+
     /// The shell's process group and the terminal's foreground process
     /// group (`tcgetpgrp` on the PTY). They differ while a command runs.
     #[cfg(unix)]
@@ -2383,7 +2438,8 @@ impl Tool for TerminalReadTool {
     fn description(&self) -> &str {
         "Read a terminal's output as clean text, with its current state (idle, command \
          running, exited) at the end. Without offset: the latest output. Pass the returned \
-         next_offset later to get only what arrived since."
+         next_offset later to get only what arrived since. Or read by lines: `lines` = the \
+         last N lines, `line_offset` = skip that many newest lines first (page back)."
     }
 
     fn input_schema(&self) -> Value {
@@ -2397,6 +2453,16 @@ impl Tool for TerminalReadTool {
                 "offset": {
                     "type": "integer",
                     "description": "Position to read from, e.g. a previous next_offset (default: the last 64 KB)"
+                },
+                "lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Read the last N lines instead of by offset (max 2000; default 200 when line_offset is set)"
+                },
+                "line_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "With lines: skip this many newest lines first, to page back through scrollback"
                 }
             },
             "required": ["session_id"]
@@ -2412,8 +2478,28 @@ impl Tool for TerminalReadTool {
             return sandbox_deny(self.sandbox);
         }
         let id = crate::required_str(&args, "session_id")?;
-        let offset = args["offset"].as_u64().map(|v| v as usize);
-        let (text, next_offset) = self.registry.read(id, offset, session)?;
+        let uint = |key: &str| match &args[key] {
+            Value::Null => Ok(None),
+            v => v
+                .as_u64()
+                .map(|v| Some(v as usize))
+                .ok_or_else(|| format!("'{key}' must be a non-negative integer")),
+        };
+        let offset = uint("offset")?;
+        let lines = uint("lines")?;
+        let line_offset = uint("line_offset")?;
+        if lines == Some(0) {
+            return Err("'lines' must be at least 1".into());
+        }
+        let (text, next_offset) = if lines.is_some() || line_offset.is_some() {
+            if offset.is_some() {
+                return Err("use either offset or lines/line_offset, not both".into());
+            }
+            self.registry
+                .read_lines(id, lines.unwrap_or(200), line_offset.unwrap_or(0), session)?
+        } else {
+            self.registry.read(id, offset, session)?
+        };
         Ok(format!("{text}\n[next_offset: {next_offset}]"))
     }
 
@@ -3254,6 +3340,78 @@ mod tests {
         );
         // PROMPT_COMMAND is not leaked into child environments.
         assert_eq!(out, "[cat:cat:dumb:1]\n0\n[exit code: 1]");
+        registry.close(&id, OWNER).unwrap();
+    }
+
+    #[test]
+    fn read_by_lines_returns_the_tail_and_pages_back() {
+        let registry = TerminalRegistry::new();
+        let id = open_bash(&registry);
+        send(&registry, &id, "seq 1 $((500))", 5000);
+        // Tail: the last lines end with the prompt.
+        let (tail, next) = registry.read_lines(&id, 3, 0, OWNER).unwrap();
+        let body: Vec<_> = tail.lines().collect();
+        assert_eq!(body[0], "499", "{tail}");
+        assert_eq!(body[1], "500");
+        assert!(body[2].starts_with("rness$"), "{tail}");
+        assert!(body[3].starts_with(&format!("[{id}: idle at prompt; lines ")), "{tail}");
+        assert!(body[3].ends_with(" of 502]"), "{tail}");
+        assert_eq!(next, registry.read(&id, None, OWNER).unwrap().1);
+
+        // Page back: skip the prompt + 10 numbers → 481..=490.
+        let (page, _) = registry.read_lines(&id, 10, 11, OWNER).unwrap();
+        let body: Vec<_> = page.lines().collect();
+        assert_eq!(&body[..10], &(481..=490).map(|n| n.to_string()).collect::<Vec<_>>()[..], "{page}");
+        assert!(body[10].ends_with("; 11 newer]"), "{page}");
+
+        // Past the start: empty range, clearly reported.
+        let (none, _) = registry.read_lines(&id, 5, 100_000, OWNER).unwrap();
+        assert!(none.contains("no lines in range"), "{none}");
+
+        // Count is capped.
+        let (big, _) = registry.read_lines(&id, 1_000_000, 0, OWNER).unwrap();
+        assert!(big.lines().count() <= MAX_READ_LINES + 1);
+        assert!(registry.read_lines(&id, 3, 0, "intruder").is_err());
+        registry.close(&id, OWNER).unwrap();
+    }
+
+    #[test]
+    fn read_by_lines_drops_the_evicted_partial_line_and_caps_bytes() {
+        let registry = TerminalRegistry::new();
+        let id = open_bash(&registry);
+        // ~390 KB of 78-byte lines: overflows the 256 KB scrollback.
+        send(&registry, &id, "for i in $(seq 1 5000); do printf '%05d %072d\\n' $i 0; done", 30000);
+        let (text, _) = registry.read_lines(&id, MAX_READ_LINES, 0, OWNER).unwrap();
+        assert!(text.len() <= MAX_READ_BYTES + 200, "{}", text.len());
+        let (all, _) = registry.read_lines(&id, MAX_READ_LINES, 1500, OWNER).unwrap();
+        // Oldest line in a deep page is whole: 5 digits, space, 72 zeros.
+        let first = all.lines().next().unwrap();
+        assert!(first.len() == 78 && first[..5].chars().all(|c| c.is_ascii_digit()), "{first:?}");
+        // Oldest retained line overall is whole too (evicted partial dropped).
+        let retained = registry.read_lines(&id, 1, 0, OWNER).unwrap().0;
+        let total: usize = retained.rsplit(" of ").next().unwrap().trim_end_matches(|c: char| !c.is_ascii_digit()).parse().unwrap();
+        let (first_line, _) = registry.read_lines(&id, 1, total - 1, OWNER).unwrap();
+        let first_line = first_line.lines().next().unwrap();
+        assert!(first_line.len() == 78 && first_line[..5].chars().all(|c| c.is_ascii_digit()), "{first_line:?}");
+        registry.close(&id, OWNER).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_read_tool_validates_line_args() {
+        let registry = TerminalRegistry::new();
+        let id = open_bash(&registry);
+        let tool = TerminalReadTool::new(registry.clone());
+        let session: SessionId = OWNER.into();
+        let ok = tool.execute_in(&session, json!({"session_id": id, "lines": 2})).await.unwrap();
+        assert!(ok.contains("lines ") && ok.contains("[next_offset: "), "{ok}");
+        for (args, needle) in [
+            (json!({"session_id": id, "lines": 0}), "at least 1"),
+            (json!({"session_id": id, "lines": -3}), "non-negative"),
+            (json!({"session_id": id, "lines": 2, "offset": 0}), "not both"),
+        ] {
+            let err = tool.execute_in(&session, args).await.unwrap_err();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
         registry.close(&id, OWNER).unwrap();
     }
 

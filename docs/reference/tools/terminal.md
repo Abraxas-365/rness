@@ -84,8 +84,12 @@ Cancellation of the turn stops the wait immediately and leaves the command runni
 | --- | --- | --- | --- |
 | `session_id` | string | Yes | Terminal id |
 | `offset` | integer | No | Byte position in the scrollback. Omitted: the last 64 KiB. |
+| `lines` | integer ≥ 1 | No | Read the last N lines instead (max 2000). Defaults to 200 when only `line_offset` is given. |
+| `line_offset` | integer ≥ 0 | No | With `lines`: skip this many newest lines first, to page back. |
 
 Returns up to 64 KiB of clean text from `offset`, then `[next_offset: N]`. When the read reaches the end, the text ends with the state first: `[term-N: idle at prompt]`, `[term-N: command running]`, or `[term-N: exited (…)]`. Pass `next_offset` later to get only new output. Scrollback keeps the latest 256 KiB; older offsets read from the oldest retained byte.
+
+With `lines`/`line_offset` (not combinable with `offset`), the window is counted in rendered lines, and the footer names the range: `[term-N: idle at prompt; lines 481-502 of 502]` at the end, or `[term-N: lines 481-490 of 502; 12 newer]` when paging back. Lines are numbered from the oldest retained line; a line cut by scrollback eviction is dropped. The 64 KiB cap still applies (oldest lines of the window go first). `next_offset` is the stream end, so an offset read afterwards returns only new output.
 
 ### `terminal_signal`
 
