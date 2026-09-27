@@ -90,8 +90,6 @@ pub struct StartupConfig {
     pub system_prompt: String,
     /// `rness.system_prompt.section{...}` declarations, in declaration order.
     pub sections: Vec<rness_engine::prompt::PromptSection>,
-    /// `rness.hooks` — Claude Code / Codex command-hook compatibility.
-    pub hooks: crate::command_hooks::HooksConfig,
     /// `rness.terminal_title` — set the terminal window title (None = on).
     pub terminal_title: Option<bool>,
 }
@@ -1558,17 +1556,6 @@ pub fn evaluate(
             config.terminal.validate()?;
         }
         _ => return Err("rness.terminal must be a table".into()),
-    }
-    // `rness.hooks = { claude_code = true, codex = true, files = {…} }`.
-    match rness.get::<mlua::Value>("hooks")? {
-        mlua::Value::Nil => {}
-        mlua::Value::Table(table) => {
-            config.hooks = lua
-                .from_value(mlua::Value::Table(table))
-                .map_err(|e| format!("rness.hooks: {e}"))?;
-            config.hooks.validate()?;
-        }
-        _ => return Err("rness.hooks must be a table".into()),
     }
     config.terminal_title = match rness.get::<mlua::Value>("terminal_title")? {
         mlua::Value::Nil => None,

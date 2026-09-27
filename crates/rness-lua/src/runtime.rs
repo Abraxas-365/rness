@@ -2513,7 +2513,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     lua.globals().set(
         "__rness_run_command_hook",
         lua.create_function(
-            |lua, (command, timeout, payload, point): (String, u64, LuaValue, Option<String>)| {
+            |lua, (command, timeout, payload): (String, u64, LuaValue)| {
                 let payload_json = match serde_json::to_string(
                     &lua.from_value::<serde_json::Value>(payload)?,
                 ) {
@@ -2526,15 +2526,6 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                 };
                 let result =
                     crate::hooks_json::run_command(&command, timeout, &payload_json);
-                // Exit 2 blocks (the CC/Codex convention), stderr is the reason.
-                if result.exit_code == 2 {
-                    if let Some(decision) = crate::hooks_json::blocking_decision(
-                        point.as_deref().unwrap_or(""),
-                        result.stderr_summary.as_deref(),
-                    ) {
-                        return lua.to_value(&decision);
-                    }
-                }
                 if result.exit_code != 0 {
                     let msg = result
                         .stderr_summary

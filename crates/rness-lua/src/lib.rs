@@ -15,7 +15,6 @@
 //! implementation is not.
 
 pub mod api;
-pub mod command_hooks;
 pub mod hooks_json;
 pub mod loader;
 pub mod packages;
