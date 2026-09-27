@@ -1727,10 +1727,18 @@ impl SessionService {
                 return Err(ServiceError::Busy);
             }
             let history = self.store.history(session)?;
-            let tip = history
-                .iter()
-                .rev()
-                .find(|e| !matches!(e.event, SessionEvent::RequestConfig(_)));
+            // Skip non-conversational bookkeeping that can land after a
+            // turn ends: request config, hook audit pairs drained after
+            // the turn (e.g. time/tmux-context pre_step hooks), titles.
+            let tip = history.iter().rev().find(|e| {
+                !matches!(
+                    e.event,
+                    SessionEvent::RequestConfig(_)
+                        | SessionEvent::HookInvoked(_)
+                        | SessionEvent::HookResult(_)
+                        | SessionEvent::Title(_)
+                )
+            });
             if !matches!(
                 tip.map(|e| &e.event),
                 Some(SessionEvent::TurnEnded {

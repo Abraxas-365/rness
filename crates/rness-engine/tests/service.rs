@@ -320,6 +320,71 @@ async fn retry_resumes_failed_context_without_duplicate_user_message() {
     assert!(service.retry(&id).is_err());
 }
 
+/// Audit/metadata events drained after a failed turn (hook audit pairs from
+/// plugins like time-context/tmux-context, titles) must not hide the failed
+/// turn from `/retry`.
+#[tokio::test]
+async fn retry_ignores_trailing_audit_and_title_events() {
+    let logs = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![
+        StepOutcome::Failed {
+            error: rness_engine::turn::provider::ProviderError {
+                code: "PROVIDER",
+                retry_after: None,
+                message: "offline".into(),
+                retryable: false,
+            },
+            partial: vec![],
+        },
+        StepOutcome::Committed(assistant("recovered", StopReason::EndTurn, vec![])),
+    ]);
+    let service = SessionService::new(
+        SessionStore::new(logs.path()),
+        provider,
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    );
+    let id = service.create(None).unwrap();
+    service
+        .send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }])
+        .unwrap();
+    service.join(&id).await;
+    {
+        let mut log = service.store().open(&id).unwrap();
+        log.append(&SessionEvent::HookInvoked(HookInvoked {
+            turn: 1,
+            point: "pre_step".into(),
+            source: "lua".into(),
+            matcher: None,
+            handler_id: "h1".into(),
+        }))
+        .unwrap();
+        log.append(&SessionEvent::HookResult(HookResult {
+            turn: 1,
+            point: "pre_step".into(),
+            handler_id: "h1".into(),
+            decision: "enter".into(),
+            exit_code: None,
+            stderr_summary: None,
+            duration_ms: 1,
+        }))
+        .unwrap();
+        log.append(&SessionEvent::Title(SessionTitle {
+            title: "t".into(),
+            source: TitleSource::Fallback,
+        }))
+        .unwrap();
+    }
+    service.retry(&id).expect("retry past trailing audit events");
+    service.join(&id).await;
+    let history = service.store().history(&id).unwrap();
+    assert!(history.iter().rev().any(|e| matches!(
+        e.event,
+        SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }
+    )));
+}
+
 struct PanicCommand;
 impl rness_engine::interaction::Command for PanicCommand {
     fn name(&self) -> &str {
