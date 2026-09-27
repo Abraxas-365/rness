@@ -111,6 +111,13 @@ pub trait Tool: Send + Sync {
     fn starts_background_job(&self, _args: &serde_json::Value) -> bool {
         false
     }
+    /// Whether an oversized text result is moved to a spill file with a
+    /// head/tail preview. Tools that already bound their own output and
+    /// are how the model pages a spill file (Read) opt out, or reading the
+    /// spill file would spill again.
+    fn spills_output(&self) -> bool {
+        true
+    }
     /// Execute with JSON args. `Err` becomes an is_error result — tools
     /// never abort a turn.
     async fn execute(&self, args: serde_json::Value) -> Result<String, String>;
@@ -236,6 +243,9 @@ pub struct ToolRegistry {
 /// with a head/tail preview pointing at the file. If the combined text of
 /// all content parts is within `MAX_INLINE_BYTES`, or if no `spill_root`
 /// is configured, the content is returned unchanged.
+///
+/// Spill files may hold secrets a tool printed: the directory is created
+/// `0700` and the file `0600` (unix).
 fn spill_if_oversized(
     content: Vec<ToolResultContentPart>,
     spill_root: &Option<std::path::PathBuf>,
@@ -274,11 +284,11 @@ fn spill_if_oversized(
         .collect::<String>();
     let file_name = format!("{}-{}.txt", call_id, safe_name);
     let file_path = spill_dir.join(&file_name);
-    if let Err(e) = std::fs::create_dir_all(&spill_dir) {
+    if let Err(e) = create_private_dir(&spill_dir) {
         tracing::warn!(%e, "spill: cannot create directory, returning inline");
         return vec![ToolResultContentPart::Text { text: full_text }];
     }
-    if let Err(e) = std::fs::write(&file_path, &full_text) {
+    if let Err(e) = write_private_file(&file_path, full_text.as_bytes()) {
         tracing::warn!(%e, "spill: cannot write file, returning inline");
         return vec![ToolResultContentPart::Text { text: full_text }];
     }
@@ -302,6 +312,113 @@ fn spill_if_oversized(
     let mut result = vec![ToolResultContentPart::Text { text: preview }];
     result.extend(non_text);
     result
+}
+
+/// `create_dir_all`, then restrict the leaf to its owner (also fixes a
+/// directory left world-readable by an older build).
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Write `bytes` to a file only its owner can read. Created `0600`; an
+/// existing file (a retried call id) is tightened before it is rewritten,
+/// and a symlink at the path is never followed.
+fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc_o_nofollow());
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)
+}
+
+#[cfg(unix)]
+fn libc_o_nofollow() -> i32 {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        0x0100
+    }
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+    {
+        0
+    }
+}
+
+/// How long spill files are kept (dsh `cleanupPeriodDays` default).
+pub const SPILL_RETENTION: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// What one [`sweep_spill_files`] pass removed.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SpillSweep {
+    pub files: usize,
+    pub bytes: u64,
+}
+
+/// Delete spill files under `<root>/<session>/spill/` last modified more
+/// than `max_age` ago, then any spill directory left empty. Best effort:
+/// errors are logged and skipped. Only regular files directly inside a
+/// real `spill` directory are touched — symlinks are never followed or
+/// removed, so nothing outside the spill tree can be deleted.
+pub fn sweep_spill_files(root: &std::path::Path, max_age: std::time::Duration) -> SpillSweep {
+    let mut swept = SpillSweep::default();
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
+        return swept;
+    };
+    let Ok(sessions) = std::fs::read_dir(root) else {
+        return swept;
+    };
+    for session in sessions.flatten() {
+        let dir = session.path().join("spill");
+        let is_dir = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir());
+        if !is_dir {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        let mut kept = false;
+        for file in files.flatten() {
+            let Ok(meta) = std::fs::symlink_metadata(file.path()) else { continue };
+            let stale = meta.file_type().is_file()
+                && meta.modified().is_ok_and(|modified| modified < cutoff);
+            if !stale {
+                kept = true;
+                continue;
+            }
+            match std::fs::remove_file(file.path()) {
+                Ok(()) => {
+                    swept.files += 1;
+                    swept.bytes += meta.len();
+                }
+                Err(e) => {
+                    kept = true;
+                    tracing::warn!(%e, path = %file.path().display(), "spill sweep: cannot remove");
+                }
+            }
+        }
+        if !kept {
+            // Fails harmlessly if a new spill landed meanwhile.
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+    swept
 }
 
 /// Find the largest byte offset ≤ `target` that is a char boundary.
@@ -668,7 +785,8 @@ impl ToolRegistry {
             let approvals = Arc::clone(&self.approvals);
             let hook_state = Arc::clone(&self.hooks);
             let hooks = self.tool_hooks();
-            let spill_root = self.spill_root.read().expect("registry lock").clone();
+            let spill_root = self.spill_root.read().expect("registry lock").clone()
+                .filter(|_| tool.as_ref().is_none_or(|tool| tool.spills_output()));
             let call = call.clone();
             let session = session.clone();
             let cancel = cancel.clone();
@@ -983,6 +1101,130 @@ mod tests {
         }
     }
 
+    /// Returns `bytes` bytes of text; `spills` mirrors a Read-like opt-out.
+    struct Big {
+        name: &'static str,
+        spills: bool,
+    }
+    #[async_trait]
+    impl Tool for Big {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn spills_output(&self) -> bool {
+            self.spills
+        }
+        async fn execute(&self, args: serde_json::Value) -> Result<String, String> {
+            let n = args["bytes"].as_u64().unwrap() as usize;
+            Ok(format!("HEAD{}TAIL", "x".repeat(n)))
+        }
+    }
+
+    async fn run_big(reg: &ToolRegistry, name: &str, bytes: usize) -> ToolResult {
+        reg.dispatch(
+            &"sess".into(),
+            &[ToolCall { call: "c1".into(), name: name.into(), args: serde_json::json!({"bytes": bytes}) }],
+            1,
+            &CancellationToken::new(),
+        )
+        .await
+        .remove(0)
+    }
+
+    #[tokio::test]
+    async fn oversized_output_spills_to_a_private_file_with_a_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::default();
+        reg.set_spill_root(dir.path().to_path_buf());
+        reg.register(Arc::new(Big { name: "big", spills: true }));
+        let result = run_big(&reg, "big", MAX_INLINE_BYTES + 10).await;
+        assert!(result.output.len() < 3 * SPILL_PREVIEW_BYTES + 400, "{}", result.output.len());
+        assert!(result.output.starts_with("HEAD") && result.output.ends_with("TAIL"));
+        let path = dir.path().join("sess/spill/c1-big.txt");
+        assert!(result.output.contains(&path.display().to_string()));
+        assert_eq!(std::fs::read(&path).unwrap().len(), MAX_INLINE_BYTES + 18);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
+        // Under the cap: untouched.
+        let small = run_big(&reg, "big", 100).await;
+        assert_eq!(small.output.len(), 108);
+    }
+
+    #[tokio::test]
+    async fn read_like_tools_are_never_spilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = ToolRegistry::default();
+        reg.set_spill_root(dir.path().to_path_buf());
+        reg.register(Arc::new(Big { name: "Read", spills: false }));
+        let result = run_big(&reg, "Read", MAX_INLINE_BYTES + 10).await;
+        assert_eq!(result.output.len(), MAX_INLINE_BYTES + 18, "full text inline");
+        assert!(!dir.path().join("sess/spill").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spill_write_tightens_existing_files_and_refuses_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_file(&path, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, "keep").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(write_private_file(&link, b"clobber").is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    }
+
+    #[test]
+    fn sweep_removes_only_expired_spill_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let old = root.join("a/spill/old.txt");
+        let fresh = root.join("b/spill/fresh.txt");
+        let lone = root.join("c/spill/lone.txt");
+        let log = root.join("a/log.jsonl");
+        for p in [&old, &fresh, &lone, &log] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "12345").unwrap();
+        }
+        let aged = std::time::SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
+        let age = |p: &std::path::Path| {
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(aged).unwrap()
+        };
+        for p in [&old, &lone, &log] {
+            age(p);
+        }
+        #[cfg(unix)]
+        {
+            // A symlink planted in a spill dir is neither followed nor removed.
+            let outside = root.join("outside.txt");
+            std::fs::write(&outside, "keep").unwrap();
+            age(&outside);
+            std::os::unix::fs::symlink(&outside, root.join("b/spill/link")).unwrap();
+        }
+        let swept = sweep_spill_files(root, SPILL_RETENTION);
+        assert_eq!(swept, SpillSweep { files: 2, bytes: 10 });
+        assert!(!old.exists() && !lone.exists());
+        assert!(fresh.exists(), "fresh spill kept");
+        assert!(log.exists(), "session logs are never touched");
+        assert!(!root.join("a/spill").exists() && !root.join("c/spill").exists(), "emptied spill dirs removed");
+        #[cfg(unix)]
+        {
+            assert!(root.join("outside.txt").exists());
+            assert!(std::fs::symlink_metadata(root.join("b/spill/link")).is_ok());
+        }
+        assert_eq!(sweep_spill_files(&root.join("missing"), SPILL_RETENTION), SpillSweep::default());
+    }
     #[tokio::test]
     async fn parallel_execution_commits_in_model_order() {
         let reg = ToolRegistry::default();

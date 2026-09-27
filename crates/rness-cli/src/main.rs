@@ -668,6 +668,16 @@ async fn main() -> anyhow::Result<()> {
     let cwd = std::env::current_dir().context("no working directory")?;
     let tools = Arc::new(ToolRegistry::default());
     tools.set_spill_root(root.clone());
+    // Retention: drop spill files older than 30 days, off the startup path.
+    {
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let swept = rness_engine::tools::sweep_spill_files(&root, rness_engine::tools::SPILL_RETENTION);
+            if swept.files > 0 {
+                tracing::info!(files = swept.files, bytes = swept.bytes, "removed expired spill files");
+            }
+        });
+    }
     let ws = rness_tools::Workspace::new(&cwd);
     let jobs = rness_tools::register_all_configured(
         &tools,

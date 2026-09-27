@@ -101,3 +101,38 @@ async fn foreground_truncation_retains_retrievable_full_output() {
         .unwrap();
     assert!(page.starts_with(&"x".repeat(65536)));
 }
+
+/// Real tools through the registry: a large Bash result spills to a file,
+/// and paging that file with Read comes back inline (no re-spill loop).
+#[tokio::test]
+async fn spilled_results_are_paged_with_read_without_spilling_again() {
+    use rness_engine::tools::{ToolCall, ToolRegistry};
+    let ws = tempfile::tempdir().unwrap();
+    let ws_path = ws.path().canonicalize().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let body: String = (0..3000).map(|i| format!("needle line {i:05} {}\n", "z".repeat(40))).collect();
+    std::fs::write(ws_path.join("big.txt"), &body).unwrap();
+    let registry = ToolRegistry::default();
+    rness_tools::register_all(&registry, Workspace::new(&ws_path));
+    registry.set_spill_root(spill.path().to_path_buf());
+    let run = |call: &str, name: &str, args: serde_json::Value| {
+        let registry = &registry;
+        let call = ToolCall { call: call.into(), name: name.into(), args };
+        async move {
+            registry
+                .dispatch(&"s".into(), &[call], 1, &tokio_util::sync::CancellationToken::new())
+                .await
+                .remove(0)
+        }
+    };
+    let bash = run("b1", "Bash", json!({"command": "head -c 60000 big.txt", "description": "dump"})).await;
+    assert!(!bash.is_error, "{}", bash.output);
+    assert!(bash.output.contains("Omitted"), "bash result should spill: {} bytes", bash.output.len());
+    let spilled = spill.path().join("s/spill/b1-Bash.txt");
+    assert!(spilled.exists());
+    let read = run("r1", "Read", json!({"path": spilled.display().to_string()})).await;
+    assert!(!read.is_error, "{}", read.output);
+    assert!(!read.output.contains("Omitted"), "Read output must not be spilled again");
+    assert!(read.output.len() > 50 * 1024, "full page inline: {}", read.output.len());
+    assert!(!spill.path().join("s/spill/r1-Read.txt").exists());
+}

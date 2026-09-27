@@ -52,6 +52,12 @@ impl Tool for ReadTool {
         "Read"
     }
 
+    /// Read bounds itself (offset/limit, 256 KiB cap) and is how the model
+    /// pages a spill file: spilling it again would loop.
+    fn spills_output(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Read a file from the filesystem. Returns numbered lines (cat -n style). \
          Use offset (1-based line) and limit to window large files."
