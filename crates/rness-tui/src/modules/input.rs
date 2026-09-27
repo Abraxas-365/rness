@@ -808,6 +808,24 @@ mod tests {
     }
 
     #[test]
+    fn skill_refreshes_never_remove_same_named_builtins() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        let mut input = Input::with_candidates(vec![("retry".into(), "Command: retry the turn".into())]);
+        input.on_action(&ctx, "input:skills", &serde_json::json!([["retry", "a skill"], ["lint", "lints"]]));
+        input.on_action(&ctx, "input:skills", &serde_json::json!([["lint", "lints v2"]]));
+        input.on_action(&ctx, "input:skills", &serde_json::json!([]));
+        assert_eq!(input.candidates, vec![("retry".to_string(), "Command: retry the turn".to_string())]);
+        input.on_action(&ctx, "input:skills", &serde_json::json!([["lint", "lints"]]));
+        input.on_action(&ctx, "input:skills", &serde_json::json!([["lint", "lints"]]));
+        assert_eq!(input.candidates.len(), 3, "repeated sends don't duplicate: {:?}", input.candidates);
+    }
+
+    #[test]
     fn plugin_catalog_removes_stale_candidates() {
         let model = crate::app::Model::new("s".into(), "m".into());
         let theme = crate::theme::Theme::default();
@@ -1107,15 +1125,11 @@ impl Component for Input {
         }
         if name == "input:skills" {
             if let Ok(skills) = serde_json::from_value::<Vec<(String, String)>>(payload.clone()) {
-                let old_names: Vec<_> = self
-                    .candidates
-                    .iter()
-                    .filter_map(|(name, _)| name.strip_prefix("skill ").map(str::to_owned))
-                    .collect();
-                self.candidates.retain(|(name, _)| {
-                    !name.starts_with("skill ")
-                        && (!old_names.contains(name)
-                            || ["agent", "skill", "unload", "colorscheme"].contains(&name.as_str()))
+                // Drop only previous skill entries (`skill <name>` and the
+                // bare `<name>` labelled "Skill: …"), never a built-in or
+                // plugin command that happens to share a skill's name.
+                self.candidates.retain(|(name, description)| {
+                    !name.starts_with("skill ") && !description.starts_with("Skill: ")
                 });
                 for (name, description) in skills {
                     self.candidates

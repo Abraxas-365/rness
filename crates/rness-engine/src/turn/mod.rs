@@ -644,7 +644,9 @@ async fn drive(
                                         }
                                     }
                                 };
-                                results.push(result);
+                                // Nested results may be self-bounded (Read opts
+                                // out of spilling); bound the program as a whole.
+                                results.push(tools.spill_result(&session, result));
                             } else {
                                 results.extend(
                                     tools

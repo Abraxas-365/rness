@@ -2036,7 +2036,7 @@ async fn run_tui(
         .unwrap_or(std::env::current_dir()?);
     for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots_with_custom(&workspace, &custom_skill_roots)) {
         candidates.push((format!("skill {}", skill.name), skill.description.clone()));
-        if !["agent", "skill", "unload"].contains(&skill.name.as_str()) {
+        if !["agent", "skill", "unload", "colorscheme"].contains(&skill.name.as_str()) {
             candidates.push((skill.name, format!("Skill: {}", skill.description)));
         }
     }
@@ -2558,7 +2558,10 @@ async fn run_tui(
                     }
                     previous_session = Some(session);
                 }
-                if previous_skills.is_none() || ticks.is_multiple_of(10) {
+                // Empty roots = the session's workspace isn't known yet
+                // (default roots are never empty): don't wipe the startup
+                // catalog with an empty list.
+                if !skill_roots.is_empty() && (previous_skills.is_none() || ticks.is_multiple_of(10)) {
                     let fingerprint = rness_tools::skills::catalog_fingerprint(&skill_roots);
                     if previous_skills.as_ref() != Some(&fingerprint) {
                         let skills: Vec<_> = rness_tools::skills::discover(&skill_roots)

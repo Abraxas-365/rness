@@ -487,3 +487,88 @@ async fn programs_are_isolated_and_budgeted() {
     .await;
     assert!(result.is_error);
 }
+
+/// A `run_code` program that combines several self-bounded (non-spilling,
+/// Read-like) results must still be spilled at the program level, or the
+/// Read opt-out would let one program flood the context.
+#[tokio::test]
+async fn run_code_program_results_are_spilled() {
+    use rness_protocol::events::*;
+    struct Page;
+    #[async_trait::async_trait]
+    impl Tool for Page {
+        fn name(&self) -> &str {
+            "Page"
+        }
+        fn spills_output(&self) -> bool {
+            false
+        }
+        async fn execute(&self, _: Value) -> Result<String, String> {
+            Ok("p".repeat(30 * 1024))
+        }
+    }
+    struct Script(std::sync::atomic::AtomicUsize);
+    #[async_trait::async_trait]
+    impl rness_engine::turn::provider::Provider for Script {
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn step(
+            &self,
+            _: rness_engine::turn::provider::StepRequest<'_>,
+            _: &CancellationToken,
+        ) -> rness_engine::turn::provider::StepOutcome {
+            let step = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let content = if step == 0 {
+                vec![ContentPart::ToolUse {
+                    call: "prog".into(),
+                    name: "run_code".into(),
+                    args: json!({"code":"local s = '' for i = 1, 3 do s = s .. tools.call('Page', {}).output end return s"}),
+                }]
+            } else {
+                vec![ContentPart::Text { text: "done".into() }]
+            };
+            rness_engine::turn::provider::StepOutcome::Committed(AssistantMessage {
+                model: "test".into(),
+                content,
+                stop: if step == 0 { StopReason::ToolUse } else { StopReason::EndTurn },
+                usage: Usage::default(),
+                estimated_input: 0,
+                chunks: vec![],
+            })
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let spill = tempfile::tempdir().unwrap();
+    let store = rness_engine::session::branch::SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let session = log.session().clone();
+    let tools = ToolRegistry::default();
+    tools.register(Arc::new(Page));
+    tools.set_spill_root(spill.path().to_path_buf());
+    let config = rness_engine::turn::TurnConfig {
+        tool_exposure: Exposure { mode: Mode::Both, deferred: vec![] },
+        ..Default::default()
+    };
+    rness_engine::turn::run_turn(
+        &store, &mut log, &Script(0.into()), &tools, &config,
+        &CancellationToken::new(), &mut || vec![], 1, &|_| {}, None,
+    )
+    .await
+    .unwrap();
+    drop(log);
+    let replayed = rness_engine::session::replay::replay(&store, &session).unwrap();
+    let result = replayed
+        .history
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::ToolResult(r) if r.name == "run_code" => Some(r.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!result.is_error, "{}", result.output);
+    assert!(result.output.len() < 8 * 1024, "program result inline: {} bytes", result.output.len());
+    assert!(result.output.contains("Omitted"), "{}", &result.output[..200.min(result.output.len())]);
+    let file = spill.path().join(session.as_str()).join("spill/prog-run_code.txt");
+    assert!(std::fs::read_to_string(&file).unwrap().len() >= 90 * 1024);
+}

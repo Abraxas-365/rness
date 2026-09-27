@@ -1301,32 +1301,57 @@ impl TerminalRegistry {
         skip: usize,
         owner: &str,
     ) -> Result<(String, usize), String> {
-        let mut inner = self.inner.lock().expect("registry lock");
-        let session = owned(&mut inner, id, owner)?;
-        let state = session.state();
-        let buf = session.output.lock().expect("output lock");
-        let total_written = buf.total_written();
-        let evicted = buf.base_offset > 0;
-        let rendered = sanitize::render(&buf.data);
-        drop(buf);
+        // Copy the raw bytes under the locks; render/split after release so
+        // a large buffer doesn't stall other terminal operations.
+        let (state, data, total_written, evicted) = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            let session = owned(&mut inner, id, owner)?;
+            let state = session.state();
+            let buf = session.output.lock().expect("output lock");
+            (state, buf.data.clone(), buf.total_written(), buf.base_offset > 0)
+        };
+        let rendered = sanitize::render(&data);
         let mut lines: Vec<&str> = rendered.split('\n').collect();
         if lines.last() == Some(&"") {
             lines.pop();
         }
-        if evicted && !lines.is_empty() {
+        // After eviction the first line is usually a partial; drop it, but
+        // never the only line (one huge line is still worth showing).
+        if evicted && lines.len() > 1 {
             lines.remove(0);
         }
         let total = lines.len();
         let end = total.saturating_sub(skip);
         let mut begin = end.saturating_sub(count.clamp(1, MAX_READ_LINES));
         let mut bytes: usize = lines[begin..end].iter().map(|l| l.len() + 1).sum();
-        while bytes > MAX_READ_BYTES && begin < end {
+        // Drop whole oldest lines past the byte cap, but always keep the
+        // newest one requested.
+        while bytes > MAX_READ_BYTES && begin + 1 < end {
             bytes -= lines[begin].len() + 1;
             begin += 1;
         }
-        let mut text = lines[begin..end].join("\n");
-        if !text.is_empty() {
+        let mut text = String::new();
+        let mut first = lines.get(begin).copied().unwrap_or_default();
+        let mut cut = 0;
+        if bytes > MAX_READ_BYTES {
+            // A single line alone exceeds the cap: keep its tail.
+            let mut at = first.len() - (MAX_READ_BYTES - 1);
+            while !first.is_char_boundary(at) {
+                at += 1;
+            }
+            cut = at;
+            first = &first[at..];
+        }
+        if begin < end {
+            text.push_str(first);
+            for line in &lines[begin + 1..end] {
+                text.push('\n');
+                text.push_str(line);
+            }
             text.push('\n');
+        }
+        if cut > 0 {
+            text.push_str(&format!("[line {} truncated: first {cut} bytes omitted]\n", begin + 1));
         }
         let range = if begin == end {
             format!("no lines in range; {total} retained")
@@ -3393,6 +3418,21 @@ mod tests {
         let (first_line, _) = registry.read_lines(&id, 1, total - 1, OWNER).unwrap();
         let first_line = first_line.lines().next().unwrap();
         assert!(first_line.len() == 78 && first_line[..5].chars().all(|c| c.is_ascii_digit()), "{first_line:?}");
+        registry.close(&id, OWNER).unwrap();
+    }
+
+    #[test]
+    fn read_by_lines_truncates_a_single_overlong_line_instead_of_dropping_it() {
+        let registry = TerminalRegistry::new();
+        let id = open_bash(&registry);
+        // One 100 KB line: longer than the 64 KiB read cap, within scrollback.
+        send(&registry, &id, "head -c 100000 /dev/zero | tr '\\0' x; echo; echo END", 30000);
+        let (text, _) = registry.read_lines(&id, 3, 0, OWNER).unwrap();
+        assert!(text.contains("END"), "{}", &text[text.len().saturating_sub(300)..]);
+        let (long, _) = registry.read_lines(&id, 1, 2, OWNER).unwrap();
+        assert!(long.len() <= MAX_READ_BYTES + 300, "{}", long.len());
+        assert!(long.contains("xxxxxxxxxx") && long.contains("truncated: first "), "{}", &long[long.len().saturating_sub(300)..]);
+        assert!(!long.contains("no lines in range"), "{}", &long[long.len().saturating_sub(300)..]);
         registry.close(&id, OWNER).unwrap();
     }
 

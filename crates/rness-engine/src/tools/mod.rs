@@ -336,7 +336,7 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc_o_nofollow());
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(path)?;
     #[cfg(unix)]
@@ -345,22 +345,6 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
     file.write_all(bytes)
-}
-
-#[cfg(unix)]
-fn libc_o_nofollow() -> i32 {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        0x0100
-    }
-    #[cfg(target_os = "linux")]
-    {
-        0o400000
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
-    {
-        0
-    }
 }
 
 /// How long spill files are kept (dsh `cleanupPeriodDays` default).
@@ -375,9 +359,10 @@ pub struct SpillSweep {
 
 /// Delete spill files under `<root>/<session>/spill/` last modified more
 /// than `max_age` ago, then any spill directory left empty. Best effort:
-/// errors are logged and skipped. Only regular files directly inside a
-/// real `spill` directory are touched — symlinks are never followed or
-/// removed, so nothing outside the spill tree can be deleted.
+/// errors are logged and skipped. Only session directories (holding a
+/// session log) are visited, so a mistaken `--root` can't sweep unrelated
+/// `spill` folders, and only regular files directly inside a real `spill`
+/// directory are touched — symlinks are never followed or removed.
 pub fn sweep_spill_files(root: &std::path::Path, max_age: std::time::Duration) -> SpillSweep {
     let mut swept = SpillSweep::default();
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
@@ -387,6 +372,9 @@ pub fn sweep_spill_files(root: &std::path::Path, max_age: std::time::Duration) -
         return swept;
     };
     for session in sessions.flatten() {
+        if !crate::session::log::log_file(&session.path()).is_file() {
+            continue;
+        }
         let dir = session.path().join("spill");
         let is_dir = std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_dir());
         if !is_dir {
@@ -630,6 +618,18 @@ impl ToolRegistry {
     /// are created on demand (e.g. `<root>/<session>/spill/`).
     pub fn set_spill_root(&self, root: std::path::PathBuf) {
         *self.spill_root.write().expect("registry lock") = Some(root);
+    }
+
+    /// Apply the oversized-output spill to a result produced outside
+    /// [`dispatch`](Self::dispatch) (the `run_code` program result, whose
+    /// nested calls — e.g. several self-bounded Reads — can add up past
+    /// the inline budget).
+    pub fn spill_result(&self, session: &SessionId, mut result: ToolResult) -> ToolResult {
+        let spill_root = self.spill_root.read().expect("registry lock").clone();
+        let content = std::mem::take(&mut result.content);
+        result.content = spill_if_oversized(content, &spill_root, session, &result.call, &result.name);
+        result.output = ToolResult::text_output(&result.content);
+        result
     }
 
     fn tool_hooks(&self) -> Option<Arc<dyn ToolHooks>> {
@@ -1193,15 +1193,19 @@ mod tests {
         let fresh = root.join("b/spill/fresh.txt");
         let lone = root.join("c/spill/lone.txt");
         let log = root.join("a/log.jsonl");
-        for p in [&old, &fresh, &lone, &log] {
+        let foreign = root.join("not-a-session/spill/keep.txt");
+        for p in [&old, &fresh, &lone, &log, &foreign] {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, "12345").unwrap();
+        }
+        for session in ["a", "b", "c"] {
+            std::fs::write(crate::session::log::log_file(&root.join(session)), "").unwrap();
         }
         let aged = std::time::SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
         let age = |p: &std::path::Path| {
             std::fs::File::options().write(true).open(p).unwrap().set_modified(aged).unwrap()
         };
-        for p in [&old, &lone, &log] {
+        for p in [&old, &lone, &log, &foreign] {
             age(p);
         }
         #[cfg(unix)]
@@ -1217,6 +1221,7 @@ mod tests {
         assert!(!old.exists() && !lone.exists());
         assert!(fresh.exists(), "fresh spill kept");
         assert!(log.exists(), "session logs are never touched");
+        assert!(foreign.exists(), "directories without a session log are not swept");
         assert!(!root.join("a/spill").exists() && !root.join("c/spill").exists(), "emptied spill dirs removed");
         #[cfg(unix)]
         {

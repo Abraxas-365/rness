@@ -33,7 +33,7 @@ pub enum LogError {
 }
 
 /// Current-generation filename.
-pub(super) fn log_file(dir: &Path) -> PathBuf {
+pub(crate) fn log_file(dir: &Path) -> PathBuf {
     dir.join(format!("session.v{FORMAT_VERSION}.jsonl"))
 }
 
