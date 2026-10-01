@@ -1073,6 +1073,32 @@ mod inspection_tests {
         assert_eq!(jobs.inspect("any", &id).unwrap().job.status, "killed");
     }
 
+    #[tokio::test]
+    async fn turn_cancel_stops_a_blocking_wait_but_not_the_job() {
+        let jobs = JobRegistry::new();
+        let (id, writer) = jobs.start_owned("bash", "long".into(), Some(&"owner".into()));
+        let tool = JobOutputTool::new(jobs.clone());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = tool
+            .execute_presented(
+                &"owner".into(),
+                &"call".into(),
+                json!({"job_id": id, "wait": true, "timeout_ms": 60_000}),
+                &cancel,
+            )
+            .await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(result.unwrap_err().contains("job keeps running"));
+        assert!(!writer.cancelled().is_cancelled());
+        assert_eq!(jobs.count("owner"), 1);
+    }
+
     #[test]
     fn recovered_interrupted_jobs_are_not_active() {
         let directory = tempfile::tempdir().unwrap();
@@ -1451,7 +1477,7 @@ impl Tool for JobOutputTool {
         session: &String,
         _call: &String,
         args: Value,
-        _cancel: &tokio_util::sync::CancellationToken,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<
         (
             Vec<rness_protocol::events::ToolResultContentPart>,
@@ -1461,7 +1487,17 @@ impl Tool for JobOutputTool {
         ),
         String,
     > {
-        let (output, metadata) = self.read_presented(Some(session), args).await?;
+        // Ctrl-C ends the turn: a blocking wait must stop with it (the job
+        // itself keeps running; it is owned by the registry, not the turn).
+        let read = self.read_presented(Some(session), args);
+        tokio::pin!(read);
+        let (output, metadata) = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return Err("stopped waiting: turn cancelled; the job keeps running".into());
+            }
+            result = &mut read => result?,
+        };
         Ok((
             vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
             None,

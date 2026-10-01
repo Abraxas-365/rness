@@ -155,7 +155,7 @@ impl Tool for SubagentTool {
     }
 
     async fn execute_in(&self, session: &SessionId, args: Value) -> Result<String, String> {
-        self.run_presented(session, args, None)
+        self.run_presented(session, args, None, None)
             .await
             .map(|(output, _)| output)
     }
@@ -176,7 +176,9 @@ impl Tool for SubagentTool {
         String,
     > {
         let presentation = Some((_call.clone(), args.clone()));
-        let (output, metadata) = self.run_presented(session, args, presentation).await?;
+        let (output, metadata) = self
+            .run_presented(session, args, presentation, Some(_cancel.clone()))
+            .await?;
         Ok((
             vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
             None,
@@ -192,6 +194,7 @@ impl SubagentTool {
         session: &SessionId,
         args: Value,
         presentation: Option<(String, Value)>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<(String, Value), String> {
         let provider = crate::required_str(&args, "provider")?.to_string();
         let prompt = crate::required_str(&args, "prompt")?.to_string();
@@ -230,9 +233,18 @@ impl SubagentTool {
         }
 
         if !background {
+            // Foreground: the child dies with the parent's turn (Ctrl-C).
             let run = self
                 .runtime
-                .start_presented(&provider, request, presentation)
+                .start_with(
+                    &provider,
+                    request,
+                    rness_engine::subagent::RunOptions {
+                        presentation,
+                        cancel,
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|e| e.to_string())?;
             return render(&run).map(|output| (output, json!({"version":1,"kind":"subagent","mode":"foreground","session":run.session,"status":"completed"})));
