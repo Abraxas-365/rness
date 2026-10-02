@@ -18,8 +18,10 @@ use std::sync::{Arc, RwLock};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+
+use rness_kernel::presentation::AppLine;
 
 use crate::component::{Component, Ctx, KeyOutcome};
 use crate::slots::{Slots, OVERLAY, SIDEBAR};
@@ -55,7 +57,7 @@ struct Inner {
     input_epoch: Option<Arc<std::sync::atomic::AtomicU64>>,
     apps: Vec<AppInfo>,
     /// app name → published lines.
-    views: std::collections::HashMap<String, Vec<String>>,
+    views: std::collections::HashMap<String, Vec<AppLine>>,
     /// slot → content rows available at last render (viewport hint the
     /// host passes to apps as `ctx.rows` so they can window long lists).
     viewports: std::collections::HashMap<String, (u16, u16)>,
@@ -187,20 +189,29 @@ impl AppsState {
         inner.active = None;
     }
 
-    pub fn publish_if_current(&self, generation: u64, name: &str, lines: Vec<String>) -> bool {
+    pub fn publish_if_current<L: Into<AppLine>>(
+        &self,
+        generation: u64,
+        name: &str,
+        lines: Vec<L>,
+    ) -> bool {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.generation != generation || !inner.apps.iter().any(|app| app.name == name) {
             return false;
         }
-        inner.views.insert(name.into(), lines);
+        inner
+            .views
+            .insert(name.into(), lines.into_iter().map(Into::into).collect());
         true
     }
 
     /// Host: publish a rendered view for an app.
-    pub fn publish(&self, name: &str, lines: Vec<String>) {
+    pub fn publish<L: Into<AppLine>>(&self, name: &str, lines: Vec<L>) {
         let mut inner = self.inner.write().expect("apps lock");
         if inner.apps.iter().any(|app| app.name == name) {
-            inner.views.insert(name.into(), lines);
+            inner
+                .views
+                .insert(name.into(), lines.into_iter().map(Into::into).collect());
         }
     }
 
@@ -376,7 +387,7 @@ impl AppsState {
             .cloned()
     }
 
-    fn view_of(&self, name: &str) -> Vec<String> {
+    fn view_of(&self, name: &str) -> Vec<AppLine> {
         self.inner
             .read()
             .expect("apps lock")
@@ -385,6 +396,36 @@ impl AppsState {
             .cloned()
             .unwrap_or_default()
     }
+}
+
+/// Keep at most `width` display columns of `spans`, ending in "…" when cut.
+fn clip_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthChar;
+    if spans.iter().map(Span::width).sum::<usize>() <= width {
+        return spans;
+    }
+    let budget = width.saturating_sub(1);
+    let (mut used, mut out) = (0, Vec::new());
+    for span in spans {
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            let w = ch.width().unwrap_or(0);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            text.push(ch);
+        }
+        let full = text.len() == span.content.len();
+        out.push(Span::styled(text, span.style));
+        if !full {
+            if width > 0 {
+                out.push(Span::styled("…", span.style));
+            }
+            break;
+        }
+    }
+    out
 }
 
 /// "ctrl+e", "f2", "alt+b" → does this KeyEvent match? (shared key
@@ -538,11 +579,48 @@ impl Component for ExtApp {
         if previous != Some(viewport) {
             self.state.send(AppEvent::Shown(app.name.clone()));
         }
+        let resolve_or = |value: &serde_json::Value, fallback| {
+            if value.is_null() {
+                fallback
+            } else {
+                resolve(value, fallback)
+            }
+        };
+        let width = usize::from(content.width);
         let lines: Vec<Line> = self
             .state
             .view_of(&app.name)
             .into_iter()
-            .map(|line| Line::from(sanitize(&line)))
+            .map(|line| {
+                let row = resolve_or(&line.style, style);
+                let spans = |spans: &[rness_kernel::presentation::StyledSpan]| {
+                    spans
+                        .iter()
+                        .map(|span| {
+                            Span::styled(
+                                sanitize(&span.text).replace(['\n', '\r'], " "),
+                                resolve_or(&span.style, row),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let mut left = spans(&line.spans);
+                let measure = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+                if !line.right.is_empty() {
+                    // Right-align by padding; the left side yields first.
+                    let right = spans(&line.right);
+                    let right_width = measure(&right);
+                    left = clip_spans(left, width.saturating_sub(right_width + 1));
+                    let pad = width.saturating_sub(measure(&left) + right_width);
+                    left.push(Span::styled(" ".repeat(pad), row));
+                    left.extend(right);
+                } else if !line.style.is_null() {
+                    // A row style fills the whole row (e.g. a selection bar).
+                    let pad = width.saturating_sub(measure(&left));
+                    left.push(Span::styled(" ".repeat(pad), row));
+                }
+                Line::from(left).style(row)
+            })
             .collect();
         // Clear symbols AND old style flags before painting the opaque panel.
         for y in area.top()..area.bottom() {
@@ -633,7 +711,7 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("jobs".into()));
         let old = state.generation();
         assert!(state.open("jobs"));
-        assert!(!state.publish_if_current(old, "jobs", vec!["stale".into()]));
+        assert!(!state.publish_if_current(old, "jobs", vec!["stale"]));
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("jobs".into()));
         let model = Model::new("s".into(), "m".into());
         let theme = Theme::default();
@@ -666,7 +744,7 @@ mod tests {
         state.set_session("other".into());
         assert_eq!(state.active(), None);
         assert_eq!(state.refresh_ms(), None);
-        assert!(!state.publish_if_current(generation, "jobs", vec!["old session".into()]));
+        assert!(!state.publish_if_current(generation, "jobs", vec!["old session"]));
     }
 
     #[test]
@@ -681,7 +759,7 @@ mod tests {
             ..Default::default()
         }]);
         state.open("jobs");
-        state.publish("jobs", vec!["a\tb\x1b[2J\x07".into()]);
+        state.publish("jobs", vec!["a\tb\x1b[2J\x07"]);
         let mut component = ExtApp {
             state: state.clone(),
             slot: OVERLAY,
@@ -706,6 +784,69 @@ mod tests {
             let tiny = Rect::new(0, 0, width, 1);
             component.render(&ctx, tiny, &mut Buffer::empty(tiny));
         }
+    }
+
+    #[test]
+    fn styled_lines_render_spans_right_alignment_and_row_fill() {
+        use rness_kernel::presentation::{AppLine, StyledSpan};
+        let span = |text: &str, style: serde_json::Value| StyledSpan {
+            text: text.into(),
+            style,
+        };
+        let state = AppsState::default();
+        state.set_apps(vec![AppInfo {
+            name: "jobs".into(),
+            slot: OVERLAY.into(),
+            title: "jobs".into(),
+            config: serde_json::json!({"height":6, "border":{"kind":"none"}}),
+            ..Default::default()
+        }]);
+        state.open("jobs");
+        state.publish(
+            "jobs",
+            vec![
+                AppLine {
+                    spans: vec![span("● ", "added".into()), span("left", "bogus".into())],
+                    right: vec![span("exit 1", serde_json::json!({"fg":"blue"}))],
+                    style: serde_json::Value::Null,
+                },
+                AppLine {
+                    spans: vec![span("selected", serde_json::Value::Null)],
+                    right: vec![],
+                    style: serde_json::json!({"bg":"blue"}),
+                },
+                AppLine {
+                    spans: vec![span(&"x".repeat(40), serde_json::Value::Null)],
+                    right: vec![span("R", serde_json::Value::Null)],
+                    style: serde_json::Value::Null,
+                },
+            ],
+        );
+        let mut component = ExtApp {
+            state: state.clone(),
+            slot: OVERLAY,
+        };
+        let model = Model::new("s".into(), "m".into());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        let area = Rect::new(0, 0, 20, 6);
+        let mut buf = Buffer::empty(area);
+        component.render(&ctx, area, &mut buf);
+        let row = |y: u16| {
+            (0..20)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert_eq!(row(1), "● left        exit 1");
+        assert_eq!(Some(buf[(0, 1)].fg), theme.added.fg);
+        assert_eq!(buf[(19, 1)].fg, ratatui::style::Color::Blue);
+        // Row style fills the whole width.
+        assert_eq!(buf[(19, 2)].bg, ratatui::style::Color::Blue);
+        // The left side is clipped with an ellipsis before the right column.
+        assert_eq!(row(3), format!("{}… R", "x".repeat(17)));
     }
 
     #[test]
@@ -742,24 +883,24 @@ mod tests {
         assert_eq!(old, state.generation());
         state.set_apps(Vec::new());
         state.set_apps(roster());
-        assert!(!state.publish_if_current(old, "tree", vec!["stale".into()]));
+        assert!(!state.publish_if_current(old, "tree", vec!["stale"]));
         let current = state.generation();
-        assert!(state.publish_if_current(current, "tree", vec!["new".into()]));
+        assert!(state.publish_if_current(current, "tree", vec!["new"]));
         state.invalidate();
         assert!(state.view_of("tree").is_empty());
-        assert!(!state.publish_if_current(current, "tree", vec!["late".into()]));
+        assert!(!state.publish_if_current(current, "tree", vec!["late"]));
     }
 
     #[test]
     fn removed_apps_drop_views_focus_and_late_publications() {
         let state = AppsState::default();
         state.set_apps(roster());
-        state.publish("tree", vec!["old".into()]);
+        state.publish("tree", vec!["old"]);
         state.inner.write().unwrap().active = Some("tree".into());
         state.set_apps(Vec::new());
         assert!(state.active().is_none());
         assert!(state.view_of("tree").is_empty());
-        state.publish("tree", vec!["late".into()]);
+        state.publish("tree", vec!["late"]);
         state.set_apps(roster());
         assert!(state.view_of("tree").is_empty());
     }
@@ -851,7 +992,7 @@ mod tests {
         state.set_apps(roster());
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         state.connect(tx.clone());
-        state.publish("sessions", vec!["a".into(), "b".into()]);
+        state.publish("sessions", vec!["a", "b"]);
 
         handle_global_key(&state, &key(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert_eq!(rx.try_recv().unwrap(), AppEvent::Shown("sessions".into()));

@@ -1129,8 +1129,18 @@ rness.commands.register {
 ```
 
 Views receive `session` and available content dimensions `rows`/`cols` (dimensions
-may be absent before the first render). Return plain strings, not ANSI markup.
-The renderer sanitizes terminal control sequences. `config.width`/`height` are
+may be absent before the first render). Each line is a plain string, a span
+`{ text = "...", style = "error" }`, or a row of spans with an optional
+right-aligned part and row fill:
+
+```lua
+{ { text = "● ", style = "added" }, "build", right = { { text = "exit 0", style = "dim" } },
+  style = { bg = "#3c3836" } }
+```
+
+Styles are theme group names or `{ fg, bg, bold, italic, underline, reverse }`
+tables, never ANSI markup; right-aligned spans stay visible when the left side is
+clipped. The renderer sanitizes terminal control sequences. `config.width`/`height` are
 positive cell dimensions clipped to the available slot; overlay width is centered.
 Border kinds are `none`, `plain` (default), `rounded`, and `double`. Styles resolve
 against the active theme. Without explicit height, the legacy content-sized panel

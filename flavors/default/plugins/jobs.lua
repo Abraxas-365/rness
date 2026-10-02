@@ -35,24 +35,39 @@ local function choice(value, description)
   return value
 end
 
--- Everything above the host's plain-string app contract lives here. State is
--- private to this plugin generation and scoped to the command's session.
+-- The monitor. State is private to this plugin generation and scoped to the
+-- command's session. Lines are strings or styled rows (see rness.ui.app).
 local states = {}
 local defaults = {
   title = "Background jobs", refresh_ms = 250,
-  layout = { height = 24 },
+  layout = {
+    height = 24, title_style = "heading",
+    border = { kind = "rounded", style = "overlay_border" },
+  },
   keys = {
-    up = { "k", "up" }, down = { "j", "down" },
+    up = { "up", "k" }, down = { "down", "j" },
     page_up = { "pageup" }, page_down = { "pagedown" },
     home = { "home" }, follow = { "end" }, open = { "enter" },
-    back = { "esc" }, pause = { "space" },
+    back = { "esc" }, pause = { "space" }, stop = { "x" }, filter = { "f" },
   },
   text = {
-    list = "Background jobs", empty = "No background jobs in this session.",
-    list_help = "j/k: select | enter: output | esc: close",
-    detail_help = "j/k PgUp/PgDn: scroll | space: pause/follow | end: follow | esc: list",
-    following = "FOLLOW", paused = "PAUSED", output = "Recent output (non-consuming, up to 8 KiB)",
-    no_output = "(no output yet)", unavailable = "Job no longer available", marker = "> ",
+    list = "", empty = "No background jobs in this session.",
+    empty_filtered = "No running jobs. Press f to show finished jobs too.",
+    list_help = nil, detail_help = nil,
+    following = "FOLLOW", paused = "PAUSED", output = "",
+    no_output = "(no output yet)", unavailable = "Job no longer available", marker = "▸ ",
+    filter_all = "all", filter_running = "running only",
+    confirm_stop = "Stop %s? Press x again to confirm, any other key cancels.",
+    stop_requested = "Stop requested: %s. It stays listed until its process exits.",
+    not_running = "That job has already finished.",
+    already_stopping = "That job is already stopping.",
+  },
+  -- Theme group names or style tables ({ fg=, bg=, bold= ... }).
+  styles = {
+    running = "heading", stopping = "removed", ok = "added", failed = "error",
+    stopped = "dim", kind = "tool_name", time = "dim", hint = "dim",
+    header = "heading", notice = "heading", confirm = "error",
+    selected = { bg = "#3c3836" }, marker = "heading",
   },
 }
 local options
@@ -74,7 +89,9 @@ end
 
 local function state(ctx)
   local session = assert(ctx.session, "jobs app requires a session")
-  if not states[session] then states[session] = { cursor = 1, offset = 0, follow = true } end
+  if not states[session] then
+    states[session] = { cursor = 1, offset = 0, follow = true, filter = "all" }
+  end
   return states[session]
 end
 
@@ -102,6 +119,10 @@ local function plain(text)
     :gsub("[%z\1-\9\11-\31\127]", "")
 end
 
+local function one_line(text)
+  return (plain(bounded(text, 1024)):gsub("%s+", " "):match("^%s*(.-)%s*$"))
+end
+
 local function wrapped(text, cols)
   local lines = {}
   for line in (plain(text) .. "\n"):gmatch("(.-)\n") do
@@ -117,12 +138,64 @@ local function dimensions(ctx)
     math.max(1, math.min(4096, ctx.cols or 80))
 end
 
+-- Status word, icon, and style for one job.
+local function status_of(job)
+  local st = options.styles
+  if job.running then
+    if job.cancellation_requested or job.status == "cancelling" then return "stopping", "◌", st.stopping end
+    return "running", "●", st.running
+  end
+  if job.status == "exited" then
+    if job.exit_code == 0 then return "exit 0", "✓", st.ok end
+    if job.exit_code == nil then return "signal", "✗", st.failed end
+    return "exit " .. job.exit_code, "✗", st.failed
+  end
+  if job.status == "killed" then return "killed", "■", st.stopped end
+  return tostring(job.status), "!", st.stopped
+end
+
+-- Elapsed time while running; total run time once settled.
+local function duration(job, now)
+  local start = math.tointeger(job.started_at_ms)
+  if not start then return "" end
+  local finish = job.running and now or math.tointeger(job.settled_at_ms) or now
+  local s = math.max(0, (finish - start) // 1000)
+  if s < 60 then return s .. "s" end
+  if s < 3600 then return string.format("%dm%02ds", s // 60, s % 60) end
+  if s < 86400 then return string.format("%dh%02dm", s // 3600, s % 3600 // 60) end
+  return string.format("%dd%02dh", s // 86400, s % 86400 // 3600)
+end
+
+-- Running jobs first, then finished; newest first within each group. Jobs
+-- without timestamps keep registry order after timestamped ones.
+local function sorted(jobs)
+  local entries = {}
+  for i, job in ipairs(jobs) do
+    local key = job.running and job.started_at_ms or job.settled_at_ms or job.started_at_ms
+    entries[i] = { job = job, index = i, key = key }
+  end
+  table.sort(entries, function(a, b)
+    if a.job.running ~= b.job.running then return a.job.running end
+    if a.key and b.key and a.key ~= b.key then return a.key > b.key end
+    if (a.key ~= nil) ~= (b.key ~= nil) then return a.key ~= nil end
+    return a.index < b.index
+  end)
+  local out = {}
+  for i, entry in ipairs(entries) do out[i] = entry.job end
+  return out
+end
+
 local function model(ctx)
   local s = state(ctx)
   local rows, cols = dimensions(ctx)
   local m = { session = ctx.session, mode = s.selected and "detail" or "list",
-    selected = s.selected, follow = s.follow, offset = s.offset,
+    selected = s.selected, follow = s.follow, offset = s.offset, filter = s.filter,
+    confirm = s.confirm, confirm_label = s.confirm_label, notice = s.notice, now_ms = os.time() * 1000,
     rows = rows, cols = cols, text = options.text }
+  -- Chrome: a header from 2 rows, a footer from 3; content gets the rest.
+  m.header, m.footer = rows >= 2, rows >= 3
+  local chrome = (m.header and 1 or 0) + (m.footer and 1 or 0)
+  m.page = math.max(1, rows - chrome)
   if s.selected then
     local ok, job = pcall(rness.jobs.inspect, ctx.session, s.selected)
     if ok then
@@ -131,55 +204,152 @@ local function model(ctx)
     else m.error = options.text.unavailable end
     m.output = s.snapshot or ""
     m.body = wrapped(m.output ~= "" and m.output or options.text.no_output, cols)
-    m.page = math.max(1, rows - 4)
     local maximum = math.max(0, #m.body - m.page)
     s.offset = s.follow and maximum or math.min(s.offset, maximum)
     m.offset = s.offset
   else
-    m.jobs = rness.jobs.list(ctx.session)
+    local all = rness.jobs.list(ctx.session)
+    m.total, m.running = #all, 0
+    local visible = {}
+    for _, job in ipairs(all) do
+      if job.running then m.running = m.running + 1 end
+      if s.filter ~= "running" or job.running then visible[#visible + 1] = job end
+    end
+    m.finished = m.total - m.running
+    m.jobs = sorted(visible)
     -- Keep finished jobs visible and preserve selection as the registry changes.
     for i, job in ipairs(m.jobs) do if job.job_id == s.cursor_id then s.cursor = i; break end end
     s.cursor = math.max(1, math.min(s.cursor, #m.jobs))
     s.cursor_id = m.jobs[s.cursor] and m.jobs[s.cursor].job_id
     m.cursor = s.cursor
-    m.page = math.max(1, rows - 2)
   end
   return m
 end
 
+local function job_row(m, job, selected, kind_width)
+  local t, st = options.text, options.styles
+  local word, icon, style = status_of(job)
+  local kind = tostring(job.kind)
+  if utf8.len(kind) and utf8.len(kind) > kind_width then
+    kind = kind:sub(1, (utf8.offset(kind, kind_width) or (#kind + 1)) - 1)
+  end
+  local blank = string.rep(" ", utf8.len(t.marker) or #t.marker)
+  return {
+    { text = selected and t.marker or blank, style = st.marker },
+    { text = icon .. " ", style = style },
+    { text = kind .. string.rep(" ", kind_width - (utf8.len(kind) or #kind)) .. " ", style = st.kind },
+    { text = string.format("%7s", duration(job, m.now_ms)) .. "  ", style = st.time },
+    { text = one_line(job.label) },
+    right = { { text = word, style = style } },
+    style = selected and st.selected or nil,
+  }
+end
+
+local function footer(m, help)
+  local st = options.styles
+  if m.confirm then
+    local label = m.confirm_label or m.confirm
+    return { text = string.format(options.text.confirm_stop, label), style = st.confirm }
+  end
+  if m.notice then return { text = m.notice, style = st.notice } end
+  return { text = help, style = st.hint }
+end
+
 local function default_view(m)
-  local t, lines = options.text, {}
+  local t, st, lines = options.text, options.styles, {}
   if m.mode == "list" then
-    if m.rows >= 2 then lines[1] = t.list .. " (" .. #m.jobs .. ")" end
-    if #m.jobs == 0 then lines[#lines + 1] = t.empty end
+    if m.header then
+      local head = {}
+      if t.list ~= "" then head[#head + 1] = { text = t.list .. "  ", style = st.header } end
+      head[#head + 1] = { text = "● " .. m.running .. " running", style = m.running > 0 and st.running or st.hint }
+      head[#head + 1] = { text = "   ✓ " .. m.finished .. " finished", style = st.hint }
+      head.right = { { text = "filter: " .. (m.filter == "running" and t.filter_running or t.filter_all), style = st.hint } }
+      lines[#lines + 1] = head
+    end
+    if #m.jobs == 0 then
+      lines[#lines + 1] = { text = (m.filter == "running" and m.total > 0) and t.empty_filtered or t.empty, style = st.hint }
+    end
+    local kind_width = 4
+    for _, job in ipairs(m.jobs) do kind_width = math.max(kind_width, utf8.len(tostring(job.kind)) or 4) end
+    kind_width = math.min(kind_width, 10)
     local first = math.max(1, m.cursor - m.page + 1)
     for i = first, math.min(#m.jobs, first + m.page - 1) do
-      lines[#lines + 1] = (i == m.cursor and t.marker or "  ") .. plain(bounded(summary(m.jobs[i]), 1024)):gsub("\n", " ")
+      lines[#lines + 1] = job_row(m, m.jobs[i], i == m.cursor, kind_width)
     end
-    if m.rows >= 3 then lines[#lines + 1] = t.list_help end
+    if m.footer then
+      while #lines < m.rows - 1 do lines[#lines + 1] = "" end
+      lines[#lines + 1] = footer(m, t.list_help)
+    end
   else
     -- Prefer actual output over chrome when the terminal has very few rows.
-    if m.rows >= 2 then
-      lines[#lines + 1] = m.job and plain(bounded(summary(m.job), 1024)):gsub("\n", " ") or t.unavailable
+    if m.header then
+      if m.job then
+        local word, icon, style = status_of(m.job)
+        local d = duration(m.job, m.now_ms)
+        local position = (m.offset + 1) .. "-" .. math.min(#m.body, m.offset + m.page) .. "/" .. #m.body
+        lines[#lines + 1] = {
+          { text = icon .. " " .. word, style = style },
+          { text = "  " .. tostring(m.job.kind), style = st.kind },
+          { text = d ~= "" and ("  " .. d) or "", style = st.time },
+          { text = "  " .. one_line(m.job.label) },
+          right = {
+            { text = tostring(m.job.job_id) .. "  ", style = st.hint },
+            { text = (t.output ~= "" and (t.output .. "  ") or ""), style = st.hint },
+            { text = m.follow and t.following or t.paused, style = m.follow and st.running or st.stopped },
+            { text = "  " .. position, style = st.hint },
+          },
+        }
+      else
+        lines[#lines + 1] = { text = t.unavailable, style = st.failed }
+      end
     end
-    if m.rows >= 3 then
-      lines[#lines + 1] = t.output .. " | " .. (m.follow and t.following or t.paused)
-        .. " | " .. (m.offset + 1) .. "-" .. math.min(#m.body, m.offset + m.page) .. "/" .. #m.body
-    end
-    if m.rows >= 4 then lines[#lines + 1] = t.detail_help end
     for i = m.offset + 1, math.min(#m.body, m.offset + m.page) do lines[#lines + 1] = m.body[i] end
+    if m.footer then
+      while #lines < m.rows - 1 do lines[#lines + 1] = "" end
+      lines[#lines + 1] = footer(m, t.detail_help)
+    end
   end
   return lines
 end
 
+local function safe_style(style)
+  assert(style == nil or type(style) == "string" or type(style) == "table",
+    "jobs line styles must be theme names or style tables")
+  return style
+end
+
+-- Bound and sanitize any view: strings, spans {text=, style=}, or rows
+-- (arrays of strings/spans with optional right= and style=).
 local function safe_lines(lines)
-  assert(type(lines) == "table", "jobs view/render must return an array of strings")
+  assert(type(lines) == "table", "jobs view/render must return an array of lines")
   local out, remaining = {}, 65536
+  local function clean(text)
+    local limit = math.max(0, remaining)
+    text = (bounded(plain(bounded(text, limit)), math.min(8192, limit)):gsub("\n", " "))
+    remaining = remaining - #text
+    return text
+  end
+  local function span(value)
+    if type(value) ~= "table" then return { text = clean(tostring(value)) } end
+    return { text = clean(tostring(value.text or "")), style = safe_style(value.style) }
+  end
   for i, line in ipairs(lines) do
     if i > 512 or remaining <= 0 then break end
-    assert(type(line) == "string", "jobs app lines must be strings")
-    line = bounded(plain(bounded(line, remaining)), math.min(8192, remaining)):gsub("\n", " ")
-    out[#out + 1], remaining = line, remaining - #line
+    if type(line) == "string" then out[#out + 1] = clean(line)
+    else
+      assert(type(line) == "table", "jobs app lines must be strings or tables")
+      if line.text ~= nil then out[#out + 1] = span(line)
+      else
+        local row = { style = safe_style(line.style) }
+        for _, value in ipairs(line) do row[#row + 1] = span(value) end
+        if line.right ~= nil then
+          assert(type(line.right) == "table", "jobs row right= must be an array")
+          row.right = {}
+          for _, value in ipairs(line.right) do row.right[#row.right + 1] = span(value) end
+        end
+        out[#out + 1] = row
+      end
+    end
   end
   -- Desired height must not collapse to the currently clipped viewport.
   while #out < options.layout.height do out[#out + 1] = "" end
@@ -201,6 +371,31 @@ local function matches(action, key)
   return false
 end
 
+-- x: first press arms a confirmation for the selected job, second stops it.
+local function stop_key(ctx, s, armed)
+  local id = s.selected
+  if not id then
+    model(ctx)
+    id = s.cursor_id
+  end
+  if not id then return true end
+  local ok, job = pcall(rness.jobs.inspect, ctx.session, id)
+  if not ok then s.notice = options.text.unavailable; return true end
+  if not job.running then s.notice = options.text.not_running; return true end
+  if job.cancellation_requested then s.notice = options.text.already_stopping; return true end
+  local label = one_line(job.label)
+  if label == "" then label = id end
+  local cut = utf8.offset(label, 41)
+  if cut and cut <= #label then label = label:sub(1, cut - 1) .. "…" end
+  if armed == id then
+    rness.jobs.stop(ctx.session, id)
+    s.notice = string.format(options.text.stop_requested, label)
+  else
+    s.confirm, s.confirm_label = id, label
+  end
+  return true
+end
+
 local function on_key(key, ctx)
   if key == " " then key = "space" end
   if options.on_key then
@@ -208,12 +403,21 @@ local function on_key(key, ctx)
     if result ~= nil then return result end
   end
   local s = state(ctx)
+  -- Any key dismisses a notice; any key but stop cancels a pending stop.
+  local armed = s.confirm
+  s.confirm, s.confirm_label, s.notice = nil, nil, nil
+  if matches("stop", key) then return stop_key(ctx, s, armed) end
+  if armed then return true end
   if matches("back", key) then
     if not s.selected then
       if key == "esc" then return false end
       return "close"
     end
     s.selected, s.snapshot, s.offset, s.follow = nil, nil, 0, true
+    return true
+  end
+  if matches("filter", key) and not s.selected then
+    s.filter = s.filter == "running" and "all" or "running"
     return true
   end
   local action
@@ -248,6 +452,11 @@ local function on_key(key, ctx)
   return true
 end
 
+local key_names = {
+  up = "↑", down = "↓", left = "←", right = "→", enter = "⏎", pageup = "PgUp",
+  pagedown = "PgDn", home = "Home", ["end"] = "End", space = "space", esc = "esc",
+}
+
 local function setup(config)
   assert(config == nil or type(config) == "table", "jobs.setup expects a table")
   local next_options = merge(defaults, config or {})
@@ -261,33 +470,37 @@ local function setup(config)
     assert(next_options[name] == nil or type(next_options[name]) == "function", "jobs " .. name .. " must be a function")
   end
   for name, value in pairs(next_options.text) do assert(type(value) == "string", "jobs text." .. name .. " must be a string") end
+  for name, value in pairs(next_options.styles) do
+    assert(type(value) == "string" or type(value) == "table", "jobs styles." .. name .. " must be a theme name or style table")
+  end
   for name, keys in pairs(next_options.keys) do
     assert(defaults.keys[name], "unknown jobs key action: " .. name)
     assert(keys == false or type(keys) == "string" or type(keys) == "table", "jobs keys must be strings, arrays, or false")
     if type(keys) == "table" then for _, key in ipairs(keys) do assert(type(key) == "string", "jobs key must be a string") end end
   end
+  -- Help shows the first key of each action: "↑/↓ select".
   local function help(actions, label)
     local keys = {}
     for _, action in ipairs(actions) do
       local value = next_options.keys[action]
-      if type(value) == "string" then keys[#keys + 1] = value
-      elseif type(value) == "table" then for _, key in ipairs(value) do keys[#keys + 1] = key end end
+      if type(value) == "table" then value = value[1] end
+      if type(value) == "string" then keys[#keys + 1] = key_names[value] or value end
     end
-    return #keys > 0 and (table.concat(keys, "/") .. ": " .. label) or nil
+    return #keys > 0 and (table.concat(keys, "/") .. " " .. label) or nil
   end
   local function hints(parts)
     local result = {}
     for i = 1, parts.n do if parts[i] then result[#result + 1] = parts[i] end end
-    return table.concat(result, " | ")
+    return table.concat(result, " · ")
   end
   local custom_text = config and config.text or {}
   if custom_text.list_help == nil then
     next_options.text.list_help = hints(table.pack(help({"up", "down"}, "select"),
-      help({"open"}, "output"), help({"back"}, "close")))
+      help({"open"}, "output"), help({"stop"}, "stop"), help({"filter"}, "filter"), help({"back"}, "close")))
   end
   if custom_text.detail_help == nil then
-    next_options.text.detail_help = hints(table.pack(help({"up", "down", "page_up", "page_down", "home"}, "scroll"),
-      help({"pause"}, "pause/follow"), help({"follow"}, "follow"), help({"back"}, "list")))
+    next_options.text.detail_help = hints(table.pack(help({"up", "down", "page_up", "page_down"}, "scroll"),
+      help({"pause"}, "pause"), help({"follow"}, "follow"), help({"stop"}, "stop"), help({"back"}, "back")))
   end
   rness.ui.app {
     name = "jobs", slot = "overlay", title = next_options.title,
@@ -301,6 +514,7 @@ setup(rness.jobs.config)
 local function open(ctx, id)
   local s = state(ctx)
   s.selected, s.snapshot, s.offset, s.follow = id, nil, 0, true
+  s.confirm, s.confirm_label, s.notice = nil, nil, nil
   return { data = { action = "app:open", app = "jobs", session = ctx.session } }
 end
 

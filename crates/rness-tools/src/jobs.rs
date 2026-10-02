@@ -46,6 +46,12 @@ pub struct JobSnapshot {
     pub running: bool,
     pub cancellation_requested: bool,
     pub output_error: Option<String>,
+    /// Unix ms when the job started; absent for records older than this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// Unix ms when the job settled; absent while running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settled_at_ms: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -98,6 +104,8 @@ struct JobState {
     owner: Option<String>,
     #[serde(default)]
     delivered: bool,
+    #[serde(default)]
+    started_at_ms: Option<u64>,
     #[serde(default)]
     settled_at_ms: Option<u64>,
     #[serde(default)]
@@ -185,6 +193,8 @@ impl Job {
             running: !state.settled,
             cancellation_requested,
             output_error: state.output_error.clone(),
+            started_at_ms: state.started_at_ms,
+            settled_at_ms: state.settled_at_ms.filter(|_| state.settled),
             exit_code: match state.status {
                 JobStatus::Exited(code) => code,
                 _ => None,
@@ -788,6 +798,7 @@ impl JobRegistry {
                 charged_bytes: 0,
                 read_from: 0,
                 settled: false,
+                started_at_ms: Some(retention::now_ms()),
                 settled_at_ms: None,
                 output_error: None,
             }),
@@ -1068,9 +1079,13 @@ mod inspection_tests {
         assert!(!jobs.stop("any", &id).unwrap());
         assert_eq!(jobs.count("any"), 1);
         assert_eq!(jobs.inspect("any", &id).unwrap().job.status, "cancelling");
+        let running = jobs.inspect("any", &id).unwrap().job;
+        assert!(running.started_at_ms.is_some() && running.settled_at_ms.is_none());
         writer.settle(JobStatus::Exited(Some(0)));
         assert_eq!(jobs.count("any"), 0);
-        assert_eq!(jobs.inspect("any", &id).unwrap().job.status, "killed");
+        let settled = jobs.inspect("any", &id).unwrap().job;
+        assert_eq!(settled.status, "killed");
+        assert!(settled.settled_at_ms >= settled.started_at_ms);
     }
 
     #[tokio::test]

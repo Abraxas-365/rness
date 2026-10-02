@@ -157,6 +157,47 @@ pub struct StyledSpan {
     pub style: serde_json::Value,
 }
 
+/// One row of an app view: left spans, optional right-aligned spans, and a
+/// row style that fills the whole row (e.g. a selection highlight). Styles
+/// are theme names or style objects; `Null` inherits the panel style.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AppLine {
+    pub spans: Vec<StyledSpan>,
+    pub right: Vec<StyledSpan>,
+    pub style: serde_json::Value,
+}
+
+impl AppLine {
+    /// The row as plain text: left spans, then right spans after a space.
+    pub fn text(&self) -> String {
+        let join = |spans: &[StyledSpan]| spans.iter().map(|s| s.text.as_str()).collect::<String>();
+        let left = join(&self.spans);
+        if self.right.is_empty() {
+            left
+        } else {
+            format!("{left} {}", join(&self.right))
+        }
+    }
+}
+
+impl From<String> for AppLine {
+    fn from(text: String) -> Self {
+        AppLine {
+            spans: vec![StyledSpan {
+                text,
+                style: serde_json::Value::Null,
+            }],
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&str> for AppLine {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppSpec {
     pub key_help: Vec<String>,
@@ -187,7 +228,7 @@ pub enum AppKeyOutcome {
 #[async_trait::async_trait]
 pub trait Applications: Send + Sync {
     async fn app_specs(&self) -> Vec<AppSpec>;
-    async fn app_view(&self, name: &str, ctx: serde_json::Value) -> Result<Vec<String>, String>;
+    async fn app_view(&self, name: &str, ctx: serde_json::Value) -> Result<Vec<AppLine>, String>;
     async fn app_key(
         &self,
         name: &str,

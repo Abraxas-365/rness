@@ -300,7 +300,7 @@ async fn jobs_command_works_while_busy_without_history_or_model_activity() {
         if result.data == serde_json::json!({"action":"app:open","app":"jobs","session":session}))
     );
     let lines = host.app_view("jobs", ctx).await.unwrap();
-    assert!(lines[0].contains("exited (code 7)"));
+    assert!(lines[0].contains("exit 7"), "{lines:?}");
     sessions.cancel(&session);
 }
 

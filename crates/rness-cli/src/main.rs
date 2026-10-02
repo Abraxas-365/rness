@@ -3029,7 +3029,7 @@ async fn refresh_app<F, Fut>(
 ) -> bool
 where
     F: FnOnce(u64, serde_json::Value) -> Fut,
-    Fut: std::future::Future<Output = Result<Vec<String>, String>>,
+    Fut: std::future::Future<Output = Result<Vec<rness_kernel::presentation::AppLine>, String>>,
 {
     let generation = state.generation();
     let Some(ctx) = state.context_if_current(generation, app) else {
@@ -3045,7 +3045,7 @@ where
         Err(error) if error.contains("runtime is busy") || error == "stale app request" => {
             return false
         }
-        Err(error) => vec![format!("error: {error}")],
+        Err(error) => vec![format!("error: {error}").into()],
     };
     state.publish_if_current(generation, app, lines)
 }
@@ -3154,7 +3154,11 @@ mod app_host_tests {
         ) -> Result<AppKeyOutcome, String> {
             unreachable!()
         }
-        async fn app_view(&self, _: &str, ctx: serde_json::Value) -> Result<Vec<String>, String> {
+        async fn app_view(
+            &self,
+            _: &str,
+            ctx: serde_json::Value,
+        ) -> Result<Vec<rness_kernel::presentation::AppLine>, String> {
             assert_eq!(ctx["session"], "s");
             assert!(ctx.get("rows").is_none());
             match self.change {

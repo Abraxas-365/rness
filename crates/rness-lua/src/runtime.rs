@@ -1254,16 +1254,85 @@ impl LuaRuntime {
         v
     }
 
-    /// Evaluate an app's `view(ctx)`: an array of strings (its lines).
+    /// Evaluate an app's `view(ctx)` as plain text (styles dropped).
     pub fn app_view(&self, name: &str, ctx: &serde_json::Value) -> Result<Vec<String>, LuaError> {
+        Ok(self
+            .app_view_lines(name, ctx)?
+            .iter()
+            .map(rness_kernel::presentation::AppLine::text)
+            .collect())
+    }
+
+    /// Evaluate an app's `view(ctx)`. Each line is a string, a span
+    /// `{text=, style=}`, or a row: an array of strings/spans with optional
+    /// `right` (array of strings/spans, right-aligned) and `style` (row fill).
+    pub fn app_view_lines(
+        &self,
+        name: &str,
+        ctx: &serde_json::Value,
+    ) -> Result<Vec<rness_kernel::presentation::AppLine>, LuaError> {
+        use rness_kernel::presentation::{AppLine, StyledSpan};
         let Some((_, view, _)) = self.apps.get(name) else {
             return Err(LuaError::UnknownApp(name.to_string()));
         };
         let f: Function = self.lua.registry_value(view)?;
         let lines: Table = f.call(self.lua.to_value(ctx)?)?;
-        Ok(lines
-            .sequence_values::<String>()
-            .collect::<mlua::Result<Vec<_>>>()?)
+        let style = |value: LuaValue| -> mlua::Result<serde_json::Value> {
+            match value {
+                LuaValue::Nil => Ok(serde_json::Value::Null),
+                LuaValue::String(_) | LuaValue::Table(_) => self.lua.from_value(value),
+                _ => Err(mlua::Error::runtime(
+                    "app line style must be a theme name or style table",
+                )),
+            }
+        };
+        let span = |value: LuaValue| -> mlua::Result<StyledSpan> {
+            match value {
+                LuaValue::String(text) => Ok(StyledSpan {
+                    text: text.to_str()?.to_owned(),
+                    style: serde_json::Value::Null,
+                }),
+                LuaValue::Table(t) => Ok(StyledSpan {
+                    text: t.get::<Option<String>>("text")?.unwrap_or_default(),
+                    style: style(t.get("style")?)?,
+                }),
+                _ => Err(mlua::Error::runtime(
+                    "app line spans must be strings or {text=, style=} tables",
+                )),
+            }
+        };
+        let spans = |t: &Table| -> mlua::Result<Vec<StyledSpan>> {
+            t.sequence_values::<LuaValue>()
+                .map(|value| span(value?))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for line in lines.sequence_values::<LuaValue>() {
+            out.push(match line? {
+                LuaValue::String(text) => AppLine::from(text.to_str()?.to_owned()),
+                LuaValue::Integer(n) => AppLine::from(n.to_string()),
+                LuaValue::Number(n) => AppLine::from(n.to_string()),
+                // A single span: {text=, style=}.
+                LuaValue::Table(t) if t.contains_key("text")? => AppLine {
+                    spans: vec![span(LuaValue::Table(t))?],
+                    ..Default::default()
+                },
+                LuaValue::Table(t) => AppLine {
+                    spans: spans(&t)?,
+                    right: match t.get::<Option<Table>>("right")? {
+                        Some(right) => spans(&right)?,
+                        None => Vec::new(),
+                    },
+                    style: style(t.get("style")?)?,
+                },
+                _ => {
+                    return Err(
+                        mlua::Error::runtime("app view lines must be strings or tables").into(),
+                    )
+                }
+            });
+        }
+        Ok(out)
     }
 
     /// Deliver a key to an app's `on_key(key, ctx)`. The return value

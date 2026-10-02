@@ -685,8 +685,12 @@ impl rness_kernel::presentation::Applications for LuaHost {
     async fn app_specs(&self) -> Vec<LuaAppSpec> {
         LuaHost::app_specs(self).await
     }
-    async fn app_view(&self, name: &str, ctx: serde_json::Value) -> Result<Vec<String>, String> {
-        LuaHost::app_view(self, name, ctx).await
+    async fn app_view(
+        &self,
+        name: &str,
+        ctx: serde_json::Value,
+    ) -> Result<Vec<rness_kernel::presentation::AppLine>, String> {
+        LuaHost::app_view_lines(self, name, ctx).await
     }
     async fn app_key(
         &self,
@@ -886,7 +890,8 @@ enum Cmd {
         guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
         name: String,
         ctx: serde_json::Value,
-        reply: tokio::sync::oneshot::Sender<Result<Vec<String>, String>>,
+        reply:
+            tokio::sync::oneshot::Sender<Result<Vec<rness_kernel::presentation::AppLine>, String>>,
     },
     AppKey {
         guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -1521,7 +1526,7 @@ impl LuaHost {
                         Cmd::AppView { guard, name, ctx, reply } => {
                             let result = if guard.as_ref().is_some_and(|guard| !guard()) {
                                 Err("stale app request".into())
-                            } else { rt.app_view(&name, &ctx).map_err(|e| e.to_string()) };
+                            } else { rt.app_view_lines(&name, &ctx).map_err(|e| e.to_string()) };
                             let _ = reply.send(result);
                         }
                         Cmd::AppKey { guard, name, key, ctx, reply } => {
@@ -1876,11 +1881,25 @@ impl LuaHost {
         rx.await.unwrap_or_default()
     }
 
+    /// Plain-text projection of [`Self::app_view_lines`] (styles dropped).
     pub async fn app_view(
         &self,
         name: &str,
         ctx: serde_json::Value,
     ) -> Result<Vec<String>, String> {
+        Ok(self
+            .app_view_lines(name, ctx)
+            .await?
+            .iter()
+            .map(rness_kernel::presentation::AppLine::text)
+            .collect())
+    }
+
+    pub async fn app_view_lines(
+        &self,
+        name: &str,
+        ctx: serde_json::Value,
+    ) -> Result<Vec<rness_kernel::presentation::AppLine>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::AppView {
@@ -1918,7 +1937,7 @@ impl LuaHost {
         name: &str,
         ctx: serde_json::Value,
         guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<rness_kernel::presentation::AppLine>, String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::AppView {
