@@ -237,3 +237,134 @@ async fn lua_connects_mcp_and_bridged_tools_survive_reload() {
         .unwrap();
     assert!(registry.get("mcp__fake__ping").is_none());
 }
+
+/// `background = true` returns before the handshake; tools appear later,
+/// failures clean up the slot, and disconnect during a handshake is safe.
+#[tokio::test(flavor = "multi_thread")]
+async fn background_connect_returns_immediately_and_registers_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("server.py");
+    // Slow handshake: the plugin load must not wait for it.
+    let slow = FAKE_SERVER.replace(
+        "import json, sys",
+        "import json, sys, time\ntime.sleep(float(sys.argv[2]) if len(sys.argv) > 2 else 0)",
+    );
+    std::fs::write(&script, slow).unwrap();
+    let marker = dir.path().join("calls");
+    let registry = Arc::new(ToolRegistry::default());
+    let sessions = Arc::new(SessionService::new(
+        SessionStore::new(dir.path()),
+        Arc::new(Silent),
+        Arc::clone(&registry),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    ));
+    let subagents = Arc::new(rness_engine::subagent::SubagentRuntime::new(
+        Arc::clone(&sessions),
+        3,
+    ));
+    let host = rness_lua::plugin_host::LuaHost::spawn().unwrap();
+    host.install_session(
+        Arc::clone(&sessions),
+        subagents,
+        Arc::clone(&registry),
+        Default::default(),
+        tokio::runtime::Handle::current(),
+        "test/model".into(),
+    )
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    host.load(
+        "bg.lua",
+        &format!(
+            r#"
+            local tools = rness.mcp.connect{{
+                name = "bg", command = "python3", args = {{ "{script}", "{marker}", "0.8" }},
+                defer_tools = true, timeout_ms = 10000, background = true,
+            }}
+            assert(#tools == 0, "background connect returns no tools yet")
+            assert(rness.mcp.servers()[1] == "bg", "listed while connecting")
+            local ok, failure = pcall(rness.mcp.connect, {{ name = "bg", command = "python3", background = true }})
+            assert(not ok and tostring(failure):find("already connected"), tostring(failure))
+            "#,
+            script = script.display(),
+            marker = marker.display(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(600),
+        "plugin load waited for the handshake: {:?}",
+        started.elapsed()
+    );
+    assert!(registry.get("mcp__bg__ping").is_none());
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while registry.get("mcp__bg__ping").is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("background tools registered");
+    assert!(registry.is_deferred("mcp__bg__ping"));
+    assert_eq!(
+        registry
+            .get("mcp__bg__ping")
+            .unwrap()
+            .execute(serde_json::json!({}))
+            .await
+            .unwrap(),
+        "pong!"
+    );
+    host.load(
+        "bg-reconnect.lua",
+        r#"
+        local names = rness.mcp.reconnect("bg")
+        assert(#names == 1 and names[1] == "mcp__bg__ping")
+        assert(rness.mcp.disconnect("bg") == true)
+    "#,
+    )
+    .await
+    .unwrap();
+    assert!(registry.get("mcp__bg__ping").is_none());
+
+    // A failing background connect is logged and frees the name.
+    host.load(
+        "bg-fail.lua",
+        r#"rness.mcp.connect{ name = "broken", command = "/nonexistent/mcp-server", background = true }"#,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let listed = host
+                .load("bg-list.lua", r#"assert(#rness.mcp.servers() == 0)"#)
+                .await;
+            if listed.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed background connect removed from servers()");
+
+    // Disconnect while the handshake is in flight: tools never appear.
+    host.load(
+        "bg-cancel.lua",
+        &format!(
+            r#"
+            rness.mcp.connect{{ name = "gone", command = "python3", args = {{ "{script}", "{marker}", "0.5" }}, background = true }}
+            assert(rness.mcp.disconnect("gone") == true)
+            "#,
+            script = script.display(),
+            marker = marker.display(),
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(registry.get("mcp__gone__ping").is_none());
+}
