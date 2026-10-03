@@ -92,13 +92,14 @@ struct CompactionPlan {
     pruned: std::collections::HashMap<EventId, (EventId, ToolResult)>,
 }
 
-fn compaction_plan(history: &[Envelope]) -> CompactionPlan {
+fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> CompactionPlan {
     let mut shadowed: HashSet<EventId> = HashSet::new();
     let mut anchors = std::collections::HashMap::new();
     let mut pruned = std::collections::HashMap::new();
     // Later checkpoints win: walk in reverse, skip checkpoints (and
     // prunes) already shadowed by a newer one.
     for env in history.iter().rev() {
+        let env: &Envelope = env.borrow();
         match &env.event {
             SessionEvent::Compaction(c) => {
                 if shadowed.contains(&env.id) {
@@ -130,12 +131,15 @@ fn compaction_plan(history: &[Envelope]) -> CompactionPlan {
 
 /// Derive the model context from a history (as returned by
 /// `SessionStore::history` — header first, events in order).
-pub fn search_surfaces(history: &[Envelope]) -> std::collections::HashMap<EventId, &'static str> {
+pub fn search_surfaces<E: std::borrow::Borrow<Envelope>>(
+    history: &[E],
+) -> std::collections::HashMap<EventId, &'static str> {
     let plan = compaction_plan(history);
     let current: HashSet<_> = model_context(history).sources.into_iter().collect();
     history
         .iter()
         .map(|event| {
+            let event = event.borrow();
             let surface =
                 if plan.shadowed.contains(&event.id) || plan.pruned.contains_key(&event.id) {
                     "shadowed"
@@ -149,7 +153,7 @@ pub fn search_surfaces(history: &[Envelope]) -> std::collections::HashMap<EventI
         .collect()
 }
 
-pub fn model_context(history: &[Envelope]) -> ModelContext {
+pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelContext {
     let mut ctx = ModelContext::default();
     let mut pending_tools: Vec<(EventId, ToolResult)> = Vec::new();
     let plan = compaction_plan(history);
@@ -164,6 +168,7 @@ pub fn model_context(history: &[Envelope]) -> ModelContext {
     };
 
     for env in history {
+        let env = env.borrow();
         if plan.shadowed.contains(&env.id) {
             // The summary replays where the folded span began.
             if let Some((ckpt, summary, _)) = plan.anchors.get(&env.id) {
@@ -302,10 +307,11 @@ fn repair_tool_pairs(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
 /// Derive the frontend transcript (attempts and all). Shadowed events
 /// are dropped and the checkpoint appears where they were — the
 /// transcript mirrors what the model now sees, plus trace items.
-pub fn transcript(history: &[Envelope]) -> Transcript {
+pub fn transcript<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Transcript {
     let mut t = Transcript::default();
     let plan = compaction_plan(history);
     for env in history {
+        let env = env.borrow();
         if plan.shadowed.contains(&env.id) {
             if let Some((ckpt, summary, span)) = plan.anchors.get(&env.id) {
                 t.items.push(TranscriptItem::Compaction {

@@ -108,10 +108,11 @@ impl AgentHintReader {
                     .history(session)?
                     .into_iter()
                     .rev()
-                    .find_map(|entry| match entry.event {
+                    .find_map(|entry| match &entry.event {
                         SessionEvent::RequestConfig(config) => Some(
                             config
                                 .agent
+                                .as_ref()
                                 .map(|agent| agent.name.chars().map(safe_char).collect()),
                         ),
                         _ => None,

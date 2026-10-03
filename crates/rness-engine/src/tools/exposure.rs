@@ -49,10 +49,12 @@ impl Exposure {
         specs
     }
 
-    pub fn activated(history: &[rness_protocol::events::Envelope]) -> BTreeSet<String> {
+    pub fn activated(
+        history: &[impl std::borrow::Borrow<rness_protocol::events::Envelope>],
+    ) -> BTreeSet<String> {
         history
             .iter()
-            .filter_map(|event| match &event.event {
+            .filter_map(|event| match &event.borrow().event {
                 SessionEvent::ToolsActivated { names } => Some(names),
                 _ => None,
             })

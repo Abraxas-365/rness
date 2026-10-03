@@ -43,7 +43,7 @@ fn messages(sessions: &SessionService, id: &SessionId) -> Vec<UserMessage> {
         .history(id)
         .unwrap()
         .into_iter()
-        .filter_map(|e| match e.event {
+        .filter_map(|e| match std::sync::Arc::unwrap_or_clone(e).event {
             SessionEvent::UserMessage(m) => Some(m),
             _ => None,
         })

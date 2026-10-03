@@ -834,7 +834,7 @@ fn settle(
 }
 
 fn settle_events(
-    history: &[rness_protocol::events::Envelope],
+    history: &[std::sync::Arc<rness_protocol::events::Envelope>],
     boundary: usize,
     child: &SessionId,
 ) -> Result<SubagentRun, ServiceError> {

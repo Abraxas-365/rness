@@ -182,8 +182,10 @@ impl Meter {
 /// provider count, which describes a context that may no longer exist.
 /// Clamped to guard against degenerate provider reports; `None` until a
 /// step records an estimate (legacy logs, fresh sessions).
-pub fn calibration(history: &[rness_protocol::events::Envelope]) -> Option<f64> {
-    history.iter().rev().find_map(|e| match &e.event {
+pub fn calibration(
+    history: &[impl std::borrow::Borrow<rness_protocol::events::Envelope>],
+) -> Option<f64> {
+    history.iter().rev().find_map(|e| match &e.borrow().event {
         SessionEvent::AssistantMessage(m) if m.estimated_input > 0 => {
             let real =
                 m.usage.input_tokens + m.usage.cache_read_tokens + m.usage.cache_write_tokens;

@@ -54,5 +54,17 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct History {
     pub session: SessionId,
-    pub envelopes: Vec<Envelope>,
+    /// Shared with the engine's parsed-log cache: cloning a history copies
+    /// pointers, never event payloads.
+    pub envelopes: Vec<std::sync::Arc<Envelope>>,
+}
+
+impl History {
+    /// Build from owned envelopes (tests, deserialized fixtures).
+    pub fn new(session: impl Into<SessionId>, envelopes: Vec<Envelope>) -> Self {
+        Self {
+            session: session.into(),
+            envelopes: envelopes.into_iter().map(std::sync::Arc::new).collect(),
+        }
+    }
 }

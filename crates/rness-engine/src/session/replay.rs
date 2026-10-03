@@ -2,6 +2,8 @@
 //! request's input. history (across forks) -> projection -> invariant
 //! check, in one call. If the invariant fails, NO request is built.
 
+use std::sync::Arc;
+
 use rness_protocol::events::{Envelope, SessionId};
 
 use crate::invariants::{assert_model_visible_logged, InvariantViolation};
@@ -19,7 +21,7 @@ pub enum ReplayError {
 /// A session's full history plus the model context derived from it,
 /// invariant-checked. What the request builder consumes.
 pub struct Replayed {
-    pub history: Vec<Envelope>,
+    pub history: Vec<Arc<Envelope>>,
     pub context: ModelContext,
 }
 

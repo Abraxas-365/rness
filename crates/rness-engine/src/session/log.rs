@@ -12,6 +12,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rness_protocol::branch::{Delegation, ForkRef};
 use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
@@ -222,7 +223,9 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
 pub(super) struct SessionReader {
     offset: u64,
     line: usize,
-    events: Vec<Envelope>,
+    /// Parsed once and shared: history reads hand out pointer copies, never
+    /// payload copies (a long session's parsed log can exceed 1 GB).
+    events: Vec<Arc<Envelope>>,
     positions: std::collections::HashMap<EventId, usize>,
     /// Cached read-only handle; lazily opened on first refresh.
     handle: Option<File>,
@@ -245,7 +248,7 @@ impl SessionReader {
     pub(super) fn read(
         &mut self,
         session: &SessionId,
-    ) -> Result<Vec<Envelope>, LogError> {
+    ) -> Result<Vec<Arc<Envelope>>, LogError> {
         self.refresh(session)?;
         Ok(self.events.clone())
     }
@@ -254,7 +257,7 @@ impl SessionReader {
         &mut self,
         session: &SessionId,
         after: &str,
-    ) -> Result<Option<Vec<Envelope>>, LogError> {
+    ) -> Result<Option<Vec<Arc<Envelope>>>, LogError> {
         self.refresh(session)?;
         Ok(self
             .positions
@@ -305,7 +308,7 @@ impl SessionReader {
                     });
                 }
                 self.positions.insert(event.id.clone(), self.events.len());
-                self.events.push(event);
+                self.events.push(Arc::new(event));
             }
             self.offset += n as u64;
             self.line += 1;
@@ -499,7 +502,12 @@ mod tests {
         log.file.write_all(&bytes[split..]).unwrap();
         assert_eq!(reader.read(&sid).unwrap().len(), 3);
         assert_eq!(
-            reader.read(&sid).unwrap(),
+            reader
+                .read(&sid)
+                .unwrap()
+                .into_iter()
+                .map(|event| (*event).clone())
+                .collect::<Vec<_>>(),
             log.read_all().unwrap()
         );
     }

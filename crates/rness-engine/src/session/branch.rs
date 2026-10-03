@@ -10,6 +10,7 @@
 use std::collections::VecDeque;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
 use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
@@ -105,7 +106,7 @@ impl SessionStore {
         }
     }
 
-    pub fn read_session(&self, session: &SessionId) -> Result<Vec<Envelope>, LogError> {
+    pub fn read_session(&self, session: &SessionId) -> Result<Vec<Arc<Envelope>>, LogError> {
         let mut readers = self.readers.lock().unwrap();
         let mut order = self.reader_order.lock().unwrap();
         if !readers.contains_key(session) {
@@ -373,9 +374,9 @@ impl SessionStore {
     /// The session's complete history: ancestor prefixes up to each fork
     /// point, then its own events. Header envelopes of ancestors are
     /// dropped; the queried session's own header leads.
-    pub fn history(&self, session: &SessionId) -> Result<Vec<Envelope>, BranchError> {
+    pub fn history(&self, session: &SessionId) -> Result<Vec<Arc<Envelope>>, BranchError> {
         let chain = self.ancestry(session)?;
-        let mut out: Vec<Envelope> = Vec::new();
+        let mut out: Vec<Arc<Envelope>> = Vec::new();
         for (i, hop) in chain.iter().enumerate() {
             let events = self.read_session(&hop.session)?;
             // This hop's prefix is bounded by where the next hop forked
@@ -722,7 +723,7 @@ impl SessionStore {
                 }
                 documents.push(SearchDocument {
                     session_id: session_id.clone(),
-                    event_ref: envelope.id,
+                    event_ref: envelope.id.clone(),
                     text,
                 });
             }
@@ -743,7 +744,7 @@ impl SessionStore {
         &self,
         session: &SessionId,
         after: &str,
-    ) -> Result<Option<Vec<Envelope>>, BranchError> {
+    ) -> Result<Option<Vec<Arc<Envelope>>>, BranchError> {
         let mut readers = self.readers.lock().unwrap();
         let mut order = self.reader_order.lock().unwrap();
         if !readers.contains_key(session) {
@@ -1111,7 +1112,7 @@ mod tests {
         let second = root.append(&msg("second")).unwrap();
         assert_eq!(
             store.history_after(&sid, &first.id).unwrap(),
-            Some(vec![second.clone()])
+            Some(vec![Arc::new(second.clone())])
         );
         let mut child = store.fork(&sid, Some(first.id.clone())).unwrap();
         let child_id = child.session().clone();
@@ -1156,7 +1157,7 @@ mod tests {
                 .history(sid)
                 .unwrap()
                 .iter()
-                .filter_map(text_of)
+                .filter_map(|e| text_of(e))
                 .map(String::from)
                 .collect()
         };

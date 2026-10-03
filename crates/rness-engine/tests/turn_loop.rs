@@ -2004,7 +2004,7 @@ mod loop_hooks_tests {
         assert!(texts[0].contains("tagged"), "tagged hook text reaches the model: {}", texts[0]);
         drop(texts);
         // Tags persist on the durable source; untagged stays None.
-        let tags: Vec<_> = store.history(log.session()).unwrap().into_iter().filter_map(|e| match e.event {
+        let tags: Vec<_> = store.history(log.session()).unwrap().into_iter().filter_map(|e| match std::sync::Arc::unwrap_or_clone(e).event {
             SessionEvent::UserMessage(UserMessage {
                 source: Some(rness_protocol::events::MessageSource::Hook { tag, .. }), ..
             }) => Some(tag),

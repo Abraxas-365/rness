@@ -2982,7 +2982,7 @@ mod tests {
         };
         let mut model = Model::new(session.clone(), "m".into());
         let start = Instant::now();
-        model.load_history(&rness_protocol::api::History { session, envelopes });
+        model.load_history(&rness_protocol::api::History::new(session, envelopes));
         eprintln!(
             "project: {} entries in {:.1}ms",
             model.entries.len(),

@@ -220,7 +220,7 @@ fn tool_results(h: &Harness, child: &SessionId) -> Vec<ToolResult> {
         .history(child)
         .unwrap()
         .into_iter()
-        .filter_map(|e| match e.event {
+        .filter_map(|e| match std::sync::Arc::unwrap_or_clone(e).event {
             SessionEvent::ToolResult(r) => Some(r),
             _ => None,
         })

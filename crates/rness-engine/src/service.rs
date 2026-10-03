@@ -2654,7 +2654,7 @@ async fn burst(
         if !taken_now.is_empty() {
             let durable = store
                 .read_session(&session)
-                .map(|events| human_prompts(events.iter()))
+                .map(|events| human_prompts(events.iter().map(|e| &**e)))
                 .unwrap_or(0);
             let mut missing = durable.saturating_sub(prompt_count.load(std::sync::atomic::Ordering::SeqCst));
             for pending in taken_now {

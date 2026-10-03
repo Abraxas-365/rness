@@ -1955,7 +1955,7 @@ impl rness_tui::app::Backend for LocalBackend {
         &self,
         session: &SessionId,
         after: &str,
-    ) -> Option<Vec<rness_protocol::events::Envelope>> {
+    ) -> Option<Vec<std::sync::Arc<rness_protocol::events::Envelope>>> {
         self.sessions
             .store()
             .history_after(session, after)

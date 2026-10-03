@@ -22,10 +22,10 @@ pub enum InvariantViolation {
 /// request (the request builder refuses to send on violation).
 pub fn assert_model_visible_logged(
     ctx: &ModelContext,
-    history: &[Envelope],
+    history: &[impl std::borrow::Borrow<Envelope>],
 ) -> Result<(), InvariantViolation> {
     for source in &ctx.sources {
-        match history.iter().find(|e| &e.id == source) {
+        match history.iter().map(|e| e.borrow()).find(|e| &e.id == source) {
             None => return Err(InvariantViolation::UnloggedSource(source.clone())),
             Some(env) => {
                 if matches!(env.event, SessionEvent::AssistantAttempt(_)) {

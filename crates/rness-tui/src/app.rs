@@ -55,7 +55,7 @@ pub trait Backend: Send + Sync {
         &self,
         _session: &SessionId,
         _after: &str,
-    ) -> Option<Vec<rness_protocol::events::Envelope>> {
+    ) -> Option<Vec<std::sync::Arc<rness_protocol::events::Envelope>>> {
         None
     }
     fn prepare_input(
@@ -251,7 +251,7 @@ impl Model {
         self.remember_projection(history);
     }
 
-    fn append_history(&mut self, events: &[rness_protocol::events::Envelope]) {
+    fn append_history(&mut self, events: &[std::sync::Arc<rness_protocol::events::Envelope>]) {
         let removed_local = self.entries.len() != self.projected_entries;
         self.entries.truncate(self.projected_entries);
         let mut names = std::mem::take(&mut self.projected_names);
@@ -283,7 +283,7 @@ impl Model {
 
     fn project_events(
         &mut self,
-        events: &[rness_protocol::events::Envelope],
+        events: &[std::sync::Arc<rness_protocol::events::Envelope>],
         checkpoints: &std::collections::HashMap<&str, (usize, String)>,
         names: &mut std::collections::HashMap<ToolCallId, String>,
         failed_attempts: &mut usize,
@@ -2187,7 +2187,11 @@ mod tests {
             fn history(&self, _: &SessionId) -> History {
                 self.history.clone()
             }
-            fn history_after(&self, _: &SessionId, after: &str) -> Option<Vec<Envelope>> {
+            fn history_after(
+                &self,
+                _: &SessionId,
+                after: &str,
+            ) -> Option<Vec<std::sync::Arc<Envelope>>> {
                 if !self.incremental {
                     return None;
                 }
@@ -2204,9 +2208,11 @@ mod tests {
             let mut history = prior_history("s");
             history.envelopes.truncate(4);
             for (index, env) in history.envelopes.iter_mut().enumerate() {
-                env.id = format!("event-{index}");
+                std::sync::Arc::make_mut(env).id = format!("event-{index}");
             }
-            if let SessionEvent::AssistantMessage(message) = &mut history.envelopes[2].event {
+            if let SessionEvent::AssistantMessage(message) =
+                &mut std::sync::Arc::make_mut(&mut history.envelopes[2]).event
+            {
                 if let ContentPart::ToolUse { name, .. } = &mut message.content[0] {
                     *name = "subagent".into();
                 }
@@ -2565,12 +2571,12 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    fn env(event: SessionEvent) -> Envelope {
-        Envelope {
+    fn env(event: SessionEvent) -> std::sync::Arc<Envelope> {
+        std::sync::Arc::new(Envelope {
             id: "01TEST".into(),
             at: "2026-01-01T00:00:00.000Z".into(),
             event,
-        }
+        })
     }
 
     #[test]
@@ -2725,9 +2731,9 @@ mod tests {
         });
         let mut history = prior_history("s");
         for (index, envelope) in history.envelopes.iter_mut().enumerate() {
-            envelope.id = format!("older-{index}");
+            std::sync::Arc::make_mut(envelope).id = format!("older-{index}");
         }
-        history.envelopes[4].id = "target".into();
+        std::sync::Arc::make_mut(&mut history.envelopes[4]).id = "target".into();
         model.load_history(&history);
         assert_eq!(model.assistant_ids[&3], committed);
         assert_ne!(model.assistant_ids[&1], committed);
@@ -2740,7 +2746,7 @@ mod tests {
         let mut model = Model::new("s".into(), "fake".into());
         let mut history = prior_history("s");
         for (index, envelope) in history.envelopes.iter_mut().enumerate() {
-            envelope.id = format!("event-{index}");
+            std::sync::Arc::make_mut(envelope).id = format!("event-{index}");
         }
         model.load_history(&history);
         let retained = model.assistant_ids[&3];
@@ -2774,9 +2780,9 @@ mod tests {
         let mut model = Model::new("s1".into(), "fake".into());
         let mut history = prior_history("s1");
         for (i, event) in history.envelopes.iter_mut().enumerate() {
-            event.id = format!("event-{i}");
+            std::sync::Arc::make_mut(event).id = format!("event-{i}");
         }
-        history.envelopes.push(Envelope {
+        history.envelopes.push(std::sync::Arc::new(Envelope {
             id: "checkpoint".into(),
             at: "".into(),
             event: SessionEvent::Compaction(rness_protocol::events::Compaction {
@@ -2784,7 +2790,7 @@ mod tests {
                 summary: "# Continuation\n\nKeep this decision.".into(),
                 model: "fake".into(),
             }),
-        });
+        }));
         model.load_history(&history);
         let checkpoint_index = model
             .entry_ids
@@ -2816,14 +2822,14 @@ mod tests {
         let mut model = Model::new("s1".into(), "fake".into());
         let mut history = prior_history("s1");
         for (i, event) in history.envelopes.iter_mut().enumerate() {
-            event.id = format!("event-{i}");
+            std::sync::Arc::make_mut(event).id = format!("event-{i}");
         }
         model.load_history(&history);
         let visits = model.projection_visits;
         model.load_history(&history);
         assert_eq!(model.projection_visits, visits);
         let mut added = history.envelopes[1].clone();
-        added.id = "appended".into();
+        std::sync::Arc::make_mut(&mut added).id = "appended".into();
         history.envelopes.push(added);
         model.load_history(&history);
         assert_eq!(model.projection_visits, visits + 1);
@@ -2839,7 +2845,7 @@ mod tests {
                 model: "fake".into(),
             },
         ));
-        checkpoint.id = "checkpoint".into();
+        std::sync::Arc::make_mut(&mut checkpoint).id = "checkpoint".into();
         history.envelopes.push(checkpoint);
         model.load_history(&history);
         assert_eq!(
@@ -2908,10 +2914,10 @@ mod tests {
                 &self,
                 _: &SessionId,
                 _: &str,
-            ) -> Option<Vec<rness_protocol::events::Envelope>> {
+            ) -> Option<Vec<std::sync::Arc<rness_protocol::events::Envelope>>> {
                 if self.delta.fetch_add(1, Ordering::SeqCst) == 0 {
                     let mut event = prior_history("s1").envelopes[1].clone();
-                    event.id = "new-event".into();
+                    std::sync::Arc::make_mut(&mut event).id = "new-event".into();
                     Some(vec![event])
                 } else {
                     Some(vec![])

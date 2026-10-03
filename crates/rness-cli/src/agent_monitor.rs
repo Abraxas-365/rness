@@ -23,7 +23,7 @@ struct ChildRead {
 
 /// Hide inherited fork context, but retain the child's own configuration and
 /// assignment. A missing boundary fails closed rather than exposing parent text.
-fn own_history(mut events: Vec<Envelope>, fork_at: Option<&str>) -> Vec<Envelope> {
+fn own_history(mut events: Vec<Arc<Envelope>>, fork_at: Option<&str>) -> Vec<Arc<Envelope>> {
     let events = if let Some(at) = fork_at {
         let start = events
             .iter()
@@ -38,7 +38,7 @@ fn own_history(mut events: Vec<Envelope>, fork_at: Option<&str>) -> Vec<Envelope
     visible_events(events)
 }
 
-fn visible_events(events: Vec<Envelope>) -> Vec<Envelope> {
+fn visible_events(events: Vec<Arc<Envelope>>) -> Vec<Arc<Envelope>> {
     events
         .into_iter()
         .filter(|event| {
@@ -50,7 +50,7 @@ fn visible_events(events: Vec<Envelope>) -> Vec<Envelope> {
         .collect()
 }
 
-fn project(child: &mut ChildRead, events: &[Envelope], running: bool) {
+fn project(child: &mut ChildRead, events: &[Arc<Envelope>], running: bool) {
     for event in events {
         match &event.event {
             SessionEvent::RequestConfig(config) => {
@@ -132,7 +132,7 @@ async fn render_results(
     lua: &impl ToolCards,
     state: &AgentMonitorState,
     child: &ChildRead,
-    events: &[Envelope],
+    events: &[Arc<Envelope>],
 ) {
     let cache = state.cards(&child.info.session);
     let generation = cache.generation();
@@ -410,12 +410,12 @@ mod tests {
         }
     }
 
-    fn event(ms: u64, event: SessionEvent) -> Envelope {
-        Envelope {
+    fn event(ms: u64, event: SessionEvent) -> Arc<Envelope> {
+        Arc::new(Envelope {
             id: ulid::Ulid::from_parts(ms, 0).to_string(),
             at: String::new(),
             event,
-        }
+        })
     }
 
     #[test]
@@ -523,7 +523,7 @@ mod tests {
         }
     }
 
-    fn result() -> Envelope {
+    fn result() -> Arc<Envelope> {
         event(
             1000,
             SessionEvent::ToolResult(
@@ -584,10 +584,12 @@ mod tests {
 
     #[test]
     fn fork_context_is_excluded_and_missing_boundary_fails_closed() {
-        let event = |id: &str| Envelope {
-            id: id.into(),
-            at: String::new(),
-            event: SessionEvent::TurnStarted { turn: 1 },
+        let event = |id: &str| {
+            Arc::new(Envelope {
+                id: id.into(),
+                at: String::new(),
+                event: SessionEvent::TurnStarted { turn: 1 },
+            })
         };
         let events = vec![event("inherited"), event("boundary"), event("child")];
         assert_eq!(

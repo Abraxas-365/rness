@@ -2346,7 +2346,7 @@ fn titles(svc: &SessionService, sid: &SessionId) -> Vec<(String, TitleSource)> {
         .read_session(sid)
         .unwrap()
         .into_iter()
-        .filter_map(|e| match e.event {
+        .filter_map(|e| match std::sync::Arc::unwrap_or_clone(e).event {
             SessionEvent::Title(t) => Some((t.title, t.source)),
             _ => None,
         })

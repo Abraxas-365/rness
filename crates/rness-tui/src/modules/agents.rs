@@ -272,7 +272,12 @@ impl AgentMonitorState {
     /// Append only if the caller's cursor still matches. False requests a full
     /// snapshot (including after retention eviction). Compaction is reprojected
     /// by Model::load_history, preserving normal Chat identity/cache semantics.
-    pub fn publish_history_after(&self, session: &str, after: &str, events: Vec<Envelope>) -> bool {
+    pub fn publish_history_after(
+        &self,
+        session: &str,
+        after: &str,
+        events: Vec<Arc<Envelope>>,
+    ) -> bool {
         let mut state = self.0.lock().expect("agent monitor lock");
         let Some(target) = state.sessions.get_mut(session) else {
             return false;
@@ -287,7 +292,7 @@ impl AgentMonitorState {
 
     /// Append an already serialized host delta. Prefer publish_history_after
     /// when multiple refreshes can run concurrently.
-    pub fn append_history(&self, session: &str, events: Vec<Envelope>) {
+    pub fn append_history(&self, session: &str, events: Vec<Arc<Envelope>>) {
         let mut state = self.0.lock().expect("agent monitor lock");
         let target = state.session(session);
         let known: std::collections::HashSet<_> = target
@@ -1139,8 +1144,8 @@ mod tests {
             call: Some("call".into()),
         }
     }
-    fn event(id: &str, text: &str) -> Envelope {
-        Envelope {
+    fn event(id: &str, text: &str) -> Arc<Envelope> {
+        Arc::new(Envelope {
             id: id.into(),
             at: String::new(),
             event: SessionEvent::AssistantMessage(AssistantMessage {
@@ -1151,7 +1156,7 @@ mod tests {
                 estimated_input: 0,
                 chunks: vec![],
             }),
-        }
+        })
     }
     fn open(drawer: &mut Agents, ctx: &Ctx<'_>, agent: Option<&str>) {
         drawer.on_action(

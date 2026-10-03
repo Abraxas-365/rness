@@ -211,7 +211,7 @@ fn workflow_result(h: &Harness, session: &SessionId) -> ToolResult {
         .history(session)
         .unwrap()
         .into_iter()
-        .find_map(|e| match e.event {
+        .find_map(|e| match std::sync::Arc::unwrap_or_clone(e).event {
             SessionEvent::ToolResult(r) if r.name == "workflow" => Some(r),
             _ => None,
         })

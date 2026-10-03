@@ -301,11 +301,11 @@ impl SubagentActivity {
         let history = sessions.store().history(&parent.to_owned())?;
         let mut calls = HashMap::new();
         for event in history {
-            if let SessionEvent::AssistantMessage(message) = event.event {
-                for part in message.content {
+            if let SessionEvent::AssistantMessage(message) = &event.event {
+                for part in &message.content {
                     if let ContentPart::ToolUse { call, name, args } = part {
                         if name == "subagent" {
-                            calls.insert(call, args);
+                            calls.insert(call.clone(), args.clone());
                         }
                     }
                 }
@@ -424,8 +424,8 @@ impl SubagentActivity {
             let event_ms = event.at.parse::<jiff::Timestamp>().ok()
                 .and_then(|at| u64::try_from(at.as_millisecond()).ok())
                 .or_else(|| event.id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms()));
-            run.after = Some(event.id);
-            run.apply_event(event.event, event_ms);
+            run.after = Some(event.id.clone());
+            run.apply_event(event.event.clone(), event_ms);
         }
     }
 

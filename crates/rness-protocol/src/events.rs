@@ -186,10 +186,10 @@ pub struct PlanState {
     pub pending: Option<bool>,
 }
 impl PlanState {
-    pub fn from_history(history: &[Envelope]) -> Self {
+    pub fn from_history(history: &[impl std::borrow::Borrow<Envelope>]) -> Self {
         let mut state = Self::default();
         for env in history {
-            match &env.event {
+            match &env.borrow().event {
                 SessionEvent::PlanMode { active } => {
                     state.active = *active;
                     state.pending = None;
@@ -231,11 +231,11 @@ pub struct TaskSnapshot {
 
 impl TaskSnapshot {
     /// Latest successful snapshot in full fork-resolved history, including compacted events.
-    pub fn from_history(history: &[Envelope]) -> Self {
+    pub fn from_history(history: &[impl std::borrow::Borrow<Envelope>]) -> Self {
         history
             .iter()
             .rev()
-            .find_map(|env| match &env.event {
+            .find_map(|env| match &env.borrow().event {
                 SessionEvent::ToolResult(result)
                 | SessionEvent::ProgramToolResult { result, .. }
                     if !result.is_error =>
