@@ -34,7 +34,7 @@ for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6
     },
   }
 end
-for _, model in ipairs({ "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "claude-opus-4-8","claude-opus-5-5"}) do
+for _, model in ipairs({ "claude-fable-5-1", "claude-opus-5-5","claude-sonnet-5-5"}) do
   rness.models.declare {
     provider = "anthropic", model = model,
     capabilities = {
@@ -44,16 +44,6 @@ for _, model in ipairs({ "claude-opus-5", "claude-fable-5", "claude-sonnet-5", "
     },
   }
 end
-rness.models.declare {
-  provider = "anthropic", model = "claude-opus-4-6",
-  capabilities = {
-    context_window = 1000000, max_output_tokens = 128000, image_input = true,
-    output_token_limit = true,
-    -- Temperature depends on thinking mode; leave it hidden in the editor.
-    reasoning = { efforts = { "low", "medium", "high", "max" },
-      budget_tokens = { min = 1024, max = 127999 } },
-  },
-}
 rness.models.declare {
   provider = "anthropic", model = "claude-haiku-4-5-20251001",
   capabilities = {
