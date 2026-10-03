@@ -344,12 +344,125 @@ pub struct Prune {
 /// A committed compaction checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Compaction {
-    /// Ids of every envelope in the shadowed span, in log order.
+    /// Ids of the envelopes this checkpoint directly folds, in log order:
+    /// the model-visible events of the span plus any earlier checkpoint or
+    /// prune whose replacement was visible there. What those earlier
+    /// checkpoints folded in turn is NOT repeated here — readers expand it
+    /// with [`shadowed_by_checkpoints`]. Older logs wrote the expanded
+    /// list; the expansion is idempotent, so both shapes read alike.
     pub replaces: Vec<EventId>,
     /// Replayed to the model in place of the shadowed events.
     pub summary: String,
     /// Model that produced the summary.
     pub model: String,
+}
+
+/// One live checkpoint's full shadow, expanded through the checkpoints and
+/// prunes it folded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointShadow {
+    /// The `compaction/summary` event.
+    pub checkpoint: EventId,
+    /// The checkpoint's summary text.
+    pub summary: String,
+    /// Every event the checkpoint stands in for, in log order.
+    pub shadowed: Vec<EventId>,
+}
+
+/// The shadow of every LIVE checkpoint in `history` (header first, log
+/// order), newest checkpoint first — the one place `replaces` is expanded.
+///
+/// A checkpoint is live unless a later one folded it. Each live
+/// checkpoint's shadow is its `replaces` plus, transitively, the shadow of
+/// every checkpoint it lists and the original of every prune it lists.
+/// The shadows of live checkpoints are disjoint. Expansion is idempotent:
+/// a checkpoint whose `replaces` was already expanded at write time
+/// (older logs) yields the same shadow.
+pub fn shadowed_by_checkpoints(
+    history: &[impl std::borrow::Borrow<Envelope>],
+) -> Vec<CheckpointShadow> {
+    use std::collections::HashMap;
+    // Work in log positions: one hash lookup per listed id, then plain
+    // indexing (ULID strings are slow to hash and sessions hold 10^4-10^5
+    // events).
+    let mut position: HashMap<&str, usize> = HashMap::with_capacity(history.len());
+    for (index, env) in history.iter().enumerate() {
+        position.insert(env.borrow().id.as_str(), index);
+    }
+    // Per event: what it folds (checkpoint -> its replaces, prune -> its
+    // original), as positions. Ids not in this history are kept as strings.
+    let mut folds: Vec<Option<Vec<usize>>> = vec![None; history.len()];
+    let mut foreign: Vec<Vec<&str>> = vec![Vec::new(); history.len()];
+    for (index, env) in history.iter().enumerate() {
+        let env = env.borrow();
+        let listed: Vec<&str> = match &env.event {
+            SessionEvent::Compaction(c) => c.replaces.iter().map(String::as_str).collect(),
+            SessionEvent::Prune(p) => vec![p.replaces.as_str()],
+            _ => continue,
+        };
+        let mut positions = Vec::with_capacity(listed.len());
+        for id in listed {
+            match position.get(id) {
+                Some(&p) => positions.push(p),
+                None => foreign[index].push(id),
+            }
+        }
+        folds[index] = Some(positions);
+    }
+    let mut claimed = vec![false; history.len()];
+    let mut shadow = vec![false; history.len()];
+    let mut out = Vec::new();
+    // Later checkpoints win: walk newest first; a checkpoint already
+    // claimed by a newer one is inert.
+    for (index, env) in history.iter().enumerate().rev() {
+        let env = env.borrow();
+        let SessionEvent::Compaction(c) = &env.event else {
+            continue;
+        };
+        if claimed[index] {
+            continue;
+        }
+        let mut members: Vec<usize> = Vec::new();
+        let mut stack: Vec<usize> = Vec::new();
+        let mut unknown: Vec<&str> = foreign[index].clone();
+        // Mark before pushing: older logs' expanded lists repeat every id
+        // many times over, and the stack must not grow with those repeats.
+        for &p in folds[index].as_deref().unwrap_or_default() {
+            if !shadow[p] {
+                shadow[p] = true;
+                members.push(p);
+                stack.push(p);
+            }
+        }
+        while let Some(p) = stack.pop() {
+            unknown.extend(foreign[p].iter().copied());
+            for &inner in folds[p].as_deref().unwrap_or_default() {
+                if !shadow[inner] {
+                    shadow[inner] = true;
+                    members.push(inner);
+                    stack.push(inner);
+                }
+            }
+        }
+        for &p in &members {
+            claimed[p] = true;
+            shadow[p] = false;
+        }
+        members.sort_unstable();
+        let mut shadowed: Vec<EventId> = members
+            .into_iter()
+            .map(|p| history[p].borrow().id.clone())
+            .collect();
+        unknown.sort_unstable();
+        unknown.dedup();
+        shadowed.extend(unknown.into_iter().map(String::from));
+        out.push(CheckpointShadow {
+            checkpoint: env.id.clone(),
+            summary: c.summary.clone(),
+            shadowed,
+        });
+    }
+    out
 }
 
 /// First line of every session log.
@@ -659,4 +772,151 @@ pub struct HookResult {
     pub stderr_summary: Option<String>,
     /// Wall-clock milliseconds.
     pub duration_ms: u64,
+}
+
+#[cfg(test)]
+mod checkpoint_shadow_tests {
+    use super::*;
+
+    fn env(id: &str, event: SessionEvent) -> Envelope {
+        Envelope {
+            id: id.into(),
+            at: "2026-01-01T00:00:00.000Z".into(),
+            event,
+        }
+    }
+    fn user(id: &str) -> Envelope {
+        env(
+            id,
+            SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text { text: id.into() }],
+                source: None,
+            }),
+        )
+    }
+    fn tool(id: &str) -> Envelope {
+        env(
+            id,
+            SessionEvent::ToolResult(ToolResult {
+                call: "c".into(),
+                name: "t".into(),
+                content: vec![],
+                output: "long".into(),
+                is_error: false,
+                duration_ms: 0,
+                tasks: None,
+                plan_review: None,
+                presentation: None,
+            }),
+        )
+    }
+    fn prune(id: &str, target: &str) -> Envelope {
+        let SessionEvent::ToolResult(mut result) = tool(target).event else {
+            unreachable!()
+        };
+        result.output = "short".into();
+        env(
+            id,
+            SessionEvent::Prune(Prune {
+                replaces: target.into(),
+                result,
+            }),
+        )
+    }
+    fn checkpoint(id: &str, replaces: &[&str]) -> Envelope {
+        env(
+            id,
+            SessionEvent::Compaction(Compaction {
+                replaces: replaces.iter().map(|s| s.to_string()).collect(),
+                summary: format!("summary {id}"),
+                model: "m".into(),
+            }),
+        )
+    }
+    fn ids(shadow: &CheckpointShadow) -> Vec<&str> {
+        shadow.shadowed.iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn direct_sources_expand_through_folded_checkpoints_and_prunes() {
+        // a b [S1 = a b] c t [P = t] d [S2 = S1 c P d]  e
+        let history = vec![
+            user("a"),
+            user("b"),
+            checkpoint("S1", &["a", "b"]),
+            user("c"),
+            tool("t"),
+            prune("P", "t"),
+            user("d"),
+            checkpoint("S2", &["S1", "c", "P", "d"]),
+            user("e"),
+        ];
+        let shadows = shadowed_by_checkpoints(&history);
+        assert_eq!(shadows.len(), 1, "S1 is folded by S2, so only S2 is live");
+        assert_eq!(shadows[0].checkpoint, "S2");
+        assert_eq!(shadows[0].summary, "summary S2");
+        // Expanded, in log order; the anchor (first) is the oldest event.
+        assert_eq!(ids(&shadows[0]), ["a", "b", "S1", "c", "t", "P", "d"]);
+    }
+
+    #[test]
+    fn expanded_lists_from_older_logs_read_identically() {
+        let direct = vec![
+            user("a"),
+            user("b"),
+            checkpoint("S1", &["a", "b"]),
+            user("c"),
+            checkpoint("S2", &["S1", "c"]),
+        ];
+        let mut expanded = direct.clone();
+        expanded[4] = checkpoint("S2", &["a", "b", "S1", "c"]);
+        let mut mixed = direct.clone();
+        mixed.push(user("d"));
+        // Old writer after new ones: lists everything again.
+        mixed.push(checkpoint("S3", &["a", "b", "S1", "c", "S2", "d"]));
+        let mut mixed_new = mixed.clone();
+        mixed_new[6] = checkpoint("S3", &["S2", "d"]);
+
+        assert_eq!(
+            shadowed_by_checkpoints(&direct),
+            shadowed_by_checkpoints(&expanded)
+        );
+        assert_eq!(
+            shadowed_by_checkpoints(&mixed),
+            shadowed_by_checkpoints(&mixed_new)
+        );
+        assert_eq!(
+            ids(&shadowed_by_checkpoints(&mixed_new)[0]),
+            ["a", "b", "S1", "c", "S2", "d"]
+        );
+    }
+
+    #[test]
+    fn independent_checkpoints_stay_live_and_disjoint() {
+        // A manual region fold S2 over [c d] beside an earlier S1 over [a b].
+        let history = vec![
+            user("a"),
+            user("b"),
+            checkpoint("S1", &["a", "b"]),
+            user("c"),
+            user("d"),
+            checkpoint("S2", &["c", "d"]),
+            user("e"),
+        ];
+        let shadows = shadowed_by_checkpoints(&history);
+        assert_eq!(shadows.len(), 2);
+        assert_eq!(shadows[0].checkpoint, "S2");
+        assert_eq!(ids(&shadows[0]), ["c", "d"]);
+        assert_eq!(shadows[1].checkpoint, "S1");
+        assert_eq!(ids(&shadows[1]), ["a", "b"]);
+    }
+
+    #[test]
+    fn empty_and_unknown_ids_are_harmless() {
+        let history = vec![user("a"), checkpoint("S1", &["a", "ghost"])];
+        let shadows = shadowed_by_checkpoints(&history);
+        assert_eq!(ids(&shadows[0]), ["a", "ghost"]);
+        assert!(shadowed_by_checkpoints(&[user("a")]).is_empty());
+    }
 }

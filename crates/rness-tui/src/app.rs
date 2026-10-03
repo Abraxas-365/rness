@@ -217,17 +217,16 @@ impl Model {
         // Keep all durable messages visible in the TUI. Live compaction
         // checkpoints become cards at their recorded log position, so a newly
         // completed summary is visible beside the newest conversation.
-        let mut shadowed: std::collections::HashSet<&str> = Default::default();
-        let mut checkpoints: std::collections::HashMap<&str, (usize, String)> = Default::default();
-        for env in history.envelopes.iter().rev() {
-            if let SessionEvent::Compaction(c) = &env.event {
-                if shadowed.contains(env.id.as_str()) {
-                    continue;
-                }
-                shadowed.extend(c.replaces.iter().map(|s| s.as_str()));
-                checkpoints.insert(env.id.as_str(), (c.replaces.len(), c.summary.clone()));
-            }
-        }
+        let shadows = rness_protocol::events::shadowed_by_checkpoints(&history.envelopes);
+        let checkpoints: std::collections::HashMap<&str, (usize, String)> = shadows
+            .iter()
+            .map(|shadow| {
+                (
+                    shadow.checkpoint.as_str(),
+                    (shadow.shadowed.len(), shadow.summary.clone()),
+                )
+            })
+            .collect();
         // Tool names live on the assistant ToolUse parts; map call → name.
         let mut names: std::collections::HashMap<ToolCallId, String> = Default::default();
         let mut failed_attempts = 0;

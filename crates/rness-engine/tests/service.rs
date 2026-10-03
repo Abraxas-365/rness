@@ -1294,6 +1294,24 @@ async fn recompaction_folds_the_previous_checkpoint() {
 
     // S1's checkpoint is inside the new span (re-shadowed).
     assert!(report.shadowed >= 3, "shadowed {}", report.shadowed);
+    // Written as direct sources only: S1 cited by id, its own span NOT
+    // repeated. The reported count is the expanded shadow.
+    let history = svc.store().history(&sid).unwrap();
+    let checkpoints: Vec<(&str, &Compaction)> = history
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::Compaction(c) => Some((e.id.as_str(), c)),
+            _ => None,
+        })
+        .collect();
+    let ((s1_id, s1), (_, s2)) = (checkpoints[0], checkpoints[1]);
+    assert!(s2.replaces.iter().any(|id| id == s1_id), "S2 must cite S1");
+    assert!(
+        s1.replaces.iter().all(|id| !s2.replaces.contains(id)),
+        "S2 repeats S1's span: {:?}",
+        s2.replaces
+    );
+    assert_eq!(report.shadowed, s1.replaces.len() + s2.replaces.len());
     let replayed = svc.replay(&sid).unwrap();
     // S2 + m3(the last turn kept) + its answer
     assert_eq!(replayed.context.turns.len(), 3);

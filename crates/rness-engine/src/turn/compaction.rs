@@ -487,27 +487,11 @@ pub async fn reduce_region_with_progress(
             .map(source_count)
             .sum();
         let n: usize = replayed.context.turns[..cut].iter().map(source_count).sum();
-        let mut selected: std::collections::HashSet<_> =
+        // Direct sources only: what the model saw in the span (earlier
+        // checkpoints and prunes are cited by their own id). Readers expand
+        // what those folded in turn via `shadowed_by_checkpoints`.
+        let selected: std::collections::HashSet<_> =
             replayed.context.sources[first..n].iter().cloned().collect();
-        // Checkpoints and prunes may themselves be folded. Claim their ancestors
-        // so older full-fidelity content cannot reappear on subsequent replay.
-        loop {
-            let before = selected.len();
-            for e in &replayed.history {
-                if selected.contains(&e.id) {
-                    match &e.event {
-                        SessionEvent::Compaction(c) => selected.extend(c.replaces.iter().cloned()),
-                        SessionEvent::Prune(p) => {
-                            selected.insert(p.replaces.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if before == selected.len() {
-                break;
-            }
-        }
         let replaces: Vec<_> = replayed
             .history
             .iter()

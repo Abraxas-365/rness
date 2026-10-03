@@ -2001,23 +2001,13 @@ impl SessionService {
             .iter()
             .map(|s| s.as_str())
             .collect();
-        // Transitive closure: folding a checkpoint also re-claims the
-        // span it shadowed — otherwise those events would resurface once
-        // their shadower is itself shadowed.
+        // Direct sources only: what the model saw in the span (earlier
+        // checkpoints and prunes are cited by their own id). Readers expand
+        // what those folded in turn via `shadowed_by_checkpoints`.
         let replaces: Vec<String> = history[..cut]
             .iter()
             .filter(|e| cited.contains(e.id.as_str()))
-            .flat_map(|e| {
-                let mut ids = vec![e.id.clone()];
-                match &e.event {
-                    SessionEvent::Compaction(c) => ids.extend(c.replaces.iter().cloned()),
-                    // Folding a prune re-claims its original too —
-                    // otherwise the full-length result resurfaces.
-                    SessionEvent::Prune(pr) => ids.push(pr.replaces.clone()),
-                    _ => {}
-                }
-                ids
-            })
+            .map(|e| e.id.clone())
             .collect();
         if replaces.is_empty() {
             return Err(ServiceError::NothingToCompact);
@@ -2043,15 +2033,21 @@ impl SessionService {
         });
         let summary = summary?;
 
-        let shadowed = replaces.len();
         let mut log = self.store.open(session)?;
-        log.append(&SessionEvent::Compaction(Compaction {
+        let checkpoint = log.append(&SessionEvent::Compaction(Compaction {
             replaces,
             summary: summary.clone(),
             model: provider.summary_model().to_string(),
         }))?;
         self.drain_queued_titles(&mut log, session);
         drop(log);
+        // Report the full shadow (what earlier checkpoints folded included),
+        // the same count the transcript card shows.
+        let shadowed =
+            rness_protocol::events::shadowed_by_checkpoints(&self.store.history(session)?)
+                .into_iter()
+                .find(|shadow| shadow.checkpoint == checkpoint.id)
+                .map_or(0, |shadow| shadow.shadowed.len());
 
         self.bus.emit::<FrameEv>(&Frame::HistoryChanged {
             session: session.clone(),

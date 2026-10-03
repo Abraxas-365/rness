@@ -96,30 +96,25 @@ fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Compactio
     let mut shadowed: HashSet<EventId> = HashSet::new();
     let mut anchors = std::collections::HashMap::new();
     let mut pruned = std::collections::HashMap::new();
-    // Later checkpoints win: walk in reverse, skip checkpoints (and
-    // prunes) already shadowed by a newer one.
+    // Live checkpoints, each expanded through what it folded (the one
+    // shared expansion of `replaces`).
+    for shadow in rness_protocol::events::shadowed_by_checkpoints(history) {
+        if let Some(first) = shadow.shadowed.first() {
+            anchors.insert(
+                first.clone(),
+                (shadow.checkpoint, shadow.summary, shadow.shadowed.len()),
+            );
+        }
+        shadowed.extend(shadow.shadowed);
+    }
+    // Later prunes win; a prune folded into a summary is inert.
     for env in history.iter().rev() {
         let env: &Envelope = env.borrow();
-        match &env.event {
-            SessionEvent::Compaction(c) => {
-                if shadowed.contains(&env.id) {
-                    continue;
-                }
-                shadowed.extend(c.replaces.iter().cloned());
-                if let Some(first) = c.replaces.first() {
-                    anchors.insert(
-                        first.clone(),
-                        (env.id.clone(), c.summary.clone(), c.replaces.len()),
-                    );
-                }
+        if let SessionEvent::Prune(pr) = &env.event {
+            if shadowed.contains(&env.id) || pruned.contains_key(&pr.replaces) {
+                continue;
             }
-            SessionEvent::Prune(pr) => {
-                if shadowed.contains(&env.id) || pruned.contains_key(&pr.replaces) {
-                    continue; // folded into a summary, or a later prune won
-                }
-                pruned.insert(pr.replaces.clone(), (env.id.clone(), pr.result.clone()));
-            }
-            _ => {}
+            pruned.insert(pr.replaces.clone(), (env.id.clone(), pr.result.clone()));
         }
     }
     CompactionPlan {
