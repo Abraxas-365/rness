@@ -175,10 +175,11 @@ pub fn read_session(root: &Path, session: &SessionId) -> Result<Vec<Envelope>, L
     read_envelopes(&path)
 }
 
-/// Drop payloads that nothing reads once committed: compaction audit bodies
-/// (`compaction/started.request`, `compaction/request.body`) and timed stream
-/// recordings (`chunks`). They stay on disk, untouched; `SessionLog::read_all`
-/// and `session_event_read` (which read the file directly) still return them.
+/// Drop payloads that nothing reads once committed: legacy compaction audit
+/// bodies (`compaction/started.request`, `compaction/request.body` — no longer
+/// written, but present in older logs) and timed stream recordings
+/// (`chunks`). They stay on disk, untouched; `SessionLog::read_all` and
+/// `session_event_read` (which read the file directly) still return them.
 /// On a 58k-event session this halves the parsed log (~1.08 GB -> ~0.5 GB).
 pub fn elide_payloads(event: &mut SessionEvent) {
     match event {
@@ -444,6 +445,31 @@ mod tests {
         assert!(full.iter().any(|e| matches!(&e.event,
             SessionEvent::CompactionFinished { chunks, .. } if chunks.len() == 1)));
         assert_eq!(fs::read(log.path()).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn compaction_started_omits_request_and_legacy_lines_still_parse() {
+        let event = SessionEvent::CompactionStarted {
+            model: "m".into(),
+            sources: vec!["a".into()],
+            estimated_input: 7,
+            request: serde_json::Value::Null,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("request"), "{json}");
+        assert_eq!(serde_json::from_str::<SessionEvent>(&json).unwrap(), event);
+        // Older logs: a full request, and the separate raw-body event.
+        let legacy: SessionEvent = serde_json::from_str(
+            r#"{"type":"compaction/started","model":"m","sources":[],"estimated_input":1,"request":{"system":"s"}}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(legacy, SessionEvent::CompactionStarted { request, .. } if request["system"] == "s")
+        );
+        let legacy: SessionEvent =
+            serde_json::from_str(r#"{"type":"compaction/request","started":"x","body":"{}"}"#)
+                .unwrap();
+        assert!(matches!(legacy, SessionEvent::CompactionRequest { .. }));
     }
 
     #[test]

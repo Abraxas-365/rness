@@ -113,8 +113,15 @@ pub enum SessionEvent {
         model: String,
         sources: Vec<EventId>,
         estimated_input: u64,
+        /// Legacy: older logs stored the full summarizer input here. It is
+        /// reconstructable from the log (`sources`) plus code, so new
+        /// writers leave it null and omit it (dsh stores no request either).
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
         request: serde_json::Value,
     },
+    /// Legacy, read-only: the raw HTTP body of a summarizer request. No
+    /// longer written (it duplicated `compaction/started.request`); kept so
+    /// older logs still parse.
     #[serde(rename = "compaction/request")]
     CompactionRequest { started: EventId, body: String },
     #[serde(rename = "compaction/finished")]

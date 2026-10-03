@@ -954,12 +954,6 @@ impl Provider for AnthropicProvider {
                     partial: vec![],
                 };
             }
-            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-                return StepOutcome::Failed {
-                    error,
-                    partial: vec![],
-                };
-            }
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },

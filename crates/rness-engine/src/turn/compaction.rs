@@ -531,29 +531,13 @@ pub async fn reduce_region_with_progress(
             model: provider.summary_model().into(),
             sources: replayed.context.sources[first..n].to_vec(),
             estimated_input: measure(&context, request.system, &[]),
-            request: serde_json::json!({"system": request.system, "turns": context.turns,
-                "config": context.config, "tools": []}),
+            // Not stored: the input is reconstructable from `sources` + code.
+            request: serde_json::Value::Null,
         })?;
-        let (sender, mut captures) =
-            tokio::sync::mpsc::channel::<crate::turn::provider::WireCapture>(1);
-        let call = crate::turn::provider::WIRE_CAPTURE
-            .scope(sender, provider.summarize_step(request, cancel));
-        tokio::pin!(call);
-        let outcome = loop {
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break StepOutcome::Cancelled { partial: vec![] },
-                Some(capture) = captures.recv() => {
-                    match log.append(&SessionEvent::CompactionRequest { started: started.id.clone(), body: capture.body }) {
-                        Ok(_) => { let _ = capture.ack.send(Ok(())); }
-                        Err(error) => {
-                            let _ = capture.ack.send(Err(error.to_string()));
-                            return Err(error.into());
-                        }
-                    }
-                }
-                result = &mut call => break result,
-            }
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => StepOutcome::Cancelled { partial: vec![] },
+            result = provider.summarize_step(request, cancel) => result,
         };
         let (usage, chunks) = match &outcome {
             StepOutcome::Committed(m) => (m.usage, m.chunks.clone()),

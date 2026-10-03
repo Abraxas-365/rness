@@ -640,12 +640,6 @@ impl Provider for OpenAiProvider {
                     partial: vec![],
                 };
             }
-            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-                return StepOutcome::Failed {
-                    error,
-                    partial: vec![],
-                };
-            }
             let mut http_request = self
                 .client
                 .post(format!("{}/chat/completions", self.base_url))

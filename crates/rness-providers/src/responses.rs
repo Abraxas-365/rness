@@ -514,12 +514,6 @@ impl Provider for ResponsesProvider {
 
         let mut refreshed = false;
         let response = loop {
-            if let Err(error) = rness_engine::turn::provider::capture_wire(&body).await {
-                return StepOutcome::Failed {
-                    error,
-                    partial: vec![],
-                };
-            }
             let sent = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },

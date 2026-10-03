@@ -40,38 +40,6 @@ pub struct StepRequest<'a> {
     pub on_delta: Option<DeltaSink<'a>>,
 }
 
-/// A prepared JSON body awaits durable acknowledgement before transmission.
-pub struct WireCapture {
-    pub body: String,
-    pub ack: tokio::sync::oneshot::Sender<Result<(), String>>,
-}
-tokio::task_local! {
-    pub static WIRE_CAPTURE: tokio::sync::mpsc::Sender<WireCapture>;
-}
-
-/// Called by adapters for each actual model request, including transport retries.
-/// Auth headers, URLs, and credential exchange requests are never captured.
-pub async fn capture_wire(body: &serde_json::Value) -> Result<(), ProviderError> {
-    let Ok(sender) = WIRE_CAPTURE.try_with(Clone::clone) else {
-        return Ok(());
-    };
-    let (ack, done) = tokio::sync::oneshot::channel();
-    let failure = |message: String| ProviderError {
-        code: "AUDIT",
-        retry_after: None,
-        message,
-        retryable: false,
-    };
-    let body = serde_json::to_string(body).map_err(|e| failure(e.to_string()))?;
-    sender
-        .send(WireCapture { body, ack })
-        .await
-        .map_err(|_| failure("request audit receiver closed".into()))?;
-    done.await
-        .map_err(|_| failure("request audit acknowledgement lost".into()))?
-        .map_err(failure)
-}
-
 /// Result of one model request.
 pub enum StepOutcome {
     /// Stream completed; the message embeds its exact chunk record.

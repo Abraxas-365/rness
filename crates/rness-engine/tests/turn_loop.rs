@@ -452,6 +452,14 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
             .iter()
             .find(|e| matches!(e.event, SessionEvent::CompactionStarted { .. }))
             .unwrap();
+        // The summarizer input is not stored (reconstructable from sources).
+        assert!(matches!(&started.event, SessionEvent::CompactionStarted { request, sources, estimated_input, .. }
+            if request.is_null() && !sources.is_empty() && *estimated_input > 0));
+        assert!(!history
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::CompactionRequest { .. })));
+        let raw = std::fs::read_to_string(dir.path().join(log.session()).join("session.v1.jsonl")).unwrap();
+        assert!(!raw.contains("\"request\"") && !raw.contains("compaction/request"));
         assert!(history.iter().any(|e| matches!(&e.event, SessionEvent::CompactionFinished { started: id, outcome, usage, chunks }
             if id == &started.id && outcome == "committed" && usage.input_tokens == 1 && !chunks.is_empty())));
         let context = replay(&store, log.session()).unwrap().context;
