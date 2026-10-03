@@ -151,7 +151,7 @@ async fn create_session(State(s): State<ServerState>, body: Option<Json<CreateBo
 }
 
 async fn history(State(s): State<ServerState>, Path(id): Path<String>) -> Response {
-    match s.sessions.store().history(&id) {
+    match s.sessions.store().history_full(&id) {
         Ok(envelopes) => Json(History {
             session: id,
             envelopes,

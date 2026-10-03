@@ -439,7 +439,8 @@ async fn pre_step_compaction_and_overflow_retry_rederive_from_log() {
             );
             assert!(estimates.last().unwrap() < &config.compaction[policy_key].threshold_tokens);
         }
-        let history = store.history(log.session()).unwrap();
+        // Audit payloads stay on disk; the cached history elides them.
+        let history = log.read_all().unwrap();
         assert_eq!(
             history
                 .iter()
@@ -1888,8 +1889,9 @@ async fn cancellation_mid_stream_preserves_partial() {
     drop(log);
 
     let replayed = replay(&store, &sid).unwrap();
-    let attempt = replayed
-        .history
+    // Stream recordings stay on disk; the cached history elides them.
+    let on_disk = rness_engine::session::log::read_session(store.root(), &sid).unwrap();
+    let attempt = on_disk
         .iter()
         .find_map(|e| match &e.event {
             SessionEvent::AssistantAttempt(a) => Some(a),
@@ -1898,6 +1900,8 @@ async fn cancellation_mid_stream_preserves_partial() {
         .expect("cancelled attempt preserved");
     assert_eq!(attempt.outcome, AttemptOutcome::Cancelled);
     assert_eq!(attempt.chunks.len(), 1);
+    assert!(replayed.history.iter().any(|e| matches!(&e.event,
+        SessionEvent::AssistantAttempt(a) if a.chunks.is_empty())));
     // Model context untouched by the dead stream.
     assert_eq!(replayed.context.turns.len(), 1);
 }

@@ -223,7 +223,7 @@ fn prefix(context: &ModelContext, retain: u64, meter: &Meter) -> usize {
 /// Close interrupted audit spans on the existing session writer. Never repeat
 /// a paid request or discard a checkpoint that landed before the interruption.
 pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError> {
-    let history = log.read_all()?;
+    let history = log.read_all_elided()?;
     let finished: std::collections::HashSet<_> = history
         .iter()
         .filter_map(|e| match &e.event {

@@ -1793,7 +1793,7 @@ impl SessionService {
                 if !retry {
                     log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
                 }
-                let all_events = log.read_all()?;
+                let all_events = log.read_all_elided()?;
                 let turns_so_far = all_events
                     .iter()
                     .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))

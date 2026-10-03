@@ -128,6 +128,12 @@ impl SessionLog {
         read_envelopes(&self.path)
     }
 
+    /// [`Self::read_all`] with [`elide_payloads`] applied while parsing, so
+    /// a long log never holds its audit bodies in memory at once.
+    pub fn read_all_elided(&self) -> Result<Vec<Envelope>, LogError> {
+        read_envelopes_with(&self.path, true)
+    }
+
     /// Truncate an unterminated last line (crash artifact). A
     /// complete-but-invalid line is corruption and surfaces on read instead.
     fn heal_torn_tail(&mut self) -> Result<(), LogError> {
@@ -169,7 +175,27 @@ pub fn read_session(root: &Path, session: &SessionId) -> Result<Vec<Envelope>, L
     read_envelopes(&path)
 }
 
+/// Drop payloads that nothing reads once committed: compaction audit bodies
+/// (`compaction/started.request`, `compaction/request.body`) and timed stream
+/// recordings (`chunks`). They stay on disk, untouched; `SessionLog::read_all`
+/// and `session_event_read` (which read the file directly) still return them.
+/// On a 58k-event session this halves the parsed log (~1.08 GB -> ~0.5 GB).
+pub fn elide_payloads(event: &mut SessionEvent) {
+    match event {
+        SessionEvent::AssistantMessage(message) => message.chunks = Vec::new(),
+        SessionEvent::AssistantAttempt(attempt) => attempt.chunks = Vec::new(),
+        SessionEvent::CompactionFinished { chunks, .. } => *chunks = Vec::new(),
+        SessionEvent::CompactionStarted { request, .. } => *request = serde_json::Value::Null,
+        SessionEvent::CompactionRequest { body, .. } => *body = String::new(),
+        _ => {}
+    }
+}
+
 pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
+    read_envelopes_with(path, false)
+}
+
+fn read_envelopes_with(path: &Path, elide: bool) -> Result<Vec<Envelope>, LogError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();
@@ -191,10 +217,14 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
         if trimmed.is_empty() {
             continue;
         }
-        let envelope: Envelope = serde_json::from_str(trimmed).map_err(|e| LogError::Corrupt {
-            line: line_no,
-            reason: e.to_string(),
-        })?;
+        let mut envelope: Envelope =
+            serde_json::from_str(trimmed).map_err(|e| LogError::Corrupt {
+                line: line_no,
+                reason: e.to_string(),
+            })?;
+        if elide {
+            elide_payloads(&mut envelope.event);
+        }
         out.push(envelope);
     }
     // First line must be a header.
@@ -216,6 +246,7 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
 
 /// Incremental reader for an immutable committed prefix. Incomplete tails are
 /// retried from their starting offset, never cached as committed events.
+/// Cached events have [`elide_payloads`] applied.
 ///
 /// The file handle is cached across refreshes so that a single reader never
 /// re-opens the file. When the reader is evicted from the LRU cache in
@@ -245,10 +276,7 @@ impl SessionReader {
         }
     }
 
-    pub(super) fn read(
-        &mut self,
-        session: &SessionId,
-    ) -> Result<Vec<Arc<Envelope>>, LogError> {
+    pub(super) fn read(&mut self, session: &SessionId) -> Result<Vec<Arc<Envelope>>, LogError> {
         self.refresh(session)?;
         Ok(self.events.clone())
     }
@@ -296,11 +324,12 @@ impl SessionReader {
                 break;
             }
             if !bytes.iter().all(u8::is_ascii_whitespace) {
-                let event: Envelope =
+                let mut event: Envelope =
                     serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
                         line: self.line + 1,
                         reason: error.to_string(),
                     })?;
+                elide_payloads(&mut event.event);
                 if self.events.is_empty() && !matches!(event.event, SessionEvent::Header(_)) {
                     return Err(LogError::Corrupt {
                         line: 1,
@@ -351,6 +380,70 @@ mod tests {
             content: vec![ContentPart::Text { text: text.into() }],
             source: None,
         })
+    }
+
+    #[test]
+    fn cached_reads_elide_audit_payloads_but_disk_keeps_them() {
+        use rness_protocol::events::{ChunkDelta, Compaction, TimedChunk};
+        let root = tempfile::tempdir().unwrap();
+        let sid = "elide".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        log.append(&SessionEvent::CompactionStarted {
+            model: "m".into(),
+            sources: vec!["a".into()],
+            estimated_input: 7,
+            request: serde_json::json!({"big": "context"}),
+        })
+        .unwrap();
+        log.append(&SessionEvent::CompactionRequest {
+            started: "s".into(),
+            body: "{\"big\":\"body\"}".into(),
+        })
+        .unwrap();
+        log.append(&SessionEvent::CompactionFinished {
+            started: "s".into(),
+            outcome: "committed".into(),
+            usage: Default::default(),
+            chunks: vec![TimedChunk {
+                ms: 1,
+                delta: ChunkDelta::Text { t: "x".into() },
+            }],
+        })
+        .unwrap();
+        log.append(&SessionEvent::Compaction(Compaction {
+            replaces: vec!["a".into()],
+            summary: "kept".into(),
+            model: "m".into(),
+        }))
+        .unwrap();
+        let disk_before = fs::read(log.path()).unwrap();
+
+        let mut reader = SessionReader::new(root.path(), &sid);
+        let cached = reader.read(&sid).unwrap();
+        let elided = log.read_all_elided().unwrap();
+        for events in [
+            cached.iter().map(|e| e.event.clone()).collect::<Vec<_>>(),
+            elided.into_iter().map(|e| e.event).collect(),
+        ] {
+            assert!(events.iter().any(|e| matches!(e, SessionEvent::CompactionStarted {
+                request: serde_json::Value::Null, estimated_input: 7, sources, .. } if sources.len() == 1)));
+            assert!(events.iter().any(
+                |e| matches!(e, SessionEvent::CompactionRequest { body, .. } if body.is_empty())
+            ));
+            assert!(events.iter().any(
+                |e| matches!(e, SessionEvent::CompactionFinished { chunks, .. } if chunks.is_empty())
+            ));
+            assert!(events.iter().any(
+                |e| matches!(e, SessionEvent::Compaction(c) if c.summary == "kept" && c.replaces.len() == 1)
+            ));
+        }
+        // Full reads and the file itself keep every payload.
+        let full = log.read_all().unwrap();
+        assert!(full.iter().any(|e| matches!(&e.event,
+            SessionEvent::CompactionRequest { body, .. } if body == "{\"big\":\"body\"}")));
+        assert!(full.iter().any(|e| matches!(&e.event,
+            SessionEvent::CompactionFinished { chunks, .. } if chunks.len() == 1)));
+        assert_eq!(fs::read(log.path()).unwrap(), disk_before);
     }
 
     #[test]

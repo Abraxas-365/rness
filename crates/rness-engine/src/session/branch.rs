@@ -405,6 +405,34 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Like [`Self::history`], but parsed from disk with every payload intact
+    /// (the cached reader elides audit bodies and stream recordings). Slow on
+    /// long sessions; for raw exports only, never the turn path.
+    pub fn history_full(&self, session: &SessionId) -> Result<Vec<Arc<Envelope>>, BranchError> {
+        let chain = self.ancestry(session)?;
+        let mut out: Vec<Arc<Envelope>> = Vec::new();
+        for (i, hop) in chain.iter().enumerate() {
+            let path = super::log::log_file(&self.root.join(&hop.session));
+            let is_queried = i == chain.len() - 1;
+            for env in super::log::read_envelopes(&path)? {
+                let is_header = matches!(env.event, SessionEvent::Header(_));
+                if is_header && !is_queried {
+                    continue;
+                }
+                let at_bound = hop.forked_at.as_ref() == Some(&env.id);
+                if is_queried && is_header {
+                    out.insert(0, Arc::new(env));
+                } else {
+                    out.push(Arc::new(env));
+                }
+                if at_bound {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Latest assistant usage and turn count over the full history, without
     /// assembling it. Folds only log bytes appended since the last call;
     /// ancestor prefixes are folded once (they end at committed fork points).
@@ -1164,6 +1192,14 @@ mod tests {
         assert_eq!(texts(&root_id), vec!["a", "b", "c"]);
         assert_eq!(texts(&child_id), vec!["a", "b", "d"]);
         assert_eq!(texts(&grand_id), vec!["a", "b", "d", "e"]);
+        // The uncached full read assembles the identical chain.
+        let owned = |events: Vec<Arc<Envelope>>| -> Vec<Envelope> {
+            events.iter().map(|e| (**e).clone()).collect()
+        };
+        for sid in [&root_id, &child_id, &grand_id] {
+            let full = owned(store.history_full(sid).unwrap());
+            assert_eq!(full, owned(store.history(sid).unwrap()));
+        }
 
         // Parent stayed byte-identical conceptually: c still in root history.
         // Ancestry chains.
