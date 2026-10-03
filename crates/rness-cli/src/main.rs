@@ -2213,6 +2213,11 @@ async fn run_tui(
             let mut cursor: Option<(SessionId, String, u64)> = None;
             let mut calls: std::collections::HashMap<String, (String, serde_json::Value)> =
                 Default::default();
+            // Unresolved calls of the latest assistant step, and the subset
+            // whose cached card is a running placeholder (replaced by the
+            // durable result, or dropped when the turn ends without one).
+            let mut pending: Vec<String> = Vec::new();
+            let mut live: std::collections::HashSet<String> = Default::default();
             while let Some(sid) = card_rx.recv().await {
                 let generation = cache.generation();
                 let delta = cursor
@@ -2225,6 +2230,8 @@ async fn run_tui(
                     delta
                 } else {
                     calls.clear();
+                    pending.clear();
+                    live.clear();
                     let Ok(history) = sessions.store().history(&sid) else {
                         continue;
                     };
@@ -2236,20 +2243,27 @@ async fn run_tui(
                 for env in &history {
                     match &env.event {
                         rness_protocol::events::SessionEvent::AssistantMessage(m) => {
+                            pending.clear();
                             for part in &m.content {
                                 if let ContentPart::ToolUse { call, name, args } = part {
                                     calls.insert(call.clone(), (name.clone(), args.clone()));
+                                    pending.push(call.clone());
                                 }
                             }
                         }
                         rness_protocol::events::SessionEvent::ToolResult(r) => {
+                            pending.retain(|call| call != &r.call);
                             let Some((name, args)) = calls.get(&r.call) else {
                                 continue;
                             };
-                            // A workflow's cached card may be its live
-                            // progress card: the durable result (after
+                            // A workflow's or running tool's cached card is a
+                            // live progress card: the durable result (after
                             // post-tool hooks) always replaces it.
-                            if cache.contains(&r.call) && name != rness_engine::workflow::TOOL {
+                            let was_live = live.remove(&r.call);
+                            if cache.contains(&r.call)
+                                && !was_live
+                                && name != rness_engine::workflow::TOOL
+                            {
                                 continue;
                             }
                             let generation = cache.generation();
@@ -2262,12 +2276,53 @@ async fn run_tui(
                                 .await
                             {
                                 cache.insert_if_current(generation, r.call.clone(), lines);
-                            } else if name == rness_engine::workflow::TOOL {
+                            } else if was_live || name == rness_engine::workflow::TOOL {
                                 cache.remove_if_current(generation, &r.call);
                             }
                         }
                         _ => {}
                     }
+                }
+                let running = matches!(sessions.phase(&sid), rness_engine::inbox::Phase::Running);
+                if running {
+                    // Show what a tool is doing (its arguments) before it
+                    // returns. Subagents and workflows publish their own.
+                    for call in &pending {
+                        let Some((name, args)) = calls.get(call) else {
+                            continue;
+                        };
+                        if live.contains(call)
+                            || cache.contains(call)
+                            || name == "subagent"
+                            || name == rness_engine::workflow::TOOL
+                        {
+                            continue;
+                        }
+                        let generation = cache.generation();
+                        if let Some(lines) =
+                            rness_engine::presentation::ToolCards::tool_card_presented(
+                                &lua,
+                                name,
+                                args.clone(),
+                                "",
+                                false,
+                                Some(serde_json::json!({"kind":"tool_live","status":"running"})),
+                            )
+                            .await
+                        {
+                            if cache.insert_if_current(generation, call.clone(), lines) {
+                                live.insert(call.clone());
+                            }
+                        }
+                    }
+                } else {
+                    // Turn ended (e.g. cancelled) without results: drop the
+                    // placeholders so the built-in header shows again.
+                    let generation = cache.generation();
+                    for call in live.drain() {
+                        cache.remove_if_current(generation, &call);
+                    }
+                    pending.clear();
                 }
             }
         })
@@ -2277,7 +2332,8 @@ async fn run_tui(
     let card_tx_sub = card_tx.clone();
     let _card_sub = kernel.bus().on::<FrameEv>(move |frame| {
         if let rness_protocol::frames::Frame::StepCommitted { session, .. }
-        | rness_protocol::frames::Frame::HistoryChanged { session } = frame
+        | rness_protocol::frames::Frame::HistoryChanged { session }
+        | rness_protocol::frames::Frame::TurnIdle { session } = frame
         {
             if *session == *card_feed.read().unwrap() {
                 let _ = card_tx_sub.send(session.clone());
