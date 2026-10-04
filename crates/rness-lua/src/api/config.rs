@@ -92,6 +92,9 @@ pub struct StartupConfig {
     pub sections: Vec<rness_engine::prompt::PromptSection>,
     /// `rness.terminal_title` — set the terminal window title (None = on).
     pub terminal_title: Option<bool>,
+    /// `rness.record_stream` — also store the exact timed stream of
+    /// committed model outputs in the session log (default false).
+    pub record_stream: bool,
 }
 
 #[cfg(test)]
@@ -1566,6 +1569,11 @@ pub fn evaluate(
         mlua::Value::Boolean(b) => Some(b),
         _ => return Err("rness.terminal_title must be a boolean".into()),
     };
+    config.record_stream = match rness.get::<mlua::Value>("record_stream")? {
+        mlua::Value::Nil => false,
+        mlua::Value::Boolean(b) => b,
+        _ => return Err("rness.record_stream must be a boolean".into()),
+    };
     config.system_prompt = system_prompt_config(rness.get("system_prompt")?)?;
     Ok(config)
 }
@@ -2036,6 +2044,18 @@ mod tests {
         std::fs::write(&path, "rness.terminal_title = false").unwrap();
         assert_eq!(load(&path).unwrap().terminal_title, Some(false));
         std::fs::write(&path, "rness.terminal_title = 'no'").unwrap();
+        assert!(load(&path).is_err());
+    }
+
+    #[test]
+    fn record_stream_defaults_off_and_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        std::fs::write(&path, "").unwrap();
+        assert!(!load(&path).unwrap().record_stream);
+        std::fs::write(&path, "rness.record_stream = true").unwrap();
+        assert!(load(&path).unwrap().record_stream);
+        std::fs::write(&path, "rness.record_stream = 1").unwrap();
         assert!(load(&path).is_err());
     }
 

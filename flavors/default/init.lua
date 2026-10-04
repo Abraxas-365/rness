@@ -46,6 +46,7 @@ rness.images = {
 }
 
 -- rness.terminal_title = false -- keep the terminal window title unchanged
+-- rness.record_stream = true -- also log the exact timed stream of every reply (large)
 
 rness.plugins.setup({
   { name = "read-image", file = "plugins/read-image.lua" },

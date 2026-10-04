@@ -93,6 +93,8 @@ pub struct SessionStore {
     /// statusline's per-step usage query never copies or re-parses a whole
     /// history, even after the reader was evicted.
     usage: std::sync::Mutex<std::collections::HashMap<SessionId, UsageCursor>>,
+    /// `rness.record_stream`, applied to every writer this store opens.
+    record_stream: std::sync::atomic::AtomicBool,
 }
 
 impl SessionStore {
@@ -103,7 +105,22 @@ impl SessionStore {
             readers: Default::default(),
             headers: Default::default(),
             usage: Default::default(),
+            record_stream: Default::default(),
         }
+    }
+
+    /// Keep the exact timed stream of committed outputs (default off).
+    pub fn set_record_stream(&self, on: bool) {
+        self.record_stream
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn writer(&self, mut log: SessionLog) -> SessionLog {
+        log.set_record_stream(
+            self.record_stream
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        log
     }
 
     pub fn read_session(&self, session: &SessionId) -> Result<Vec<Arc<Envelope>>, LogError> {
@@ -213,7 +230,9 @@ impl SessionStore {
     /// Create a root session (no parent).
     pub fn create(&self, workspace: Option<String>) -> Result<SessionLog, BranchError> {
         let sid = ulid::Ulid::new().to_string();
-        Ok(SessionLog::create(&self.root, &sid, workspace, None, None)?)
+        Ok(self.writer(SessionLog::create(
+            &self.root, &sid, workspace, None, None,
+        )?))
     }
 
     /// Create a session on behalf of a delegating agent (subagent spawn):
@@ -224,13 +243,13 @@ impl SessionStore {
         delegation: Delegation,
     ) -> Result<SessionLog, BranchError> {
         let sid = ulid::Ulid::new().to_string();
-        Ok(SessionLog::create(
+        Ok(self.writer(SessionLog::create(
             &self.root,
             &sid,
             workspace,
             None,
             Some(delegation),
-        )?)
+        )?))
     }
 
     /// Byte length of a session's committed log, or None if it has none.
@@ -247,7 +266,7 @@ impl SessionStore {
     }
 
     pub fn open(&self, session: &SessionId) -> Result<SessionLog, BranchError> {
-        Ok(SessionLog::open(&self.root, session)?)
+        Ok(self.writer(SessionLog::open(&self.root, session)?))
     }
 
     /// Fork `session` at event `at` (or its tip when `None`). Returns the
@@ -304,13 +323,13 @@ impl SessionStore {
             session: session.clone(),
             at,
         };
-        Ok(SessionLog::create(
+        Ok(self.writer(SessionLog::create(
             &self.root,
             &child,
             workspace,
             Some(fork),
             delegation,
-        )?)
+        )?))
     }
 
     /// Delegation lineage of a session, if an agent created it.

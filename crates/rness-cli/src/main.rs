@@ -768,6 +768,7 @@ async fn main() -> anyhow::Result<()> {
         .services()
         .get::<SessionService>("sessions")
         .context("sessions service missing")?;
+    sessions.store().set_record_stream(startup.record_stream);
     sessions.set_images(image_store)?;
     lua.set_bus(Arc::clone(kernel.bus()));
     sessions.set_loop_hooks(Some(Arc::new(lua.clone())));

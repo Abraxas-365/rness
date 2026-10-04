@@ -89,8 +89,11 @@ that reaches a model request must be reconstructable from the log. No
 hidden context, ever.
 
 **Attempt preservation:** failed / cancelled / retried attempts are kept as
-events (deepseek's `assistant/attempt`) without polluting model history.
-Committed messages embed the exact timed chunk stream that produced them.
+events (deepseek's `assistant/attempt`) without polluting model history,
+together with whatever streamed before they died. Committed messages store
+their result; the exact timed chunk stream behind it is recorded only with
+`rness.record_stream = true` (off by default: on a 12 h session it was 158 MB
+of a 722 MB log, and nothing reads it back).
 
 **Versioned from day 1:** `session.v1.jsonl`. One migration module per
 vN→vN+1 step. Committed generations are never mutated (copy-on-write).

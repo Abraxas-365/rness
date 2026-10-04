@@ -114,6 +114,19 @@ end)
 
 The CLI synchronizes loaded Lua tools into the engine registry before firing `ready`. A current frontend session is not guaranteed at that point.
 
+## Session log size
+
+`rness.record_stream` (startup-only, default `false`) controls whether the
+exact timed stream of each committed reply is written to the session log.
+Off, the reply's result is still stored in full (message content, compaction
+summary, usage, timing of the event); only the token-by-token recording is
+left out. Failed, cancelled and rejected requests always keep what streamed,
+because that is their only record.
+
+```lua
+rness.record_stream = true -- debug provider streaming; grows logs ~20-30%
+```
+
 ## Applying changes
 
 Restart after editing startup declarations, plugin selection, options, or central mappings. Explicit file/linked-package sources with `watch=true` reload registrations without reexecuting `init.lua`; managed Git packages and inline sources are not watchable. Busy engine maintenance is retried automatically. See [reload guarantees](../plugins/loading-and-lifecycle.md#runtime-reload).

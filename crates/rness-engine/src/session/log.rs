@@ -43,6 +43,9 @@ pub struct SessionLog {
     session: SessionId,
     file: File,
     path: PathBuf,
+    /// `rness.record_stream`: keep the exact timed stream of committed
+    /// outputs. Off by default — see [`drop_committed_stream`].
+    record_stream: bool,
 }
 
 impl SessionLog {
@@ -96,6 +99,7 @@ impl SessionLog {
                 session: session.clone(),
                 file,
                 path,
+                record_stream: false,
             }),
             Err(_) => Err(LogError::Locked(session.clone())),
         }
@@ -109,12 +113,21 @@ impl SessionLog {
         &self.path
     }
 
+    /// Record the exact timed stream of committed outputs too (default off).
+    pub fn set_record_stream(&mut self, on: bool) {
+        self.record_stream = on;
+    }
+
     /// Append one event and fsync. Returns the committed envelope.
     pub fn append(&mut self, event: &SessionEvent) -> Result<Envelope, LogError> {
+        let mut event = event.clone();
+        if !self.record_stream {
+            drop_committed_stream(&mut event);
+        }
         let envelope = Envelope {
             id: ulid::Ulid::new().to_string(),
             at: now_rfc3339(),
-            event: event.clone(),
+            event,
         };
         let mut line = serde_json::to_string(&envelope)?;
         line.push('\n');
@@ -173,6 +186,22 @@ pub fn read_session(root: &Path, session: &SessionId) -> Result<Vec<Envelope>, L
         return Err(LogError::NotFound(session.clone()));
     }
     read_envelopes(&path)
+}
+
+/// Write-side policy when `record_stream` is off: a committed output drops
+/// its timed stream, because the result is already in the event
+/// (`assistant/message.content`, the `compaction/summary` text). Failed,
+/// cancelled and rejected requests keep theirs — it is the only record of
+/// what the model sent, and they are rare and small. On a 12 h session the
+/// dropped streams were 158 MB of 722 MB.
+pub fn drop_committed_stream(event: &mut SessionEvent) {
+    match event {
+        SessionEvent::AssistantMessage(message) => message.chunks = Vec::new(),
+        SessionEvent::CompactionFinished {
+            outcome, chunks, ..
+        } if outcome == "committed" => *chunks = Vec::new(),
+        _ => {}
+    }
 }
 
 /// Drop payloads that nothing reads once committed: legacy compaction audit
@@ -389,6 +418,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sid = "elide".to_string();
         let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        // Disk must hold every payload (as legacy logs do) to test elision.
+        log.set_record_stream(true);
         log.append(&SessionEvent::CompactionStarted {
             model: "m".into(),
             sources: vec!["a".into()],
@@ -445,6 +476,71 @@ mod tests {
         assert!(full.iter().any(|e| matches!(&e.event,
             SessionEvent::CompactionFinished { chunks, .. } if chunks.len() == 1)));
         assert_eq!(fs::read(log.path()).unwrap(), disk_before);
+    }
+
+    #[test]
+    fn committed_streams_are_dropped_unless_recording_is_on() {
+        use rness_protocol::events::{
+            AssistantAttempt, AssistantMessage, AttemptOutcome, ChunkDelta, StopReason, TimedChunk,
+        };
+        let chunks = || {
+            vec![TimedChunk {
+                ms: 3,
+                delta: ChunkDelta::Text { t: "hi".into() },
+            }]
+        };
+        let finished = |outcome: &str| SessionEvent::CompactionFinished {
+            started: "s".into(),
+            outcome: outcome.into(),
+            usage: Default::default(),
+            chunks: chunks(),
+        };
+        let events = [
+            SessionEvent::AssistantMessage(AssistantMessage {
+                model: "m".into(),
+                content: vec![rness_protocol::events::ContentPart::Text { text: "hi".into() }],
+                stop: StopReason::EndTurn,
+                usage: Default::default(),
+                estimated_input: 0,
+                chunks: chunks(),
+            }),
+            finished("committed"),
+            // Failures/rejections keep their only record of the reply.
+            SessionEvent::AssistantAttempt(AssistantAttempt {
+                model: "m".into(),
+                outcome: AttemptOutcome::Cancelled,
+                chunks: chunks(),
+            }),
+            finished("non_shrinking"),
+            finished("failed: TIMEOUT: x"),
+        ];
+        let kept = |e: &SessionEvent| match e {
+            SessionEvent::AssistantMessage(m) => m.chunks.len(),
+            SessionEvent::AssistantAttempt(a) => a.chunks.len(),
+            SessionEvent::CompactionFinished { chunks, .. } => chunks.len(),
+            _ => unreachable!(),
+        };
+        for (record, expected) in [(false, [0, 0, 1, 1, 1]), (true, [1, 1, 1, 1, 1])] {
+            let root = tempfile::tempdir().unwrap();
+            let sid = "stream".to_string();
+            let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+            log.set_record_stream(record);
+            let returned: Vec<_> = events.iter().map(|e| log.append(e).unwrap()).collect();
+            let disk = log.read_all().unwrap();
+            for (index, want) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    kept(&disk[index + 1].event),
+                    want,
+                    "record={record} #{index}"
+                );
+                // The returned envelope is exactly what was committed.
+                assert_eq!(returned[index], disk[index + 1]);
+            }
+            // The result itself is never dropped.
+            assert!(
+                matches!(&disk[1].event, SessionEvent::AssistantMessage(m) if m.content.len() == 1)
+            );
+        }
     }
 
     #[test]
