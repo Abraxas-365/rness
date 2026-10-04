@@ -855,6 +855,7 @@ enum Cmd {
         context: serde_json::Value,
         name: String,
         args: serde_json::Value,
+        cancel: tokio_util::sync::CancellationToken,
         reply: tokio::sync::oneshot::Sender<Result<(String, Option<serde_json::Value>), String>>,
     },
     FireHook {
@@ -1054,6 +1055,7 @@ fn sync_commands(
 
 struct PendingTool {
     thread: crate::runtime::CommandThread,
+    cancel: tokio_util::sync::CancellationToken,
     reply: tokio::sync::oneshot::Sender<Result<(String, Option<serde_json::Value>), String>>,
 }
 
@@ -1090,6 +1092,7 @@ fn tool_step(
                     .send(Err("session query runtime unavailable".into()));
                 return;
             };
+            let cancel = tool.cancel.clone();
             pending.insert(id, tool);
             let mut completion = ToolCompletion {
                 tx,
@@ -1097,15 +1100,17 @@ fn tool_step(
                 result: None,
             };
             runtime.spawn(async move {
-                completion.result = Some(
-                    match tokio::time::timeout(std::time::Duration::from_secs(60), request.0).await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
+                completion.result = Some(tokio::select! {
+                    biased;
+                    // Ctrl-C: settle now; a cancel-aware request (SQLite
+                    // refresh, llm.complete) stops on the same token.
+                    _ = cancel.cancelled() => Err("tool call cancelled".into()),
+                    result = tokio::time::timeout(std::time::Duration::from_secs(60), request.0) => {
+                        result.unwrap_or_else(|_| {
                             Err("session query timed out; index worker may still finish".into())
-                        }
-                    },
-                );
+                        })
+                    }
+                });
                 drop(completion);
             });
         }
@@ -1446,7 +1451,7 @@ impl LuaHost {
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);
                         }
-                        Cmd::CallTool { name, args, context, reply } => {
+                        Cmd::CallTool { name, args, context, cancel, reply } => {
                             use mlua::LuaSerdeExt;
                             let mut thread = match rt.tool_thread(&name) {
                                 Ok(thread) => thread,
@@ -1456,8 +1461,8 @@ impl LuaHost {
                             next_tool_id = next_tool_id.checked_add(1).expect("tool ID exhausted");
                             let step = rt.lua().to_value(&args).and_then(|args|
                                 Ok((args, rt.lua().to_value(&context)?))).map_err(|e| e.to_string())
-                                .and_then(|args| rt.resume_tool(&mut thread, args));
-                            tool_step(id, PendingTool { thread, reply }, step, &mut pending_tools,
+                                .and_then(|args| rt.resume_tool(&mut thread, args, &cancel));
+                            tool_step(id, PendingTool { thread, cancel, reply }, step, &mut pending_tools,
                                 session_binding.as_ref().map(|b| &b.rt), &command_tx);
                         }
                         Cmd::ResumeTool { id, result } => {
@@ -1466,8 +1471,8 @@ impl LuaHost {
                             if tool.reply.is_closed() { continue; }
                             let step = match result {
                                 Ok(value) => rt.lua().to_value(&value).map_err(|e| e.to_string())
-                                    .and_then(|value| rt.resume_tool(&mut tool.thread, (true, value))),
-                                Err(error) => rt.resume_tool(&mut tool.thread, (false, error)),
+                                    .and_then(|value| rt.resume_tool(&mut tool.thread, (true, value), &tool.cancel)),
+                                Err(error) => rt.resume_tool(&mut tool.thread, (false, error), &tool.cancel),
                             };
                             tool_step(id, tool, step, &mut pending_tools,
                                 session_binding.as_ref().map(|b| &b.rt), &command_tx);
@@ -1727,16 +1732,35 @@ impl LuaHost {
         args: serde_json::Value,
         context: serde_json::Value,
     ) -> Result<(String, Option<serde_json::Value>), String> {
+        self.call_tool_cancellable(name, args, context, &Default::default())
+            .await
+    }
+
+    /// Like [`Self::call_tool_presented`], but `cancel` (the turn's token)
+    /// stops the Lua tool and any query it is awaiting.
+    pub async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context: serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<(String, Option<serde_json::Value>), String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(Cmd::CallTool {
                 name: name.into(),
                 args,
                 context,
+                cancel: cancel.clone(),
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        tokio::select! {
+            biased;
+            reply = rx => reply.map_err(|_| "lua vm gone")?,
+            // Dropping `rx` closes the reply; the actor discards the call.
+            _ = cancel.cancelled() => Err("tool call cancelled".into()),
+        }
     }
 
     /// Fire-and-forget: never blocks the caller on Lua execution.
@@ -2196,6 +2220,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.call_tool("owned", json!({})).await.unwrap(), "new");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_busy_lua_tool_and_the_host_stays_usable() {
+        let host = LuaHost::spawn().unwrap();
+        host.load(
+            "p",
+            r#"
+            rness.tool.register{ name = "spin", run = function() while true do end end }
+            rness.tool.register{ name = "add", run = function(a) return tostring(a.x + a.y) end }
+            "#,
+        )
+        .await
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            canceller.cancel();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            host.call_tool_cancellable("spin", json!({}), json!({}), &cancel),
+        )
+        .await
+        .expect("cancel must stop a busy tool");
+        assert!(result.unwrap_err().contains("cancelled"));
+        // The VM hook stopped the loop: the actor serves the next call.
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                host.call_tool("add", json!({"x": 2, "y": 3}))
+            )
+            .await
+            .expect("actor must be free after cancel"),
+            Ok("5".into())
+        );
     }
 
     #[tokio::test]

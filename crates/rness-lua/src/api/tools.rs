@@ -122,7 +122,7 @@ impl Tool for LuaTool {
         context["call"] = serde_json::json!(call);
         let (output, presentation) = self
             .host
-            .call_tool_presented(&self.spec.name, args, context)
+            .call_tool_cancellable(&self.spec.name, args, context, cancel)
             .await?;
         Ok((
             vec![rness_protocol::events::ToolResultContentPart::Text { text: output }],
@@ -136,6 +136,19 @@ impl Tool for LuaTool {
         self.host
             .call_tool_context(&self.spec.name, args, self.context.clone())
             .await
+    }
+
+    async fn execute_call(
+        &self,
+        _session: &String,
+        _call: &str,
+        args: serde_json::Value,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<String, String> {
+        self.host
+            .call_tool_cancellable(&self.spec.name, args, self.context.clone(), cancel)
+            .await
+            .map(|(output, _)| output)
     }
 }
 

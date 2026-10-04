@@ -25,6 +25,26 @@ const MAX_INLINE_BYTES: usize = 50 * 1024;
 /// How many bytes of head and tail to keep in the inline preview.
 const SPILL_PREVIEW_BYTES: usize = 2048;
 
+/// After a cancel, how long a running tool may take to stop on its own
+/// (bash kills its process group, MCP notifies the server) before the
+/// dispatcher abandons it and settles the call as cancelled.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Run `work` to completion unless `cancel` fires; then allow
+/// [`CANCEL_GRACE`] for it to settle. `None` = abandoned (future dropped).
+async fn settle_or_abandon<T>(
+    work: impl std::future::Future<Output = T>,
+    cancel: &CancellationToken,
+) -> Option<T> {
+    tokio::pin!(work);
+    tokio::select! {
+        biased;
+        done = &mut work => return Some(done),
+        _ = cancel.cancelled() => {}
+    }
+    tokio::time::timeout(CANCEL_GRACE, work).await.ok()
+}
+
 /// Side data of the most recent tool-body run under `tool_execute`.
 #[derive(Default)]
 struct BodyRun {
@@ -702,9 +722,10 @@ impl ToolRegistry {
     /// Execute `calls` concurrently (up to `max_concurrency` at once) and
     /// return results in the SAME order as `calls`. An unknown tool yields
     /// an is_error result, not a crash. `session` is the calling session
-    /// (delegating tools need to know their parent). `cancel` interrupts
-    /// WAITING — a pending approval resolves as cancelled — but a tool
-    /// already executing runs to completion (its result still commits).
+    /// (delegating tools need to know their parent). `cancel` resolves
+    /// waiting calls as cancelled; an executing tool gets [`CANCEL_GRACE`]
+    /// to honor the token (its own result then commits) and is otherwise
+    /// abandoned with a cancelled result.
     pub async fn dispatch(
         &self,
         session: &SessionId,
@@ -791,7 +812,12 @@ impl ToolRegistry {
             let session = session.clone();
             let cancel = cancel.clone();
             handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire_owned().await.expect("semaphore open");
+                // A call queued behind a slow sibling must not outlive a cancel.
+                let _permit = tokio::select! {
+                    biased;
+                    permit = sem.acquire_owned() => Some(permit.expect("semaphore open")),
+                    _ = cancel.cancelled() => None,
+                };
                 let started = Instant::now();
                 let mut plan_review = None;
                 let mut presentation = None;
@@ -928,9 +954,18 @@ impl ToolRegistry {
                                 })
                             }
                         };
-                        let executed = match &hooks {
-                            Some(h) => h.tool_execute(&event, &run_body, &cancel).await,
-                            None => Ok(run_body().await),
+                        let executing = async {
+                            match &hooks {
+                                Some(h) => h.tool_execute(&event, &run_body, &cancel).await,
+                                None => Ok(run_body().await),
+                            }
+                        };
+                        let Some(executed) = settle_or_abandon(executing, &cancel).await else {
+                            failure_kind = "approval_cancelled";
+                            break 'gate Err(format!(
+                                "tool call cancelled; it was still running after {}s and was abandoned",
+                                CANCEL_GRACE.as_secs()
+                            ));
                         };
                         let run = std::mem::take(&mut *body.lock().expect("tool body lock"));
                         match executed {
@@ -976,8 +1011,11 @@ impl ToolRegistry {
                         duration_ms: started.elapsed().as_millis() as u64,
                     };
                     // Post hooks see the settled result even after a turn
-                    // cancel; the host bounds them with its own timeout.
-                    let decision = h.post_tool(&event, &draft, &CancellationToken::new()).await;
+                    // cancel; the host bounds them with its own timeout, and a
+                    // cancel bounds them to CANCEL_GRACE (the result stays as is).
+                    let decision = settle_or_abandon(h.post_tool(&event, &draft, &CancellationToken::new()), &cancel)
+                        .await
+                        .unwrap_or_else(|| Ok(PostToolDecision::Accept { content: None, additional_contexts: Vec::new() }));
                     let contexts = match decision {
                         Ok(PostToolDecision::Accept { content: replacement, additional_contexts }) => {
                             if let Some(replacement) = replacement {

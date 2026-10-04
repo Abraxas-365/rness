@@ -270,3 +270,35 @@ fn read_is_lazy_and_foreign_database_is_refused() {
         )
         .is_err());
 }
+
+#[test]
+fn cancelled_search_stops_refresh_and_keeps_committed_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    log.append(&message("needle")).unwrap();
+    let path = dir.path().join("index.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let error = provider
+        .execute_cancellable(
+            &store,
+            log.session(),
+            "session_search",
+            request(json!({"query":"needle"})),
+            &cancel,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cancelled"), "{error}");
+    // The provider stays usable; a fresh token finishes the refresh.
+    let found = provider
+        .execute(
+            &store,
+            log.session(),
+            "session_search",
+            request(json!({"query":"needle"})),
+        )
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+}

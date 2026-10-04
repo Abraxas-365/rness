@@ -1394,12 +1394,35 @@ impl LuaRuntime {
         })
     }
 
+    /// Runs the tool coroutine until it yields or returns. `cancel` is the
+    /// turn's token: it is visible to cancel-aware APIs (`rness.llm.complete`,
+    /// `rness.http`, `rness.process.run`) and stops busy Lua code.
     pub(crate) fn resume_tool(
         &self,
         command: &mut CommandThread,
         args: impl mlua::IntoLuaMulti,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<ToolStep, String> {
-        let values = self.resume_thread(command, args)?;
+        if cancel.is_cancelled() {
+            return Err("tool call cancelled".into());
+        }
+        let token = cancel.clone();
+        command.thread.set_hook(
+            mlua::HookTriggers::new().every_nth_instruction(1000),
+            move |_, _| {
+                if token.is_cancelled() {
+                    Err(mlua::Error::runtime("tool call cancelled"))
+                } else {
+                    Ok(mlua::VmState::Continue)
+                }
+            },
+        );
+        self.lua.set_app_data(cancel.clone());
+        let values = self.resume_thread(command, args);
+        self.lua.remove_hook();
+        self.lua
+            .remove_app_data::<tokio_util::sync::CancellationToken>();
+        let values = values?;
         if command.thread.status() == mlua::ThreadStatus::Resumable {
             if values.len() != 1 {
                 return Err("unsupported tool yield".into());

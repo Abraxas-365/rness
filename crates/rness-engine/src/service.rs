@@ -1954,6 +1954,10 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
+        // Idle-only, so the burst token is free: installing a fresh one makes
+        // `cancel(session)` (Ctrl-C) stop the summarizer request.
+        let cancel = CancellationToken::new();
+        *live.cancel.lock().unwrap() = cancel.clone();
         let policy = replayed
             .context
             .config
@@ -2026,7 +2030,7 @@ impl SessionService {
             events: replaces.len(),
             estimated_tokens,
         });
-        let summary = summarize(provider.as_ref(), fold_ctx, policy).await;
+        let summary = summarize(provider.as_ref(), fold_ctx, policy, &cancel).await;
         self.bus.emit::<FrameEv>(&Frame::CompactionFinished {
             session: session.clone(),
             changed: summary.is_ok(),
@@ -2473,6 +2477,7 @@ async fn summarize(
     provider: &dyn Provider,
     mut ctx: crate::session::projection::ModelContext,
     policy: Option<&crate::turn::compaction::Policy>,
+    cancel: &CancellationToken,
 ) -> Result<String, ServiceError> {
     ctx.turns.push(crate::session::projection::ModelTurn::User {
         content: vec![ContentPart::Text {
@@ -2490,8 +2495,7 @@ async fn summarize(
         tools: &[],
         on_delta: None,
     };
-    let cancel = CancellationToken::new();
-    match provider.summarize_step(request, &cancel).await {
+    match provider.summarize_step(request, cancel).await {
         crate::turn::provider::StepOutcome::Committed(msg) => {
             let text: String = msg
                 .content

@@ -36,6 +36,8 @@ pub struct SqliteSessionSearch {
     path: PathBuf,
     connection: Option<Connection>,
     pages: std::collections::HashMap<String, query::SearchPage>,
+    /// Token of the operation in flight, read by the SQLite progress handler.
+    cancel: std::sync::Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>,
 }
 
 impl SqliteSessionSearch {
@@ -46,6 +48,7 @@ impl SqliteSessionSearch {
             path,
             connection: None,
             pages: Default::default(),
+            cancel: Default::default(),
         }
     }
 

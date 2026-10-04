@@ -172,7 +172,15 @@ pub fn install(
                     let sessions = sessions.clone();
                     let provider = provider.clone();
                     let runtime = runtime.clone();
+                    // Present while a tool coroutine runs (set by resume_tool).
+                    // A child token: the drop guard must never cancel the turn.
+                    let cancel = lua
+                        .app_data_ref::<tokio_util::sync::CancellationToken>()
+                        .map(|cancel| cancel.child_token())
+                        .unwrap_or_default();
                     Ok(SearchRequest(Box::pin(async move {
+                        // Abandoning the wait (Ctrl-C) also stops the worker.
+                        let _stop = cancel.clone().drop_guard();
                         runtime
                             .spawn_blocking(move || {
                                 // Do not queue unbounded blocking workers behind one index.
@@ -180,7 +188,13 @@ pub fn install(
                                     "session search busy; retry shortly".to_string()
                                 })?;
                                 provider
-                                    .execute(sessions.store(), &caller, &operation, request)
+                                    .execute_cancellable(
+                                        sessions.store(),
+                                        &caller,
+                                        &operation,
+                                        request,
+                                        &cancel,
+                                    )
                                     .map_err(|e| e.to_string())
                             })
                             .await

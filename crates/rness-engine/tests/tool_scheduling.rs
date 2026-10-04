@@ -89,3 +89,79 @@ async fn cancellation_prevents_later_exclusive_calls() {
     assert!(results[0].is_error);
     assert!(events.lock().unwrap().is_empty());
 }
+
+/// Ignores its cancel token, like a hung network call or a tool with only
+/// `execute(args)`.
+struct Stubborn;
+#[async_trait]
+impl Tool for Stubborn {
+    fn name(&self) -> &str {
+        "stubborn"
+    }
+    async fn execute(&self, _: Value) -> Result<String, String> {
+        tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        Ok("finished".into())
+    }
+}
+
+#[tokio::test]
+async fn cancel_abandons_a_tool_that_ignores_its_token() {
+    let registry = ToolRegistry::default();
+    registry.register(Arc::new(Stubborn));
+    let cancel = CancellationToken::new();
+    let calls = [ToolCall {
+        call: "a".into(),
+        name: "stubborn".into(),
+        args: json!({}),
+    }];
+    let session = "s".into();
+    let dispatch = registry.dispatch(&session, &calls, 1, &cancel);
+    tokio::pin!(dispatch);
+    tokio::select! {
+        _ = &mut dispatch => panic!("tool finished before cancellation"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+    let cancelled = std::time::Instant::now();
+    cancel.cancel();
+    let results = tokio::time::timeout(std::time::Duration::from_secs(10), dispatch)
+        .await
+        .expect("cancel must settle a stuck tool within the grace period");
+    assert!(cancelled.elapsed() < std::time::Duration::from_secs(5));
+    assert!(results[0].is_error);
+    assert!(
+        results[0].output.contains("cancelled"),
+        "{}",
+        results[0].output
+    );
+    assert_eq!(
+        results[0].presentation.as_ref().unwrap()["outcome"],
+        "approval_cancelled"
+    );
+}
+
+#[tokio::test]
+async fn cancel_releases_calls_queued_behind_a_stuck_tool() {
+    let registry = ToolRegistry::default();
+    registry.register(Arc::new(Stubborn));
+    let cancel = CancellationToken::new();
+    let calls: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|id| ToolCall {
+            call: id.into(),
+            name: "stubborn".into(),
+            args: json!({}),
+        })
+        .collect();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        canceller.cancel();
+    });
+    let results = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        registry.dispatch(&"s".into(), &calls, 1, &cancel),
+    )
+    .await
+    .expect("queued calls must not wait for the stuck one");
+    assert!(results.iter().all(|r| r.is_error), "{results:?}");
+}

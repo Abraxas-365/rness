@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 fn invalid(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
@@ -145,6 +146,13 @@ impl SqliteSessionSearch {
         if self.connection.is_none() {
             let mut connection = Connection::open(&self.path)?;
             connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            // Long FTS queries and index writes abort with SQLITE_INTERRUPT
+            // once the current operation's token is cancelled.
+            let cancel = std::sync::Arc::clone(&self.cancel);
+            connection.progress_handler(
+                10_000,
+                Some(move || cancel.lock().is_ok_and(|token| token.is_cancelled())),
+            );
             let app: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
             let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
             let tables: i64 = connection.query_row(
@@ -189,7 +197,20 @@ impl SqliteSessionSearch {
         Ok(self.connection.as_mut().unwrap())
     }
 
-    fn refresh(&mut self, store: &SessionStore, caller: &String, workspace: &str) -> Result<()> {
+    fn refresh(
+        &mut self,
+        store: &SessionStore,
+        caller: &String,
+        workspace: &str,
+        cancel: &CancellationToken,
+    ) -> Result<()> {
+        let cancelled = || -> Result<()> {
+            if cancel.is_cancelled() {
+                Err(invalid("session search cancelled"))
+            } else {
+                Ok(())
+            }
+        };
         let connection = self.query_connection()?;
         let old = connection
             .prepare("SELECT session, revision FROM revisions WHERE workspace=?1")?
@@ -218,12 +239,17 @@ impl SqliteSessionSearch {
                 params![workspace, session],
             )?;
         }
+        tx.commit()?;
         for (session, revision) in &revisions {
             if old.get(session) == Some(revision) {
                 continue;
             }
+            cancelled()?;
             let events = store.search_events(caller, session)?;
             let surfaces = search_surfaces(&events);
+            // One transaction per session: a cancelled or slow refresh keeps
+            // the sessions it already indexed, so retries make progress.
+            let tx = connection.transaction()?;
             tx.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM event_scope WHERE workspace=?1 AND session=?2)", params![workspace, session])?;
             tx.execute(
                 "DELETE FROM event_scope WHERE workspace=?1 AND session=?2",
@@ -232,7 +258,10 @@ impl SqliteSessionSearch {
             let mut scope_insert =
                 tx.prepare("INSERT INTO event_scope(rowid,workspace,session) VALUES(?1,?2,?3)")?;
             let mut insert = tx.prepare("INSERT INTO events(workspace,session,event,kind,surface,time,body) VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
-            for event in events {
+            for (index, event) in events.into_iter().enumerate() {
+                if index % 512 == 0 {
+                    cancelled()?;
+                }
                 let value = serde_json::to_value(&event.event)?;
                 let mut parts = Vec::new();
                 searchable(&value, &mut parts);
@@ -248,10 +277,11 @@ impl SqliteSessionSearch {
                 scope_insert.execute(params![tx.last_insert_rowid(), workspace, session])?;
             }
             drop(insert);
+            drop(scope_insert);
             tx.execute("INSERT INTO revisions VALUES(?1,?2,?3) ON CONFLICT(workspace,session) DO UPDATE SET revision=excluded.revision",
                 params![workspace, session, revision])?;
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -263,6 +293,33 @@ impl SqliteSessionSearch {
         caller: &String,
         operation: &str,
         request: QueryRequest,
+    ) -> Result<Value> {
+        self.execute_cancellable(store, caller, operation, request, &CancellationToken::new())
+    }
+
+    /// As [`Self::execute`]; `cancel` stops an index refresh between rows
+    /// (sessions already indexed stay indexed) and interrupts SQLite queries.
+    pub fn execute_cancellable(
+        &mut self,
+        store: &SessionStore,
+        caller: &String,
+        operation: &str,
+        request: QueryRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        *self.cancel.lock().expect("search cancel lock") = cancel.clone();
+        let result = self.execute_inner(store, caller, operation, request, cancel);
+        *self.cancel.lock().expect("search cancel lock") = CancellationToken::new();
+        result
+    }
+
+    fn execute_inner(
+        &mut self,
+        store: &SessionStore,
+        caller: &String,
+        operation: &str,
+        request: QueryRequest,
+        cancel: &CancellationToken,
     ) -> Result<Value> {
         let workspace = store.search_workspace(caller, request.session_id.as_ref())?;
         let limit = request.limit.unwrap_or(20);
@@ -299,7 +356,7 @@ impl SqliteSessionSearch {
                         .ok_or_else(|| invalid("invalid cursor"))?;
                     return self.cached_page(store, caller, token, start.parse()?, limit, &scope);
                 }
-                self.refresh(store, caller, &workspace)?;
+                self.refresh(store, caller, &workspace, cancel)?;
                 let session = if operation == "session_event_search" {
                     Some(request.session_id.as_ref().unwrap_or(caller))
                 } else {

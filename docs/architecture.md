@@ -398,7 +398,11 @@ Build order follows the dependency graph:
   Cancelling the turn withdraws the question (`approval_resolved`
   frame, fail-closed as Cancelled) — `ToolRegistry::dispatch` takes the
   turn's CancellationToken so a pending approval can never outlive its
-  turn. `ApprovalRequest` now carries the session id (protocol-owned,
+  turn. A tool already executing gets 2 s to honor the token (bash kills
+  its process group, MCP notifies the server, Lua tools stop at the next
+  VM hook or awaited query); after that the dispatcher abandons it and
+  commits a cancelled result, so Ctrl-C never waits on a stuck tool.
+  `ApprovalRequest` now carries the session id (protocol-owned,
   same shape everywhere).
 - **Workspace instructions SHIPPED** (dsh agent-instructions model):
   `engine/instructions.rs` discovers instruction files (AGENTS.md
