@@ -303,12 +303,20 @@ pub fn install(
     session.set(
         "title",
         lua.create_function(
-            move |_, (id, new_title, source, max_bytes): (String, Option<String>, Option<String>, Option<usize>)| {
+            move |_,
+                  (id, new_title, source, max_bytes): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<usize>,
+            )| {
                 if let Some(title) = new_title {
                     let source = match source.as_deref() {
                         None | Some("user") => rness_protocol::events::TitleSource::User,
                         Some("model") => rness_protocol::events::TitleSource::Model,
-                        Some(other) => return Err(err(format!("unknown title source '{other}' (user|model)"))),
+                        Some(other) => {
+                            return Err(err(format!("unknown title source '{other}' (user|model)")))
+                        }
                     };
                     let max_bytes = max_bytes.unwrap_or(rness_engine::titles::DEFAULT_MAX_BYTES);
                     s.set_title(&id, title, source, max_bytes).map_err(err)?;
@@ -324,7 +332,10 @@ pub fn install(
         "title_info",
         lua.create_function(move |lua, id: String| {
             let info = s.title_with_source(&id).map_err(err)?;
-            lua.to_value(&info.map(|(title, source)| serde_json::json!({ "title": title, "source": source })))
+            lua.to_value(
+                &info
+                    .map(|(title, source)| serde_json::json!({ "title": title, "source": source })),
+            )
         })?,
     )?;
 

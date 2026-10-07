@@ -82,9 +82,18 @@ fn delegation_lineage(
 /// Add delegation `parent` + `lineage` (nearest first) for opts.agent scoping.
 fn add_lineage(binding: Option<&SessionBinding>, payload: &mut serde_json::Value) {
     let Some(binding) = binding else { return };
-    let Some(session) = payload.get("session").and_then(|s| s.as_str()).map(str::to_owned) else { return };
+    let Some(session) = payload
+        .get("session")
+        .and_then(|s| s.as_str())
+        .map(str::to_owned)
+    else {
+        return;
+    };
     let lineage = delegation_lineage(&binding.sessions, &session);
-    payload["parent"] = lineage.first().cloned().map_or(serde_json::Value::Null, serde_json::Value::String);
+    payload["parent"] = lineage
+        .first()
+        .cloned()
+        .map_or(serde_json::Value::Null, serde_json::Value::String);
     payload["lineage"] = serde_json::json!(lineage);
 }
 
@@ -125,15 +134,21 @@ fn hook_content(
             .iter()
             .map(|part| match part {
                 serde_json::Value::String(text) => Ok(Part::Text { text: text.clone() }),
-                serde_json::Value::Object(map) if map.get("type").and_then(|t| t.as_str()) == Some("text") => map
-                    .get("text")
-                    .and_then(|t| t.as_str())
-                    .map(|text| Part::Text { text: text.into() })
-                    .ok_or_else(|| format!("{field}: text part needs a string 'text'")),
-                other => serde_json::from_value(other.clone()).map_err(|e| format!("{field}: invalid content part: {e}")),
+                serde_json::Value::Object(map)
+                    if map.get("type").and_then(|t| t.as_str()) == Some("text") =>
+                {
+                    map.get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|text| Part::Text { text: text.into() })
+                        .ok_or_else(|| format!("{field}: text part needs a string 'text'"))
+                }
+                other => serde_json::from_value(other.clone())
+                    .map_err(|e| format!("{field}: invalid content part: {e}")),
             })
             .collect(),
-        _ => Err(format!("{field} must be a string or an array of content parts")),
+        _ => Err(format!(
+            "{field} must be a string or an array of content parts"
+        )),
     }
 }
 
@@ -151,10 +166,13 @@ fn hook_contexts(
             if single.as_object().is_some_and(|m| m.is_empty()) {
                 return Ok(Vec::new());
             }
-            Ok(vec![hook_message(single).map_err(|e| format!("additional_contexts: {e}"))?])
+            Ok(vec![
+                hook_message(single).map_err(|e| format!("additional_contexts: {e}"))?
+            ])
         }
         Some(_) => Err(
-            "additional_contexts must be a string, a {text=, tag=} table, or an array of them".into(),
+            "additional_contexts must be a string, a {text=, tag=} table, or an array of them"
+                .into(),
         ),
     }
 }
@@ -177,7 +195,9 @@ fn outcome_value(outcome: &rness_engine::tools::hooks::ExecuteOutcome) -> serde_
 
 /// `{content = "text" | parts, is_error = bool}`; `output` is accepted as
 /// a text alias so returning `next()`'s table unchanged round-trips.
-fn execute_outcome(value: &serde_json::Value) -> Result<rness_engine::tools::hooks::ExecuteOutcome, String> {
+fn execute_outcome(
+    value: &serde_json::Value,
+) -> Result<rness_engine::tools::hooks::ExecuteOutcome, String> {
     let serde_json::Value::Object(map) = value else {
         return Err("tool_execute must return a table {content, is_error}".into());
     };
@@ -262,7 +282,10 @@ impl LuaHost {
 
         // Emit hook/invoked audit event.
         if let Some(bus) = &self.bus {
-            let matcher = payload.get("tool").and_then(|t| t.as_str()).map(str::to_owned);
+            let matcher = payload
+                .get("tool")
+                .and_then(|t| t.as_str())
+                .map(str::to_owned);
             bus.emit::<rness_engine::service::HookAuditEv>(
                 &rness_engine::service::HookAuditNotice {
                     session: audit_session.clone(),
@@ -283,7 +306,13 @@ impl LuaHost {
         let _guard = token.clone().drop_guard();
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::Intercept { event: event.into(), payload, default, cancel: token.clone(), reply })
+            .send(Cmd::Intercept {
+                event: event.into(),
+                payload,
+                default,
+                cancel: token.clone(),
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         let result = tokio::select! {
             biased;
@@ -294,7 +323,11 @@ impl LuaHost {
         // Emit hook/result audit event.
         if let Some(bus) = &self.bus {
             let decision = match &result {
-                Ok(v) => v.get("kind").and_then(|k| k.as_str()).unwrap_or("ok").to_string(),
+                Ok(v) => v
+                    .get("kind")
+                    .and_then(|k| k.as_str())
+                    .unwrap_or("ok")
+                    .to_string(),
                 Err(e) => format!("error: {e}"),
             };
             bus.emit::<rness_engine::service::HookAuditEv>(
@@ -331,16 +364,27 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
             return Ok(PreToolDecision::Allow);
         }
         let decision = self
-            .intercept("pre_tool", hook_payload(event), serde_json::json!({"kind": "allow"}), cancel)
+            .intercept(
+                "pre_tool",
+                hook_payload(event),
+                serde_json::json!({"kind": "allow"}),
+                cancel,
+            )
             .await?;
-        let reason = decision.get("reason").and_then(|r| r.as_str()).map(str::to_owned);
+        let reason = decision
+            .get("reason")
+            .and_then(|r| r.as_str())
+            .map(str::to_owned);
         match hook_kind(&decision)? {
             "allow" => Ok(PreToolDecision::Allow),
             "deny" => Ok(PreToolDecision::Deny {
-                reason: reason.unwrap_or_else(|| format!("{} was denied by a pre_tool hook", event.tool)),
+                reason: reason
+                    .unwrap_or_else(|| format!("{} was denied by a pre_tool hook", event.tool)),
             }),
             "ask" => Ok(PreToolDecision::Ask { reason }),
-            other => Err(format!("pre_tool: unknown decision kind '{other}' (allow, deny, ask)")),
+            other => Err(format!(
+                "pre_tool: unknown decision kind '{other}' (allow, deny, ask)"
+            )),
         }
     }
 
@@ -353,7 +397,12 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
             return Ok(None);
         }
         let decision = self
-            .intercept(crate::runtime::GUARD_EVENT, hook_payload(event), serde_json::Value::Null, cancel)
+            .intercept(
+                crate::runtime::GUARD_EVENT,
+                hook_payload(event),
+                serde_json::Value::Null,
+                cancel,
+            )
             .await?;
         if decision.is_null() {
             return Ok(None);
@@ -367,7 +416,9 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("{} was denied by a guard", event.tool)),
             )),
-            other => Err(format!("guard: unknown decision kind '{other}' (deny or nil)")),
+            other => Err(format!(
+                "guard: unknown decision kind '{other}' (deny or nil)"
+            )),
         }
     }
 
@@ -385,11 +436,18 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
         let _cancel_on_drop = token.clone().drop_guard();
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(Cmd::ExecuteStart { payload: hook_payload(event), cancel: token.clone(), reply })
+            .send(Cmd::ExecuteStart {
+                payload: hook_payload(event),
+                cancel: token.clone(),
+                reply,
+            })
             .map_err(|_| "lua vm gone")?;
         let (id, mut step) = hook_reply(rx, &token).await?;
         // Release the parked coroutine however this future ends.
-        let _park = ExecuteParking { tx: self.tx.clone(), id };
+        let _park = ExecuteParking {
+            tx: self.tx.clone(),
+            id,
+        };
         let mut last = None;
         loop {
             match step {
@@ -397,7 +455,12 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
                     let outcome = next().await;
                     let (reply, rx) = tokio::sync::oneshot::channel();
                     self.tx
-                        .send(Cmd::ExecuteResume { id, outcome: outcome_value(&outcome), cancel: token.clone(), reply })
+                        .send(Cmd::ExecuteResume {
+                            id,
+                            outcome: outcome_value(&outcome),
+                            cancel: token.clone(),
+                            reply,
+                        })
                         .map_err(|_| "lua vm gone")?;
                     last = Some(outcome);
                     step = match hook_reply(rx, &token).await {
@@ -407,7 +470,9 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
                     };
                 }
                 ExecuteStep::Done(serde_json::Value::Null) => {
-                    return last.ok_or_else(|| "tool_execute: the chain returned nil without calling next()".into());
+                    return last.ok_or_else(|| {
+                        "tool_execute: the chain returned nil without calling next()".into()
+                    });
                 }
                 ExecuteStep::Done(value) => return execute_outcome(&value),
             }
@@ -432,28 +497,49 @@ impl rness_engine::tools::hooks::ToolHooks for LuaHost {
             "duration_ms": result.duration_ms,
         });
         let decision = self
-            .intercept("post_tool", payload, serde_json::json!({"kind": "accept"}), cancel)
+            .intercept(
+                "post_tool",
+                payload,
+                serde_json::json!({"kind": "accept"}),
+                cancel,
+            )
             .await?;
         let additional_contexts = hook_contexts(&decision)?;
         match hook_kind(&decision)? {
             "accept" => {
                 let content = match (decision.get("content"), decision.get("value")) {
-                    (Some(_), Some(_)) => return Err("post_tool: accept takes content or value, not both".into()),
+                    (Some(_), Some(_)) => {
+                        return Err("post_tool: accept takes content or value, not both".into())
+                    }
                     (Some(content), None) => Some(hook_content(content, "content")?),
-                    (None, Some(serde_json::Value::String(text))) => Some(hook_content(&serde_json::Value::String(text.clone()), "value")?),
-                    (None, Some(value)) => Some(hook_content(&serde_json::Value::String(value.to_string()), "value")?),
+                    (None, Some(serde_json::Value::String(text))) => Some(hook_content(
+                        &serde_json::Value::String(text.clone()),
+                        "value",
+                    )?),
+                    (None, Some(value)) => Some(hook_content(
+                        &serde_json::Value::String(value.to_string()),
+                        "value",
+                    )?),
                     (None, None) => None,
                 };
-                Ok(PostToolDecision::Accept { content, additional_contexts })
+                Ok(PostToolDecision::Accept {
+                    content,
+                    additional_contexts,
+                })
             }
             "block" => {
                 let feedback = decision
                     .get("feedback")
                     .ok_or_else(|| "post_tool: block needs 'feedback'".to_string())
                     .and_then(|feedback| hook_content(feedback, "feedback"))?;
-                Ok(PostToolDecision::Block { feedback, additional_contexts })
+                Ok(PostToolDecision::Block {
+                    feedback,
+                    additional_contexts,
+                })
             }
-            other => Err(format!("post_tool: unknown decision kind '{other}' (accept, block)")),
+            other => Err(format!(
+                "post_tool: unknown decision kind '{other}' (accept, block)"
+            )),
         }
     }
 
@@ -542,7 +628,10 @@ fn hook_message(
                 Some(serde_json::Value::String(t)) if !t.is_empty() => Some(t.clone()),
                 Some(_) => return Err("message 'tag' must be a non-empty string".into()),
             };
-            Ok(HookMessage { text: text.into(), tag })
+            Ok(HookMessage {
+                text: text.into(),
+                tag,
+            })
         }
         _ => Err("messages must be strings or {text=, tag=} tables".into()),
     }
@@ -561,7 +650,9 @@ fn hook_messages(
             }
             Ok(vec![hook_message(single)?])
         }
-        Some(_) => Err("messages must be a string, a {text=, tag=} table, or an array of them".into()),
+        Some(_) => {
+            Err("messages must be a string, a {text=, tag=} table, or an array of them".into())
+        }
     }
 }
 
@@ -596,7 +687,12 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
             return Ok(PreStepDecision::Enter);
         }
         let decision = self
-            .intercept("pre_step", loop_payload(event), serde_json::json!({"kind": "enter"}), cancel)
+            .intercept(
+                "pre_step",
+                loop_payload(event),
+                serde_json::json!({"kind": "enter"}),
+                cancel,
+            )
             .await?;
         match hook_kind(&decision)? {
             "enter" => {
@@ -608,7 +704,9 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
                 }
             }
             "reject" => Ok(PreStepDecision::Reject),
-            other => Err(format!("pre_step: unknown decision kind '{other}' (enter, reject)")),
+            other => Err(format!(
+                "pre_step: unknown decision kind '{other}' (enter, reject)"
+            )),
         }
     }
 
@@ -621,7 +719,12 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
             return Ok(());
         }
         let _ = self
-            .intercept("request", loop_payload(event), serde_json::Value::Null, cancel)
+            .intercept(
+                "request",
+                loop_payload(event),
+                serde_json::Value::Null,
+                cancel,
+            )
             .await?;
         Ok(())
     }
@@ -663,7 +766,12 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
             return Ok(TurnStoppingAction::Stop);
         }
         let decision = self
-            .intercept("turn_stopping", loop_payload(event), serde_json::json!({"kind": "stop"}), cancel)
+            .intercept(
+                "turn_stopping",
+                loop_payload(event),
+                serde_json::json!({"kind": "stop"}),
+                cancel,
+            )
             .await?;
         match hook_kind(&decision)? {
             "continue" => {
@@ -675,7 +783,9 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
                 }
             }
             "stop" => Ok(TurnStoppingAction::Stop),
-            other => Err(format!("turn_stopping: unknown decision kind '{other}' (stop, continue)")),
+            other => Err(format!(
+                "turn_stopping: unknown decision kind '{other}' (stop, continue)"
+            )),
         }
     }
 }
@@ -780,9 +890,7 @@ enum Cmd {
         reply: tokio::sync::oneshot::Sender<Result<crate::runtime::ExecuteStep, String>>,
     },
     /// The caller abandoned a parked chain.
-    ExecuteDrop {
-        id: u64,
-    },
+    ExecuteDrop { id: u64 },
     WebTransform {
         operation: String,
         phase: String,
@@ -1633,7 +1741,15 @@ impl LuaHost {
         let (config, hook_counts) = ready_rx
             .recv()
             .map_err(|_| "lua vm thread died".to_string())??;
-        Ok((Self { tx, generation, hook_counts, bus: None }, config))
+        Ok((
+            Self {
+                tx,
+                generation,
+                hook_counts,
+                bus: None,
+            },
+            config,
+        ))
     }
 
     pub async fn load(&self, name: &str, source: &str) -> Result<(), String> {
@@ -2307,16 +2423,32 @@ mod tests {
     #[test]
     fn hook_messages_accept_strings_and_tagged_tables() {
         use rness_engine::turn::hooks::HookMessage;
-        let m = |text: &str, tag: Option<&str>| HookMessage { text: text.into(), tag: tag.map(Into::into) };
-        assert_eq!(hook_messages(&json!({"messages": "a"})).unwrap(), [m("a", None)]);
+        let m = |text: &str, tag: Option<&str>| HookMessage {
+            text: text.into(),
+            tag: tag.map(Into::into),
+        };
         assert_eq!(
-            hook_messages(&json!({"messages": ["a", {"text": "b", "tag": "time"}, {"text": "c"}]})).unwrap(),
+            hook_messages(&json!({"messages": "a"})).unwrap(),
+            [m("a", None)]
+        );
+        assert_eq!(
+            hook_messages(&json!({"messages": ["a", {"text": "b", "tag": "time"}, {"text": "c"}]}))
+                .unwrap(),
             [m("a", None), m("b", Some("time")), m("c", None)]
         );
-        assert_eq!(hook_messages(&json!({"messages": {"text": "d", "tag": "t"}})).unwrap(), [m("d", Some("t"))]);
+        assert_eq!(
+            hook_messages(&json!({"messages": {"text": "d", "tag": "t"}})).unwrap(),
+            [m("d", Some("t"))]
+        );
         assert!(hook_messages(&json!({"messages": {}})).unwrap().is_empty());
         assert!(hook_messages(&json!({})).unwrap().is_empty());
-        for bad in [json!({"messages": [1]}), json!({"messages": [{"tag": "x"}]}), json!({"messages": [{"text": "x", "tag": 3}]}), json!({"messages": [{"text": "x", "tag": ""}]}), json!({"messages": 5})] {
+        for bad in [
+            json!({"messages": [1]}),
+            json!({"messages": [{"tag": "x"}]}),
+            json!({"messages": [{"text": "x", "tag": 3}]}),
+            json!({"messages": [{"text": "x", "tag": ""}]}),
+            json!({"messages": 5}),
+        ] {
             assert!(hook_messages(&bad).is_err(), "{bad}");
         }
     }
@@ -2349,19 +2481,51 @@ mod tests {
         let registry = ToolRegistry::default();
         crate::api::tools::sync_lua_tools(&registry, &host, &[]).await;
         registry.set_hooks(Some(std::sync::Arc::new(host.clone())));
-        let call = |id: &str, say: &str| ToolCall { call: id.into(), name: "echo".into(), args: json!({"say": say}) };
+        let call = |id: &str, say: &str| ToolCall {
+            call: id.into(),
+            name: "echo".into(),
+            args: json!({"say": say}),
+        };
         let results = registry
-            .dispatch(&"s".into(), &[call("a", "hi"), call("b", "secret"), call("c", "guarded")], 1, &tokio_util::sync::CancellationToken::new())
+            .dispatch(
+                &"s".into(),
+                &[call("a", "hi"), call("b", "secret"), call("c", "guarded")],
+                1,
+                &tokio_util::sync::CancellationToken::new(),
+            )
             .await;
-        assert_eq!((results[0].output.as_str(), results[0].is_error), ("hi!", false));
-        assert_eq!((results[1].output.as_str(), results[1].is_error), ("no secrets", true));
-        assert_eq!((results[2].output.as_str(), results[2].is_error), ("guarded", true));
-        assert_eq!(registry.take_hook_contexts(&"s".into()), [
-            HookContext { call: "a".into(), text: "checked a".into(), tag: None },
-            HookContext { call: "a".into(), text: "lint a".into(), tag: Some("lint".into()) },
-        ]);
+        assert_eq!(
+            (results[0].output.as_str(), results[0].is_error),
+            ("hi!", false)
+        );
+        assert_eq!(
+            (results[1].output.as_str(), results[1].is_error),
+            ("no secrets", true)
+        );
+        assert_eq!(
+            (results[2].output.as_str(), results[2].is_error),
+            ("guarded", true)
+        );
+        assert_eq!(
+            registry.take_hook_contexts(&"s".into()),
+            [
+                HookContext {
+                    call: "a".into(),
+                    text: "checked a".into(),
+                    tag: None
+                },
+                HookContext {
+                    call: "a".into(),
+                    text: "lint a".into(),
+                    tag: Some("lint".into())
+                },
+            ]
+        );
         // tool_result is fire-and-forget but ordered before this call.
-        assert_eq!(host.call_tool("seen", json!({})).await, Ok("a=hi!,b=no secrets,c=guarded".into()));
+        assert_eq!(
+            host.call_tool("seen", json!({})).await,
+            Ok("a=hi!,b=no secrets,c=guarded".into())
+        );
     }
 
     #[tokio::test]
@@ -2380,12 +2544,26 @@ mod tests {
         let registry = ToolRegistry::default();
         crate::api::tools::sync_lua_tools(&registry, &host, &[]).await;
         registry.set_hooks(Some(std::sync::Arc::new(host.clone())));
-        let call = |say: &str| ToolCall { call: say.into(), name: "echo".into(), args: json!({"say": say}) };
+        let call = |say: &str| ToolCall {
+            call: say.into(),
+            name: "echo".into(),
+            args: json!({"say": say}),
+        };
         let cancel = tokio_util::sync::CancellationToken::new();
-        let bad = registry.dispatch(&"s".into(), &[call("bad")], 1, &cancel).await.remove(0);
-        assert!(bad.is_error && bad.output.contains("unknown decision kind 'maybe'"), "{}", bad.output);
+        let bad = registry
+            .dispatch(&"s".into(), &[call("bad")], 1, &cancel)
+            .await
+            .remove(0);
+        assert!(
+            bad.is_error && bad.output.contains("unknown decision kind 'maybe'"),
+            "{}",
+            bad.output
+        );
         // A nil return from the chain means the default (allow).
-        let ok = registry.dispatch(&"s".into(), &[call("ok")], 1, &cancel).await.remove(0);
+        let ok = registry
+            .dispatch(&"s".into(), &[call("ok")], 1, &cancel)
+            .await
+            .remove(0);
         assert_eq!((ok.output.as_str(), ok.is_error), ("ok", false));
     }
 
@@ -2418,19 +2596,45 @@ mod tests {
         crate::api::tools::sync_lua_tools(&registry, &host, &[]).await;
         registry.set_hooks(Some(std::sync::Arc::new(host.clone())));
         let cancel = tokio_util::sync::CancellationToken::new();
-        let call = |name: &str, mode: &str| ToolCall { call: mode.into(), name: name.into(), args: json!({"mode": mode}) };
+        let call = |name: &str, mode: &str| ToolCall {
+            call: mode.into(),
+            name: name.into(),
+            args: json!({"mode": mode}),
+        };
         // Retry: first run errors, the wrapper runs the body again.
-        let retried = registry.dispatch(&"s".into(), &[call("flaky", "retry")], 1, &cancel).await.remove(0);
-        assert_eq!((retried.output.as_str(), retried.is_error), ("ran 2", false));
+        let retried = registry
+            .dispatch(&"s".into(), &[call("flaky", "retry")], 1, &cancel)
+            .await
+            .remove(0);
+        assert_eq!(
+            (retried.output.as_str(), retried.is_error),
+            ("ran 2", false)
+        );
         // Short-circuit: the body never runs.
-        let skipped = registry.dispatch(&"s".into(), &[call("flaky", "skip")], 1, &cancel).await.remove(0);
-        assert_eq!((skipped.output.as_str(), skipped.is_error), ("skipped", false));
+        let skipped = registry
+            .dispatch(&"s".into(), &[call("flaky", "skip")], 1, &cancel)
+            .await
+            .remove(0);
+        assert_eq!(
+            (skipped.output.as_str(), skipped.is_error),
+            ("skipped", false)
+        );
         assert_eq!(host.call_tool("count", json!({})).await, Ok("2".into()));
         // nil without next() is a wrapper bug, not a silent success.
-        let bad = registry.dispatch(&"s".into(), &[call("flaky", "nil")], 1, &cancel).await.remove(0);
-        assert!(bad.is_error && bad.output.contains("without calling next()"), "{}", bad.output);
+        let bad = registry
+            .dispatch(&"s".into(), &[call("flaky", "nil")], 1, &cancel)
+            .await
+            .remove(0);
+        assert!(
+            bad.is_error && bad.output.contains("without calling next()"),
+            "{}",
+            bad.output
+        );
         // Unmatched tools bypass the wrapper.
-        let other = registry.dispatch(&"s".into(), &[call("count", "x")], 1, &cancel).await.remove(0);
+        let other = registry
+            .dispatch(&"s".into(), &[call("count", "x")], 1, &cancel)
+            .await
+            .remove(0);
         assert_eq!(other.output, "2");
     }
 

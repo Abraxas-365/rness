@@ -100,7 +100,11 @@ fn cap_block(mut text: String, name: &str) -> String {
         while !text.is_char_boundary(cut) {
             cut -= 1;
         }
-        tracing::warn!(context = name, bytes = text.len(), "context block truncated");
+        tracing::warn!(
+            context = name,
+            bytes = text.len(),
+            "context block truncated"
+        );
         text.truncate(cut);
         text.push_str("\n[context block truncated]");
     }
@@ -313,7 +317,11 @@ async fn drive(
 
         // Loop hook: pre_step — may inject messages or reject the step.
         if let Some(hooks) = loop_hooks {
-            let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+            let loop_event = LoopEvent {
+                session: session.clone(),
+                turn: turn_no,
+                step: step_no,
+            };
             let decision = tokio::select! {
                 biased;
                 d = hooks.pre_step(&loop_event, cancel) => d,
@@ -329,7 +337,9 @@ async fn drive(
                 Ok(PreStepDecision::EnterWithMessages { messages }) => {
                     for message in messages {
                         log.append(&SessionEvent::UserMessage(UserMessage {
-                            content: vec![rness_protocol::events::ContentPart::Text { text: message.text }],
+                            content: vec![rness_protocol::events::ContentPart::Text {
+                                text: message.text,
+                            }],
                             intent: rness_protocol::events::UserIntent::Inject,
                             source: Some(rness_protocol::events::MessageSource::Hook {
                                 event: "pre_step".into(),
@@ -337,7 +347,9 @@ async fn drive(
                                 tag: message.tag,
                             }),
                         }))?;
-                        frames(Frame::HistoryChanged { session: session.clone() });
+                        frames(Frame::HistoryChanged {
+                            session: session.clone(),
+                        });
                     }
                 }
                 Ok(PreStepDecision::Enter) => {}
@@ -483,9 +495,15 @@ async fn drive(
             };
             // Loop hook: request — currently observe-only.
             if let Some(hooks) = loop_hooks {
-                let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                let loop_event = LoopEvent {
+                    session: session.clone(),
+                    turn: turn_no,
+                    step: step_no,
+                };
                 if let Err(e) = hooks.request(&loop_event, cancel).await {
-                    if cancel.is_cancelled() { return Ok(TurnOutcome::Cancelled); }
+                    if cancel.is_cancelled() {
+                        return Ok(TurnOutcome::Cancelled);
+                    }
                     tracing::warn!(session = %session, "request hook failed: {e}");
                 }
             }
@@ -529,7 +547,11 @@ async fn drive(
                     // when the built-in policy would not.
                     let mut hook_retry = false;
                     if let Some(hooks) = loop_hooks {
-                        let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                        let loop_event = LoopEvent {
+                            session: session.clone(),
+                            turn: turn_no,
+                            step: step_no,
+                        };
                         let info = hooks::RequestError {
                             code: error.code.into(),
                             message: error.message.clone(),
@@ -539,7 +561,9 @@ async fn drive(
                         };
                         match hooks.request_error(&loop_event, &info, cancel).await {
                             Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
-                            Err(e) => tracing::warn!(session = %session, "request_error hook failed: {e}"),
+                            Err(e) => {
+                                tracing::warn!(session = %session, "request_error hook failed: {e}")
+                            }
                             Ok(RequestErrorAction::Retry) => hook_retry = true,
                             Ok(RequestErrorAction::Default) => {}
                         }
@@ -601,7 +625,9 @@ async fn drive(
                             last: error.message,
                         });
                     }
-                    if let Some(delay) = retry_delay.or(hook_retry.then(|| std::time::Duration::from_millis(500))) {
+                    if let Some(delay) =
+                        retry_delay.or(hook_retry.then(|| std::time::Duration::from_millis(500)))
+                    {
                         tokio::select! {
                             biased;
                             _ = cancel.cancelled() => return Ok(TurnOutcome::Cancelled),
@@ -635,21 +661,27 @@ async fn drive(
             })?;
 
         // Is this a terminal stop (EndTurn, or max_tokens with no tool calls)?
-        let is_stopping = stop == StopReason::EndTurn
-            || (stop == StopReason::MaxTokens && calls.is_empty());
+        let is_stopping =
+            stop == StopReason::EndTurn || (stop == StopReason::MaxTokens && calls.is_empty());
 
         if is_stopping {
             // Loop hook: turn_stopping — listeners may inject messages
             // to continue the turn instead of closing it.
             if let Some(hooks) = loop_hooks {
-                let loop_event = LoopEvent { session: session.clone(), turn: turn_no, step: step_no };
+                let loop_event = LoopEvent {
+                    session: session.clone(),
+                    turn: turn_no,
+                    step: step_no,
+                };
                 match hooks.turn_stopping(&loop_event, cancel).await {
                     Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
                     Err(e) => tracing::warn!(session = %session, "turn_stopping hook failed: {e}"),
                     Ok(TurnStoppingAction::Continue { messages }) if !messages.is_empty() => {
                         for message in messages {
                             log.append(&SessionEvent::UserMessage(UserMessage {
-                                content: vec![rness_protocol::events::ContentPart::Text { text: message.text }],
+                                content: vec![rness_protocol::events::ContentPart::Text {
+                                    text: message.text,
+                                }],
                                 intent: rness_protocol::events::UserIntent::Steer,
                                 source: Some(rness_protocol::events::MessageSource::Hook {
                                     event: "turn_stopping".into(),
@@ -657,7 +689,9 @@ async fn drive(
                                     tag: message.tag,
                                 }),
                             }))?;
-                            frames(Frame::HistoryChanged { session: session.clone() });
+                            frames(Frame::HistoryChanged {
+                                session: session.clone(),
+                            });
                         }
                         continue; // another step
                     }
@@ -725,7 +759,11 @@ async fn drive(
                         let mut results = Vec::new();
                         for call in calls {
                             if !exposed.contains(&call.name) {
-                                results.push(crate::tools::exposure::result(call, Err("tool is not exposed; discover it with ToolSearch first".into())));
+                                results.push(crate::tools::exposure::result(
+                                    call,
+                                    Err("tool is not exposed; discover it with ToolSearch first"
+                                        .into()),
+                                ));
                             } else if call.name == "ToolSearch" {
                                 let output = config.tool_exposure.search(tools, &call.args);
                                 match output {
@@ -821,15 +859,19 @@ async fn drive(
                 // messages after the whole result block (providers need
                 // tool results adjacent to their calls).
                 for context in tools.take_hook_contexts(&session) {
-                    log.append(&SessionEvent::UserMessage(rness_protocol::events::UserMessage {
-                        content: vec![rness_protocol::events::ContentPart::Text { text: context.text }],
-                        intent: rness_protocol::events::UserIntent::Inject,
-                        source: Some(rness_protocol::events::MessageSource::Hook {
-                            event: "post_tool".into(),
-                            call: Some(context.call),
-                            tag: context.tag,
-                        }),
-                    }))?;
+                    log.append(&SessionEvent::UserMessage(
+                        rness_protocol::events::UserMessage {
+                            content: vec![rness_protocol::events::ContentPart::Text {
+                                text: context.text,
+                            }],
+                            intent: rness_protocol::events::UserIntent::Inject,
+                            source: Some(rness_protocol::events::MessageSource::Hook {
+                                event: "post_tool".into(),
+                                call: Some(context.call),
+                                tag: context.tag,
+                            }),
+                        },
+                    ))?;
                     frames(Frame::HistoryChanged {
                         session: session.clone(),
                     });

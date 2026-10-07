@@ -101,15 +101,15 @@ async fn workflow_card_example_shows_progress_then_result() {
     .unwrap();
     let args = serde_json::json!({"meta":{"name":"audit","description":"x"},"script":"RAW-SCRIPT"});
     let running = serde_json::json!({"kind":"workflow_activity", "name":"panic-audit",
-        "description":"Audit crates", "phase":"Scan", "status":"running", "elapsed_ms":3000,
-        "total":14, "counts":{"running":1,"queued":1,"completed":1,"failed":1,"cancelled":0},
-        "logs":["scanning 4 crates"],
-        "members":[
-            {"seq":10,"label":"engine","phase":"Scan","status":"completed"},
-            {"seq":11,"label":"tools","phase":"Scan","status":"running","session":"s1"},
-            {"seq":12,"label":"lua","status":"failed"},
-            {"seq":13,"label":"tui","status":"queued"}
-        ]});
+    "description":"Audit crates", "phase":"Scan", "status":"running", "elapsed_ms":3000,
+    "total":14, "counts":{"running":1,"queued":1,"completed":1,"failed":1,"cancelled":0},
+    "logs":["scanning 4 crates"],
+    "members":[
+        {"seq":10,"label":"engine","phase":"Scan","status":"completed"},
+        {"seq":11,"label":"tools","phase":"Scan","status":"running","session":"s1"},
+        {"seq":12,"label":"lua","status":"failed"},
+        {"seq":13,"label":"tui","status":"queued"}
+    ]});
     let lines = host
         .tool_card_presented("workflow", args.clone(), "", false, Some(running))
         .await
@@ -2109,7 +2109,11 @@ async fn tree_view_renders_and_navigates() {
 async fn time_context_every_turn_skips_tool_loop_steps() {
     use rness_engine::turn::hooks::{LoopEvent, LoopHooks, PreStepDecision};
     let plugin = include_str!("../../../flavors/default/plugins/time-context.lua");
-    let step = |turn, step| LoopEvent { session: "s".into(), turn, step };
+    let step = |turn, step| LoopEvent {
+        session: "s".into(),
+        turn,
+        step,
+    };
     let cancel = CancellationToken::new();
     let tagged = |d: &PreStepDecision| match d {
         PreStepDecision::EnterWithMessages { messages } => {
@@ -2124,16 +2128,24 @@ async fn time_context_every_turn_skips_tool_loop_steps() {
     let host = LuaHost::spawn().unwrap();
     host.load("time", plugin).await.unwrap();
     for (turn, s) in [(1, 1), (1, 2), (1, 3)] {
-        assert!(tagged(&host.pre_step(&step(turn, s), &cancel).await.unwrap()), "step {s}");
+        assert!(
+            tagged(&host.pre_step(&step(turn, s), &cancel).await.unwrap()),
+            "step {s}"
+        );
     }
 
     // every = "turn": first step only.
     let host = LuaHost::spawn().unwrap();
-    host.load("cfg", r#"rness.time_context = { every = "turn" }"#).await.unwrap();
+    host.load("cfg", r#"rness.time_context = { every = "turn" }"#)
+        .await
+        .unwrap();
     host.load("time", plugin).await.unwrap();
     assert!(tagged(&host.pre_step(&step(1, 1), &cancel).await.unwrap()));
     for s in [2, 3] {
-        assert_eq!(host.pre_step(&step(1, s), &cancel).await.unwrap(), PreStepDecision::Enter);
+        assert_eq!(
+            host.pre_step(&step(1, s), &cancel).await.unwrap(),
+            PreStepDecision::Enter
+        );
     }
     assert!(tagged(&host.pre_step(&step(2, 1), &cancel).await.unwrap()));
 
@@ -2166,12 +2178,27 @@ async fn time_context_resend_after_and_subagent_skip() {
     host.load("time", plugin).await.unwrap();
     let advance = |n: u32, name: String| {
         let host = host.clone();
-        async move { host.load(&name, &format!("rness.test_now = rness.test_now + {n}")).await.unwrap() }
+        async move {
+            host.load(&name, &format!("rness.test_now = rness.test_now + {n}"))
+                .await
+                .unwrap()
+        }
     };
     let pre = |turn, step| {
         let host = host.clone();
         let cancel = cancel.clone();
-        async move { host.pre_step(&LoopEvent { session: "root".into(), turn, step }, &cancel).await.unwrap() }
+        async move {
+            host.pre_step(
+                &LoopEvent {
+                    session: "root".into(),
+                    turn,
+                    step,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap()
+        }
     };
     let sent = |d: &PreStepDecision| matches!(d, PreStepDecision::EnterWithMessages { .. });
 
@@ -2183,16 +2210,46 @@ async fn time_context_resend_after_and_subagent_skip() {
     advance(1, "t3".into()).await;
     assert!(sent(&pre(1, 4).await), "10 min: resend mid-turn");
     advance(60, "t4".into()).await;
-    assert!(!sent(&pre(1, 5).await), "resend timer restarts after the resend");
+    assert!(
+        !sent(&pre(1, 5).await),
+        "resend timer restarts after the resend"
+    );
     assert!(sent(&pre(2, 1).await), "new turn always sends");
 
     // Delegated session (the host adds `parent` for subagents): skipped.
     let child = |parent: serde_json::Value| serde_json::json!({"session": "child", "turn": 1, "step": 1, "parent": parent});
-    let kind = |v: serde_json::Value| v.get("messages").map(|m| !m.is_null() && m != &serde_json::json!({}));
-    let skipped = host.intercept("pre_step", child(serde_json::json!("root")), serde_json::json!({"kind": "enter"}), &cancel).await.unwrap();
-    assert_ne!(kind(skipped.clone()), Some(true), "subagent must not get time: {skipped}");
-    let top = host.intercept("pre_step", child(serde_json::Value::Null), serde_json::json!({"kind": "enter"}), &cancel).await.unwrap();
-    assert_eq!(kind(top.clone()), Some(true), "top-level session still gets time: {top}");
+    let kind = |v: serde_json::Value| {
+        v.get("messages")
+            .map(|m| !m.is_null() && m != &serde_json::json!({}))
+    };
+    let skipped = host
+        .intercept(
+            "pre_step",
+            child(serde_json::json!("root")),
+            serde_json::json!({"kind": "enter"}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        kind(skipped.clone()),
+        Some(true),
+        "subagent must not get time: {skipped}"
+    );
+    let top = host
+        .intercept(
+            "pre_step",
+            child(serde_json::Value::Null),
+            serde_json::json!({"kind": "enter"}),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        kind(top.clone()),
+        Some(true),
+        "top-level session still gets time: {top}"
+    );
 }
 
 /// tmux-context runs its real shell query against fake `tmux`/`ps` on PATH:
@@ -2236,7 +2293,18 @@ esac"#,
     let pre = |turn| {
         let host = host.clone();
         let cancel = cancel.clone();
-        async move { host.pre_step(&LoopEvent { session: "s".into(), turn, step: 1 }, &cancel).await.unwrap() }
+        async move {
+            host.pre_step(
+                &LoopEvent {
+                    session: "s".into(),
+                    turn,
+                    step: 1,
+                },
+                &cancel,
+            )
+            .await
+            .unwrap()
+        }
     };
     let set = |lua: &'static str, name: &'static str| {
         let host = host.clone();
@@ -2258,19 +2326,42 @@ esac"#,
         "tmux location (turn 1):\nsession \"main\", window 2 \"code\", pane 1 (%42)\nwindow active, pane active\nlayout aaaa,80x24,0,0,42"
     );
     assert_eq!(text(pre(2).await), None, "unchanged state is suppressed");
-    set(r#"rness.fake.layout = "bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}""#, "split").await;
+    set(
+        r#"rness.fake.layout = "bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}""#,
+        "split",
+    )
+    .await;
     let relaid = text(pre(3).await).expect("layout change re-injects");
-    assert!(relaid.starts_with("tmux location (turn 3):") && relaid.ends_with("layout bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}"), "{relaid}");
+    assert!(
+        relaid.starts_with("tmux location (turn 3):")
+            && relaid.ends_with("layout bbbb,80x24,0,0{40x24,0,0,42,39x24,41,0,43}"),
+        "{relaid}"
+    );
 
     // Inherited $TMUX_PANE: the pane's tty is some other terminal → nothing.
-    set(r#"rness.fake.pane_tty = "/dev/ttys009"; rness.fake.layout = "cccc""#, "inherited").await;
+    set(
+        r#"rness.fake.pane_tty = "/dev/ttys009"; rness.fake.layout = "cccc""#,
+        "inherited",
+    )
+    .await;
     assert_eq!(text(pre(4).await), None, "inherited env must not inject");
     // No controlling tty at all (daemon/CI): nothing.
-    set(r#"rness.fake.pane_tty = "/dev/ttys003"; rness.fake.self_tty = "??""#, "notty").await;
+    set(
+        r#"rness.fake.pane_tty = "/dev/ttys003"; rness.fake.self_tty = "??""#,
+        "notty",
+    )
+    .await;
     assert_eq!(text(pre(5).await), None);
 
     // Invalid config fails at load.
     let bad = LuaHost::spawn().unwrap();
-    bad.load("cfg", "rness.tmux_context = { refresh_interval = -1 }").await.unwrap();
-    assert!(bad.load("tmux", plugin).await.unwrap_err().to_string().contains("must be"));
+    bad.load("cfg", "rness.tmux_context = { refresh_interval = -1 }")
+        .await
+        .unwrap();
+    assert!(bad
+        .load("tmux", plugin)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("must be"));
 }

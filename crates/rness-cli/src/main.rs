@@ -425,7 +425,10 @@ async fn main() -> anyhow::Result<()> {
     // Qualify credential keys in auth_store / auth_oauth so the resolver reads
     // the right slot from credentials.json (e.g. "anthropic/work" instead of "anthropic").
     for (provider_name, declaration) in &startup.providers {
-        let effective_account = cli.account.as_deref().or(declaration.default_account.as_deref());
+        let effective_account = cli
+            .account
+            .as_deref()
+            .or(declaration.default_account.as_deref());
         if let Some(acct) = effective_account {
             if let Some(base) = auth_store.get(provider_name) {
                 let qualified = CredentialStore::credential_key(base, Some(acct));
@@ -599,8 +602,8 @@ async fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?,
     );
     let resolver_images = image_store.clone();
-    let provider_resolver: Arc<rness_engine::service::ProviderResolver> =
-        Arc::new(move |selection| {
+    let provider_resolver: Arc<rness_engine::service::ProviderResolver> = Arc::new(
+        move |selection| {
             let mut provider = (|| {
                 if let Some(credential) = auth_oauth.get(&selection.route) {
                     // If the exact credential key has no tokens, try the first
@@ -676,7 +679,8 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or("new provider unexpectedly shared")?
                 .configure_images(resolver_images.clone(), image_policy.clone());
             Ok(provider)
-        });
+        },
+    );
 
     let provider = provider_resolver(creation_seed.selection.as_ref().unwrap())
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -690,18 +694,20 @@ async fn main() -> anyhow::Result<()> {
     {
         let root = root.clone();
         std::thread::spawn(move || {
-            let swept = rness_engine::tools::sweep_spill_files(&root, rness_engine::tools::SPILL_RETENTION);
+            let swept =
+                rness_engine::tools::sweep_spill_files(&root, rness_engine::tools::SPILL_RETENTION);
             if swept.files > 0 {
-                tracing::info!(files = swept.files, bytes = swept.bytes, "removed expired spill files");
+                tracing::info!(
+                    files = swept.files,
+                    bytes = swept.bytes,
+                    "removed expired spill files"
+                );
             }
         });
     }
     let ws = rness_tools::Workspace::new(&cwd);
-    let jobs = rness_tools::register_all_configured(
-        &tools,
-        ws.clone(),
-        startup.sandbox.process.clone(),
-    );
+    let jobs =
+        rness_tools::register_all_configured(&tools, ws.clone(), startup.sandbox.process.clone());
     jobs.configure_retention(startup.job_retention.clone())
         .map_err(anyhow::Error::msg)?;
     jobs.enable_persistence(&root.join("jobs"))
@@ -797,8 +803,9 @@ async fn main() -> anyhow::Result<()> {
     let legacy_skill_roots =
         rness_tools::skills::default_roots_with_custom(&cwd, &custom_skill_roots_for_resolver);
     sessions.set_input_resolver(Arc::new(move |workspace, content| {
-        let roots = workspace
-            .map(|w| rness_tools::skills::default_roots_with_custom(w, &custom_skill_roots_for_resolver));
+        let roots = workspace.map(|w| {
+            rness_tools::skills::default_roots_with_custom(w, &custom_skill_roots_for_resolver)
+        });
         rness_tools::skills::resolve_input(roots.as_deref().unwrap_or(&legacy_skill_roots), content)
     }));
 
@@ -945,10 +952,7 @@ async fn main() -> anyhow::Result<()> {
                     let code = rness_lua::hooks_json::generate_lua(&config);
                     if !code.is_empty() {
                         if let Err(e) = lua.load("hooks.json", &code).await {
-                            eprintln!(
-                                "warning: hooks.json at {}: {e}",
-                                path.display()
-                            );
+                            eprintln!("warning: hooks.json at {}: {e}", path.display());
                         } else {
                             tracing::info!(path = %path.display(), "loaded hooks.json");
                         }
@@ -1061,19 +1065,18 @@ async fn main() -> anyhow::Result<()> {
         // Session idle (turn finished, waiting for input).
         let l8: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
         let s8 = kernel.bus().on::<SessionIdleEv>(move |session| {
-            l8.fire_hook(
-                "session_idle",
-                serde_json::json!({"session": session}),
-            );
+            l8.fire_hook("session_idle", serde_json::json!({"session": session}));
         });
         // A human prompt was committed (title policy, prompt logging).
         let l9: Arc<dyn rness_kernel::presentation::HookSink> = Arc::new(lua.clone());
-        let s9 = kernel.bus().on::<rness_engine::service::PromptCommittedEv>(move |n| {
-            l9.fire_hook(
-                "prompt",
-                serde_json::json!({"session": n.session, "text": n.text, "index": n.index}),
-            );
-        });
+        let s9 = kernel
+            .bus()
+            .on::<rness_engine::service::PromptCommittedEv>(move |n| {
+                l9.fire_hook(
+                    "prompt",
+                    serde_json::json!({"session": n.session, "text": n.text, "index": n.index}),
+                );
+            });
         (s1, s2, s3, s4, s5, s6, s7, s8, s9)
     };
 
@@ -1501,7 +1504,10 @@ mod command_admission_tests {
         ) -> Result<CommandResult, ServiceError> {
             let line = format!("{} {}", self.name, input.raw_input.trim());
             self.ran.lock().unwrap().push(line.clone());
-            Ok(CommandResult { message: line, data: serde_json::Value::Null })
+            Ok(CommandResult {
+                message: line,
+                data: serde_json::Value::Null,
+            })
         }
     }
 
@@ -1531,7 +1537,11 @@ mod command_admission_tests {
         for name in ["alpha", "beta"] {
             sessions
                 .commands()
-                .register(Arc::new(Probe { name, release: release.clone(), ran: ran.clone() }))
+                .register(Arc::new(Probe {
+                    name,
+                    release: release.clone(),
+                    ran: ran.clone(),
+                }))
                 .unwrap();
         }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1549,12 +1559,24 @@ mod command_admission_tests {
         backend.complete(&sid, "/alpha x".into());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !sessions.command_running(&sid) {
-            assert!(std::time::Instant::now() < deadline, "completion never started");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "completion never started"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        assert_eq!(backend.submit(send(&sid, "/alpha one")).unwrap().as_deref(), Some("Command running"));
-        assert_eq!(backend.submit(send(&sid, "/beta two")).unwrap().as_deref(), Some("Command running"));
-        assert!(ran.lock().unwrap().is_empty(), "deferred until the completion ends");
+        assert_eq!(
+            backend.submit(send(&sid, "/alpha one")).unwrap().as_deref(),
+            Some("Command running")
+        );
+        assert_eq!(
+            backend.submit(send(&sid, "/beta two")).unwrap().as_deref(),
+            Some("Command running")
+        );
+        assert!(
+            ran.lock().unwrap().is_empty(),
+            "deferred until the completion ends"
+        );
         // Not a command: "/usr/bin/foo" is a prompt and must not be deferred
         // (it is refused now rather than silently queued behind the slot).
         assert!(backend.submit(send(&sid, "/usr/bin/foo crashes")).is_err());
@@ -1577,12 +1599,19 @@ mod command_admission_tests {
         backend.complete(&sid, "/alpha y".into());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !sessions.command_running(&sid) {
-            assert!(std::time::Instant::now() < deadline, "second completion never started");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "second completion never started"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         backend.submit(send(&sid, "/beta three")).unwrap();
         assert!(backend.command_running(&sid));
-        backend.submit(ClientRequest::Cancel { session: sid.clone() }).unwrap();
+        backend
+            .submit(ClientRequest::Cancel {
+                session: sid.clone(),
+            })
+            .unwrap();
         release.add_permits(1);
         loop {
             let action = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
@@ -1874,7 +1903,8 @@ impl rness_tui::app::Backend for LocalBackend {
 
     fn command_running(&self, session: &SessionId) -> bool {
         // A deferred command counts: Ctrl-C must not quit under it.
-        self.sessions.command_running(session) || self.deferred.lock().unwrap().contains_key(session)
+        self.sessions.command_running(session)
+            || self.deferred.lock().unwrap().contains_key(session)
     }
 
     fn quit_blockers(&self) -> Vec<String> {
@@ -1900,7 +1930,10 @@ impl rness_tui::app::Backend for LocalBackend {
             } => {
                 let prepared = match content.as_slice() {
                     [ContentPart::Text { text }] => {
-                        match self.admit_command(&session, text).map_err(|e| e.to_string())? {
+                        match self
+                            .admit_command(&session, text)
+                            .map_err(|e| e.to_string())?
+                        {
                             Admission::Ready(command) => Some(command),
                             Admission::Deferred => return Ok(Some("Command running".into())),
                             Admission::NotCommand => None,
@@ -1909,7 +1942,12 @@ impl rness_tui::app::Backend for LocalBackend {
                     _ => None,
                 };
                 if let Some(command) = prepared {
-                    run_prepared(command, self.sessions.clone(), self.results.clone(), session);
+                    run_prepared(
+                        command,
+                        self.sessions.clone(),
+                        self.results.clone(),
+                        session,
+                    );
                     return Ok(Some("Command running".into()));
                 }
                 match self
@@ -2053,7 +2091,10 @@ async fn run_tui(
         .workspace(&session)?
         .map(std::path::PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots_with_custom(&workspace, &custom_skill_roots)) {
+    for skill in rness_tools::skills::discover(&rness_tools::skills::default_roots_with_custom(
+        &workspace,
+        &custom_skill_roots,
+    )) {
         candidates.push((format!("skill {}", skill.name), skill.description.clone()));
         if !["agent", "skill", "unload", "colorscheme"].contains(&skill.name.as_str()) {
             candidates.push((skill.name, format!("Skill: {}", skill.description)));
@@ -2627,8 +2668,10 @@ async fn run_tui(
                         let root = workspace
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|| workspace_fallback.clone());
-                        skill_roots =
-                            rness_tools::skills::default_roots_with_custom(&root, &custom_skill_roots);
+                        skill_roots = rness_tools::skills::default_roots_with_custom(
+                            &root,
+                            &custom_skill_roots,
+                        );
                         previous_skills = None;
                     }
                     previous_session = Some(session);
@@ -2636,7 +2679,9 @@ async fn run_tui(
                 // Empty roots = the session's workspace isn't known yet
                 // (default roots are never empty): don't wipe the startup
                 // catalog with an empty list.
-                if !skill_roots.is_empty() && (previous_skills.is_none() || ticks.is_multiple_of(10)) {
+                if !skill_roots.is_empty()
+                    && (previous_skills.is_none() || ticks.is_multiple_of(10))
+                {
                     let fingerprint = rness_tools::skills::catalog_fingerprint(&skill_roots);
                     if previous_skills.as_ref() != Some(&fingerprint) {
                         let skills: Vec<_> = rness_tools::skills::discover(&skill_roots)

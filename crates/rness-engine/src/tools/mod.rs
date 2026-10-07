@@ -17,7 +17,9 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::approval::{ApprovalRequest, Approvals, Decision};
-use hooks::{ExecuteOutcome, HookContext, PostToolDecision, PreToolDecision, ToolHookEvent, ToolHooks};
+use hooks::{
+    ExecuteOutcome, HookContext, PostToolDecision, PreToolDecision, ToolHookEvent, ToolHooks,
+};
 
 /// Max bytes of tool-result text kept inline for the model. Larger results
 /// are spilled to a file and replaced with a head/tail preview.
@@ -300,7 +302,13 @@ fn spill_if_oversized(
     let spill_dir = root.join(session.as_str()).join("spill");
     let safe_name = tool_name
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>();
     let file_name = format!("{}-{}.txt", call_id, safe_name);
     let file_path = spill_dir.join(&file_name);
@@ -314,7 +322,10 @@ fn spill_if_oversized(
     }
     // Build head/tail preview.
     let head_end = char_boundary_before(&full_text, SPILL_PREVIEW_BYTES);
-    let tail_start = char_boundary_after(&full_text, full_text.len().saturating_sub(SPILL_PREVIEW_BYTES));
+    let tail_start = char_boundary_after(
+        &full_text,
+        full_text.len().saturating_sub(SPILL_PREVIEW_BYTES),
+    );
     let omitted = full_text.len() - head_end - (full_text.len() - tail_start);
     let preview = format!(
         "{}\n\n(Omitted {} bytes. Full result: {}. Use Read with offset/limit to page, or Grep to search.)\n\n{}",
@@ -400,10 +411,14 @@ pub fn sweep_spill_files(root: &std::path::Path, max_age: std::time::Duration) -
         if !is_dir {
             continue;
         }
-        let Ok(files) = std::fs::read_dir(&dir) else { continue };
+        let Ok(files) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         let mut kept = false;
         for file in files.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(file.path()) else { continue };
+            let Ok(meta) = std::fs::symlink_metadata(file.path()) else {
+                continue;
+            };
             let stale = meta.file_type().is_file()
                 && meta.modified().is_ok_and(|modified| modified < cutoff);
             if !stale {
@@ -631,7 +646,9 @@ impl ToolRegistry {
 
     /// Record the current turn number so tool hooks include it in audit events.
     pub fn set_current_turn(&self, turn: u32) {
-        self.hooks.current_turn.store(turn, std::sync::atomic::Ordering::Relaxed);
+        self.hooks
+            .current_turn
+            .store(turn, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Set the root directory for spill files. Session-scoped subdirectories
@@ -647,7 +664,8 @@ impl ToolRegistry {
     pub fn spill_result(&self, session: &SessionId, mut result: ToolResult) -> ToolResult {
         let spill_root = self.spill_root.read().expect("registry lock").clone();
         let content = std::mem::take(&mut result.content);
-        result.content = spill_if_oversized(content, &spill_root, session, &result.call, &result.name);
+        result.content =
+            spill_if_oversized(content, &spill_root, session, &result.call, &result.name);
         result.output = ToolResult::text_output(&result.content);
         result
     }
@@ -806,7 +824,11 @@ impl ToolRegistry {
             let approvals = Arc::clone(&self.approvals);
             let hook_state = Arc::clone(&self.hooks);
             let hooks = self.tool_hooks();
-            let spill_root = self.spill_root.read().expect("registry lock").clone()
+            let spill_root = self
+                .spill_root
+                .read()
+                .expect("registry lock")
+                .clone()
                 .filter(|_| tool.as_ref().is_none_or(|tool| tool.spills_output()));
             let call = call.clone();
             let session = session.clone();
@@ -1085,8 +1107,14 @@ impl ToolRegistry {
 fn refusal(decision: Decision) -> Option<(&'static str, String)> {
     match decision {
         Decision::Allowed => None,
-        Decision::Rejected => Some(("approval_rejected", "the user rejected this tool call".into())),
-        Decision::Cancelled => Some(("approval_cancelled", "approval request was cancelled".into())),
+        Decision::Rejected => Some((
+            "approval_rejected",
+            "the user rejected this tool call".into(),
+        )),
+        Decision::Cancelled => Some((
+            "approval_cancelled",
+            "approval request was cancelled".into(),
+        )),
         Decision::Unavailable => Some((
             "approval_unavailable",
             "approval required but no approver is available — the call was blocked".into(),
@@ -1161,7 +1189,11 @@ mod tests {
     async fn run_big(reg: &ToolRegistry, name: &str, bytes: usize) -> ToolResult {
         reg.dispatch(
             &"sess".into(),
-            &[ToolCall { call: "c1".into(), name: name.into(), args: serde_json::json!({"bytes": bytes}) }],
+            &[ToolCall {
+                call: "c1".into(),
+                name: name.into(),
+                args: serde_json::json!({"bytes": bytes}),
+            }],
             1,
             &CancellationToken::new(),
         )
@@ -1174,9 +1206,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::default();
         reg.set_spill_root(dir.path().to_path_buf());
-        reg.register(Arc::new(Big { name: "big", spills: true }));
+        reg.register(Arc::new(Big {
+            name: "big",
+            spills: true,
+        }));
         let result = run_big(&reg, "big", MAX_INLINE_BYTES + 10).await;
-        assert!(result.output.len() < 3 * SPILL_PREVIEW_BYTES + 400, "{}", result.output.len());
+        assert!(
+            result.output.len() < 3 * SPILL_PREVIEW_BYTES + 400,
+            "{}",
+            result.output.len()
+        );
         assert!(result.output.starts_with("HEAD") && result.output.ends_with("TAIL"));
         let path = dir.path().join("sess/spill/c1-big.txt");
         assert!(result.output.contains(&path.display().to_string()));
@@ -1184,7 +1223,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode(&path), 0o600);
             assert_eq!(mode(path.parent().unwrap()), 0o700);
         }
@@ -1198,9 +1238,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reg = ToolRegistry::default();
         reg.set_spill_root(dir.path().to_path_buf());
-        reg.register(Arc::new(Big { name: "Read", spills: false }));
+        reg.register(Arc::new(Big {
+            name: "Read",
+            spills: false,
+        }));
         let result = run_big(&reg, "Read", MAX_INLINE_BYTES + 10).await;
-        assert_eq!(result.output.len(), MAX_INLINE_BYTES + 18, "full text inline");
+        assert_eq!(
+            result.output.len(),
+            MAX_INLINE_BYTES + 18,
+            "full text inline"
+        );
         assert!(!dir.path().join("sess/spill").exists());
     }
 
@@ -1214,7 +1261,10 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_private_file(&path, b"new").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         let target = dir.path().join("target.txt");
         std::fs::write(&target, "keep").unwrap();
         let link = dir.path().join("link.txt");
@@ -1241,7 +1291,12 @@ mod tests {
         }
         let aged = std::time::SystemTime::now() - Duration::from_secs(31 * 24 * 3600);
         let age = |p: &std::path::Path| {
-            std::fs::File::options().write(true).open(p).unwrap().set_modified(aged).unwrap()
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(aged)
+                .unwrap()
         };
         for p in [&old, &lone, &log, &foreign] {
             age(p);
@@ -1255,18 +1310,33 @@ mod tests {
             std::os::unix::fs::symlink(&outside, root.join("b/spill/link")).unwrap();
         }
         let swept = sweep_spill_files(root, SPILL_RETENTION);
-        assert_eq!(swept, SpillSweep { files: 2, bytes: 10 });
+        assert_eq!(
+            swept,
+            SpillSweep {
+                files: 2,
+                bytes: 10
+            }
+        );
         assert!(!old.exists() && !lone.exists());
         assert!(fresh.exists(), "fresh spill kept");
         assert!(log.exists(), "session logs are never touched");
-        assert!(foreign.exists(), "directories without a session log are not swept");
-        assert!(!root.join("a/spill").exists() && !root.join("c/spill").exists(), "emptied spill dirs removed");
+        assert!(
+            foreign.exists(),
+            "directories without a session log are not swept"
+        );
+        assert!(
+            !root.join("a/spill").exists() && !root.join("c/spill").exists(),
+            "emptied spill dirs removed"
+        );
         #[cfg(unix)]
         {
             assert!(root.join("outside.txt").exists());
             assert!(std::fs::symlink_metadata(root.join("b/spill/link")).is_ok());
         }
-        assert_eq!(sweep_spill_files(&root.join("missing"), SPILL_RETENTION), SpillSweep::default());
+        assert_eq!(
+            sweep_spill_files(&root.join("missing"), SPILL_RETENTION),
+            SpillSweep::default()
+        );
     }
     #[tokio::test]
     async fn parallel_execution_commits_in_model_order() {
@@ -1318,46 +1388,90 @@ mod tests {
     struct Script(std::sync::Mutex<Vec<String>>);
     #[async_trait]
     impl ToolHooks for Script {
-        async fn pre_tool(&self, e: &ToolHookEvent, _: &CancellationToken) -> Result<PreToolDecision, String> {
+        async fn pre_tool(
+            &self,
+            e: &ToolHookEvent,
+            _: &CancellationToken,
+        ) -> Result<PreToolDecision, String> {
             let say = e.args["say"].as_str().unwrap_or("").to_string();
             self.0.lock().unwrap().push(format!("pre:{say}"));
             Ok(match say.as_str() {
-                "rm" => PreToolDecision::Deny { reason: "no rm".into() },
-                "ask" => PreToolDecision::Ask { reason: Some("why".into()) },
+                "rm" => PreToolDecision::Deny {
+                    reason: "no rm".into(),
+                },
+                "ask" => PreToolDecision::Ask {
+                    reason: Some("why".into()),
+                },
                 "boom" => return Err("exploded".into()),
                 _ => PreToolDecision::Allow,
             })
         }
-        async fn guard(&self, e: &ToolHookEvent, _: &CancellationToken) -> Result<Option<String>, String> {
+        async fn guard(
+            &self,
+            e: &ToolHookEvent,
+            _: &CancellationToken,
+        ) -> Result<Option<String>, String> {
             self.0.lock().unwrap().push("guard".into());
             Ok((e.args["say"] == "guarded").then(|| "guard says no".into()))
         }
-        async fn tool_execute(&self, e: &ToolHookEvent, next: &hooks::ExecuteNext, _: &CancellationToken) -> Result<ExecuteOutcome, String> {
+        async fn tool_execute(
+            &self,
+            e: &ToolHookEvent,
+            next: &hooks::ExecuteNext,
+            _: &CancellationToken,
+        ) -> Result<ExecuteOutcome, String> {
             match e.args["say"].as_str() {
-                Some("cached") => Ok(ExecuteOutcome { content: vec![ToolResultContentPart::Text { text: "from cache".into() }], is_error: false }),
+                Some("cached") => Ok(ExecuteOutcome {
+                    content: vec![ToolResultContentPart::Text {
+                        text: "from cache".into(),
+                    }],
+                    is_error: false,
+                }),
                 Some("retry") => {
                     let first = next().await;
                     let second = next().await;
-                    Ok(ExecuteOutcome { content: [first.content, second.content].concat(), is_error: false })
+                    Ok(ExecuteOutcome {
+                        content: [first.content, second.content].concat(),
+                        is_error: false,
+                    })
                 }
                 Some("wrapfail") => Err("wrapper broke".into()),
                 _ => Ok(next().await),
             }
         }
-        async fn post_tool(&self, e: &ToolHookEvent, r: &ToolResult, _: &CancellationToken) -> Result<PostToolDecision, String> {
+        async fn post_tool(
+            &self,
+            e: &ToolHookEvent,
+            r: &ToolResult,
+            _: &CancellationToken,
+        ) -> Result<PostToolDecision, String> {
             self.0.lock().unwrap().push(format!("post:{}", r.output));
             Ok(if e.args["say"] == "blocked" {
-                PostToolDecision::Block { feedback: vec![ToolResultContentPart::Text { text: "try again".into() }], additional_contexts: vec![] }
+                PostToolDecision::Block {
+                    feedback: vec![ToolResultContentPart::Text {
+                        text: "try again".into(),
+                    }],
+                    additional_contexts: vec![],
+                }
             } else {
-                PostToolDecision::Accept { content: None, additional_contexts: vec![
-                    format!("saw {}", r.output).into(),
-                    hooks::HookMessage { text: "lint ok".into(), tag: Some("lint".into()) },
-                    "   ".into(),
-                ] }
+                PostToolDecision::Accept {
+                    content: None,
+                    additional_contexts: vec![
+                        format!("saw {}", r.output).into(),
+                        hooks::HookMessage {
+                            text: "lint ok".into(),
+                            tag: Some("lint".into()),
+                        },
+                        "   ".into(),
+                    ],
+                }
             })
         }
         fn tool_result(&self, _: &ToolHookEvent, r: &ToolResult) {
-            self.0.lock().unwrap().push(format!("result:{}", r.is_error));
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("result:{}", r.is_error));
         }
     }
 
@@ -1371,8 +1485,14 @@ mod tests {
     }
 
     async fn run(reg: &ToolRegistry, say: &str) -> ToolResult {
-        let call = ToolCall { call: say.into(), name: "sleep_echo".into(), args: serde_json::json!({"say": say}) };
-        reg.dispatch(&"s".into(), &[call], 1, &CancellationToken::new()).await.remove(0)
+        let call = ToolCall {
+            call: say.into(),
+            name: "sleep_echo".into(),
+            args: serde_json::json!({"say": say}),
+        };
+        reg.dispatch(&"s".into(), &[call], 1, &CancellationToken::new())
+            .await
+            .remove(0)
     }
 
     #[tokio::test]
@@ -1384,28 +1504,57 @@ mod tests {
 
         let ok = run(&reg, "hi").await;
         assert_eq!((ok.output.as_str(), ok.is_error), ("hi", false));
-        assert_eq!(*script.0.lock().unwrap(), ["pre:hi", "guard", "post:hi", "result:false"]);
+        assert_eq!(
+            *script.0.lock().unwrap(),
+            ["pre:hi", "guard", "post:hi", "result:false"]
+        );
         let contexts = reg.take_hook_contexts(&"s".into());
-        assert_eq!(contexts, [
-            HookContext { call: "hi".into(), text: "saw hi".into(), tag: None },
-            HookContext { call: "hi".into(), text: "lint ok".into(), tag: Some("lint".into()) },
-        ]);
+        assert_eq!(
+            contexts,
+            [
+                HookContext {
+                    call: "hi".into(),
+                    text: "saw hi".into(),
+                    tag: None
+                },
+                HookContext {
+                    call: "hi".into(),
+                    text: "lint ok".into(),
+                    tag: Some("lint".into())
+                },
+            ]
+        );
         assert!(reg.take_hook_contexts(&"s".into()).is_empty());
 
         script.0.lock().unwrap().clear();
         let denied = run(&reg, "rm").await;
         assert!(denied.is_error);
         assert_eq!(denied.output, "no rm");
-        assert_eq!(denied.presentation.as_ref().unwrap()["outcome"], "hook_denied");
+        assert_eq!(
+            denied.presentation.as_ref().unwrap()["outcome"],
+            "hook_denied"
+        );
         // Denials skip guard and the body but still reach post_tool.
-        assert_eq!(*script.0.lock().unwrap(), ["pre:rm", "post:no rm", "result:true"]);
+        assert_eq!(
+            *script.0.lock().unwrap(),
+            ["pre:rm", "post:no rm", "result:true"]
+        );
 
         let guarded = run(&reg, "guarded").await;
-        assert_eq!((guarded.output.as_str(), guarded.is_error), ("guard says no", true));
+        assert_eq!(
+            (guarded.output.as_str(), guarded.is_error),
+            ("guard says no", true)
+        );
 
         let blocked = run(&reg, "blocked").await;
-        assert_eq!((blocked.output.as_str(), blocked.is_error), ("try again", true));
-        assert_eq!(blocked.presentation.as_ref().unwrap()["outcome"], "hook_blocked");
+        assert_eq!(
+            (blocked.output.as_str(), blocked.is_error),
+            ("try again", true)
+        );
+        assert_eq!(
+            blocked.presentation.as_ref().unwrap()["outcome"],
+            "hook_blocked"
+        );
 
         script.0.lock().unwrap().clear();
         let failed = run(&reg, "boom").await;
@@ -1423,14 +1572,23 @@ mod tests {
         reg.approvals().set_answerer(answer.clone());
 
         let rejected = run(&reg, "ask").await;
-        assert_eq!(rejected.presentation.as_ref().unwrap()["outcome"], "approval_rejected");
-        assert_eq!(answer.1.lock().unwrap().as_ref().unwrap().reason.as_deref(), Some("why"));
+        assert_eq!(
+            rejected.presentation.as_ref().unwrap()["outcome"],
+            "approval_rejected"
+        );
+        assert_eq!(
+            answer.1.lock().unwrap().as_ref().unwrap().reason.as_deref(),
+            Some("why")
+        );
 
         // No approver: fail closed.
         let reg2 = ToolRegistry::default();
         reg2.register(Arc::new(SleepEcho));
         reg2.set_hooks(Some(Arc::new(Script::default())));
-        assert_eq!(run(&reg2, "ask").await.presentation.unwrap()["outcome"], "approval_unavailable");
+        assert_eq!(
+            run(&reg2, "ask").await.presentation.unwrap()["outcome"],
+            "approval_unavailable"
+        );
 
         // Policy `never` rejects without prompting.
         reg.approvals().set_policy(crate::approval::Policy::Never);
@@ -1447,16 +1605,32 @@ mod tests {
         reg.set_hooks(Some(script.clone()));
 
         let cached = run(&reg, "cached").await;
-        assert_eq!((cached.output.as_str(), cached.is_error), ("from cache", false));
+        assert_eq!(
+            (cached.output.as_str(), cached.is_error),
+            ("from cache", false)
+        );
         let retried = run(&reg, "retry").await;
         assert_eq!(retried.output, "retry\nretry");
 
         script.0.lock().unwrap().clear();
         let failed = run(&reg, "wrapfail").await;
-        assert!(failed.is_error && failed.output.contains("wrapper broke"), "{}", failed.output);
-        assert_eq!(failed.presentation.as_ref().unwrap()["outcome"], "hook_failed");
+        assert!(
+            failed.is_error && failed.output.contains("wrapper broke"),
+            "{}",
+            failed.output
+        );
+        assert_eq!(
+            failed.presentation.as_ref().unwrap()["outcome"],
+            "hook_failed"
+        );
         // A failing wrapper is still a settled result: post_tool sees it.
-        assert_eq!(script.0.lock().unwrap()[2..], ["post:tool_execute hook failed: wrapper broke".to_string(), "result:true".into()]);
+        assert_eq!(
+            script.0.lock().unwrap()[2..],
+            [
+                "post:tool_execute hook failed: wrapper broke".to_string(),
+                "result:true".into()
+            ]
+        );
     }
 
     #[tokio::test]

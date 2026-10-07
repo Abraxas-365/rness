@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use mlua::{Lua, Table};
 
-use crate::api::session::{CommandYield, command_yield_wrapper};
+use crate::api::session::{command_yield_wrapper, CommandYield};
 
 fn err(e: impl std::fmt::Display) -> mlua::Error {
     mlua::Error::runtime(e.to_string())
@@ -37,7 +37,9 @@ pub fn install(
         let profile: Option<String> = opts.get("profile")?;
         let max_output_tokens: Option<u32> = opts.get("max_output_tokens")?;
         if max_output_tokens == Some(0) {
-            return Err(err("rness.llm.complete: 'max_output_tokens' must be positive"));
+            return Err(err(
+                "rness.llm.complete: 'max_output_tokens' must be positive",
+            ));
         }
         let timeout_secs: Option<u64> = opts.get("timeout")?;
         let timeout = std::time::Duration::from_secs(timeout_secs.unwrap_or(30));
@@ -52,10 +54,8 @@ pub fn install(
                     .flatten()
             })
             .ok_or_else(|| {
-                err(
-                    "rness.llm.complete: 'session' is required \
-                     (pass explicitly from tool context, e.g. session = ctx.session)",
-                )
+                err("rness.llm.complete: 'session' is required \
+                     (pass explicitly from tool context, e.g. session = ctx.session)")
             })?;
 
         let cancel = lua

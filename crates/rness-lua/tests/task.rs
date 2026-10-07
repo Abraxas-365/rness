@@ -54,7 +54,12 @@ impl Provider for GatedTitle {
     }
 }
 
-async fn host() -> (LuaHost, Arc<SessionService>, Arc<GatedTitle>, tempfile::TempDir) {
+async fn host() -> (
+    LuaHost,
+    Arc<SessionService>,
+    Arc<GatedTitle>,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().unwrap();
     let provider = Arc::new(GatedTitle {
         gate: Semaphore::new(0),
@@ -72,7 +77,10 @@ async fn host() -> (LuaHost, Arc<SessionService>, Arc<GatedTitle>, tempfile::Tem
     let host = LuaHost::spawn().unwrap();
     host.install_session(
         sessions.clone(),
-        Arc::new(rness_engine::subagent::SubagentRuntime::new(sessions.clone(), 3)),
+        Arc::new(rness_engine::subagent::SubagentRuntime::new(
+            sessions.clone(),
+            3,
+        )),
         registry,
         Default::default(),
         tokio::runtime::Handle::current(),
@@ -106,7 +114,13 @@ async fn eventually(mut cond: impl FnMut() -> bool) {
 async fn session_with_prompt(sessions: &SessionService) -> String {
     let sid = sessions.create(None).unwrap();
     sessions
-        .send(&sid, UserIntent::Followup, vec![ContentPart::Text { text: "refactor the parser".into() }])
+        .send(
+            &sid,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "refactor the parser".into(),
+            }],
+        )
         .unwrap();
     sessions.join(&sid).await;
     sid
@@ -173,7 +187,10 @@ async fn unload_and_cancel_stop_parked_tasks_and_errors_are_contained() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     // Unloading the owner cancels the parked task: releasing the model
     // afterwards commits nothing.
-    assert!(host.unload_coordinated("titler", vec![], |_| {}).await.unwrap());
+    assert!(host
+        .unload_coordinated("titler", vec![], |_| {})
+        .await
+        .unwrap());
     // One permit: the cancelled tasks never consume it, so "again" does.
     provider.gate.add_permits(1);
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -193,16 +210,24 @@ async fn unload_and_cancel_stop_parked_tasks_and_errors_are_contained() {
     .unwrap();
     host.fire_hook("go", serde_json::json!({ "session": sid }));
     eventually(|| sessions.title(&sid).unwrap().is_some()).await;
-    assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Parser refactor"));
+    assert_eq!(
+        sessions.title(&sid).unwrap().as_deref(),
+        Some("Parser refactor")
+    );
 
     // A hot reload cancels the old generation's parked tasks too.
-    sessions.set_title(&sid, "Before reload".into(), TitleSource::Model, 80).unwrap();
+    sessions
+        .set_title(&sid, "Before reload".into(), TitleSource::Model, 80)
+        .unwrap();
     host.fire_hook("go", serde_json::json!({ "session": sid }));
     tokio::time::sleep(Duration::from_millis(50)).await;
     host.reload(vec![]).await.unwrap();
     provider.gate.add_permits(1);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Before reload"));
+    assert_eq!(
+        sessions.title(&sid).unwrap().as_deref(),
+        Some("Before reload")
+    );
 }
 
 /// The real plugin on a real host: root sessions carry `parent` = JSON null
@@ -248,7 +273,11 @@ async fn run_title(sessions: &Arc<SessionService>, sid: &str, input: &str) -> St
         .unwrap()
         .expect("title command registered");
     let sessions = sessions.clone();
-    match tokio::task::spawn_blocking(move || command.execute(&sessions)).await.unwrap().unwrap() {
+    match tokio::task::spawn_blocking(move || command.execute(&sessions))
+        .await
+        .unwrap()
+        .unwrap()
+    {
         rness_engine::inbox::Disposition::Command(result) => result.message,
         other => panic!("unexpected disposition {other:?}"),
     }
@@ -262,11 +291,13 @@ async fn title_command_runs_during_a_turn_and_auto_reports_by_notice() {
     let sid = session_with_prompt(&sessions).await;
     let notices: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let seen = notices.clone();
-    let _sub = sessions.bus().on::<rness_engine::service::FrameEv>(move |frame| {
-        if let rness_protocol::frames::Frame::Notice { text, .. } = frame {
-            seen.lock().unwrap().push(text.clone());
-        }
-    });
+    let _sub = sessions
+        .bus()
+        .on::<rness_engine::service::FrameEv>(move |frame| {
+            if let rness_protocol::frames::Frame::Notice { text, .. } = frame {
+                seen.lock().unwrap().push(text.clone());
+            }
+        });
     let plugin = format!(
         "local setup = (function() {} end)()\nsetup({{ auto = 'off', fallback = false }})",
         include_str!("../../../flavors/default/plugins/title.lua")
@@ -274,34 +305,71 @@ async fn title_command_runs_during_a_turn_and_auto_reports_by_notice() {
     host.load("title", &plugin).await.unwrap();
 
     // A turn is running.
-    provider.gate_turns.store(true, std::sync::atomic::Ordering::SeqCst);
+    provider
+        .gate_turns
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     sessions
-        .send(&sid, UserIntent::Followup, vec![ContentPart::Text { text: "keep going".into() }])
+        .send(
+            &sid,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "keep going".into(),
+            }],
+        )
         .unwrap();
     assert_eq!(sessions.phase(&sid), rness_engine::inbox::Phase::Running);
 
-    assert_eq!(run_title(&sessions, &sid, "/title Mid turn").await, "Title set: Mid turn");
+    assert_eq!(
+        run_title(&sessions, &sid, "/title Mid turn").await,
+        "Title set: Mid turn"
+    );
     assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Mid turn"));
 
     // /title auto returns before the model answers; the session stays usable.
-    assert_eq!(run_title(&sessions, &sid, "/title auto").await, "Generating title…");
+    assert_eq!(
+        run_title(&sessions, &sid, "/title auto").await,
+        "Generating title…"
+    );
     assert!(!sessions.command_running(&sid));
-    assert_eq!(run_title(&sessions, &sid, "/title").await, "Mid turn (pinned)");
+    assert_eq!(
+        run_title(&sessions, &sid, "/title").await,
+        "Mid turn (pinned)"
+    );
     provider.gate.add_permits(1);
-    eventually(|| notices.lock().unwrap().iter().any(|n| n == "Title: Parser refactor")).await;
-    assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Parser refactor"));
+    eventually(|| {
+        notices
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|n| n == "Title: Parser refactor")
+    })
+    .await;
+    assert_eq!(
+        sessions.title(&sid).unwrap().as_deref(),
+        Some("Parser refactor")
+    );
 
     // Renaming supersedes an in-flight /title auto.
     run_title(&sessions, &sid, "/title auto").await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(run_title(&sessions, &sid, "/title Final").await, "Title set: Final");
+    assert_eq!(
+        run_title(&sessions, &sid, "/title Final").await,
+        "Title set: Final"
+    );
     provider.gate.add_permits(1);
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(sessions.title(&sid).unwrap().as_deref(), Some("Final"));
-    assert_eq!(notices.lock().unwrap().len(), 1, "superseded request reports nothing");
+    assert_eq!(
+        notices.lock().unwrap().len(),
+        1,
+        "superseded request reports nothing"
+    );
 
     provider.turn_gate.add_permits(1);
     sessions.join(&sid).await;
-    assert!(sessions.notify(&sid, " \u{1b} ").is_err(), "empty notice after stripping controls");
+    assert!(
+        sessions.notify(&sid, " \u{1b} ").is_err(),
+        "empty notice after stripping controls"
+    );
     drop(host);
 }

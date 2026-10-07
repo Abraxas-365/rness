@@ -918,7 +918,12 @@ impl Component for Chat {
                 .entry_ids
                 .iter()
                 .enumerate()
-                .filter(|(i, _)| ctx.model.entries.get(*i).is_some_and(|entry| self.selectable(entry)))
+                .filter(|(i, _)| {
+                    ctx.model
+                        .entries
+                        .get(*i)
+                        .is_some_and(|entry| self.selectable(entry))
+                })
                 .collect();
             let Some(index) = targets.iter().position(|(_, target)| **target == id) else {
                 self.selected_message = None;
@@ -1050,7 +1055,12 @@ impl Component for Chat {
                 .iter()
                 .enumerate()
                 .rev()
-                .find(|(i, _)| ctx.model.entries.get(*i).is_some_and(|entry| self.selectable(entry)))
+                .find(|(i, _)| {
+                    ctx.model
+                        .entries
+                        .get(*i)
+                        .is_some_and(|entry| self.selectable(entry))
+                })
                 .map(|(_, id)| id.clone());
             self.message_expanded = true;
             self.message_scroll = 0;
@@ -1804,7 +1814,9 @@ impl Component for Chat {
                                     &self.config[role],
                                 );
                                 let options = match entry {
-                                    Entry::User { source, .. } => source_options(&options, source.as_ref()),
+                                    Entry::User { source, .. } => {
+                                        source_options(&options, source.as_ref())
+                                    }
                                     _ => options,
                                 };
                                 if options["visible"] == false
@@ -1815,7 +1827,8 @@ impl Component for Chat {
                                 let inner_width = panel_inner_width(&options, width);
                                 let mut body = Vec::new();
                                 match entry {
-                                    Entry::User { content, .. } | Entry::Assistant { content, .. } => {
+                                    Entry::User { content, .. }
+                                    | Entry::Assistant { content, .. } => {
                                         for part in content {
                                             match part {
                                 ContentPart::Text { text } if role == "assistant" => body.extend(crate::core::render::render_markdown_configured(text, inner_width, theme, &options["markdown"])),
@@ -3067,14 +3080,25 @@ mod tests {
         let text = |t: &str| vec![ContentPart::Text { text: t.into() }];
         let mut model = Model::new("hidden".into(), "fake".into());
         model.entries = vec![
-            Entry::User { content: text("typed prompt"), source: None },
+            Entry::User {
+                content: text("typed prompt"),
+                source: None,
+            },
             Entry::User {
                 content: text("CLOCK-SECRET"),
-                source: Some(MessageSource::Hook { event: "pre_step".into(), call: None, tag: Some("time".into()) }),
+                source: Some(MessageSource::Hook {
+                    event: "pre_step".into(),
+                    call: None,
+                    tag: Some("time".into()),
+                }),
             },
             Entry::User {
                 content: text("LINT-SHOWN"),
-                source: Some(MessageSource::Hook { event: "pre_step".into(), call: None, tag: Some("lint".into()) }),
+                source: Some(MessageSource::Hook {
+                    event: "pre_step".into(),
+                    call: None,
+                    tag: Some("lint".into()),
+                }),
             },
             Entry::User {
                 content: text("job finished"),
@@ -3085,7 +3109,10 @@ mod tests {
         model.history_revision = 1;
         model.history_epoch = 1;
         let theme = Theme::default();
-        let ctx = Ctx { model: &model, theme: &theme };
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
         let area = Rect::new(0, 0, 80, 30);
         let mut chat = Chat {
             config: serde_json::json!({
@@ -3102,22 +3129,35 @@ mod tests {
         let screen = |chat: &mut Chat| {
             let mut buffer = Buffer::empty(area);
             chat.render(&ctx, area, &mut buffer);
-            buffer.content.iter().map(|cell| cell.symbol()).collect::<String>()
+            buffer
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
         };
         let shown = screen(&mut chat);
         assert!(!shown.contains("CLOCK-SECRET"), "hook default hidden");
-        assert!(shown.contains("LINT-SHOWN") && shown.contains("Lint"), "tag overrides hook");
-        assert!(shown.contains("Job") && shown.contains("job finished"), "job relabelled");
+        assert!(
+            shown.contains("LINT-SHOWN") && shown.contains("Lint"),
+            "tag overrides hook"
+        );
+        assert!(
+            shown.contains("Job") && shown.contains("job finished"),
+            "job relabelled"
+        );
         assert!(shown.contains("You") && shown.contains("typed prompt"));
 
         // Selection walks visible entries only.
         chat.on_binding(&ctx, "select_message");
         assert_eq!(chat.selected_message.as_deref(), Some("u3"));
         for _ in 0..5 {
-            chat.on_key(&ctx, crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('k'),
-                crossterm::event::KeyModifiers::NONE,
-            ));
+            chat.on_key(
+                &ctx,
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('k'),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            );
             assert_ne!(chat.selected_message.as_deref(), Some("u1"));
         }
         assert_eq!(chat.selected_message.as_deref(), Some("u0"));

@@ -404,9 +404,14 @@ impl SubagentActivity {
         }
         // A live ToolStarted can precede the first history refresh for this turn.
         if run.status == "running" && run.activity == "Thinking" {
-            if let Some(name) = run.tools.iter().rev()
+            if let Some(name) = run
+                .tools
+                .iter()
+                .rev()
                 .find(|tool| tool["status"] == "running")
-                .and_then(|tool| tool["name"].as_str()).filter(|name| !name.is_empty()) {
+                .and_then(|tool| tool["name"].as_str())
+                .filter(|name| !name.is_empty())
+            {
                 run.activity = tail(name, MAX_ACTIVITY_BYTES).into();
             }
         }
@@ -414,16 +419,36 @@ impl SubagentActivity {
 
     fn sync_history(run: &mut Run, sessions: &SessionService) {
         let history = match &run.after {
-            Some(after) => sessions.store().history_after(&run.child, after).ok().flatten().unwrap_or_else(|| {
-                sessions.store().history(&run.child).unwrap_or_default().into_iter()
-                    .skip_while(|event| event.id != *after).skip(1).collect()
-            }),
+            Some(after) => sessions
+                .store()
+                .history_after(&run.child, after)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| {
+                    sessions
+                        .store()
+                        .history(&run.child)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .skip_while(|event| event.id != *after)
+                        .skip(1)
+                        .collect()
+                }),
             None => sessions.store().history(&run.child).unwrap_or_default(),
         };
         for event in history {
-            let event_ms = event.at.parse::<jiff::Timestamp>().ok()
+            let event_ms = event
+                .at
+                .parse::<jiff::Timestamp>()
+                .ok()
                 .and_then(|at| u64::try_from(at.as_millisecond()).ok())
-                .or_else(|| event.id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms()));
+                .or_else(|| {
+                    event
+                        .id
+                        .parse::<ulid::Ulid>()
+                        .ok()
+                        .map(|id| id.timestamp_ms())
+                });
             run.after = Some(event.id.clone());
             run.apply_event(event.event.clone(), event_ms);
         }
@@ -455,22 +480,33 @@ impl SubagentActivity {
         parent: &str,
     ) -> Vec<(String, Value, Value)> {
         let mut runs = self.runs.lock().unwrap();
-        runs.values_mut().filter(|run| run.parent == parent).map(|run| {
-            Self::refresh_run(run, sessions);
-            let card_tools: Vec<Value> = run.tools.iter().map(|tool| {
-                json!({
-                    "call": tool["call"],
-                    "name": tool["name"],
-                    "status": tool["status"],
-                })
-            }).collect();
-            (run.call.clone(), run.args.clone(), json!({
-                "kind":"subagent_activity", "session":run.child, "status":run.status,
-                "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
-                "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
-                "live":tail(&run.live, MAX_CARD_LIVE_BYTES), "tools":card_tools,
-            }))
-        }).collect()
+        runs.values_mut()
+            .filter(|run| run.parent == parent)
+            .map(|run| {
+                Self::refresh_run(run, sessions);
+                let card_tools: Vec<Value> = run
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "call": tool["call"],
+                            "name": tool["name"],
+                            "status": tool["status"],
+                        })
+                    })
+                    .collect();
+                (
+                    run.call.clone(),
+                    run.args.clone(),
+                    json!({
+                        "kind":"subagent_activity", "session":run.child, "status":run.status,
+                        "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
+                        "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
+                        "live":tail(&run.live, MAX_CARD_LIVE_BYTES), "tools":card_tools,
+                    }),
+                )
+            })
+            .collect()
     }
 }
 

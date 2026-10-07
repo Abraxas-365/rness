@@ -125,7 +125,9 @@ impl Event for PromptCommittedEv {
 }
 
 fn human_prompts<'a>(events: impl Iterator<Item = &'a rness_protocol::events::Envelope>) -> usize {
-    events.filter(|e| crate::titles::human_text(&e.event).is_some()).count()
+    events
+        .filter(|e| crate::titles::human_text(&e.event).is_some())
+        .count()
 }
 
 /// Announce human prompts just committed at the end of `events`.
@@ -140,7 +142,11 @@ fn announce_prompts(
     for e in tail {
         if let Some(text) = crate::titles::human_text(&e.event) {
             index += 1;
-            bus.emit::<PromptCommittedEv>(&PromptNotice { session: session.clone(), text, index });
+            bus.emit::<PromptCommittedEv>(&PromptNotice {
+                session: session.clone(),
+                text,
+                index,
+            });
         }
     }
 }
@@ -294,7 +300,11 @@ fn effective_title(
     Ok(crate::titles::current(events.iter().map(|e| &e.event)))
 }
 
-fn announce_title(bus: &EventBus, session: &SessionId, title: &rness_protocol::events::SessionTitle) {
+fn announce_title(
+    bus: &EventBus,
+    session: &SessionId,
+    title: &rness_protocol::events::SessionTitle,
+) {
     bus.emit::<TitleChangedEv>(&TitleNotice {
         session: session.clone(),
         title: title.title.clone(),
@@ -318,7 +328,11 @@ fn commit_title(
     explicit: bool,
 ) -> Result<bool, ServiceError> {
     let inbox = live.inbox.lock().unwrap();
-    if !title_admitted(effective_title(store, live, session)?.as_ref(), &title, explicit) {
+    if !title_admitted(
+        effective_title(store, live, session)?.as_ref(),
+        &title,
+        explicit,
+    ) {
         return Ok(false);
     }
     if inbox.phase() == Phase::Running {
@@ -353,7 +367,9 @@ fn commit_title(
 /// queue only once it is durable.
 fn drain_titles(log: &mut crate::session::log::SessionLog, live: &Live) {
     loop {
-        let Some(title) = live.titles.lock().unwrap().first().cloned() else { return };
+        let Some(title) = live.titles.lock().unwrap().first().cloned() else {
+            return;
+        };
         if let Err(e) = log.append(&SessionEvent::Title(title)) {
             tracing::warn!(session = %log.session(), "title append failed: {e}");
         }
@@ -1230,7 +1246,14 @@ impl SessionService {
         max_bytes: usize,
     ) -> Result<(), ServiceError> {
         let title = self.title_event(title, source, max_bytes)?;
-        commit_title(&self.store, &self.live(session), &self.bus, session, title, true)?;
+        commit_title(
+            &self.store,
+            &self.live(session),
+            &self.bus,
+            session,
+            title,
+            true,
+        )?;
         Ok(())
     }
 
@@ -1245,7 +1268,14 @@ impl SessionService {
         max_bytes: usize,
     ) -> Result<bool, ServiceError> {
         let title = self.title_event(title, source, max_bytes)?;
-        commit_title(&self.store, &self.live(session), &self.bus, session, title, false)
+        commit_title(
+            &self.store,
+            &self.live(session),
+            &self.bus,
+            session,
+            title,
+            false,
+        )
     }
 
     /// Persist titles queued while an idle writer (compaction, prune) held
@@ -1293,10 +1323,7 @@ impl SessionService {
                 .models
                 .resolve_profile_for(
                     name,
-                    session_config
-                        .selection
-                        .as_ref()
-                        .map(|s| s.route.as_str()),
+                    session_config.selection.as_ref().map(|s| s.route.as_str()),
                 )
                 .map_err(ServiceError::InvalidConfig)?,
             None => session_config,
@@ -1791,7 +1818,11 @@ impl SessionService {
                 // the turn (dsh baseline order).
                 self.ensure_instructions(&mut log)?;
                 if !retry {
-                    log.append(&SessionEvent::UserMessage(UserMessage { intent, content, source }))?;
+                    log.append(&SessionEvent::UserMessage(UserMessage {
+                        intent,
+                        content,
+                        source,
+                    }))?;
                 }
                 let all_events = log.read_all_elided()?;
                 let turns_so_far = all_events
@@ -1809,7 +1840,8 @@ impl SessionService {
                     "compact"
                 } else {
                     "resume"
-                }.into();
+                }
+                .into();
                 inbox.set_phase(Phase::Running);
                 drop(inbox);
                 // Announced once Running, so titles set in response queue
@@ -2554,7 +2586,11 @@ async fn burst(
             });
             if let Some(text) = crate::titles::human_text(&message) {
                 let index = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                bus.emit::<PromptCommittedEv>(&PromptNotice { session: session.clone(), text, index });
+                bus.emit::<PromptCommittedEv>(&PromptNotice {
+                    session: session.clone(),
+                    text,
+                    index,
+                });
             }
         }
     };
@@ -2656,7 +2692,8 @@ async fn burst(
                 .read_session(&session)
                 .map(|events| human_prompts(events.iter().map(|e| &**e)))
                 .unwrap_or(0);
-            let mut missing = durable.saturating_sub(prompt_count.load(std::sync::atomic::Ordering::SeqCst));
+            let mut missing =
+                durable.saturating_sub(prompt_count.load(std::sync::atomic::Ordering::SeqCst));
             for pending in taken_now {
                 let message = SessionEvent::UserMessage(UserMessage {
                     intent: pending.intent,

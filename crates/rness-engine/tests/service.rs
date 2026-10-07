@@ -347,7 +347,13 @@ async fn retry_ignores_trailing_audit_and_title_events() {
     );
     let id = service.create(None).unwrap();
     service
-        .send(&id, UserIntent::Followup, vec![ContentPart::Text { text: "hello".into() }])
+        .send(
+            &id,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "hello".into(),
+            }],
+        )
         .unwrap();
     service.join(&id).await;
     {
@@ -376,12 +382,17 @@ async fn retry_ignores_trailing_audit_and_title_events() {
         }))
         .unwrap();
     }
-    service.retry(&id).expect("retry past trailing audit events");
+    service
+        .retry(&id)
+        .expect("retry past trailing audit events");
     service.join(&id).await;
     let history = service.store().history(&id).unwrap();
     assert!(history.iter().rev().any(|e| matches!(
         e.event,
-        SessionEvent::TurnEnded { outcome: TurnOutcome::Completed, .. }
+        SessionEvent::TurnEnded {
+            outcome: TurnOutcome::Completed,
+            ..
+        }
     )));
 }
 
@@ -1105,7 +1116,9 @@ async fn frames_stream_on_the_bus_and_reconcile_on_commit() {
         use rness_protocol::frames::Frame;
         f.lock().unwrap().push(match frame {
             // Usage telemetry and titles are independent of the lifecycle ordering checked here.
-            Frame::ContextUsage { .. } | Frame::TitleChanged { .. } | Frame::Notice { .. } => return,
+            Frame::ContextUsage { .. } | Frame::TitleChanged { .. } | Frame::Notice { .. } => {
+                return
+            }
             Frame::StepStarted { .. } => "step".into(),
             Frame::Delta { chunk, .. } => match chunk {
                 ChunkDelta::Text { t } => format!("delta:{t}"),
@@ -2330,7 +2343,8 @@ impl Provider for Titler {
     async fn step(&self, request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
         if request.system.starts_with("Create a concise title") {
             let framed = match &request.context.turns[0] {
-                rness_engine::session::projection::ModelTurn::User { content } => match &content[0] {
+                rness_engine::session::projection::ModelTurn::User { content } => match &content[0]
+                {
                     ContentPart::Text { text } => text.clone(),
                     _ => String::new(),
                 },
@@ -2371,12 +2385,16 @@ fn titles(svc: &SessionService, sid: &SessionId) -> Vec<(String, TitleSource)> {
         .collect()
 }
 
-fn prompts_seen(svc: &SessionService) -> (Arc<Mutex<Vec<(String, usize)>>>, rness_kernel::Disposer) {
+fn prompts_seen(
+    svc: &SessionService,
+) -> (Arc<Mutex<Vec<(String, usize)>>>, rness_kernel::Disposer) {
     let seen: Arc<Mutex<Vec<(String, usize)>>> = Arc::default();
     let s = Arc::clone(&seen);
-    let sub = svc.bus().on::<rness_engine::service::PromptCommittedEv>(move |n| {
-        s.lock().unwrap().push((n.text.clone(), n.index));
-    });
+    let sub = svc
+        .bus()
+        .on::<rness_engine::service::PromptCommittedEv>(move |n| {
+            s.lock().unwrap().push((n.text.clone(), n.index));
+        });
     (seen, sub)
 }
 
@@ -2387,26 +2405,49 @@ async fn offered_titles_follow_pin_rules_and_frames() {
     let svc = service(dir.path(), provider.clone());
     let frames: Arc<Mutex<Vec<String>>> = Arc::default();
     let f = Arc::clone(&frames);
-    let _sub = svc.bus().on::<rness_engine::service::FrameEv>(move |frame| {
-        if let rness_protocol::frames::Frame::TitleChanged { title, .. } = frame {
-            f.lock().unwrap().push(title.clone());
-        }
-    });
+    let _sub = svc
+        .bus()
+        .on::<rness_engine::service::FrameEv>(move |frame| {
+            if let rness_protocol::frames::Frame::TitleChanged { title, .. } = frame {
+                f.lock().unwrap().push(title.clone());
+            }
+        });
     let sid = svc.create(None).unwrap();
     // The engine sets no title on its own: that is plugin policy.
-    svc.send(&sid, UserIntent::Followup, text("please refactor the parser module")).unwrap();
+    svc.send(
+        &sid,
+        UserIntent::Followup,
+        text("please refactor the parser module"),
+    )
+    .unwrap();
     svc.join(&sid).await;
     assert!(titles(&svc, &sid).is_empty());
 
     // A fallback fills an untitled session only.
-    assert!(svc.offer_title(&sid, "please refactor".into(), TitleSource::Fallback, 80).unwrap());
-    assert!(!svc.offer_title(&sid, "other".into(), TitleSource::Fallback, 80).unwrap());
+    assert!(svc
+        .offer_title(&sid, "please refactor".into(), TitleSource::Fallback, 80)
+        .unwrap());
+    assert!(!svc
+        .offer_title(&sid, "other".into(), TitleSource::Fallback, 80)
+        .unwrap());
     // A model title replaces a fallback and another model title.
-    assert!(svc.offer_title(&sid, "  \u{1b}[1mRefactor\u{1b}[0m the\nparser ".into(), TitleSource::Model, 80).unwrap());
-    assert!(svc.offer_title(&sid, "Parser refactor".into(), TitleSource::Model, 8).unwrap());
+    assert!(svc
+        .offer_title(
+            &sid,
+            "  \u{1b}[1mRefactor\u{1b}[0m the\nparser ".into(),
+            TitleSource::Model,
+            80
+        )
+        .unwrap());
+    assert!(svc
+        .offer_title(&sid, "Parser refactor".into(), TitleSource::Model, 8)
+        .unwrap());
     // A user title pins against automatic offers.
-    svc.set_title(&sid, "Mine".into(), TitleSource::User, 80).unwrap();
-    assert!(!svc.offer_title(&sid, "Model again".into(), TitleSource::Model, 80).unwrap());
+    svc.set_title(&sid, "Mine".into(), TitleSource::User, 80)
+        .unwrap();
+    assert!(!svc
+        .offer_title(&sid, "Model again".into(), TitleSource::Model, 80)
+        .unwrap());
     assert_eq!(
         titles(&svc, &sid),
         vec![
@@ -2416,9 +2457,16 @@ async fn offered_titles_follow_pin_rules_and_frames() {
             ("Mine".into(), TitleSource::User),
         ]
     );
-    assert_eq!(*frames.lock().unwrap(), vec!["please refactor", "Refactor the parser", "Parser r", "Mine"]);
-    assert!(svc.offer_title(&sid, "x".into(), TitleSource::Model, 201).is_err());
-    assert!(svc.offer_title(&sid, " \u{7} ".into(), TitleSource::Model, 80).is_err());
+    assert_eq!(
+        *frames.lock().unwrap(),
+        vec!["please refactor", "Refactor the parser", "Parser r", "Mine"]
+    );
+    assert!(svc
+        .offer_title(&sid, "x".into(), TitleSource::Model, 201)
+        .is_err());
+    assert!(svc
+        .offer_title(&sid, " \u{7} ".into(), TitleSource::Model, 80)
+        .is_err());
 }
 
 #[tokio::test]
@@ -2427,17 +2475,23 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
     let provider = titler("Model title", true);
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
-    svc.send(&sid, UserIntent::Followup, text("first prompt")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("first prompt"))
+        .unwrap();
     assert_eq!(svc.phase(&sid), Phase::Running);
     // Offers and renames mid-turn are queued and visible at once.
-    assert!(svc.offer_title(&sid, "first prompt".into(), TitleSource::Fallback, 80).unwrap());
-    svc.set_title(&sid, "My \u{7}name".into(), TitleSource::User, 80).unwrap();
+    assert!(svc
+        .offer_title(&sid, "first prompt".into(), TitleSource::Fallback, 80)
+        .unwrap());
+    svc.set_title(&sid, "My \u{7}name".into(), TitleSource::User, 80)
+        .unwrap();
     assert_eq!(
         svc.title_with_source(&sid).unwrap(),
         Some(("My name".into(), TitleSource::User))
     );
     // A model title arriving during the turn is rejected by the pin.
-    assert!(!svc.offer_title(&sid, "Model title".into(), TitleSource::Model, 80).unwrap());
+    assert!(!svc
+        .offer_title(&sid, "Model title".into(), TitleSource::Model, 80)
+        .unwrap());
     provider.turn_gate.as_ref().unwrap().add_permits(1);
     svc.join(&sid).await;
     assert_eq!(
@@ -2449,14 +2503,23 @@ async fn user_rename_during_turn_is_queued_and_pins_against_offers() {
     );
 
     // Unpinning (explicit model-sourced title) lets automatic titles apply.
-    svc.set_title(&sid, "My name".into(), TitleSource::Model, 80).unwrap();
-    assert_eq!(svc.title_with_source(&sid).unwrap().unwrap().1, TitleSource::Model);
-    assert!(svc.offer_title(&sid, "Model title".into(), TitleSource::Model, 80).unwrap());
-    assert!(svc.set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User, 80).is_err());
+    svc.set_title(&sid, "My name".into(), TitleSource::Model, 80)
+        .unwrap();
+    assert_eq!(
+        svc.title_with_source(&sid).unwrap().unwrap().1,
+        TitleSource::Model
+    );
+    assert!(svc
+        .offer_title(&sid, "Model title".into(), TitleSource::Model, 80)
+        .unwrap());
+    assert!(svc
+        .set_title(&sid, " \u{1b}[0m ".into(), TitleSource::User, 80)
+        .is_err());
 
     // Explicit titles honour a larger cap too (not only offers).
     let long = "word ".repeat(30);
-    svc.set_title(&sid, long.clone(), TitleSource::User, 120).unwrap();
+    svc.set_title(&sid, long.clone(), TitleSource::User, 120)
+        .unwrap();
     let stored = svc.title(&sid).unwrap().unwrap();
     assert!(stored.len() > 80 && stored.len() <= 120, "{}", stored.len());
 }
@@ -2470,14 +2533,20 @@ async fn idle_title_waits_for_a_writer_instead_of_dropping() {
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
     let writer = svc.store().open(&sid).unwrap();
-    assert!(svc.offer_title(&sid, "While locked".into(), TitleSource::Model, 80).unwrap());
+    assert!(svc
+        .offer_title(&sid, "While locked".into(), TitleSource::Model, 80)
+        .unwrap());
     assert_eq!(svc.title(&sid).unwrap().as_deref(), Some("While locked"));
     drop(writer);
     // The next commit drains the queue first, keeping order.
-    svc.set_title(&sid, "After".into(), TitleSource::User, 80).unwrap();
+    svc.set_title(&sid, "After".into(), TitleSource::User, 80)
+        .unwrap();
     assert_eq!(
         titles(&svc, &sid),
-        vec![("While locked".into(), TitleSource::Model), ("After".into(), TitleSource::User)]
+        vec![
+            ("While locked".into(), TitleSource::Model),
+            ("After".into(), TitleSource::User)
+        ]
     );
 }
 
@@ -2488,11 +2557,13 @@ async fn notices_strip_deceptive_controls_and_are_capped() {
     let sid = svc.create(None).unwrap();
     let frames = Arc::new(Mutex::new(Vec::new()));
     let sink = frames.clone();
-    let _sub = svc.bus().on::<rness_engine::service::FrameEv>(move |frame| {
-        if let rness_protocol::frames::Frame::Notice { text, .. } = frame {
-            sink.lock().unwrap().push(text.clone());
-        }
-    });
+    let _sub = svc
+        .bus()
+        .on::<rness_engine::service::FrameEv>(move |frame| {
+            if let rness_protocol::frames::Frame::Notice { text, .. } = frame {
+                sink.lock().unwrap().push(text.clone());
+            }
+        });
     svc.notify(&sid, "a\u{202E}b\u{7}c\nd").unwrap();
     svc.notify(&sid, &"é".repeat(5000)).unwrap();
     assert!(svc.notify(&sid, "\u{200B}\u{1}").is_err());
@@ -2511,14 +2582,23 @@ async fn human_prompts_and_llm_complete_for_title_plugins() {
     let svc = service(dir.path(), provider.clone());
     let sid = svc.create(None).unwrap();
     assert!(svc.human_prompts(&sid).unwrap().is_empty());
-    svc.send(&sid, UserIntent::Followup, text("alpha prompt")).unwrap();
+    svc.send(&sid, UserIntent::Followup, text("alpha prompt"))
+        .unwrap();
     svc.join(&sid).await;
-    svc.send(&sid, UserIntent::Inject, text("injected context")).unwrap();
-    svc.send(&sid, UserIntent::Followup, text("beta prompt")).unwrap();
+    svc.send(&sid, UserIntent::Inject, text("injected context"))
+        .unwrap();
+    svc.send(&sid, UserIntent::Followup, text("beta prompt"))
+        .unwrap();
     svc.join(&sid).await;
-    assert_eq!(svc.human_prompts(&sid).unwrap(), vec!["alpha prompt", "beta prompt"]);
+    assert_eq!(
+        svc.human_prompts(&sid).unwrap(),
+        vec!["alpha prompt", "beta prompt"]
+    );
     let fork = svc.fork(&sid, None).unwrap();
-    assert!(svc.human_prompts(&fork).unwrap().is_empty(), "forks do not inherit prompts");
+    assert!(
+        svc.human_prompts(&fork).unwrap().is_empty(),
+        "forks do not inherit prompts"
+    );
 
     provider.gate.add_permits(1);
     let reply = svc
@@ -2534,11 +2614,13 @@ async fn human_prompts_and_llm_complete_for_title_plugins() {
         .await
         .unwrap();
     assert_eq!(reply, "Refactor the parser");
-    assert_eq!(provider.title_prompts.lock().unwrap()[0], ("alpha prompt".into(), Some(64)));
+    assert_eq!(
+        provider.title_prompts.lock().unwrap()[0],
+        ("alpha prompt".into(), Some(64))
+    );
     // Completion commits nothing.
     assert!(titles(&svc, &sid).is_empty());
 }
-
 
 #[tokio::test]
 async fn human_prompts_are_announced_with_their_index() {
@@ -2548,7 +2630,8 @@ async fn human_prompts_are_announced_with_their_index() {
     let (seen, _sub) = prompts_seen(&svc);
     let sid = svc.create(None).unwrap();
     // Injected context is not a human prompt.
-    svc.send(&sid, UserIntent::Inject, text("background context")).unwrap();
+    svc.send(&sid, UserIntent::Inject, text("background context"))
+        .unwrap();
     svc.send(&sid, UserIntent::Followup, text("one")).unwrap();
     // Queued followup + steer during the running turn.
     svc.send(&sid, UserIntent::Followup, text("two")).unwrap();
@@ -2559,7 +2642,10 @@ async fn human_prompts_are_announced_with_their_index() {
     svc.join(&sid).await;
     let mut got = seen.lock().unwrap().clone();
     assert_eq!(got.len(), 3, "{got:?}");
-    assert_eq!(got.iter().map(|(_, i)| *i).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        got.iter().map(|(_, i)| *i).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     got.sort();
     assert_eq!(
         got.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(),
