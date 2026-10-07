@@ -15,7 +15,21 @@ For exact tool fields, the Lua API, and configuration types, see the [terminal t
 | A program that asks questions (`npm init`, a confirmation prompt) | A terminal |
 | A full-screen program (vim, htop, less) | Neither. Use a plain command instead |
 
-The default flavor's `tool:terminal` [system-prompt section](system-prompt.md) tells the model the same thing: prefer Bash for bounded commands, track terminal ids, close terminals it no longer needs, and stop stuck commands with `terminal_signal`.
+The default flavor's `tool:terminal` [system-prompt section](system-prompt.md) tells the model the same thing: when a terminal fits and when Bash does, to prefer one-shot `ssh host 'cmd'` over an interactive remote shell, how to restore exit codes in one (see [remote and nested shells](#remote-and-nested-shells)), to track terminal ids and close terminals it no longer needs, and to stop stuck commands with `terminal_signal`.
+
+## Remote and nested shells
+
+rness knows a command finished because its controlled shell prints a hidden marker (`OSC 133;D;<exit>`) before every prompt. A shell started inside the terminal, such as `ssh host`, `docker exec -it … bash`, `kubectl exec -it`, `sudo -i` or a nested `bash`, doesn't print it. Every command there settles only after 5 seconds of silence (`still running, no output for 5s`; on Linux often `waiting for input`, since ssh reads the terminal) and reports no exit code. Long quiet commands can also return early.
+
+- For one-off remote commands, use `ssh host 'cmd'` from Bash or the terminal's own shell. ssh exits with the remote command's code, so everything works normally.
+- When an interactive remote shell is really needed, send this once after connecting (bash):
+
+  ```sh
+  PROMPT_COMMAND='printf "\033]133;D;%s\007" $?'
+  ```
+
+  The remote shell then reports exit codes and settles immediately, like a local terminal. For zsh, use `precmd() { printf '\033]133;D;%s\007' $? }`.
+- Use key-based auth. Anything typed into a terminal ends up in the transcript.
 
 ## Prerequisites
 

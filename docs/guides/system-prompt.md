@@ -122,7 +122,7 @@ Keep sections short. Any section that appears or disappears mid-session changes 
 | `tool:Bash` | 1000 | `Bash` | Check exit codes; prefer file tools over shell equivalents |
 | `tool:Edit` | 1300 | `Edit` | Read first; add context instead of switching to Write |
 | `tool:jobs` | 1600 | `job_output` | Track job ids, don't poll, collect before answering |
-| `tool:terminal` | 1700 | `terminal_open` | Prefer Bash for one-shot commands; close sessions |
+| `tool:terminal` | 1700 | `terminal_open` | When a terminal fits (servers, REPLs, debuggers, remote shells, prompts) vs Bash; ssh exit codes; close sessions |
 | `tool:web` | 2000 | `web_search` or `web_fetch` | Untrusted content; cite URLs |
 | `tool:web_search` | 2010 | `web_search` | Snippets; fetch for full content |
 | `tool:session_search` | 2300 | `session_search` (plugin, opt-in) | Search, then trace or read hits |
