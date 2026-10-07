@@ -46,6 +46,11 @@ struct Cli {
     #[arg(short, long)]
     session: Option<String>,
 
+    /// Fork an existing session and continue in the copy: a new session
+    /// with the same history, leaving the original untouched.
+    #[arg(long, value_name = "SESSION", conflicts_with_all = ["session", "serve", "list"])]
+    fork: Option<String>,
+
     /// Model selection: <provider>/<model> (e.g. anthropic/claude-sonnet-4-5,
     /// openai-chatgpt/gpt-5.5, ollama/qwen3). Both parts required — rness
     /// has no default provider and no default model.
@@ -267,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(rness_tools::terminal::run_reaper());
     }
     raise_fd_limit();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     #[cfg(feature = "experimental-control")]
     if cli.control_socket.is_some() && cli.command.is_some() {
         bail!("--control-socket is only supported in native TUI mode");
@@ -453,6 +458,19 @@ async fn main() -> anyhow::Result<()> {
             .get_mut(&selection.route)
             .expect("parsed selection references a known route")
             .base_url = Some(url.clone());
+    }
+    // --fork: branch the session now; everything below then treats the
+    // copy exactly like `--session <copy>` (same config, model, sandbox).
+    if let Some(source) = cli.fork.take() {
+        let store = rness_engine::session::branch::SessionStore::new(root.clone());
+        let child = store
+            .fork(&source, None)
+            .with_context(|| format!("fork session {source}"))?;
+        let child = child.session().clone();
+        if !interactive {
+            eprintln!("forked {source} -> {child}");
+        }
+        cli.session = Some(child);
     }
     let mut creation_seed = if let Some(session) = &cli.session {
         let store = rness_engine::session::branch::SessionStore::new(root.clone());

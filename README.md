@@ -195,6 +195,7 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 | One headless prompt | `rness -m chatgpt/gpt-6-astra --reasoning high -p "Explain this project"` |
 | Resume a session | `rness -s SESSION_ID` |
 | Resume with a prompt | `rness -s SESSION_ID -p "Continue the implementation"` |
+| Fork a session and continue in the copy | `rness --fork SESSION_ID` |
 | List saved sessions for the current directory | `rness --list` |
 | HTTP/SSE server | `rness --serve 127.0.0.1:7777 -m chatgpt/gpt-6-astra --reasoning high` |
 | Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
@@ -298,6 +299,7 @@ Reasoning effort is not a universal model capability. Do not assume every model 
 | `--account NAME` | Use a named stored credential for the selected connection (e.g. a second Anthropic account); see [multiple accounts](docs/reference/configuration/providers.md#multiple-accounts-per-provider). |
 | `-p`, `--prompt` | Run a headless prompt and print the transcript. |
 | `-s`, `--session` | Continue an existing session. |
+| `--fork` | Fork an existing session at its latest event and continue in the new copy. The copy shares the history up to that point (nothing is duplicated on disk), keeps the original's workspace, model and settings, and never gets a looser sandbox. The original is untouched. Scheduled reminders stay with the original. Works with `-p`; not with `--session`, `--serve` or `--list`. |
 | `--profile` / `--agent` | Select a declared profile or agent. |
 | `--base-url URL` | Override the selected provider endpoint. |
 | `--route SPEC` | Declare an OpenAI-compatible connection; repeat for multiple connections. |
