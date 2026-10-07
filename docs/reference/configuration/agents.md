@@ -160,6 +160,8 @@ shared key language (`ctrl+u`, `shift+tab`, `<F6>`, etc.).
 | `previous_agent` / `next_agent` | `shift+tab` / `tab` | List and detail |
 | `list_up` / `list_down` | `{ "up", "k" }` / `{ "down", "j" }` | List only |
 | `open_detail` | `enter` | List only |
+| `filter` | `f` | List only: cycle recent → all → running |
+| `show_all` | `a` | List only: toggle all agents / the default filter |
 | `metadata_up` / `metadata_down` | `alt+pageup` / `alt+pagedown` | Detail metadata |
 | `page_up` / `page_down` | `pageup` / `pagedown` | Detail transcript |
 | `follow` | `end` | Resume following latest output |
@@ -178,11 +180,29 @@ Keep a usable `back` key. No fixed Escape fallback is retained after rebinding
 or disabling it. Read-only action filtering, descendant authorization, and
 approval/question priority cannot be changed by these options.
 
+### List
+
+The list shows **Running** agents first (newest first), then **Recent** finished
+agents (most recently finished first), each under a section header. Older
+finished agents are summarized as `… N older hidden · a show all`. Rows show a
+status icon, alias, role, a one-line task preview (without an
+`In the X codebase at /path,` preamble, home directory as `~`), run time, how
+long ago it finished, and the status. Panels narrower than 60 columns drop the
+time columns. The cursor opens on the top row. Filter changes last until the
+monitor closes.
+
+| `list` field | Default | Behavior |
+| --- | --- | --- |
+| `filter` | `"recent"` | Initial filter: `"active"` (running only), `"recent"`, or `"all"` |
+| `order` | `"newest"` | Order within each group: `"newest"` or `"oldest"` first |
+| `group` | `true` | Show `Running · N` / `Recent · N` section headers |
+| `recent` | `{ secs = 1800, min = 3, max = 10 }` | Recent = finished within `secs` (≤ 1 year), at least `min` and at most `max` (0–1000) agents |
+
 ### Layout, text, and styles
 
 | `layout` field | Default | Range / behavior |
 | --- | --- | --- |
-| `list_rows` | All agents | 1–1000; maximum requested visible rows, plus border/footer; selection scrolls into view |
+| `list_rows` | 20 | 1–1000; maximum visible list rows (headers included), plus border/footer; selection scrolls into view |
 | `metadata_rows` | 3 | 0–1000; maximum task/identity rows; zero hides metadata; also limited to one third of available detail body |
 | `page_lines` | 10 | 1–1000; transcript page step |
 | `wheel_lines` | 3 | 1–1000; detail wheel step; list wheel still moves one agent |
@@ -191,17 +211,26 @@ approval/question priority cannot be changed by these options.
 `text` supports `title` (`"Agents"`), `empty` (`"No agents published yet."`),
 `waiting` (`"Waiting for an authorized agent entry (or agent not found)."`),
 `incoming_label` (`"Incoming message"`), `following` (`"Following"`),
-`paused` (`"Paused"`), and `paused_new` (`"Paused + new"`). Values are strings
+`paused` (`"Paused"`), `paused_new` (`"Paused + new"`), `section_running`
+(`"Running"`), `section_recent` (`"Recent"`), `section_finished` (`"Finished"`,
+used with the all filter), `empty_active` (`"No running agents."`),
+`empty_recent` (`"Nothing running or recently finished."`),
+`older_hidden` (`"… {n} older hidden"`), `finished_hidden`
+(`"… {n} finished hidden"`), `ago` (`"{age} ago"`), and `status_finished`
+(`"done"`, the word shown for finished one-shot agents). `{n}` and `{age}` are
+replaced literally. Values are strings
 of at most 256 bytes without control characters; empty strings are allowed.
-The title retains the agent count and read-only indicator.
+The title retains the running and total agent counts and the read-only indicator.
 
-`styles` supports `frame`, `border`, `heading` (frame title), and `hint`, with
-fallback theme roles `overlay`, `overlay_border`, `heading`, and `dim`.
+`styles` supports `frame` (default theme role `overlay`), `border`
+(`overlay_border`), `heading` (frame title, `heading`), `hint` (`dim`), `section`
+(list section headers, `heading`), `task` (task preview, `dim`), and `selected`
+(fill for the selected row, unstyled by default).
 Each accepts the usual messagebox style name or inline style table.
 Other message and status colors continue to inherit the shared theme.
 
 This is focused customization, not an arbitrary Lua drawer renderer: responsive
-column widths/order, status mapping, metadata identity labels, rounded border,
+column widths/order, status icons and colors, metadata identity labels, rounded border,
 and the read-only safety boundary remain built in.
 
 Implementation: [declarations](../../../crates/rness-lua/src/api/config.rs), [service selection](../../../crates/rness-engine/src/service.rs), [turn enforcement](../../../crates/rness-engine/src/turn/mod.rs).

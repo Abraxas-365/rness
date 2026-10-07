@@ -49,7 +49,10 @@ entry to the existing `rness.plugins.setup` list, then restart with a new binary
 
 ## Reading an agent's execution
 
-`/agents` opens the live list; select an agent with ↑/↓ and press Enter, or use
+`/agents` opens the live list: running agents first, then recently finished
+ones, with older agents summarized (press `a` to show all, `f` to cycle
+recent/all/running). Continuable agents waiting idle for a message are listed
+with the finished ones, since they are not working. Select an agent with ↑/↓ and press Enter, or use
 `/agents a1` directly. On a selected delegation or `send_message` card in the main
 conversation, press `i` to inspect its associated child.
 
@@ -88,6 +91,8 @@ rness.ui.messagebox.agents = {
     page_up = "ctrl+u", page_down = "ctrl+d", toggle_tool = "enter",
   },
   layout = { list_rows = 12, metadata_rows = 5, page_lines = 15 },
+  -- Running first, then agents finished in the last 10 minutes (2..8 of them).
+  list = { filter = "recent", recent = { secs = 600, min = 2, max = 8 } },
   text = { title = "Workers", incoming_label = "Assignment" },
   styles = { border = { fg = "cyan" }, hint = "dim" },
 }

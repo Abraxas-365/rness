@@ -22,7 +22,7 @@ const MAX_SESSIONS: usize = 256;
 const MAX_LIVE_BYTES: usize = 256 * 1024;
 const MAX_LIVE_TOOLS: usize = 128;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentInfo {
     pub session: String,
     pub alias: String,
@@ -34,6 +34,10 @@ pub struct AgentInfo {
     pub status: String,
     pub elapsed_ms: u64,
     pub call: Option<String>,
+    /// Unix milliseconds the child was created, when known.
+    pub started_ms: Option<u64>,
+    /// Unix milliseconds its latest turn ended; `None` while running or unknown.
+    pub ended_ms: Option<u64>,
 }
 
 struct Session {
@@ -380,10 +384,140 @@ fn elapsed(ms: u64) -> String {
 fn status_style(status: &str, theme: &crate::theme::Theme) -> ratatui::style::Style {
     match status {
         "failed" | "error" => theme.error,
-        "completed" | "done" | "idle" => theme.added,
+        "finished" | "completed" | "done" | "idle" => theme.added,
         "running" => theme.statusline_accent,
         _ => theme.dim,
     }
+}
+
+fn status_icon(status: &str) -> &'static str {
+    match status {
+        "running" => "●",
+        "failed" | "error" => "✗",
+        "finished" | "completed" | "done" | "idle" => "✓",
+        "interrupted" => "⊘",
+        _ => "·",
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Compact age: `45s`, `12m`, `3h`, `2d`.
+fn short_age(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..=59 => format!("{s}s"),
+        60..=3599 => format!("{}m", s / 60),
+        3600..=86_399 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86_400),
+    }
+}
+
+/// Replace `home` with `~` only where it is a whole path prefix: not inside
+/// another path (`/srv/Users/me`) and not a sibling (`/Users/meg`).
+fn replace_home(text: &str, home: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut prev: Option<char> = None;
+    while let Some(at) = rest.find(home) {
+        let before = rest[..at].chars().next_back().or(prev);
+        let after = rest[at + home.len()..].chars().next();
+        let starts = before.is_none_or(|c| c.is_whitespace() || "\"'`=:(,".contains(c));
+        let ends = after.is_none_or(|c| c == '/' || c.is_whitespace() || ",.;:)\"'`".contains(c));
+        out.push_str(&rest[..at]);
+        out.push_str(if starts && ends { "~" } else { home });
+        prev = home.chars().next_back();
+        rest = &rest[at + home.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One-line task preview: the first non-empty line, without the routine
+/// "In the X codebase at /path," preamble, with the home directory as `~`.
+fn short_task(task: &str, home: Option<&str>) -> String {
+    let line = task
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let mut text = line;
+    if let Some(rest) = text
+        .strip_prefix("In the ")
+        .or_else(|| text.strip_prefix("in the "))
+    {
+        let marker = [" codebase at ", " repo at "]
+            .iter()
+            .find_map(|m| rest.find(m).map(|at| at + m.len()));
+        // Only "… at /path, task": the comma must end the path token itself.
+        if let Some(path_start) = marker {
+            let after = &rest[path_start..];
+            let token_end = after.find(char::is_whitespace).unwrap_or(after.len());
+            if token_end > 1 && after[..token_end].ends_with(',') {
+                text = after[token_end..].trim_start();
+            }
+        }
+    }
+    let mut out = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(home) = home.filter(|h| h.len() > 1) {
+        out = replace_home(&out, home);
+    }
+    let mut chars = out.chars();
+    match chars.next() {
+        Some(first) if text.len() != line.len() => first.to_uppercase().chain(chars).collect(),
+        _ => out,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListFilter {
+    Active,
+    Recent,
+    All,
+}
+
+impl ListFilter {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "active" => Some(Self::Active),
+            "recent" => Some(Self::Recent),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Active => "running",
+            Self::Recent => "recent",
+            Self::All => "all",
+        }
+    }
+    fn next(self) -> Self {
+        match self {
+            Self::Active => Self::Recent,
+            Self::Recent => Self::All,
+            Self::All => Self::Active,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ListRow {
+    Section(String, usize),
+    Agent(usize),
+    Note(String),
+}
+
+/// Display rows plus the selectable agents (indexes into the published list)
+/// in display order.
+struct ListView {
+    rows: Vec<ListRow>,
+    order: Vec<usize>,
 }
 
 /// A fixed cell-width column, clipping whole graphemes rather than bytes.
@@ -422,6 +556,8 @@ const MONITOR_KEYS: &[(&str, &[&str])] = &[
     ("list_up", &["up", "k"]),
     ("list_down", &["down", "j"]),
     ("open_detail", &["enter"]),
+    ("filter", &["f"]),
+    ("show_all", &["a"]),
     ("metadata_up", &["alt+pageup"]),
     ("metadata_down", &["alt+pagedown"]),
     ("page_up", &["pageup"]),
@@ -439,6 +575,11 @@ struct Agents {
     selected: Option<String>,
     list_offset: usize,
     metadata_scroll: HashMap<String, u16>,
+    /// Session override of `list.filter`; reset whenever the monitor opens.
+    filter: Option<ListFilter>,
+    /// Until the user moves the cursor it follows the top row, so the first
+    /// fresh publication after opening (or a newly started agent) is selected.
+    follow_top: bool,
 }
 
 impl Agents {
@@ -450,7 +591,113 @@ impl Agents {
             selected: None,
             list_offset: 0,
             metadata_scroll: HashMap::new(),
+            filter: None,
+            follow_top: false,
         }
+    }
+
+    fn default_filter(&self) -> ListFilter {
+        self.option("list", "filter")
+            .as_str()
+            .and_then(ListFilter::parse)
+            .unwrap_or(ListFilter::Recent)
+    }
+
+    fn filter(&self) -> ListFilter {
+        self.filter.unwrap_or_else(|| self.default_filter())
+    }
+
+    fn recent(&self, name: &str, default: u64) -> u64 {
+        self.config["agents"]["list"]["recent"][name]
+            .as_u64()
+            .unwrap_or(default)
+    }
+
+    fn list_text(&self, name: &str, default: &str, n: usize) -> String {
+        self.text(name, default).replace("{n}", &n.to_string())
+    }
+
+    /// Running agents first, then the most recently finished. Ties keep
+    /// creation order, so agents without timestamps stay stable.
+    fn list_view(
+        &self,
+        agents: &[AgentInfo],
+        now: u64,
+        group: bool,
+        filter: ListFilter,
+    ) -> ListView {
+        let newest = self.option("list", "order").as_str() != Some("oldest");
+        let (mut running, mut finished): (Vec<usize>, Vec<usize>) =
+            (0..agents.len()).partition(|&i| agents[i].status == "running");
+        let finished_at = |i: usize| agents[i].ended_ms.or(agents[i].started_ms);
+        running.sort_by_key(|&i| std::cmp::Reverse(agents[i].started_ms.unwrap_or(0)));
+        finished.sort_by_key(|&i| std::cmp::Reverse(finished_at(i).unwrap_or(0)));
+        let keep = match filter {
+            ListFilter::All => finished.len(),
+            ListFilter::Active => 0,
+            ListFilter::Recent => {
+                let window = self.recent("secs", 1800).saturating_mul(1000);
+                let within = finished
+                    .iter()
+                    .take_while(|&&i| {
+                        finished_at(i).is_some_and(|t| now.saturating_sub(t) <= window)
+                    })
+                    .count();
+                within
+                    .max(self.recent("min", 3) as usize)
+                    .min(self.recent("max", 10) as usize)
+                    .min(finished.len())
+            }
+        };
+        let hidden = finished.len() - keep;
+        finished.truncate(keep);
+        if !newest {
+            running.reverse();
+            finished.reverse();
+        }
+        let mut rows = Vec::new();
+        if group && !running.is_empty() {
+            rows.push(ListRow::Section(
+                self.text("section_running", "Running").to_owned(),
+                running.len(),
+            ));
+        }
+        rows.extend(running.iter().map(|&i| ListRow::Agent(i)));
+        if group && !finished.is_empty() {
+            let label = if filter == ListFilter::All {
+                self.text("section_finished", "Finished")
+            } else {
+                self.text("section_recent", "Recent")
+            };
+            rows.push(ListRow::Section(label.to_owned(), finished.len()));
+        }
+        rows.extend(finished.iter().map(|&i| ListRow::Agent(i)));
+        if running.is_empty() && finished.is_empty() && !agents.is_empty() {
+            let note = if filter == ListFilter::Active {
+                self.text("empty_active", "No running agents.")
+            } else {
+                self.text("empty_recent", "Nothing running or recently finished.")
+            };
+            rows.push(ListRow::Note(note.to_owned()));
+        }
+        if hidden > 0 {
+            let mut note = if filter == ListFilter::Active {
+                self.list_text("finished_hidden", "… {n} finished hidden", hidden)
+            } else {
+                self.list_text("older_hidden", "… {n} older hidden", hidden)
+            };
+            let hint = self.hint("show_all", "show all");
+            if !hint.is_empty() {
+                note = format!("{note} · {hint}");
+            }
+            rows.push(ListRow::Note(note));
+        }
+        let order = running.into_iter().chain(finished).collect();
+        ListView { rows, order }
+    }
+
+    fn group(&self) -> bool {
+        self.option("list", "group").as_bool().unwrap_or(true)
     }
 
     fn option(&self, section: &str, name: &str) -> &serde_json::Value {
@@ -557,19 +804,117 @@ impl Agents {
         if state.agents.is_empty() {
             return;
         }
-        let index = state
-            .agents
-            .iter()
-            .position(|a| Some(&a.session) == self.selected.as_ref())
-            .unwrap_or(0);
-        let index = index
-            .saturating_add_signed(delta)
-            .min(state.agents.len() - 1);
-        self.selected = Some(state.agents[index].session.clone());
+        let mut order = self
+            .list_view(&state.agents, now_ms(), false, self.filter())
+            .order;
+        let position = |order: &[usize]| {
+            order
+                .iter()
+                .position(|&i| Some(&state.agents[i].session) == self.selected.as_ref())
+        };
+        // A detail opened outside the current filter still cycles through
+        // everyone; in the list the cursor never lands on a hidden row.
+        let detail_open = matches!(&state.requested, Some((_, Some(_))));
+        if detail_open && position(&order).is_none() && self.selected.is_some() {
+            order = self
+                .list_view(&state.agents, now_ms(), false, ListFilter::All)
+                .order;
+        }
+        if order.is_empty() {
+            return;
+        }
+        let index = position(&order).unwrap_or(0);
+        let index = index.saturating_add_signed(delta).min(order.len() - 1);
+        self.follow_top = false;
+        self.selected = Some(state.agents[order[index]].session.clone());
         if let Some((_, detail)) = &mut state.requested {
             if detail.is_some() {
                 *detail = self.selected.clone();
             }
+        }
+    }
+
+    fn toggle_filter(&mut self, next: ListFilter) {
+        self.filter = (next != self.default_filter()).then_some(next);
+        self.list_offset = 0;
+    }
+
+    /// `› ● a3   reviewer    ● Review the parser…   1m 05s   2m ago      done`
+    /// Narrow panels drop duration and age; very narrow ones drop the task.
+    fn agent_row(
+        &self,
+        ctx: &Ctx<'_>,
+        a: &AgentInfo,
+        width: usize,
+        now: u64,
+        home: Option<&str>,
+        state: &Monitor,
+    ) -> Line<'static> {
+        let selected = Some(&a.session) == self.selected.as_ref();
+        let fresh = state
+            .sessions
+            .get(&a.session)
+            .is_some_and(|s| s.activity != s.seen);
+        let status = status_style(&a.status, ctx.theme);
+        let role_width = if width >= 90 { 16 } else { 12 };
+        let role = format!(
+            "{}{}",
+            "  ".repeat(a.depth.saturating_sub(1).min(3)),
+            a.name
+        );
+        let mut spans = vec![
+            Span::styled(
+                if selected { "› " } else { "  " },
+                ctx.theme.statusline_accent,
+            ),
+            Span::styled(format!("{} ", status_icon(&a.status)), status),
+            Span::styled(column(&a.alias, 5), ctx.theme.tool_name),
+            Span::styled(
+                column(&role, role_width),
+                if selected {
+                    ctx.theme.heading
+                } else {
+                    ctx.theme.assistant_text
+                },
+            ),
+            Span::styled(if fresh { "● " } else { "  " }, ctx.theme.statusline_accent),
+        ];
+        let mut right = Vec::new();
+        if width >= 60 {
+            right.push((format!("{:>8}", elapsed(a.elapsed_ms)), ctx.theme.dim));
+            let age = match a.ended_ms.or(a.started_ms) {
+                Some(t) if a.status != "running" => self
+                    .text("ago", "{age} ago")
+                    .replace("{age}", &short_age(now.saturating_sub(t))),
+                _ => String::new(),
+            };
+            right.push((format!("{age:>9}"), ctx.theme.dim));
+        }
+        let word = match a.status.as_str() {
+            "finished" => self.text("status_finished", "done"),
+            other => other,
+        };
+        right.push((format!("{word:>12}"), status));
+        let used = 2 + 2 + 5 + role_width + 2;
+        let right_width: usize = right
+            .iter()
+            .map(|(t, _)| unicode_width::UnicodeWidthStr::width(t.as_str()))
+            .sum();
+        let task_width = width.saturating_sub(used + right_width);
+        if task_width >= 8 {
+            spans.push(Span::styled(
+                column(&short_task(&a.task, home), task_width),
+                self.style(ctx.theme, "task", ctx.theme.dim),
+            ));
+            spans.extend(right.into_iter().map(|(t, s)| Span::styled(t, s)));
+        } else if let Some((t, s)) = right.pop() {
+            spans.push(Span::styled(t.trim_start().to_owned(), s));
+        }
+        let line = Line::from(spans);
+        if selected {
+            line.style(self.style(ctx.theme, "selected", ratatui::style::Style::default()))
+        } else {
+            line
         }
     }
 }
@@ -590,12 +935,13 @@ impl Component for Agents {
         {
             Some(u16::MAX)
         } else {
+            let rows = self
+                .list_view(&state.agents, now_ms(), self.group(), self.filter())
+                .rows
+                .len();
             Some(
-                state
-                    .agents
-                    .len()
-                    .max(1)
-                    .min(usize::from(self.number("list_rows", u16::MAX).max(1)))
+                rows.max(1)
+                    .min(usize::from(self.number("list_rows", 20).max(1)))
                     .saturating_add(3)
                     .min(usize::from(u16::MAX)) as u16,
             )
@@ -678,8 +1024,15 @@ impl Component for Agents {
                     state.agents.clear();
                     state.root = root.to_owned();
                 }
-                self.selected =
-                    selected.or_else(|| state.agents.first().map(|a| a.session.clone()));
+                self.filter = None;
+                self.follow_top = selected.is_none();
+                // Start on the top row: the newest running agent when any runs.
+                self.selected = selected.or_else(|| {
+                    self.list_view(&state.agents, now_ms(), false, self.filter())
+                        .order
+                        .first()
+                        .map(|&i| state.agents[i].session.clone())
+                });
                 self.list_offset = 0;
             }
             "chat:messagebox-config" => {
@@ -745,12 +1098,27 @@ impl Component for Agents {
             match key.code {
                 _ if self.matches("list_up", key) => self.navigate(-1),
                 _ if self.matches("list_down", key) => self.navigate(1),
+                _ if self.matches("filter", key) => self.toggle_filter(self.filter().next()),
+                _ if self.matches("show_all", key) => {
+                    let default = match self.default_filter() {
+                        ListFilter::All => ListFilter::Recent,
+                        other => other,
+                    };
+                    self.toggle_filter(if self.filter() == ListFilter::All {
+                        default
+                    } else {
+                        ListFilter::All
+                    })
+                }
                 _ if self.matches("open_detail", key) => {
                     let mut state = self.state.0.lock().expect("agent monitor lock");
-                    let selected = self
-                        .selected
-                        .clone()
-                        .or_else(|| state.agents.first().map(|a| a.session.clone()));
+                    let first = self
+                        .list_view(&state.agents, now_ms(), false, self.filter())
+                        .order
+                        .first()
+                        .map(|&i| state.agents[i].session.clone());
+                    let selected = self.selected.clone().or(first);
+                    self.follow_top = false;
                     if let Some((_, detail)) = &mut state.requested {
                         *detail = selected;
                     }
@@ -865,11 +1233,19 @@ impl Component for Agents {
             .style(self.style(ctx.theme, "frame", ctx.theme.overlay))
             .border_style(self.style(ctx.theme, "border", ctx.theme.overlay_border))
             .title(Line::styled(
-                format!(
-                    " {} · {} · read-only ",
-                    self.text("title", "Agents"),
-                    state.agents.len()
-                ),
+                {
+                    let running = state
+                        .agents
+                        .iter()
+                        .filter(|a| a.status == "running")
+                        .count();
+                    let mut title = format!(" {} · ", self.text("title", "Agents"));
+                    if running > 0 {
+                        title.push_str(&format!("{running} running · "));
+                    }
+                    title.push_str(&format!("{} · read-only ", state.agents.len()));
+                    title
+                },
                 self.style(ctx.theme, "heading", ctx.theme.heading),
             ));
         let inner = block.inner(area);
@@ -1010,105 +1386,80 @@ impl Component for Agents {
                 .style(self.style(ctx.theme, "hint", ctx.theme.dim))
                 .render(hint, buf);
         } else {
-            if !state
-                .agents
-                .iter()
-                .any(|a| Some(&a.session) == self.selected.as_ref())
-            {
-                self.selected = state.agents.first().map(|a| a.session.clone());
+            let now = now_ms();
+            let view = self.list_view(&state.agents, now, self.group(), self.filter());
+            let in_view = |session: Option<&String>| {
+                view.order
+                    .iter()
+                    .any(|&i| Some(&state.agents[i].session) == session)
+            };
+            if self.follow_top || !in_view(self.selected.as_ref()) {
+                self.selected = view.order.first().map(|&i| state.agents[i].session.clone());
             }
-            let index = state
-                .agents
+            let index = view
+                .rows
                 .iter()
-                .position(|a| Some(&a.session) == self.selected.as_ref())
+                .position(|row| {
+                    matches!(row, ListRow::Agent(i)
+                        if Some(&state.agents[*i].session) == self.selected.as_ref())
+                })
                 .unwrap_or(0);
             let visible = usize::from(body.height).max(1);
-            self.list_offset = self.list_offset.min(index);
-            if index >= self.list_offset + visible {
-                self.list_offset = index + 1 - visible;
+            // Keep the selected row's section header and a trailing note visible.
+            let mut top = index;
+            if top > 0 && matches!(view.rows[top - 1], ListRow::Section(..)) {
+                top -= 1;
             }
-            let lines = if state.agents.is_empty() {
+            self.list_offset = self.list_offset.min(top);
+            let mut bottom = index;
+            if view
+                .rows
+                .get(index + 1)
+                .is_some_and(|r| matches!(r, ListRow::Note(_)))
+            {
+                bottom += 1;
+            }
+            if bottom >= self.list_offset + visible {
+                self.list_offset = (bottom + 1).saturating_sub(visible).min(index);
+            }
+            let home = std::env::var("HOME").ok();
+            let width = usize::from(body.width);
+            let section_style = self.style(ctx.theme, "section", ctx.theme.heading);
+            let lines: Vec<Line> = if state.agents.is_empty() {
                 vec![Line::raw(self.text("empty", "No agents published yet."))]
             } else {
-                state
-                    .agents
+                view.rows
                     .iter()
                     .skip(self.list_offset)
                     .take(visible)
-                    .map(|a| {
-                        let selected = Some(&a.session) == self.selected.as_ref();
-                        let fresh = state
-                            .sessions
-                            .get(&a.session)
-                            .is_some_and(|s| s.activity != s.seen);
-                        let width = usize::from(body.width);
-                        let mut spans = vec![Span::styled(
-                            if selected { "› " } else { "  " },
-                            ctx.theme.statusline_accent,
-                        )];
-                        if width >= 60 {
-                            let role_width = if width >= 90 { 20 } else { 14 };
-                            spans.push(Span::styled(column(&a.alias, 6), ctx.theme.tool_name));
-                            let role = format!(
-                                "{}{}",
-                                "  ".repeat(a.depth.saturating_sub(1).min(3)),
-                                a.name
-                            );
-                            spans.push(Span::styled(
-                                column(&role, role_width),
-                                if selected {
-                                    ctx.theme.heading
-                                } else {
-                                    ctx.theme.assistant_text
-                                },
-                            ));
-                            spans.push(Span::styled(
-                                column(&a.status, 12),
-                                status_style(&a.status, ctx.theme),
-                            ));
-                            spans.push(Span::styled(
-                                column(&elapsed(a.elapsed_ms), 9),
-                                ctx.theme.dim,
-                            ));
-                            spans.push(Span::styled(
-                                if fresh { "● " } else { "  " },
-                                ctx.theme.statusline_accent,
-                            ));
-                            spans.push(Span::styled(
-                                column(&a.task, width.saturating_sub(31 + role_width)),
-                                ctx.theme.dim,
-                            ));
-                        } else {
-                            spans.push(Span::styled(
-                                column(
-                                    &format!("{} {}", a.alias, a.name),
-                                    width.saturating_sub(15),
-                                ),
-                                if selected {
-                                    ctx.theme.heading
-                                } else {
-                                    ctx.theme.assistant_text
-                                },
-                            ));
-                            spans.push(Span::styled(
-                                column(&a.status, width.saturating_sub(2).min(12)),
-                                status_style(&a.status, ctx.theme),
-                            ));
-                            if fresh {
-                                spans.push(Span::styled("●", ctx.theme.statusline_accent));
-                            }
+                    .map(|row| match row {
+                        ListRow::Section(label, count) => Line::from(vec![Span::styled(
+                            format!("{label} · {count}"),
+                            section_style,
+                        )]),
+                        ListRow::Note(text) => {
+                            Line::from(vec![Span::styled(format!("  {text}"), ctx.theme.dim)])
                         }
-                        Line::from(spans)
+                        ListRow::Agent(i) => {
+                            let a = &state.agents[*i];
+                            self.agent_row(ctx, a, width, now, home.as_deref(), &state)
+                        }
                     })
                     .collect()
             };
             Paragraph::new(lines).render(body, buf);
+            let filter = if self.filter() == self.default_filter() {
+                self.hint("filter", "filter")
+            } else {
+                self.hint("filter", &format!("filter: {}", self.filter().name()))
+            };
             Paragraph::new(
                 [
-                    self.hint("back", "close"),
                     self.hint("list_up", "previous"),
                     self.hint("list_down", "next"),
                     self.hint("open_detail", "detail"),
+                    filter,
+                    self.hint("back", "close"),
                 ]
                 .into_iter()
                 .filter(|s| !s.is_empty())
@@ -1142,6 +1493,7 @@ mod tests {
             status: "running".into(),
             elapsed_ms: 123,
             call: Some("call".into()),
+            ..Default::default()
         }
     }
     fn event(id: &str, text: &str) -> Arc<Envelope> {
@@ -1314,7 +1666,288 @@ mod tests {
             .collect::<String>()
             .contains("Esc list"));
         key(&mut drawer, &ctx, KeyCode::Esc);
-        assert_eq!(drawer.height(&ctx, 80), Some(4));
+        // One "Running · 1" section header plus the agent row, border and footer.
+        assert_eq!(drawer.height(&ctx, 80), Some(5));
+    }
+
+    fn finished(session: &str, ended_ago_s: u64, now: u64) -> AgentInfo {
+        AgentInfo {
+            status: "finished".into(),
+            started_ms: Some(now - ended_ago_s * 1000 - 5000),
+            ended_ms: Some(now - ended_ago_s * 1000),
+            ..info(session)
+        }
+    }
+
+    fn screen(drawer: &mut Agents, ctx: &Ctx<'_>, width: u16, height: u16) -> Vec<String> {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        drawer.render(ctx, area, &mut buf);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_puts_running_first_hides_old_finished_and_filters() {
+        let now = now_ms();
+        let mut agents = vec![
+            finished("a1", 7200, now),
+            finished("a2", 60, now),
+            AgentInfo {
+                started_ms: Some(now - 30_000),
+                task: "In the rness codebase at /tmp/x, review the parser.\nMore.".into(),
+                ..info("a3")
+            },
+            finished("a4", 3 * 86_400, now),
+            finished("a5", 4 * 86_400, now),
+            AgentInfo {
+                status: "error".into(),
+                ..finished("a6", 120, now)
+            },
+        ];
+        agents.push(AgentInfo {
+            started_ms: Some(now - 1000),
+            ..info("a7")
+        });
+        let state = AgentMonitorState::default();
+        state.publish_agents("root", agents);
+        let mut drawer = Agents::new(state.clone());
+        let model = Model::new("root".into(), String::new());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        drawer.on_action(
+            &ctx,
+            "chat:messagebox-config",
+            &serde_json::json!({"agents":{"list":{"recent":{"secs":600,"min":1,"max":5}}}}),
+        );
+        open(&mut drawer, &ctx, None);
+        // Cursor starts on the newest running agent.
+        assert_eq!(drawer.selected.as_deref(), Some("a7"));
+        // Running(2) + header + recent(a2, a6) + header + hidden note.
+        assert_eq!(drawer.height(&ctx, 80), Some(7 + 3));
+        let lines = screen(&mut drawer, &ctx, 100, 10);
+        assert!(lines[0].contains("2 running · 7 · read-only"), "{lines:?}");
+        assert!(lines[1].contains("Running · 2"), "{lines:?}");
+        assert!(lines[2].starts_with("│› ● a7"), "{lines:?}");
+        assert!(
+            lines[3].contains("a3") && lines[3].contains("Review the parser."),
+            "{lines:?}"
+        );
+        assert!(
+            !lines[3].contains("codebase") && !lines[3].contains("More"),
+            "{lines:?}"
+        );
+        assert!(lines[4].contains("Recent · 2"), "{lines:?}");
+        assert!(
+            lines[5].contains("✓ a2") && lines[5].contains("1m ago") && lines[5].contains("done")
+        );
+        assert!(
+            lines[6].contains("✗ a6") && lines[6].contains("2m ago") && lines[6].contains("error")
+        );
+        assert!(
+            lines[7].contains("… 3 older hidden · a show all"),
+            "{lines:?}"
+        );
+        assert!(
+            lines[8].contains("f filter") && lines[8].contains("Esc close"),
+            "{lines:?}"
+        );
+
+        // Navigation follows display order and skips headers.
+        for _ in 0..3 {
+            key(&mut drawer, &ctx, KeyCode::Down);
+        }
+        assert_eq!(drawer.selected.as_deref(), Some("a6"));
+        key(&mut drawer, &ctx, KeyCode::Down);
+        assert_eq!(drawer.selected.as_deref(), Some("a6"));
+
+        // a shows everything, newest finished first.
+        key(&mut drawer, &ctx, KeyCode::Char('a'));
+        assert_eq!(drawer.height(&ctx, 80), Some(12));
+        let all = screen(&mut drawer, &ctx, 100, 12);
+        assert!(all[4].contains("Finished · 5"), "{all:?}");
+        let order: Vec<_> = all[5..10]
+            .iter()
+            .map(|l| l.split_whitespace().nth(2).unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(order, ["a2", "a6", "a1", "a4", "a5"], "{all:?}");
+        assert!(
+            all[9].contains("4d ago") && all[10].contains("f filter: all"),
+            "{all:?}"
+        );
+
+        // f cycles all → running only; finished are summarized.
+        key(&mut drawer, &ctx, KeyCode::Char('f'));
+        assert_eq!(drawer.height(&ctx, 80), Some(7));
+        let active = screen(&mut drawer, &ctx, 100, 7);
+        assert!(
+            active[3].contains("a3") && active[4].contains("5 finished hidden"),
+            "{active:?}"
+        );
+        assert!(active[5].contains("f filter: running"), "{active:?}");
+        // The selection fell outside the filter and moved to the top row.
+        assert_eq!(drawer.selected.as_deref(), Some("a7"));
+        key(&mut drawer, &ctx, KeyCode::Char('f'));
+        assert!(screen(&mut drawer, &ctx, 100, 10)[4].contains("Recent · 2"));
+
+        // Reopening restores the configured default filter.
+        key(&mut drawer, &ctx, KeyCode::Char('a'));
+        key(&mut drawer, &ctx, KeyCode::Esc);
+        open(&mut drawer, &ctx, None);
+        assert_eq!(drawer.height(&ctx, 80), Some(10));
+
+        // Nothing recent: the note names the recent window, not "running".
+        let quiet = AgentMonitorState::default();
+        quiet.publish_agents("root", vec![finished("old", 7200, now)]);
+        let mut quiet_drawer = Agents::new(quiet);
+        quiet_drawer.on_action(
+            &ctx,
+            "chat:messagebox-config",
+            &serde_json::json!({"agents":{"list":{"filter":"all","recent":{"secs":60,"min":0,"max":5}}}}),
+        );
+        open(&mut quiet_drawer, &ctx, None);
+        assert!(screen(&mut quiet_drawer, &ctx, 100, 6)[2].contains("old"));
+        // With an "all" default, a still toggles to the recent window.
+        key(&mut quiet_drawer, &ctx, KeyCode::Char('a'));
+        let recent = screen(&mut quiet_drawer, &ctx, 100, 6);
+        assert!(
+            recent[1].contains("Nothing running or recently finished."),
+            "{recent:?}"
+        );
+        // Narrow panels keep icon, alias, role and status; never panic.
+        let narrow = screen(&mut drawer, &ctx, 40, 10);
+        assert!(
+            narrow[2].contains("a7") && narrow[2].contains("running"),
+            "{narrow:?}"
+        );
+        assert!(!narrow[5].contains("ago"), "{narrow:?}");
+        for width in [0, 1, 8, 20, 59, 61] {
+            screen(&mut drawer, &ctx, width, 6);
+        }
+
+        // Configured order, grouping and filter.
+        drawer.on_action(
+            &ctx,
+            "chat:messagebox-config",
+            &serde_json::json!({"agents":{"list":{"filter":"all","group":false,"order":"oldest"},
+                "keys":{"show_all":false}}}),
+        );
+        open(&mut drawer, &ctx, None);
+        let plain = screen(&mut drawer, &ctx, 100, 10);
+        assert!(
+            plain[1].contains("a3") && plain[2].contains("a7"),
+            "{plain:?}"
+        );
+        assert!(
+            plain[3].contains("a5") && plain[7].contains("a2"),
+            "{plain:?}"
+        );
+        assert!(!plain.join("\n").contains("Running ·"), "{plain:?}");
+    }
+
+    #[test]
+    fn cursor_follows_top_row_until_the_user_moves_it() {
+        let now = now_ms();
+        let state = AgentMonitorState::default();
+        let mut drawer = Agents::new(state.clone());
+        let model = Model::new("root".into(), String::new());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        // Opened before the host publishes (a stale list was empty).
+        open(&mut drawer, &ctx, None);
+        state.publish_agents(
+            "root",
+            vec![finished("old", 600, now), finished("new", 5, now)],
+        );
+        screen(&mut drawer, &ctx, 100, 8);
+        assert_eq!(drawer.selected.as_deref(), Some("new"));
+        // A newly started agent becomes the top row and takes the cursor.
+        let running = AgentInfo {
+            started_ms: Some(now),
+            ..info("live")
+        };
+        state.publish_agents(
+            "root",
+            vec![
+                finished("old", 600, now),
+                finished("new", 5, now),
+                running.clone(),
+            ],
+        );
+        screen(&mut drawer, &ctx, 100, 8);
+        assert_eq!(drawer.selected.as_deref(), Some("live"));
+        // Once the user picks a row it stays put through later publications.
+        key(&mut drawer, &ctx, KeyCode::Down);
+        assert_eq!(drawer.selected.as_deref(), Some("new"));
+        let second = AgentInfo {
+            started_ms: Some(now + 1),
+            ..info("live2")
+        };
+        state.publish_agents(
+            "root",
+            vec![
+                finished("old", 600, now),
+                finished("new", 5, now),
+                running,
+                second,
+            ],
+        );
+        screen(&mut drawer, &ctx, 100, 9);
+        assert_eq!(drawer.selected.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn short_task_and_ages() {
+        assert_eq!(
+            short_task(
+                "In the rness codebase at /Users/me/rness, find X.",
+                Some("/Users/me")
+            ),
+            "Find X."
+        );
+        assert_eq!(
+            short_task("\n  Check /Users/me/a   now\nsecond", Some("/Users/me")),
+            "Check ~/a now"
+        );
+        assert_eq!(
+            short_task("In the end, it works", None),
+            "In the end, it works"
+        );
+        // The comma must end the path; otherwise the task text is kept whole.
+        assert_eq!(
+            short_task(
+                "In the rness codebase at /Users/me/rness. Review a.rs, then report.",
+                Some("/Users/me")
+            ),
+            "In the rness codebase at ~/rness. Review a.rs, then report."
+        );
+        // Home is replaced only as a whole path prefix.
+        assert_eq!(
+            short_task(
+                "cat /Users/meg/x /srv/Users/me/y /Users/me",
+                Some("/Users/me")
+            ),
+            "cat /Users/meg/x /srv/Users/me/y ~"
+        );
+        assert_eq!(short_age(59_000), "59s");
+        assert_eq!(short_age(3_600_000), "1h");
+        assert_eq!(short_age(2 * 86_400_000), "2d");
+        assert_eq!(status_icon("interrupted"), "⊘");
+        let theme = Theme::default();
+        assert_eq!(status_style("finished", &theme), theme.added);
     }
 
     #[test]

@@ -225,29 +225,35 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
         lines[0].contains("2 running") && lines[0].contains("1 finished"),
         "{lines:?}"
     );
+    // Sections, newest running job first; the panel fits its content.
+    assert!(lines[1].starts_with("Running · 2"), "{lines:?}");
     assert!(
-        lines[1].starts_with("▸ ● ") && lines[1].contains("first"),
+        lines[2].starts_with("▸ ◌ ")
+            && lines[2].contains("second")
+            && lines[2].ends_with("stopping"),
         "{lines:?}"
     );
-    assert!(lines[2].contains("second") && lines[2].ends_with("stopping"));
-    assert!(lines[3].contains("finished") && lines[3].ends_with("exit 7"));
-    assert!(lines[7].contains("⏎ output") && lines[7].contains("x stop"));
+    assert!(lines[3].contains("first") && lines[3].ends_with("running"));
+    assert!(lines[4].starts_with("Recent · 1"));
+    assert!(lines[5].contains("finished") && lines[5].ends_with("exit 7"));
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert!(lines[6].contains("⏎ output") && lines[6].contains("x stop"));
     assert_eq!(host.app_key("jobs", "z", ctx.clone()).await.unwrap(), Pass);
     assert_eq!(
         host.app_key("jobs", "j", ctx.clone()).await.unwrap(),
         Consumed
     );
-    assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[2].starts_with("▸ "));
+    assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[3].starts_with("▸ "));
     host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
     assert!(host
         .app_view("jobs", ctx.clone())
         .await
         .unwrap()
         .join("\n")
-        .contains("second output"));
+        .contains("first output"));
     host.load(
         "settle",
-        "jobs[2].running=false; jobs[2].status='killed'; jobs[2].output='final output'",
+        "jobs[1].running=false; jobs[1].status='killed'; jobs[1].output='final output'",
     )
     .await
     .unwrap();
@@ -264,12 +270,14 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
         Consumed
     );
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
-    // Finished jobs sort after running ones; selection follows identity.
+    // The settled job moves to Recent; selection follows identity.
     assert!(lines[0].contains("1 running") && lines[0].contains("2 finished"));
+    assert!(lines[3].starts_with("Recent · 2"), "{lines:?}");
     assert!(
-        lines[2].starts_with("▸ ") && lines[2].contains("second") && lines[2].ends_with("killed")
+        lines[5].starts_with("▸ ") && lines[5].contains("first") && lines[5].ends_with("killed"),
+        "{lines:?}"
     );
-    host.app_key("jobs", "j", ctx.clone()).await.unwrap();
+    host.app_key("jobs", "k", ctx.clone()).await.unwrap();
     host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
     let retained = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(retained[0].contains("exit 7") && retained[0].contains("done"));
@@ -289,7 +297,7 @@ async fn monitor_navigation_retains_finished_jobs_and_session_isolation() {
     "#).await.unwrap();
     assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[0].contains("exit 7"));
     host.load("reset", "open_jobs('')").await.unwrap();
-    assert!(host.app_view("jobs", ctx).await.unwrap()[0].contains("filter: all"));
+    assert!(host.app_view("jobs", ctx).await.unwrap()[0].contains("showing recent"));
 }
 
 #[tokio::test]
@@ -382,7 +390,7 @@ async fn monitor_live_tail_pause_scroll_end_wrap_and_small_viewports() {
         .app_view("jobs", json!({"session":"one","rows":1,"cols":80}))
         .await
         .unwrap();
-    assert!(lines[0].contains("first"), "{lines:?}");
+    assert!(lines[0].contains("second"), "{lines:?}");
     for (rows, cols) in [(0, 0), (1, 1), (2, 2), (4, 3), (10000, 10000)] {
         let lines = host
             .app_view("jobs", json!({"session":"one","rows":rows,"cols":cols}))
@@ -421,7 +429,7 @@ async fn monitor_custom_options_keys_render_override_and_validation() {
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert_eq!(lines[0], "Custom 3");
     assert!(
-        lines[2].starts_with("* ") && lines[2].contains("second"),
+        lines[3].starts_with("* ") && lines[3].contains("first"),
         "{lines:?}"
     );
     assert_eq!(lines.len(), 12);
@@ -486,7 +494,8 @@ async fn monitor_list_paging_keeps_selected_identity_as_jobs_settle() {
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     let selected =
         |lines: &[String], label: &str| lines[3].starts_with("▸ ") && lines[3].contains(label);
-    assert!(selected(&lines, "task 4 "), "{lines:?}");
+    // Untimed jobs keep registry order, newest (last registered) first.
+    assert!(selected(&lines, "task 17 "), "{lines:?}");
     host.load(
         "finish-earlier",
         "jobs[1].running=false; jobs[1].status='exited'; jobs[1].exit_code=0",
@@ -495,13 +504,15 @@ async fn monitor_list_paging_keeps_selected_identity_as_jobs_settle() {
     .unwrap();
     assert!(selected(
         &host.app_view("jobs", ctx.clone()).await.unwrap(),
-        "task 4 "
+        "task 17 "
     ));
-    // The finished job moved below every running job.
+    // The finished job moved to the Recent section below every running job.
     host.app_key("jobs", "end", ctx.clone()).await.unwrap();
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(
-        selected(&lines, "task 1 ") && lines[3].ends_with("exit 0"),
+        selected(&lines, "task 1 ")
+            && lines[3].ends_with("done")
+            && lines[2].starts_with("Recent · 1"),
         "{lines:?}"
     );
     host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
@@ -518,7 +529,8 @@ async fn monitor_list_paging_keeps_selected_identity_as_jobs_settle() {
     host.app_key("jobs", "esc", ctx.clone()).await.unwrap();
     host.app_key("jobs", "home", ctx.clone()).await.unwrap();
     let lines = host.app_view("jobs", ctx).await.unwrap();
-    assert!(lines[1].starts_with("▸ ") && lines[1].contains("task 2 "));
+    assert!(lines[1].starts_with("Running · 19"), "{lines:?}");
+    assert!(lines[2].starts_with("▸ ") && lines[2].contains("task 20 "));
 }
 
 #[tokio::test]
@@ -553,30 +565,51 @@ async fn monitor_sorts_filters_styles_and_confirms_stops() {
         lines[0].contains("2 running") && lines[0].contains("2 finished"),
         "{lines:?}"
     );
-    // Running newest-first, then finished most-recent-first, with durations.
-    assert!(lines[1].contains("new run"), "{lines:?}");
-    assert!(lines[2].contains("old run") && lines[2].contains("2m0"));
+    // Running newest-first, then finished most-recent-first, with durations
+    // and how long ago each finished.
+    assert!(lines[1].starts_with("Running · 2"), "{lines:?}");
+    assert!(lines[2].contains("new run"), "{lines:?}");
+    assert!(lines[3].contains("old run") && lines[3].contains("2m0"));
+    assert!(lines[4].starts_with("Recent · 2"));
     assert!(
-        lines[3].contains("failed later")
-            && lines[3].contains("59s")
-            && lines[3].ends_with("exit 2")
+        lines[5].contains("failed later")
+            && lines[5].contains("59s")
+            && lines[5].contains("agent")
+            && lines[5].ends_with("exit 2"),
+        "{lines:?}"
     );
     assert!(
-        lines[4].contains("passed") && lines[4].contains("10s") && lines[4].ends_with("exit 0")
+        lines[6].contains("passed")
+            && lines[6].contains("10s")
+            && lines[6].contains("50s ago")
+            && lines[6].ends_with("done"),
+        "{lines:?}"
     );
 
     let styled = host.app_view_lines("jobs", ctx.clone()).await.unwrap();
-    assert_eq!(styled[1].style, json!({"bg":"#3c3836"}));
-    assert_eq!(styled[1].right[0].style, json!("heading"));
-    assert_eq!(styled[2].style, serde_json::Value::Null);
-    assert_eq!(styled[3].right[0].style, json!("error"));
-    assert_eq!(styled[4].right[0].style, json!("added"));
+    assert_eq!(styled[2].style, json!({"bg":"#3c3836"}));
+    assert_eq!(styled[2].right.last().unwrap().style, json!("heading"));
+    assert_eq!(styled[3].style, serde_json::Value::Null);
+    assert_eq!(styled[5].right.last().unwrap().style, json!("error"));
+    assert_eq!(styled[6].right.last().unwrap().style, json!("added"));
 
-    // f toggles running-only.
+    // f cycles recent -> all -> running -> recent.
+    host.app_key("jobs", "f", ctx.clone()).await.unwrap();
+    let all = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(
+        all[0].contains("showing all") && all[4].starts_with("Finished · 2"),
+        "{all:?}"
+    );
     host.app_key("jobs", "f", ctx.clone()).await.unwrap();
     let filtered = host.app_view("jobs", ctx.clone()).await.unwrap();
-    assert!(filtered[0].contains("running only") && !filtered.join("\n").contains("passed"));
+    assert!(
+        filtered[0].contains("showing running")
+            && !filtered.join("\n").contains("passed")
+            && filtered.iter().any(|l| l.contains("2 finished hidden")),
+        "{filtered:?}"
+    );
     host.app_key("jobs", "f", ctx.clone()).await.unwrap();
+    assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[0].contains("showing recent"));
 
     // x arms, any other key disarms (and is swallowed), x x stops.
     assert_eq!(
@@ -588,7 +621,7 @@ async fn monitor_sorts_filters_styles_and_confirms_stops() {
     host.app_key("jobs", "j", ctx.clone()).await.unwrap();
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(
-        lines[1].starts_with("▸ ") && lines[7].contains("x stop"),
+        lines[2].starts_with("▸ ") && lines[7].contains("x stop"),
         "{lines:?}"
     );
     host.load("none-yet", "assert(#stopped==0)").await.unwrap();
@@ -602,7 +635,7 @@ async fn monitor_sorts_filters_styles_and_confirms_stops() {
     .unwrap();
     let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
     assert!(
-        lines[7].contains("Stop requested: new run") && lines[1].ends_with("stopping"),
+        lines[7].contains("Stop requested: new run") && lines[2].ends_with("stopping"),
         "{lines:?}"
     );
     host.app_key("jobs", "x", ctx.clone()).await.unwrap();
@@ -625,4 +658,233 @@ async fn monitor_sorts_filters_styles_and_confirms_stops() {
     )
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn monitor_recent_window_search_labels_and_auto_height() {
+    let host = monitor_host_config("{ list={ recent={ secs=600, min=1, max=3 } } }").await;
+    host.load(
+        "history",
+        r#"
+        local now=os.time()*1000
+        local home=os.getenv('HOME') or '/home/tester'
+        jobs={
+          {job_id='live',kind='bash',label='cd '..home..'/proj && cargo test',status='running',running=true,
+            started_at_ms=now-3000},
+        }
+        -- Ten finished jobs: one 1 minute ago, the rest hours ago.
+        for i=1,10 do
+          local ended=now-(i==1 and 60 or 3600*i)*1000
+          jobs[#jobs+1]={job_id='f'..i,kind='subagent',label='subagent [spawn]: review '..i,
+            status='exited',exit_code=0,running=false,started_at_ms=ended-5000,settled_at_ms=ended}
+        end
+        -- A legacy record without timestamps: its ULID ID still dates it.
+        jobs[#jobs+1]={job_id='j01M3896CKJ3TR8JNFAPC82KPW8',kind='bash',label='legacy',
+          status='exited',exit_code=0,running=false}
+    "#,
+    )
+    .await
+    .unwrap();
+    // No rows hint: the panel requests only the rows it needs.
+    let ctx = json!({"session":"one","cols":100});
+    let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(
+        lines[0].contains("1 running") && lines[0].contains("11 finished"),
+        "{lines:?}"
+    );
+    assert!(lines[1].starts_with("Running · 1"));
+    // Leading "cd <dir> &&" is dropped and the kind is shortened.
+    assert!(
+        lines[2].contains("cargo test") && !lines[2].contains("cd "),
+        "{lines:?}"
+    );
+    // The elapsed whole seconds can tick over between fixture and render.
+    assert!(
+        (lines[2].contains("3s") || lines[2].contains("4s")) && lines[2].ends_with("running"),
+        "{lines:?}"
+    );
+    // Only the job within secs=600 (min=1) is recent; the rest are hidden.
+    assert!(lines[3].starts_with("Recent · 1"), "{lines:?}");
+    assert!(
+        lines[4].contains("agent ") && lines[4].contains("review 1") && lines[4].contains("1m ago")
+    );
+    assert!(!lines[4].contains("subagent [spawn]"), "{lines:?}");
+    assert!(
+        lines[5].contains("10 older hidden") && lines[5].contains("a show all"),
+        "{lines:?}"
+    );
+    assert_eq!(lines.len(), 7, "{lines:?}");
+
+    // a shows everything, capped only by the panel's max height.
+    host.app_key("jobs", "a", ctx.clone()).await.unwrap();
+    let all = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(
+        all[0].contains("showing all") && all[3].starts_with("Finished · 11"),
+        "{all:?}"
+    );
+    assert!(
+        all.iter()
+            .any(|l| l.contains("legacy") && l.contains("d ago")),
+        "{all:?}"
+    );
+    assert_eq!(all.len(), 16, "{all:?}");
+    host.app_key("jobs", "a", ctx.clone()).await.unwrap();
+    assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[0].contains("showing recent"));
+
+    // / searches every job regardless of the filter; esc clears it.
+    host.app_key("jobs", "/", ctx.clone()).await.unwrap();
+    for key in ["r", "e", "v", "i", "e", "w", "space", "7"] {
+        host.app_key("jobs", key, ctx.clone()).await.unwrap();
+    }
+    let found = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(found[0].contains("/review 7"), "{found:?}");
+    assert!(
+        found[1].starts_with("Finished · 1")
+            && found[2].starts_with("▸ ")
+            && found[2].contains("review 7")
+            && found.len() == 5,
+        "{found:?}"
+    );
+    host.app_key("jobs", "backspace", ctx.clone())
+        .await
+        .unwrap();
+    host.app_key("jobs", "z", ctx.clone()).await.unwrap();
+    let none = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(none[1].contains("No jobs match"), "{none:?}");
+    host.app_key("jobs", "esc", ctx.clone()).await.unwrap();
+    assert_eq!(host.app_view("jobs", ctx.clone()).await.unwrap(), lines);
+
+    // Enter keeps the query and returns keys to navigation; esc then clears it.
+    host.app_key("jobs", "/", ctx.clone()).await.unwrap();
+    host.app_key("jobs", "l", ctx.clone()).await.unwrap();
+    host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
+    assert_eq!(
+        host.app_key("jobs", "j", ctx.clone()).await.unwrap(),
+        rness_lua::runtime::AppKeyOutcome::Consumed
+    );
+    assert!(host.app_view("jobs", ctx.clone()).await.unwrap()[0].contains("/l"));
+    host.app_key("jobs", "esc", ctx.clone()).await.unwrap();
+    let cleared = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(
+        cleared[0].contains("showing recent") && cleared.len() == lines.len(),
+        "{cleared:?}"
+    );
+
+    // A narrow panel drops time columns before the label.
+    let narrow = host
+        .app_view("jobs", json!({"session":"one","cols":50}))
+        .await
+        .unwrap();
+    assert!(
+        narrow[4].contains("review 1") && !narrow[4].contains("ago"),
+        "{narrow:?}"
+    );
+}
+
+#[tokio::test]
+async fn monitor_list_options_columns_order_and_validation() {
+    let host = monitor_host_config(
+        r#"{ list={ filter='all', group=false, order='oldest', columns={'id','label','status'},
+             shorten_labels=false },
+             format_label=function(job,label) return label:upper() end }"#,
+    )
+    .await;
+    let ctx = json!({"session":"one","rows":8,"cols":100});
+    let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
+    // No sections; running first, each group oldest (registry order) first.
+    assert!(
+        lines[1].starts_with("▸ j1") && lines[1].contains("FIRST"),
+        "{lines:?}"
+    );
+    assert!(lines[2].contains("j2") && lines[2].contains("SECOND"));
+    assert!(lines[3].contains("FINISHED") && lines[3].ends_with("exit 7"));
+    assert!(!lines.join("\n").contains("bash"), "{lines:?}");
+    for config in [
+        "{list={filter='bogus'}}",
+        "{list={order='random'}}",
+        "{list={columns={'label','nope'}}}",
+        "{list={columns={}}}",
+        "{list={recent={secs=-1}}}",
+        "{list={group='yes'}}",
+        "{layout={min_height=20,max_height=10}}",
+        "{layout={max_height=40}}",
+        "{format_label='x'}",
+    ] {
+        let invalid = LuaHost::spawn().unwrap();
+        invalid
+            .load("options", &format!("rness.jobs.config={config}"))
+            .await
+            .unwrap();
+        assert!(
+            invalid
+                .load(
+                    "jobs",
+                    include_str!("../../../flavors/default/plugins/jobs.lua")
+                )
+                .await
+                .is_err(),
+            "{config}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn monitor_label_boundaries_search_and_text_compatibility() {
+    let host = monitor_host_config(
+        "{ list={ filter='all' }, text={ filter_running='live only', empty_filtered='idle' } }",
+    )
+    .await;
+    host.load(
+        "paths",
+        r#"
+        local home=os.getenv('HOME') or '/home/tester'
+        jobs={
+          {job_id='a',kind='bash',label='cat '..home..'/x /srv'..home..'/y '..home..'g/z',
+            status='exited',exit_code=0,running=false,started_at_ms=1,settled_at_ms=2},
+        }
+    "#,
+    )
+    .await
+    .unwrap();
+    let ctx = json!({"session":"one","cols":120});
+    let lines = host.app_view("jobs", ctx.clone()).await.unwrap();
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/tester".into());
+    // Only a whole leading home path becomes ~; nested or sibling paths stay.
+    assert!(
+        lines[2].contains(&format!("cat ~/x /srv{home}/y {home}g/z")),
+        "{lines:?}"
+    );
+    // Search matches the label as displayed.
+    host.app_key("jobs", "/", ctx.clone()).await.unwrap();
+    for key in ["~", "/", "x"] {
+        host.app_key("jobs", key, ctx.clone()).await.unwrap();
+    }
+    let found = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(found[1].starts_with("Finished · 1"), "{found:?}");
+    // f during a kept search leaves the search and applies the filter visibly.
+    host.app_key("jobs", "enter", ctx.clone()).await.unwrap();
+    host.app_key("jobs", "f", ctx.clone()).await.unwrap();
+    let active = host.app_view("jobs", ctx.clone()).await.unwrap();
+    assert!(
+        active[0].contains("showing live only") && active[1].contains("idle"),
+        "{active:?}"
+    );
+    // Format texts that would fail at render time are rejected at setup.
+    for config in ["{text={running_count='at 50%'}}", "{text={ago='%d ago'}}"] {
+        let invalid = LuaHost::spawn().unwrap();
+        invalid
+            .load("options", &format!("rness.jobs.config={config}"))
+            .await
+            .unwrap();
+        assert!(
+            invalid
+                .load(
+                    "jobs",
+                    include_str!("../../../flavors/default/plugins/jobs.lua")
+                )
+                .await
+                .is_err(),
+            "{config}"
+        );
+    }
 }

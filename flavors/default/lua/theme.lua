@@ -91,11 +91,15 @@ rness.ui.messagebox = {
     keys = {
       back = "esc", previous_agent = "shift+tab", next_agent = "tab",
       list_up = { "up", "k" }, list_down = { "down", "j" }, open_detail = "enter",
+      filter = "f", show_all = "a",
       metadata_up = "alt+pageup", metadata_down = "alt+pagedown",
       page_up = "pageup", page_down = "pagedown", follow = "end",
       scroll_up = "up", scroll_down = "down", toggle_tool = { "enter", "ctrl+o" },
     },
-    layout = { metadata_rows = 3, wheel_lines = 3, page_lines = 10, metadata_scroll_lines = 3 },
+    layout = { list_rows = 20, metadata_rows = 3, wheel_lines = 3, page_lines = 10, metadata_scroll_lines = 3 },
+    -- Running agents first; then those finished in the last `secs` (at least
+    -- `min`, at most `max`). filter = "active" | "recent" | "all".
+    list = { filter = "recent", order = "newest", group = true, recent = { secs = 1800, min = 3, max = 10 } },
     text = { title = "Agents", incoming_label = "Incoming message" },
     styles = { frame = "overlay", border = "overlay_border", heading = "heading", hint = "dim" },
   },

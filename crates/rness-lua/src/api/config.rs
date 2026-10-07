@@ -354,13 +354,16 @@ mod permission_tests {
         });
         super::validate_messagebox(&config, "messagebox", "root").unwrap();
         for bad in [
-            json!({"assistant":{"sources":{"hook":{}}}}),        // only under user
-            json!({"user":{"sources":{"bogus":{}}}}),            // unknown kind
-            json!({"user":{"sources":{"job":{"tags":{}}}}}),     // tags only under hook
+            json!({"assistant":{"sources":{"hook":{}}}}), // only under user
+            json!({"user":{"sources":{"bogus":{}}}}),     // unknown kind
+            json!({"user":{"sources":{"job":{"tags":{}}}}}), // tags only under hook
             json!({"user":{"sources":{"hook":{"sources":{}}}}}), // no nesting
             json!({"user":{"sources":{"hook":{"tags":{"x":{"visible":"no"}}}}}}),
         ] {
-            assert!(super::validate_messagebox(&bad, "messagebox", "root").is_err(), "{bad}");
+            assert!(
+                super::validate_messagebox(&bad, "messagebox", "root").is_err(),
+                "{bad}"
+            );
         }
         for action in [
             "selection_previous",
@@ -442,8 +445,9 @@ mod permission_tests {
         std::fs::write(
             &path,
             r#"rness.ui.messagebox = { agents = {
-            keys = { back = "q", list_up = { "k", "ctrl+p" }, toggle_tool = false },
+            keys = { back = "q", list_up = { "k", "ctrl+p" }, toggle_tool = false, show_all = false, filter = "F" },
             layout = { metadata_rows = 0, list_rows = 12, page_lines = 7 },
+            list = { filter = "all", order = "oldest", group = false, recent = { secs = 600, min = 1, max = 5 } },
             text = { incoming_label = "Assignment" }, styles = { border = { fg = "red" } }
         } }"#,
         )
@@ -468,6 +472,12 @@ mod permission_tests {
             "layout={metadata_rows=-1}",
             "layout={list_rows=1001}",
             "layout={page_lines=1.5}",
+            "list={filter='bogus'}",
+            "list={order='random'}",
+            "list={group='yes'}",
+            "list={recent={secs=-1}}",
+            "list={recent={window=5}}",
+            "list={surprise=true}",
             "styles={border={unknown=true}}",
             "text={title=false}",
             "text={title='bad\\nline'}",
@@ -554,7 +564,10 @@ fn validate_agents_monitor(value: &serde_json::Value, path: &str) -> Result<(), 
         .as_object()
         .ok_or_else(|| format!("{path} must be a table"))?;
     for (section, values) in object {
-        if !matches!(section.as_str(), "keys" | "layout" | "text" | "styles") {
+        if !matches!(
+            section.as_str(),
+            "keys" | "layout" | "text" | "styles" | "list"
+        ) {
             return Err(format!("invalid agents option: {path}.{section}"));
         }
         let values = values
@@ -572,6 +585,8 @@ fn validate_agents_monitor(value: &serde_json::Value, path: &str) -> Result<(), 
                             | "list_up"
                             | "list_down"
                             | "open_detail"
+                            | "filter"
+                            | "show_all"
                             | "metadata_up"
                             | "metadata_down"
                             | "page_up"
@@ -613,19 +628,47 @@ fn validate_agents_monitor(value: &serde_json::Value, path: &str) -> Result<(), 
                             | "following"
                             | "paused"
                             | "paused_new"
+                            | "section_running"
+                            | "section_recent"
+                            | "section_finished"
+                            | "empty_active"
+                            | "empty_recent"
+                            | "older_hidden"
+                            | "finished_hidden"
+                            | "ago"
+                            | "status_finished"
                     ) && value
                         .as_str()
                         .is_some_and(|s| s.len() <= 256 && !s.chars().any(char::is_control))
                 }
                 "styles" => {
-                    matches!(key.as_str(), "frame" | "border" | "heading" | "hint")
-                        && validate_messagebox(
-                            &serde_json::json!({"style": value}),
-                            &field,
-                            "message",
-                        )
-                        .is_ok()
+                    matches!(
+                        key.as_str(),
+                        "frame" | "border" | "heading" | "hint" | "section" | "task" | "selected"
+                    ) && validate_messagebox(
+                        &serde_json::json!({"style": value}),
+                        &field,
+                        "message",
+                    )
+                    .is_ok()
                 }
+                "list" => match key.as_str() {
+                    "filter" => value
+                        .as_str()
+                        .is_some_and(|s| matches!(s, "active" | "recent" | "all")),
+                    "order" => value
+                        .as_str()
+                        .is_some_and(|s| matches!(s, "newest" | "oldest")),
+                    "group" => value.is_boolean(),
+                    "recent" => value.as_object().is_some_and(|recent| {
+                        recent.iter().all(|(name, n)| {
+                            let max = if name == "secs" { 365 * 86_400 } else { 1000 };
+                            matches!(name.as_str(), "secs" | "min" | "max")
+                                && n.as_u64().is_some_and(|n| n <= max)
+                        })
+                    }),
+                    _ => false,
+                },
                 _ => false,
             };
             if !valid {

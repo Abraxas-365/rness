@@ -50,6 +50,10 @@ fn visible_events(events: Vec<Arc<Envelope>>) -> Vec<Arc<Envelope>> {
         .collect()
 }
 
+fn ulid_ms(id: &str) -> Option<u64> {
+    id.parse::<ulid::Ulid>().ok().map(|id| id.timestamp_ms())
+}
+
 fn project(child: &mut ChildRead, events: &[Arc<Envelope>], running: bool) {
     for event in events {
         match &event.event {
@@ -76,6 +80,7 @@ fn project(child: &mut ChildRead, events: &[Arc<Envelope>], running: bool) {
             SessionEvent::TurnStarted { .. } => {
                 child.info.status = "running".into();
                 child.info.elapsed_ms = 0;
+                child.info.ended_ms = None;
                 child.turn_started = event
                     .id
                     .parse::<ulid::Ulid>()
@@ -95,6 +100,7 @@ fn project(child: &mut ChildRead, events: &[Arc<Envelope>], running: bool) {
                     .zip(event.id.parse::<ulid::Ulid>().ok())
                     .map(|(start, end)| end.timestamp_ms().saturating_sub(start))
                     .unwrap_or(0);
+                child.info.ended_ms = ulid_ms(&event.id);
                 child.turn_started = None;
             }
             SessionEvent::AssistantMessage(message) => {
@@ -117,6 +123,14 @@ fn project(child: &mut ChildRead, events: &[Arc<Envelope>], running: bool) {
     } else if child.info.status == "running" {
         // A historical open turn is not evidence of an active process.
         child.info.status = "interrupted".into();
+        // Interrupted just now if this poll brought no events; otherwise at
+        // the last recorded event.
+        child.info.ended_ms = events.last().and_then(|e| ulid_ms(&e.id)).or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as u64)
+        });
         child.turn_started = None;
     }
     if let Some(started) = child.turn_started {
@@ -211,6 +225,8 @@ pub fn spawn(
                                 status: "unknown".into(),
                                 elapsed_ms: 0,
                                 call: link.call,
+                                started_ms: ulid_ms(&agent.session),
+                                ended_ms: None,
                             };
                             readers.insert(
                                 agent.session,
@@ -403,6 +419,7 @@ mod tests {
                 status: "unknown".into(),
                 elapsed_ms: 0,
                 call: None,
+                ..Default::default()
             },
             after: None,
             turn_started: None,
