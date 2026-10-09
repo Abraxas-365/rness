@@ -1542,19 +1542,21 @@ impl Component for Chat {
         } else {
             None
         };
-        // Progressive layout: while nothing else changed, lay out a batch of
-        // estimated (stale) entries per frame, newest first.
-        let progressive: Vec<usize> =
-            if !self.stale.is_empty() && dirty.as_ref().is_some_and(|calls| calls.is_empty()) {
-                self.stale
-                    .iter()
-                    .rev()
-                    .take(self.refill_batch.max(MIN_REFILL))
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        // Progressive layout: on frames that touch at most some cards (none
+        // or a few dirty ones), lay out a batch of estimated (stale) entries
+        // too, newest first. Dirty cards are laid out first (required) and
+        // the batch takes what is left of the budget, so a card that
+        // changes every frame (spinner, progress) cannot starve the refill.
+        let progressive: Vec<usize> = if !self.stale.is_empty() && dirty.is_some() {
+            self.stale
+                .iter()
+                .rev()
+                .take(self.refill_batch.max(MIN_REFILL))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let unchanged = base_unchanged && progressive.is_empty();
         let mut durable_rows = self.row_ends.last().copied().unwrap_or(0);
         let mut assistant_count = ctx.model.next_assistant_id;
@@ -4498,6 +4500,93 @@ mod tests {
         assert_eq!(chat.row_ends, reference.row_ends);
         assert_eq!(chat.card_rows, reference.card_rows);
         assert_eq!(render(&mut chat, &model, narrow), expected);
+    }
+
+    /// A Lua card that changes every frame (spinner, live progress) makes
+    /// every frame a dirty-card frame. Background refill must still run
+    /// after the dirty cards, or `stale` never empties: `scroll_extent`
+    /// stays unclamped and estimated `card_rows` stay forever.
+    #[test]
+    fn background_refill_finishes_while_a_card_changes_every_frame() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("spinner".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 3 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: "line\n".repeat(1 + i % 5),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 12);
+        // Zero budget: exactly MIN_REFILL background entries per frame.
+        let mut chat = Chat {
+            refill_budget: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        let publish = |chat: &Chat, frame: usize| {
+            chat.cards.insert(
+                "call-2997".into(),
+                vec![rness_kernel::presentation::StyledLine {
+                    text: format!("spinner {}", ["|", "/", "-", "\\"][frame % 4]),
+                    ..Default::default()
+                }],
+            );
+        };
+        let render = |chat: &mut Chat| {
+            chat.render(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                area,
+                &mut Buffer::empty(area),
+            );
+        };
+        publish(&chat, 0);
+        render(&mut chat);
+        let stale = chat.stale.len();
+        assert!(stale > 100, "{stale}");
+        // N = what the refill needs at MIN_REFILL per frame, plus slack.
+        let limit = stale / MIN_REFILL + 10;
+        let mut frames = 0;
+        while !chat.stale.is_empty() {
+            frames += 1;
+            assert!(
+                frames <= limit,
+                "refill stalled: {} stale after {frames} frames",
+                chat.stale.len()
+            );
+            let before = chat.cards.revision();
+            publish(&chat, frames);
+            assert_ne!(chat.cards.revision(), before);
+            render(&mut chat);
+            assert_eq!(chat.cache_card_revision, chat.cards.revision());
+        }
+        assert_ne!(model.scroll_extent.get(), usize::MAX);
+        assert_eq!(model.scroll_extent.get(), chat.total_rows - 12);
+        let mut reference = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        reference.cards.insert(
+            "call-2997".into(),
+            chat.cards.get(&"call-2997".into()).unwrap().to_vec(),
+        );
+        render(&mut reference);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
     }
 
     #[test]
