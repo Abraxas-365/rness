@@ -287,6 +287,8 @@ impl SqliteSessionSearch {
             })?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
         let mut probes = Vec::new();
+        // Sessions whose header cannot be read, with the log revision seen.
+        let mut unreadable: Vec<(String, String)> = Vec::new();
         for session in store.list()? {
             let in_workspace = store
                 .workspace(&session)
@@ -296,12 +298,31 @@ impl SqliteSessionSearch {
                 Ok(Some(probe)) => probes.push((session, probe)),
                 Ok(None) => {}
                 Err(error) => {
-                    tracing::warn!(%session, %error, "session search skips an unreadable session")
+                    // Record the log's revision (when it can be stat'ed) so the
+                    // warning is given once per change, not on every search.
+                    match store.search_probe(&session) {
+                        Ok(probe) => {
+                            if old.get(&session) != Some(&probe.revision) {
+                                tracing::warn!(
+                                    %session, %error,
+                                    "session search skips an unreadable session"
+                                );
+                            }
+                            unreadable.push((session, probe.revision));
+                        }
+                        Err(_) => tracing::warn!(
+                            %session, %error,
+                            "session search skips an unreadable session"
+                        ),
+                    }
                 }
             }
         }
-        let present: std::collections::HashSet<_> =
-            probes.iter().map(|(session, _)| session).collect();
+        let present: std::collections::HashSet<_> = probes
+            .iter()
+            .map(|(session, _)| session)
+            .chain(unreadable.iter().map(|(session, _)| session))
+            .collect();
         let tx = connection.transaction()?;
         for session in old.keys().filter(|id| !present.contains(id)) {
             forget(&tx, workspace, session)?;
@@ -309,6 +330,12 @@ impl SqliteSessionSearch {
                 "DELETE FROM revisions WHERE workspace=?1 AND session=?2",
                 params![workspace, session],
             )?;
+        }
+        for (session, revision) in &unreadable {
+            if old.get(session) != Some(revision) {
+                forget(&tx, workspace, session)?;
+                set_revision(&tx, workspace, session, revision)?;
+            }
         }
         tx.commit()?;
         for (session, probe) in &probes {

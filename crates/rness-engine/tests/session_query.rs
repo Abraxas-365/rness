@@ -567,3 +567,66 @@ fn v4_index_gets_a_new_file_and_leaves_older_indexes_untouched() {
         .unwrap();
     assert_eq!(v2_version, 2);
 }
+
+/// A session whose header cannot be read is recorded with its log revision,
+/// so it is skipped (and warned about) once per change, not on every search.
+#[test]
+fn unreadable_header_records_a_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    let mut broken = store.create(Some("/w".into())).unwrap();
+    let caller = log.session().clone();
+    log.append(&message("needle ok")).unwrap();
+    broken.append(&message("needle broken")).unwrap();
+    let broken_id = broken.session().clone();
+    let path = dir.path().join("index.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let run = |provider: &mut SqliteSessionSearch| {
+        provider
+            .execute(
+                &store,
+                &caller,
+                "session_search",
+                request(json!({"query":"needle","limit":100})),
+            )
+            .unwrap()
+    };
+    assert_eq!(run(&mut provider)["items"].as_array().unwrap().len(), 2);
+    // Fresh store handle: the first store cached the readable header.
+    // A newer-format header still lists, but its header cannot be read.
+    let text = std::fs::read_to_string(broken.path()).unwrap();
+    assert!(text.contains("\"version\":1"));
+    std::fs::write(
+        broken.path(),
+        text.replacen("\"version\":1", "\"version\":99", 1),
+    )
+    .unwrap();
+    let store2 = SessionStore::new(dir.path());
+    let found = provider
+        .execute(
+            &store2,
+            &caller,
+            "session_search",
+            request(json!({"query":"needle","limit":100})),
+        )
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1, "{found}");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let recorded: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM revisions WHERE session=?1",
+            [&broken_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM event_scope WHERE session=?1",
+            [&broken_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "nothing stale served from it");
+}
