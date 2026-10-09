@@ -139,8 +139,14 @@ pub struct Model {
     pub model_name: String,
     pub profile_name: Option<String>,
     pub agent_name: Option<String>,
-    /// Scrollback offset from the bottom (0 = pinned to latest).
-    pub scroll_from_bottom: u16,
+    /// Scrollback offset from the bottom (0 = pinned to latest), in rows.
+    /// `usize`: long sessions exceed 65 535 rows.
+    pub scroll_from_bottom: usize,
+    /// Largest useful `scroll_from_bottom` (total rows − viewport height),
+    /// written by the chat module on each render; `usize::MAX` until the
+    /// first render. `scroll_up` clamps to it so presses past the top do
+    /// not pile up as dead offset.
+    pub scroll_extent: std::cell::Cell<usize>,
     /// A sensitive tool call paused for a decision. The approval overlay
     /// selects itself into `overlay` while this is Some (chain pattern —
     /// no shell-driven mount/unmount).
@@ -181,10 +187,27 @@ impl Model {
             profile_name: None,
             agent_name: None,
             scroll_from_bottom: 0,
+            scroll_extent: std::cell::Cell::new(usize::MAX),
             pending_approval: None,
             should_quit: false,
             title: None,
         }
+    }
+
+    /// Scroll up `n` rows, saturating and clamped to the last rendered
+    /// extent (an offset past it would show the same top frame). Never
+    /// lowers the offset: the chat's scroll anchor moves the view by the
+    /// offset delta, so a decrease would scroll down.
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll_from_bottom = self
+            .scroll_from_bottom
+            .saturating_add(n)
+            .min(self.scroll_extent.get().max(self.scroll_from_bottom));
+    }
+
+    /// Scroll down `n` rows (towards the latest), saturating at 0.
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(n);
     }
 
     /// Project an immutable, append-only session log. Session changes, shortened
@@ -547,8 +570,8 @@ pub enum Action {
     PasteClipboard,
     Cancel,
     Quit,
-    ScrollUp(u16),
-    ScrollDown(u16),
+    ScrollUp(usize),
+    ScrollDown(usize),
     /// The pending approval was answered with this decision.
     ResolveApproval(rness_protocol::api::ApprovalDecision),
     /// Open extension point: named action + payload, broadcast to every
@@ -1507,12 +1530,8 @@ impl App {
                     )));
                 }
             }
-            Action::ScrollUp(n) => {
-                self.model.scroll_from_bottom = self.model.scroll_from_bottom.saturating_add(n)
-            }
-            Action::ScrollDown(n) => {
-                self.model.scroll_from_bottom = self.model.scroll_from_bottom.saturating_sub(n)
-            }
+            Action::ScrollUp(n) => self.model.scroll_up(n),
+            Action::ScrollDown(n) => self.model.scroll_down(n),
             Action::ResolveApproval(decision) => {
                 if let Some(pending) = self.model.pending_approval.take() {
                     let _ = pending.respond.send(decision);

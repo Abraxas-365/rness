@@ -11,16 +11,16 @@ use ratatui::widgets::Widget;
 /// their scroll state to reality).
 pub fn render_bottom_anchored(
     lines: &[Line<'_>],
-    from_bottom: u16,
+    from_bottom: usize,
     area: Rect,
     buf: &mut Buffer,
-) -> u16 {
+) -> usize {
     if area.height == 0 || area.width == 0 {
         return 0;
     }
     let height = area.height as usize;
     let max_offset = lines.len().saturating_sub(height);
-    let offset = (from_bottom as usize).min(max_offset);
+    let offset = from_bottom.min(max_offset);
 
     let end = lines.len() - offset;
     let start = end.saturating_sub(height);
@@ -32,7 +32,7 @@ pub fn render_bottom_anchored(
         let rect = Rect::new(area.x, y0 + i as u16, area.width, 1);
         line.render(rect, buf);
     }
-    offset as u16
+    offset
 }
 
 #[cfg(test)]
@@ -73,6 +73,19 @@ mod tests {
         let clamped = render_bottom_anchored(&lines, 99, area, &mut buf);
         assert_eq!(clamped, 2);
         assert_eq!(row(&buf, 0, 10), "line1");
+    }
+
+    #[test]
+    fn offsets_beyond_u16_are_not_truncated() {
+        let lines: Vec<Line> = (0..70_010).map(|i| Line::raw(format!("l{i}"))).collect();
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buf = Buffer::empty(area);
+        let clamped = render_bottom_anchored(&lines, 70_000, area, &mut buf);
+        assert_eq!(clamped, 70_000);
+        assert_eq!(row(&buf, 2, 10), "l9");
+        let clamped = render_bottom_anchored(&lines, usize::MAX, area, &mut buf);
+        assert_eq!(clamped, 70_007);
+        assert_eq!(row(&buf, 0, 10), "l0");
     }
 
     #[test]

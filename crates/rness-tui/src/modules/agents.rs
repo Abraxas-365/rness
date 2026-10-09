@@ -987,12 +987,13 @@ impl Component for Agents {
                     if state.root != root || !state.agents.iter().any(|a| a.session == session) {
                         return;
                     }
-                    let scroll = &mut state.session(&session).model.scroll_from_bottom;
-                    *scroll = if up {
-                        scroll.saturating_add(self.number("wheel_lines", 3))
+                    let lines = usize::from(self.number("wheel_lines", 3));
+                    let model = &mut state.session(&session).model;
+                    if up {
+                        model.scroll_up(lines)
                     } else {
-                        scroll.saturating_sub(self.number("wheel_lines", 3))
-                    };
+                        model.scroll_down(lines)
+                    }
                 } else {
                     self.navigate(if up { -1 } else { 1 });
                 }
@@ -1141,7 +1142,7 @@ impl Component for Agents {
             };
             return KeyOutcome::consumed();
         }
-        let page_lines = self.number("page_lines", 10);
+        let page_lines = usize::from(self.number("page_lines", 10));
         let page_up = self.matches("page_up", key);
         let page_down = self.matches("page_down", key);
         let follow = self.matches("follow", key);
@@ -1154,13 +1155,12 @@ impl Component for Agents {
         }
         let target = state.session(&session);
         let chat = Self::chat(&mut self.chats, &self.config, target, ctx.theme);
-        let scroll = &mut target.model.scroll_from_bottom;
         match key.code {
-            _ if page_up => *scroll = scroll.saturating_add(page_lines),
-            _ if page_down => *scroll = scroll.saturating_sub(page_lines),
-            _ if follow => *scroll = 0,
-            _ if scroll_up && !chat.captures_input() => *scroll = scroll.saturating_add(1),
-            _ if scroll_down && !chat.captures_input() => *scroll = scroll.saturating_sub(1),
+            _ if page_up => target.model.scroll_up(page_lines),
+            _ if page_down => target.model.scroll_down(page_lines),
+            _ if follow => target.model.scroll_from_bottom = 0,
+            _ if scroll_up && !chat.captures_input() => target.model.scroll_up(1),
+            _ if scroll_down && !chat.captures_input() => target.model.scroll_down(1),
             _ => {
                 let child_ctx = Ctx {
                     model: &target.model,
@@ -1182,14 +1182,8 @@ impl Component for Agents {
                 let mut inspect = None;
                 for action in outcome.actions {
                     match action {
-                        Action::ScrollUp(n) => {
-                            target.model.scroll_from_bottom =
-                                target.model.scroll_from_bottom.saturating_add(n)
-                        }
-                        Action::ScrollDown(n) => {
-                            target.model.scroll_from_bottom =
-                                target.model.scroll_from_bottom.saturating_sub(n)
-                        }
+                        Action::ScrollUp(n) => target.model.scroll_up(n),
+                        Action::ScrollDown(n) => target.model.scroll_down(n),
                         Action::Custom(ref name, _) if name == "terminal:copy-text" => {
                             allowed.push(action)
                         }

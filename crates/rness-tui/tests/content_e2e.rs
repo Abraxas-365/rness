@@ -200,7 +200,7 @@ fn surfaces(name: &str, content: &str) -> Vec<(&'static str, LogBuilder)> {
 /// Bottom-anchored viewport shows the end of the content; for content
 /// whose MARK is at the start we scroll to the top to look for it.
 fn render_top(app: &mut rness_tui::app::App, w: u16, h: u16) -> ratatui::buffer::Buffer {
-    app.model.scroll_from_bottom = u16::MAX;
+    app.model.scroll_from_bottom = usize::MAX;
     let _ = render_unscrubbed(app, w, h);
     let b = render_unscrubbed(app, w, h); // second frame: anchors settle
     app.model.scroll_from_bottom = 0;
@@ -397,7 +397,7 @@ fn tiny_terminals_do_not_panic() {
     for config in [flavor_config(), Value::Null] {
         let (mut app, _be) = new_app("s-tiny", b.history(), config.clone());
         for &(w, h) in &sizes {
-            for scroll in [0u16, 5, u16::MAX] {
+            for scroll in [0usize, 5, usize::MAX] {
                 app.model.scroll_from_bottom = scroll;
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     render(&mut app, w, h)

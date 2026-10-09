@@ -288,6 +288,18 @@ pub fn long_session(
     compact_every: usize,
 ) -> LogBuilder {
     let mut b = LogBuilder::new(session);
+    extend_long_session(&mut b, turns, tools_per_turn, compact_every);
+    b
+}
+
+/// Append [`long_session`] turns to `b` (event ids continue `b`'s sequence,
+/// so they stay unique when the builder already has events).
+pub fn extend_long_session(
+    b: &mut LogBuilder,
+    turns: usize,
+    tools_per_turn: usize,
+    compact_every: usize,
+) {
     for t in 0..turns {
         if compact_every > 0 && t > 0 && t % compact_every == 0 {
             b.compact(&format!("## Summary {t}\n\n{}", prose(t * 7 + 1, 600)));
@@ -315,7 +327,6 @@ pub fn long_session(
             prose(t * 7 + 3, 300)
         ));
     }
-    b
 }
 
 // ---------------------------------------------------------------------------

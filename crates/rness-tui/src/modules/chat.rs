@@ -20,7 +20,7 @@ pub struct Chat {
     /// feeds it — zero magic, zero cost.
     selected_message: Option<String>,
     message_expanded: bool,
-    message_scroll: u16,
+    message_scroll: usize,
     cards: CardCache,
     config: serde_json::Value,
     focused_call: Option<String>,
@@ -46,7 +46,7 @@ pub struct Chat {
     cached_positions: std::collections::HashMap<String, usize>,
     scroll_anchor: Option<(String, usize)>,
     live_scroll_anchor: Option<(Option<usize>, usize)>,
-    last_scroll: u16,
+    last_scroll: usize,
     durable_stamp: Option<String>,
     cache_epoch: u64,
     cache_view: String,
@@ -545,6 +545,15 @@ fn panel(
         border,
     ));
     out
+}
+
+/// Signed `last - current` scroll movement (rows the view start moves down).
+fn scroll_delta(last: usize, current: usize) -> isize {
+    if last >= current {
+        isize::try_from(last - current).unwrap_or(isize::MAX)
+    } else {
+        isize::try_from(current - last).map_or(isize::MIN, |d| -d)
+    }
 }
 
 fn visual_rows(line: Line<'static>, width: usize, wrap: bool) -> Vec<Line<'static>> {
@@ -1227,7 +1236,6 @@ impl Component for Chat {
                 self.total_rows
                     .saturating_sub(row.saturating_add(self.viewport_height))
             };
-            let target = target.min(u16::MAX as usize) as u16;
             let current = ctx.model.scroll_from_bottom;
             let action = if target >= current {
                 crate::app::Action::ScrollUp(target - current)
@@ -1500,8 +1508,10 @@ impl Component for Chat {
             // refilled when they scroll into view or in later frames.
             let entry_id = |index: usize| ctx.model.entry_ids.get(index).map_or("", String::as_str);
             let window_start = if old_layout.is_some() {
-                let target =
-                    usize::from(ctx.model.scroll_from_bottom) + 2 * usize::from(area.height);
+                let target = ctx
+                    .model
+                    .scroll_from_bottom
+                    .saturating_add(2 * usize::from(area.height));
                 let mut rows = 0;
                 let mut start = ctx.model.entries.len();
                 while start > 0 && rows < target {
@@ -2398,8 +2408,13 @@ impl Component for Chat {
         self.total_rows = durable_rows + lines.len();
         self.viewport_height = usize::from(area.height);
         let height = self.viewport_height;
-        let offset =
-            usize::from(ctx.model.scroll_from_bottom).min(self.total_rows.saturating_sub(height));
+        let offset = ctx
+            .model
+            .scroll_from_bottom
+            .min(self.total_rows.saturating_sub(height));
+        // Without an anchor the effective offset is `offset`; an anchor
+        // moves `start` by the scroll delta instead (see below).
+        let mut effective_scroll = offset;
         let mut end = self.total_rows - offset;
         let mut start = end.saturating_sub(height);
         if ctx.model.scroll_from_bottom != 0 && self.last_scroll != 0 {
@@ -2411,7 +2426,8 @@ impl Component for Chat {
                         self.row_ends[index - 1]
                     };
                     let anchored = base + row.min(&(self.row_ends[index] - base).saturating_sub(1));
-                    let delta = self.last_scroll as isize - ctx.model.scroll_from_bottom as isize;
+                    let delta = scroll_delta(self.last_scroll, ctx.model.scroll_from_bottom);
+                    effective_scroll = ctx.model.scroll_from_bottom;
                     start = anchored
                         .saturating_add_signed(delta)
                         .min(self.total_rows.saturating_sub(height));
@@ -2438,7 +2454,8 @@ impl Component for Chat {
                         })
                 };
                 if let Some(base) = base {
-                    let delta = self.last_scroll as isize - ctx.model.scroll_from_bottom as isize;
+                    let delta = scroll_delta(self.last_scroll, ctx.model.scroll_from_bottom);
+                    effective_scroll = ctx.model.scroll_from_bottom;
                     start = (base + row)
                         .saturating_add_signed(delta)
                         .min(self.total_rows.saturating_sub(height));
@@ -2446,6 +2463,10 @@ impl Component for Chat {
                 }
             }
         }
+        // Scrolling up can move the view by at most `start` more rows.
+        ctx.model
+            .scroll_extent
+            .set(effective_scroll.saturating_add(start));
         let selected_index = self
             .selected_message
             .as_ref()
@@ -2453,7 +2474,8 @@ impl Component for Chat {
         if let Some(index) = selected_index.filter(|index| *index < self.row_ends.len()) {
             let base = index.checked_sub(1).map_or(0, |i| self.row_ends[i]);
             let selected_end = self.row_ends[index];
-            let scroll = usize::from(self.message_scroll)
+            let scroll = self
+                .message_scroll
                 .min(selected_end.saturating_sub(base).saturating_sub(1));
             start = if selected_end.saturating_sub(base) > height || scroll > 0 {
                 base + scroll
@@ -3933,6 +3955,117 @@ mod tests {
         assert_eq!(chat.cached_ids, vec!["event-b"]);
     }
 
+    /// B4-2: offsets beyond 65 535 rows. A tool card at the top, then
+    /// ~80k rows of 40-line notices.
+    fn tall_transcript() -> crate::app::Model {
+        use crate::app::Entry;
+        let mut model = crate::app::Model::new("tall".into(), "fake".into());
+        model.entries.push(Entry::ToolResult {
+            call: "top-call".into(),
+            name: "TopTool".into(),
+            output: "top output\n".into(),
+            is_error: false,
+        });
+        model.entry_ids.push("e-top".into());
+        for i in 0..2000 {
+            let body: String = (0..40).map(|l| format!("n{i} l{l}\n")).collect();
+            model.entries.push(Entry::Notice(body));
+            model.entry_ids.push(format!("e-{i}"));
+        }
+        model
+    }
+
+    fn render_rows(
+        chat: &mut super::Chat,
+        model: &crate::app::Model,
+        area: ratatui::layout::Rect,
+    ) -> Vec<String> {
+        use super::*;
+        let theme = crate::theme::Theme::default();
+        let mut buf = Buffer::empty(area);
+        chat.render(
+            &Ctx {
+                model,
+                theme: &theme,
+            },
+            area,
+            &mut buf,
+        );
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_beyond_u16_rows_reaches_the_top_and_back() {
+        use super::*;
+        let mut model = tall_transcript();
+        let area = Rect::new(0, 0, 60, 20);
+        let mut chat = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        let bottom = render_rows(&mut chat, &model, area);
+        assert!(chat.total_rows > 80_000, "{}", chat.total_rows);
+        let extent = chat.total_rows - 20;
+        assert_eq!(model.scroll_extent.get(), extent);
+
+        // One jump far past u16::MAX lands exactly where asked.
+        model.scroll_up(70_000);
+        assert_eq!(model.scroll_from_bottom, 70_000);
+        let mid = render_rows(&mut chat, &model, area);
+        assert_ne!(mid, bottom);
+        model.scroll_down(70_000);
+        assert_eq!(render_rows(&mut chat, &model, area), bottom);
+
+        // Saturating scroll clamps to the extent; the top is shown and a
+        // single step down moves the view (no dead offset to unwind).
+        model.scroll_up(usize::MAX);
+        let top = render_rows(&mut chat, &model, area);
+        assert!(top[0].contains("top output"), "{top:#?}");
+        model.scroll_up(usize::MAX);
+        assert_eq!(model.scroll_from_bottom, extent);
+        model.scroll_down(1);
+        assert_eq!(model.scroll_from_bottom, extent - 1);
+        let below = render_rows(&mut chat, &model, area);
+        assert_ne!(below, top);
+        assert_eq!(below[..19], top[1..]);
+    }
+
+    #[test]
+    fn card_jump_beyond_u16_rows_targets_the_card() {
+        use super::*;
+        let mut model = tall_transcript();
+        let area = Rect::new(0, 0, 60, 20);
+        let theme = crate::theme::Theme::default();
+        let mut chat = Chat {
+            config: serde_json::json!({}),
+            exact_layout: true,
+            ..Default::default()
+        };
+        render_rows(&mut chat, &model, area);
+        let actions = chat
+            .on_binding(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                "previous_tool",
+            )
+            .actions;
+        let [crate::app::Action::ScrollUp(n)] = actions[..] else {
+            panic!("{actions:?}");
+        };
+        assert!(n > usize::from(u16::MAX), "{n}");
+        model.scroll_up(n);
+        let rows = render_rows(&mut chat, &model, area);
+        assert!(rows[0].contains("top output"), "{rows:#?}");
+    }
+
     #[test]
     fn virtual_viewport_reuses_entries_and_matches_flat_render() {
         use super::*;
@@ -4065,7 +4198,7 @@ mod tests {
 
         // Jumping to the top of a freshly resized transcript shows exact rows.
         render(&mut chat, &model, wide);
-        model.scroll_from_bottom = u16::MAX;
+        model.scroll_from_bottom = usize::MAX;
         let top = render(&mut chat, &model, wide);
         let (_, expected) = exact(&model, wide);
         assert_eq!(top, expected);
