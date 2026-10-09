@@ -189,9 +189,24 @@ Time spent processing a returned event is excluded. This is **not** a total turn
 or generation duration limit: a healthy stream can run indefinitely. Once the
 first event has arrived, keepalives can keep it alive even without tokens.
 Before the first event, keepalives extend the deadline only up to twice the
-timeout from the start of the stream, so a stream of nothing but comments fails
-with a retryable timeout instead of hanging. Waiting for initial HTTP response headers
-also has the configured deadline.
+timeout or 15 minutes from the start of the stream, whichever is longer, so a
+stream of nothing but comments eventually fails with a retryable timeout
+instead of hanging. A timeout of `0` disables both limits. Waiting for initial
+HTTP response headers also has the configured deadline.
+
+The 15-minute floor exists because some gateways send only SSE comment
+keep-alives while a reasoning model thinks before its first token (for
+example OpenRouter's `: OPENROUTER PROCESSING`), which can take minutes. To
+tune it for a connection, set its idle timeout: the first-event limit is
+`max(2 × timeout, 15 min)`, so a timeout above 7.5 minutes raises it
+(`set_stream_idle_timeout("router", 1200000)` allows 40 minutes), and `0`
+removes it:
+
+```lua
+-- "router" points at OpenRouter: up to 40 min of keep-alives before the
+-- first token, 20 min without an event or keep-alive after it.
+rness.providers.set_stream_idle_timeout("router", 1200000)
+```
 
 Establishing the connection (TCP and TLS) has its own bound: 10 seconds, or half
 the idle deadline when that is shorter. A host that never answers fails with a

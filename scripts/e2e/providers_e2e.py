@@ -55,20 +55,24 @@ def gateway_shapes(t, fp):
 
 
 def heartbeat_forever(t, fp, seconds):
+    # Before the first event keep-alives extend the idle deadline up to max(2 x idle, 15 min) (B5-6):
+    # gateways send only comments while a reasoning model thinks. With idle=1s the stream must still be
+    # running after `seconds` (> 2 x idle), and Ctrl-C must end it promptly. The cap itself is unit-tested.
     for shape in ("anthropic", "openai"):
         init = IDLE.format(route=ROUTE[shape], ms=1000)
         with with_rness(WP, provider=fp, shape=shape, init_append=init, tag=f"hb-{shape}") as r:
             p = r.spawn_headless("hi", scenario="heartbeat-forever:200")
-            done = wait_until(lambda: p.poll() is not None, seconds, 0.2)
-            t.check(f"{shape} heartbeat-only stream ends (idle=1s) within {seconds}s", done,
-                    f"still running after {seconds}s" if not done else "")
-            if done:
-                sess = r.latest_session()
-                a = attempts(r.log(sess)) if sess else []
-                t.check(f"{shape} heartbeat-only stream: 3 retryable TIMEOUT attempts",
-                        len(a) == 3 and all(x.get("code") == "TIMEOUT" and x.get("retryable") for x in a),
-                        json.dumps(a)[:300])
-            if not done:
+            ended = wait_until(lambda: p.poll() is not None, seconds, 0.2)
+            t.check(f"{shape} heartbeat-only stream (idle=1s) not cut at 2x idle: running after {seconds}s",
+                    not ended, f"exited rc={p.returncode}" if ended else "")
+            t0 = time.monotonic()
+            with contextlib.suppress(OSError):
+                os.killpg(p.pid, signal.SIGINT)
+            stopped = wait_until(lambda: p.poll() is not None, 5, 0.05)
+            dt = time.monotonic() - t0
+            t.check(f"{shape} heartbeat-only stream: SIGINT ends it within 2s",
+                    stopped and dt < 2 and p.returncode not in (0, None), f"rc={p.returncode} {dt:.1f}s")
+            if not stopped:
                 with contextlib.suppress(OSError):
                     os.killpg(p.pid, signal.SIGKILL)
                 p.wait(10)
@@ -152,9 +156,8 @@ def main():
     try:
         groups = {
             "gateway": lambda: gateway_shapes(t, fp),
-            # Each attempt is capped at 2x idle before the first event: 3 x 2 s
-            # + 0.5 s + 1 s backoff ~ 7.5 s, plus startup.
-            "heartbeat": lambda: heartbeat_forever(t, fp, 12),
+            # idle=1s: still streaming at 4 s (> 2 x idle, < the 15 min first-event floor).
+            "heartbeat": lambda: heartbeat_forever(t, fp, 4),
             "blackhole": lambda: blackhole(t, fp),
             "huge": lambda: huge_tool_json_rss(t, fp, 16 if a.quick else 64),
             "utf8": lambda: split_utf8_tui(t, fp),

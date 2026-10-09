@@ -51,11 +51,18 @@ pub async fn idle_deadline(timeout: Option<Duration>) {
 /// of MiB; this bounds memory against a broken or hostile server.
 pub const MAX_EVENT_BYTES: usize = 128 * 1024 * 1024;
 
+/// Lower bound of the first-event cap. Some gateways send only keep-alive
+/// comments while a reasoning model thinks before its first token (e.g.
+/// OpenRouter's `: OPENROUTER PROCESSING`), for minutes; a short idle timeout
+/// must not cut those off.
+pub const FIRST_EVENT_FLOOR: Duration = Duration::from_secs(15 * 60);
+
 pub struct SseReader {
     inner: Pin<Box<dyn Stream<Item = Result<Frame, String>> + Send>>,
     timeout: Option<Duration>,
     /// Until the first event, keep-alive comments cannot push the deadline
-    /// past this (`2 × timeout` after the reader was created).
+    /// past this: `max(2 × timeout, FIRST_EVENT_FLOOR)` after the reader was
+    /// created. None when the idle timeout is disabled.
     first_event_by: Option<tokio::time::Instant>,
 }
 
@@ -566,6 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn comments_before_the_first_event_are_capped_at_twice_the_timeout() {
+        // Floor below 2 × timeout: the cap is 2 × timeout (100 ms).
         let stream = futures_util::stream::unfold((), |_| async {
             tokio::time::sleep(Duration::from_millis(10)).await;
             Some((
@@ -573,7 +581,11 @@ mod tests {
                 (),
             ))
         });
-        let mut reader = SseReader::new(stream, Some(Duration::from_millis(50)));
+        let mut reader = SseReader::with_first_event_floor(
+            stream,
+            Some(Duration::from_millis(50)),
+            Duration::ZERO,
+        );
         let t0 = std::time::Instant::now();
         let out = tokio::time::timeout(
             Duration::from_secs(2),
@@ -605,11 +617,67 @@ mod tests {
                 n + 1,
             ))
         });
-        let mut reader = SseReader::new(stream, Some(Duration::from_millis(50)));
+        let mut reader = SseReader::with_first_event_floor(
+            stream,
+            Some(Duration::from_millis(50)),
+            Duration::ZERO,
+        );
         assert!(matches!(
             reader.pull(&CancellationToken::new()).await,
             SsePull::Event { .. }
         ));
+    }
+
+    /// A comment-only stream for `ms` per comment, forever.
+    fn pings(every_ms: u64) -> impl Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+        futures_util::stream::unfold((), move |_| async move {
+            tokio::time::sleep(Duration::from_millis(every_ms)).await;
+            Some((Ok(bytes::Bytes::from_static(b": PROCESSING\n\n")), ()))
+        })
+    }
+
+    #[tokio::test]
+    async fn first_event_cap_has_a_floor_above_twice_a_short_timeout() {
+        // idle 30 ms, floor 300 ms: keep-alives hold the stream well past
+        // 2 × idle (a reasoning model behind a gateway), then the floor ends it.
+        let mut reader = SseReader::with_first_event_floor(
+            pings(10),
+            Some(Duration::from_millis(30)),
+            Duration::from_millis(300),
+        );
+        let t0 = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(3),
+            reader.pull(&CancellationToken::new()),
+        )
+        .await
+        .expect("the floor still ends a comment-only stream");
+        assert!(matches!(out, SsePull::Timeout));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(290),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn production_cap_is_fifteen_minutes_or_twice_the_timeout() {
+        assert_eq!(FIRST_EVENT_FLOOR, Duration::from_secs(15 * 60));
+        for (idle, cap) in [
+            (Duration::from_secs(1), FIRST_EVENT_FLOOR),
+            (Duration::from_secs(300), FIRST_EVENT_FLOOR),
+            (Duration::from_secs(600), Duration::from_secs(1200)),
+        ] {
+            let t0 = tokio::time::Instant::now();
+            let reader = SseReader::new(pings(1000), Some(idle));
+            let by = reader.first_event_by.expect("cap set") - t0;
+            assert!(
+                by >= cap && by < cap + Duration::from_secs(1),
+                "idle {idle:?}: {by:?}"
+            );
+        }
+        // 0 (None) disables the watchdog and the cap.
+        assert!(SseReader::new(pings(1000), None).first_event_by.is_none());
     }
 }
 
@@ -627,17 +695,26 @@ impl SseReader {
         S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
         E: std::error::Error + Send + Sync + 'static,
     {
+        Self::with_first_event_floor(bytes, timeout, FIRST_EVENT_FLOOR)
+    }
+
+    fn with_first_event_floor<S, E>(bytes: S, timeout: Option<Duration>, floor: Duration) -> Self
+    where
+        S: Stream<Item = Result<bytes::Bytes, E>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
+    {
         Self {
             inner: Box::pin(SseDecoder::new(bytes, MAX_EVENT_BYTES)),
             timeout,
-            first_event_by: timeout.map(|t| tokio::time::Instant::now() + t * 2),
+            first_event_by: timeout.map(|t| tokio::time::Instant::now() + (t * 2).max(floor)),
         }
     }
 
     /// Next event. Each wait has a fresh idle deadline; a complete comment
     /// line (keep-alive) restarts it, fragmentary bytes do not. Before the
-    /// first event, keep-alives restart it only up to `2 × timeout` after
-    /// the stream started, so a stream of nothing but comments still ends.
+    /// first event, keep-alives restart it only up to
+    /// `max(2 × timeout, FIRST_EVENT_FLOOR)` after the stream started, so a
+    /// stream of nothing but comments still ends.
     pub async fn pull(&mut self, cancel: &CancellationToken) -> SsePull {
         loop {
             let deadline = self.timeout.map(|t| {

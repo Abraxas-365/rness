@@ -304,12 +304,48 @@ async fn split_utf8_inside_every_multibyte_char_reassembles_exactly() {
 // -- heartbeat-only stream vs the idle timer -----------------------------
 
 #[tokio::test]
-async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
-    // Idle timeout 300 ms; server sends `: ping` every 100 ms and nothing else.
-    // B5-6: before the first event, comments extend the deadline only up to
-    // 2 × idle, so the step fails with TIMEOUT after ~600 ms (not never).
+async fn heartbeat_comments_hold_the_first_token_past_twice_the_idle_timeout() {
+    // Idle timeout 300 ms; the server sends only `: OPENROUTER PROCESSING`
+    // every 100 ms for 1.2 s (4 × idle), then the answer: a reasoning model
+    // behind a gateway. Before the first event comments extend the deadline
+    // up to max(2 × idle, 15 min) (B5-6 floor), so this commits. The cap
+    // ending a comment-only stream is unit-tested in sse.rs with a small floor.
     let dir = tempfile::tempdir().unwrap();
     for shape in SHAPES {
+        let script: Script = Arc::new(move || {
+            let mut v = vec![Piece(sse_head(), 0)];
+            for _ in 0..12 {
+                v.push(Piece(b": OPENROUTER PROCESSING\n\n".to_vec(), 100));
+            }
+            v.push(Piece(
+                text_stream(shape, &["thought ", "long"])
+                    .concat()
+                    .into_bytes(),
+                0,
+            ));
+            v
+        });
+        let (base, _) = raw_server(script).await;
+        let p = provider(shape, &base, Some(Duration::from_millis(300)), dir.path());
+        let t0 = Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            step(p.as_ref(), &CancellationToken::new()),
+        )
+        .await
+        .expect("step finishes once the answer arrives");
+        let ms = t0.elapsed().as_millis();
+        println!("WP5 heartbeat_first_token {shape:?}: took_ms={ms} (idle=300ms)");
+        assert_eq!(
+            text_of(&out),
+            "thought long",
+            "{shape:?}: {}",
+            describe(&out)
+        );
+        assert!(ms >= 1100, "{shape:?}: {ms} ms");
+
+        // A comment-only stream is still running at 5 × idle, and cancel
+        // ends it promptly.
         let script: Script = Arc::new(|| {
             let mut v = vec![Piece(sse_head(), 0)];
             for _ in 0..600 {
@@ -320,31 +356,22 @@ async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
         let (base, _) = raw_server(script).await;
         let p = provider(shape, &base, Some(Duration::from_millis(300)), dir.path());
         let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            c2.cancel();
+        });
         let t0 = Instant::now();
-        let r = tokio::time::timeout(Duration::from_secs(2), step(p.as_ref(), &cancel)).await;
-        let ms = t0.elapsed().as_millis();
-        println!(
-            "WP5 heartbeat_forever {shape:?}: still_running_after_2s={} took_ms={ms} (idle=300ms)",
-            r.is_err()
-        );
-        let out = r.expect("a comment-only stream must time out");
+        let out = tokio::time::timeout(Duration::from_secs(5), step(p.as_ref(), &cancel))
+            .await
+            .expect("cancel ends a comment-only stream");
         assert!(
-            matches!(&out, StepOutcome::Failed { error, .. } if error.code == "TIMEOUT" && error.retryable),
+            matches!(out, StepOutcome::Cancelled { .. }),
             "{shape:?}: {}",
             describe(&out)
         );
-        assert!(
-            ms >= 550,
-            "{shape:?}: comments extended the deadline ({ms} ms)"
-        );
-        // Cancel still works promptly.
-        let c2 = cancel.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            c2.cancel();
-        });
-        let out = step(p.as_ref(), &cancel).await;
-        assert!(matches!(out, StepOutcome::Cancelled { .. }));
+        let ms = t0.elapsed().as_millis();
+        assert!((1400..3000).contains(&ms), "{shape:?}: {ms} ms");
     }
 }
 
@@ -352,7 +379,7 @@ async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
 async fn heartbeat_without_trailing_blank_line_still_resets_idle() {
     // ":" lines without the blank line terminator (`:x\n` only) are comments too.
     // After the first event they keep a stream alive indefinitely (1 s of
-    // comments vs a 300 ms idle timeout); before it, up to 2 × idle (B5-6).
+    // comments vs a 300 ms idle timeout); before it, up to max(2 × idle, 15 min) (B5-6).
     let dir = tempfile::tempdir().unwrap();
     for (after_first_event, comments) in [(true, 10), (false, 4)] {
         let script: Script = Arc::new(move || {
