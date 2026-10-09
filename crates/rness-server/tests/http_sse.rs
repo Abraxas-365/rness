@@ -893,3 +893,64 @@ async fn cancelling_the_turn_withdraws_the_question() {
     );
     assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+/// B5-10: a send refused as busy is a transient 409 with `Retry-After`,
+/// never a 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_send_is_409_with_retry_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    let maintenance = sessions.try_extension_maintenance().unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/request"))
+        .json(&serde_json::json!({
+            "type":"send", "session":id, "intent":"followup",
+            "content":[{"kind":"text","text":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(response.text().await.unwrap().contains("busy"));
+    drop(maintenance);
+}
+
+/// B5-10: concurrent sends to one idle session all succeed: one starts,
+/// the rest queue as followups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_remote_sends_all_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let url = format!("{base}/api/request");
+        let id = id.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "type":"send", "session":id, "intent":"followup",
+                    "content":[{"kind":"text","text":format!("msg {i}")}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            (
+                response.status(),
+                response.json::<serde_json::Value>().await.unwrap(),
+            )
+        }));
+    }
+    let mut started = 0;
+    for task in tasks {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        if body["status"] == "started" {
+            started += 1;
+        }
+    }
+    assert_eq!(started, 1);
+}

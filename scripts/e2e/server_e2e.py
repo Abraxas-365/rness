@@ -384,12 +384,9 @@ def g_concurrent(t, fp):
         ths = [threading.Thread(target=one, args=(i,)) for i in range(20)]
         [th.start() for th in ths]
         [th.join() for th in ths]
-        busy = sum("session is busy" in e for e in errs)
-        print(f"      20 concurrent sends: ok={len(results)} busy-500={busy} other-errors={len(errs) - busy}")
-        t.xcheck("20 concurrent sends: none rejected", not errs,
-                 "B5-10 concurrent sends race on operation.try_lock -> 500 'session is busy' instead of queueing",
-                 f"busy={busy} other={[e for e in errs if 'busy' not in e][:1]}")
-        t.check("rejections are busy-500 only (no other errors)", len(errs) == busy, errs[:2])
+        print(f"      20 concurrent sends: ok={len(results)} errors={len(errs)}")
+        t.check("20 concurrent sends: none rejected", not errs, errs[:2])
+        t.check("no 500s: any rejection is 409 busy (none expected)", not any("500" in e for e in errs), errs[:2])
         t.check("at most one 'started'", results.count("started") == 1, {s: results.count(s) for s in set(results)})
         done = wait_until(lambda: (r.api("GET", f"/api/sessions/{sid}/phase")["phase"] == "idle"
                                    and len([e for e in r.api("GET", f"/api/sessions/{sid}")["envelopes"]

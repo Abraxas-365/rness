@@ -2748,3 +2748,38 @@ async fn human_prompts_are_announced_with_their_index() {
     assert_eq!(seen.lock().unwrap().last().unwrap(), &("four".into(), 4));
     assert!(titles(&svc, &sid).is_empty());
 }
+
+/// B5-10: concurrent admissions to one idle session queue behind the
+/// operation lock instead of failing `Busy`: one starts, the rest queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_async_sends_queue_instead_of_busy() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Scripted::gated(
+        (0..20)
+            .map(|_| StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![])))
+            .collect(),
+        gate.clone(),
+    );
+    let svc = Arc::new(service(dir.path(), provider));
+    let sid = svc.create(None).unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let fut = svc.send_async(sid.clone(), UserIntent::Followup, text(&format!("msg {i}")));
+        tasks.push(tokio::spawn(fut));
+    }
+    let mut started = 0;
+    let mut queued = 0;
+    for task in tasks {
+        match task.await.unwrap().expect("no send may be rejected") {
+            Disposition::StartTurn => started += 1,
+            Disposition::Queued => queued += 1,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!((started, queued), (1, 19));
+    gate.add_permits(100);
+    tokio::time::timeout(std::time::Duration::from_secs(20), svc.join(&sid))
+        .await
+        .unwrap();
+}

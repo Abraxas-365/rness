@@ -21,6 +21,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Opt into filesystem write restrictions | [Sandbox configuration](reference/configuration/sandbox.md) |
 | Call delegation APIs from Lua | [Lua subagents reference](reference/lua/subagents.md) |
 | Let the model orchestrate many subagents with a script (opt-in) | [Workflows guide](guides/workflows.md), [recipes](../examples/workflows/), [workflow tool reference](reference/tools/workflow.md) |
+| Handle busy sends (409) and lagged SSE clients | [HTTP API notes](reference/http-api.md) |
 | Check which model settings win | [Configuration precedence](reference/configuration-precedence.md) |
 | Monitor or stop background jobs | [Background job controls](guides/background-jobs.md) |
 | Run dev servers, REPLs, and interactive programs the model keeps using; watch and stop them | [Persistent terminals](guides/terminals.md), [terminal tools reference](reference/tools/terminal.md) |
