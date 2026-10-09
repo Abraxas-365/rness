@@ -94,8 +94,7 @@ def section_args(t, fp):
             res = r.headless("hi", "--root", str(ro))
             t.check("args: --root unwritable fails non-zero, nothing on stdout", res.rc != 0 and not res.stdout,
                     f"rc={res.rc} {short(res.stderr)}")
-            t.xcheck("args: --root unwritable error names the path", str(ro.name) in res.stderr,
-                     "error is just 'job recovery: Permission denied (os error 13)' with no path", short(res.stderr))
+            t.check("args: --root unwritable error names the path", str(ro.name) in res.stderr, short(res.stderr))
             res = r.headless("hi", "--root", str(ro / "sub"))
             t.check("args: --root under unwritable parent fails non-zero", res.rc != 0, f"rc={res.rc} {short(res.stderr)}")
         finally:
@@ -143,8 +142,7 @@ def section_args(t, fp):
         res = r.run("--serve", "0.0.0.0:8708")
         t.check("args: --serve non-loopback without token refused", res.rc != 0 and "TOKEN" in res.stderr.upper(),
                 f"rc={res.rc} {short(res.stderr)}")
-        t.xcheck("args: refused --serve does not claim to be serving", "serving on" not in res.stderr,
-                 "prints 'rness serving on http://0.0.0.0:…' before the token check fails", short(res.stderr))
+        t.check("args: refused --serve does not claim to be serving", "serving on" not in res.stderr, short(res.stderr))
         res = bare("--version")
         t.check("args: --version", res.rc == 0 and res.stdout.startswith("rness"), res.stdout)
 
@@ -160,8 +158,7 @@ def section_list(t, fp):
         generate(r.root, other, turns=3, sessions=50, seed=12)
         gen_s = time.perf_counter() - t0
         bare = r.run("--list", provider=False)
-        t.xcheck("list: --list works without -m", bare.rc == 0 and len(bare.stdout.split()) == 600,
-                 "--list fails with 'no model selected' unless -m is given", short(bare.stderr))
+        t.check("list: --list works without -m", bare.rc == 0 and len(bare.stdout.split()) == 600, short(bare.stderr))
         rep = perf.Reporter("cli-list-600", wp=WP, binary=BIN)
         out = None
         for _ in range(7):
@@ -237,8 +234,11 @@ def section_headless(t, fp):
                 rc, out, err, sid = res.rc, res.stdout, res.stderr, res.session
             outcome = [e["outcome"] for e in r.log(sid) if e["type"] == "turn/ended"] if sid else None
             t.check(f"headless: {name}: turn recorded as failed", outcome == ["failed"], outcome)
-            t.xcheck(f"headless: {name}: exit code non-zero", rc != 0,
-                     "headless -p exits 0 when the turn fails", f"rc={rc}")
+            t.check(f"headless: {name}: exit code 1", rc == 1, f"rc={rc}")
+            lines = err.strip().splitlines()
+            t.check(f"headless: {name}: 'rness: turn failed' line precedes the final session line",
+                    len(lines) >= 2 and lines[-1].startswith("session:") and sid
+                    and any(l.startswith("rness: turn failed") for l in lines[-3:-1]), short(err))
             t.check(f"headless: {name}: stdout has no error text", out.strip() == "you: hi", repr(out))
             t.check(f"headless: {name}: error explained on stderr", "attempt: Error" in err, short(err))
         # SIGINT mid-turn

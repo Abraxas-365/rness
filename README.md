@@ -201,6 +201,8 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 | Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
 | One-off OpenAI-compatible connection | `rness --route local=http://localhost:8000/v1,none -m local/YOUR_MODEL` |
 
+Headless `-p` exit codes: `0` turn completed, `1` turn failed or startup/configuration error, `2` usage error, `130` turn cancelled or interrupted (Ctrl-C). Codes 3–5 are reserved; scripts should test for non-zero. `--list` needs no model.
+
 Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
 
 </details>
@@ -297,7 +299,7 @@ Reasoning effort is not a universal model capability. Do not assume every model 
 | :--- | :--- |
 | `-m`, `--model` | Select `connection/model`; with `--provider`, supply a literal model ID instead. |
 | `--account NAME` | Use a named stored credential for the selected connection (e.g. a second Anthropic account); see [multiple accounts](docs/reference/configuration/providers.md#multiple-accounts-per-provider). |
-| `-p`, `--prompt` | Run a headless prompt and print the transcript. |
+| `-p`, `--prompt` | Run a headless prompt and print the transcript (stdout). Exits 0 when the turn completed, 1 when it failed (one `rness: turn failed: CODE: message` line on stderr before the `session:` line), 130 when it was cancelled. |
 | `-s`, `--session` | Continue an existing session. |
 | `--fork` | Fork an existing session at its latest event and continue in the new copy. The copy shares the history up to that point (nothing is duplicated on disk), keeps the original's workspace, model and settings, and never gets a looser sandbox. The original is untouched. Scheduled reminders stay with the original. Works with `-p`; not with `--session`, `--serve` or `--list`. |
 | `--profile` / `--agent` | Select a declared profile or agent. |

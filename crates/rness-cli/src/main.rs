@@ -264,8 +264,20 @@ enum AuthAction {
     },
 }
 
+/// Process exit status: `run`'s code on success; 1 (with anyhow's usual
+/// `Error: …` report) on a startup/config error. See `headless_exit`.
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(code) => std::process::ExitCode::from(code),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> anyhow::Result<u8> {
     // The terminal cleanup helper re-executes this binary (see
     // rness_tools::terminal::configure_reaper); it does nothing else.
     if std::env::args().nth(1).as_deref() == Some(TERMINAL_REAPER_ARG) {
@@ -279,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
     }
     #[cfg(feature = "experimental-control")]
     if let Some(Command::Send(args)) = cli.command {
-        return control_socket::send(args).await;
+        return control_socket::send(args).await.map(|()| 0);
     }
     #[cfg(feature = "experimental-control")]
     let control_path = cli.control_socket.clone();
@@ -324,7 +336,8 @@ async fn main() -> anyhow::Result<()> {
             Command::Send(_) => unreachable!("handled before provider/config initialization"),
             Command::Auth { action } => run_auth(action).await,
             Command::Plugin { action } => run_plugin(action),
-        };
+        }
+        .map(|()| 0);
     }
 
     let root = match cli.root {
@@ -334,6 +347,18 @@ async fn main() -> anyhow::Result<()> {
             .join(".rness")
             .join("sessions"),
     };
+    std::fs::create_dir_all(&root).with_context(|| format!("session root {}", root.display()))?;
+
+    // Listing needs only the session store and the working directory: no
+    // model, provider or plugins.
+    if cli.list {
+        let cwd = std::env::current_dir().context("no working directory")?;
+        let store = rness_engine::session::branch::SessionStore::new(root.clone());
+        for id in sessions_in_directory(&store, &cwd)? {
+            println!("{id}");
+        }
+        return Ok(0);
+    }
 
     // Routes and credentials remain exclusively at this composition root.
     // The resolver receives only the durable public route/model selection.
@@ -711,7 +736,7 @@ async fn main() -> anyhow::Result<()> {
     jobs.configure_retention(startup.job_retention.clone())
         .map_err(anyhow::Error::msg)?;
     jobs.enable_persistence(&root.join("jobs"))
-        .map_err(|e| anyhow::anyhow!("job recovery: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("job recovery in {}: {e}", root.join("jobs").display()))?;
     if let Some(lsp) = startup.lsp.clone() {
         rness_tools::lsp::register(&tools, lsp)
             .map_err(|e| anyhow::anyhow!("invalid rness.lsp: {e}"))?;
@@ -1080,13 +1105,6 @@ async fn main() -> anyhow::Result<()> {
         (s1, s2, s3, s4, s5, s6, s7, s8, s9)
     };
 
-    if cli.list {
-        for id in sessions_in_directory(sessions.store(), &cwd)? {
-            println!("{id}");
-        }
-        return Ok(());
-    }
-
     // Server mode: same engine, same plugins, HTTP/SSE instead of TUI.
     // Hot reload stays on — a server deployment edits plugins too.
     if let Some(addr) = cli.serve {
@@ -1126,22 +1144,23 @@ async fn main() -> anyhow::Result<()> {
         let listener = tokio::net::TcpListener::bind(&addr)
             .await
             .with_context(|| format!("bind {addr}"))?;
-        jobs.attach_sessions(&sessions);
-        eprintln!(
-            "rness serving on http://{addr} (model: {})",
-            selection.model
-        );
+        // Refuse (e.g. non-loopback without a token) before announcing.
         let auth = rness_server::auth::Auth::for_bind(
             listener.local_addr()?,
             std::env::var("RNESS_SERVER_TOKEN").ok(),
         )
         .map_err(anyhow::Error::msg)?;
+        jobs.attach_sessions(&sessions);
+        eprintln!(
+            "rness serving on http://{addr} (model: {})",
+            selection.model
+        );
         let router = rness_server::router(state).layer(axum::middleware::from_fn_with_state(
             auth,
             rness_server::auth::authorize,
         ));
         axum::serve(listener, router).await?;
-        return Ok(());
+        return Ok(0);
     }
 
     let session = match cli.session {
@@ -1217,7 +1236,8 @@ async fn main() -> anyhow::Result<()> {
             terminals.clone(),
             startup.terminal_title.unwrap_or(true),
         )
-        .await;
+        .await
+        .map(|()| 0);
     };
 
     questions.set_available(false);
@@ -1248,8 +1268,66 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    let history = sessions.store().history(&session)?;
+    let (code, failure) = headless_exit(last_turn_outcome(&history));
+    if let Some(line) = failure {
+        eprintln!("{line}");
+    }
     eprintln!("\nsession: {session}");
-    Ok(())
+    Ok(code)
+}
+
+/// The outcome of the session's last `turn/ended`, with the code and
+/// message of the last failed attempt in that turn (if any).
+type LastTurn = Option<(
+    rness_protocol::events::TurnOutcome,
+    Option<(Option<String>, String)>,
+)>;
+
+fn last_turn_outcome(history: &[Arc<rness_protocol::events::Envelope>]) -> LastTurn {
+    use rness_protocol::events::{AttemptOutcome, SessionEvent};
+    let end = history
+        .iter()
+        .rposition(|env| matches!(env.event, SessionEvent::TurnEnded { .. }))?;
+    let SessionEvent::TurnEnded { turn, outcome } = history[end].event else {
+        unreachable!("matched above");
+    };
+    let error = history[..end]
+        .iter()
+        .rev()
+        .take_while(|env| !matches!(env.event, SessionEvent::TurnStarted { turn: t } if t == turn))
+        .find_map(|env| match &env.event {
+            SessionEvent::AssistantAttempt(attempt) => match &attempt.outcome {
+                AttemptOutcome::Error { message, code, .. } => {
+                    Some((code.clone(), message.clone()))
+                }
+                AttemptOutcome::Cancelled => None,
+            },
+            _ => None,
+        });
+    Some((outcome, error))
+}
+
+/// Headless (`-p`) exit status: 0 completed, 1 failed (or no turn ended),
+/// 130 cancelled; plus the one stderr line explaining a non-zero status.
+fn headless_exit(last: LastTurn) -> (u8, Option<String>) {
+    use rness_protocol::events::TurnOutcome;
+    match last {
+        Some((TurnOutcome::Completed, _)) => (0, None),
+        Some((TurnOutcome::Cancelled, _)) => (130, Some("rness: turn cancelled".into())),
+        Some((TurnOutcome::Failed, error)) => {
+            let detail = match error {
+                Some((code, message)) => format!(
+                    ": {}: {}",
+                    code.as_deref().unwrap_or("ERROR"),
+                    message.replace(['\r', '\n'], " ")
+                ),
+                None => String::new(),
+            };
+            (1, Some(format!("rness: turn failed{detail}")))
+        }
+        None => (1, Some("rness: no turn completed".into())),
+    }
 }
 
 fn print_parts(who: &str, parts: &[ContentPart]) {
@@ -3017,6 +3095,108 @@ fn sessions_in_directory(
         }
     }
     Ok(matches)
+}
+
+#[cfg(test)]
+mod headless_exit_tests {
+    use super::*;
+    use rness_protocol::events::{
+        AssistantAttempt, AttemptOutcome, Envelope, SessionEvent, TurnOutcome,
+    };
+
+    fn env(event: SessionEvent) -> Arc<Envelope> {
+        Arc::new(Envelope {
+            id: String::new(),
+            at: String::new(),
+            event,
+        })
+    }
+
+    fn attempt(code: &str, message: &str) -> Arc<Envelope> {
+        env(SessionEvent::AssistantAttempt(AssistantAttempt {
+            model: "m".into(),
+            outcome: AttemptOutcome::Error {
+                message: message.into(),
+                retryable: true,
+                code: Some(code.into()),
+                retry_in_ms: None,
+            },
+            chunks: Vec::new(),
+        }))
+    }
+
+    fn ended(turn: u32, outcome: TurnOutcome) -> Arc<Envelope> {
+        env(SessionEvent::TurnEnded { turn, outcome })
+    }
+
+    #[test]
+    fn completed_turn_exits_zero_even_after_retried_attempts() {
+        let history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            attempt("HTTP", "http 529"),
+            ended(1, TurnOutcome::Completed),
+        ];
+        let last = last_turn_outcome(&history);
+        assert!(matches!(last, Some((TurnOutcome::Completed, Some(_)))));
+        assert_eq!(headless_exit(last), (0, None));
+    }
+
+    #[test]
+    fn failed_turn_reports_the_last_error_attempt() {
+        let history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            attempt("HTTP", "first"),
+            attempt("PROVIDER", "stream\nended"),
+            ended(1, TurnOutcome::Failed),
+        ];
+        assert_eq!(
+            headless_exit(last_turn_outcome(&history)),
+            (
+                1,
+                Some("rness: turn failed: PROVIDER: stream ended".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn only_the_last_turn_counts_and_earlier_errors_do_not_leak() {
+        let history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            attempt("HTTP", "old"),
+            ended(1, TurnOutcome::Failed),
+            env(SessionEvent::TurnStarted { turn: 2 }),
+            ended(2, TurnOutcome::Failed),
+        ];
+        assert_eq!(
+            headless_exit(last_turn_outcome(&history)),
+            (1, Some("rness: turn failed".to_string()))
+        );
+        let history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            ended(1, TurnOutcome::Failed),
+            env(SessionEvent::TurnStarted { turn: 2 }),
+            ended(2, TurnOutcome::Completed),
+        ];
+        assert_eq!(headless_exit(last_turn_outcome(&history)), (0, None));
+    }
+
+    #[test]
+    fn cancelled_and_missing_turns() {
+        let history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            ended(1, TurnOutcome::Cancelled),
+        ];
+        assert_eq!(
+            headless_exit(last_turn_outcome(&history)),
+            (130, Some("rness: turn cancelled".to_string()))
+        );
+        let history = vec![env(SessionEvent::TurnStarted { turn: 1 })];
+        assert_eq!(last_turn_outcome(&history), None);
+        assert_eq!(
+            headless_exit(None),
+            (1, Some("rness: no turn completed".to_string()))
+        );
+    }
 }
 
 #[cfg(test)]
