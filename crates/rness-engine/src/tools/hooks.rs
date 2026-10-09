@@ -33,7 +33,7 @@ pub struct ToolHookEvent {
     pub session: SessionId,
     pub call: ToolCallId,
     pub tool: String,
-    pub args: serde_json::Value,
+    pub args: std::sync::Arc<serde_json::Value>,
     /// Turn number for audit correlation. 0 when dispatched outside a turn loop.
     pub turn: u32,
 }

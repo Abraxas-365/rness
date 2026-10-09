@@ -120,6 +120,36 @@ pub fn json_depth(bytes: &[u8]) -> usize {
     max
 }
 
+/// An `io::Write` sink that only counts the bytes written to it.
+struct ByteCount(usize);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compact JSON length of `value`, computed without materializing it.
+pub fn json_len<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<usize> {
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, value)?;
+    Ok(count.0)
+}
+
+/// `serde_json::to_vec` into a buffer of exactly the right size. A plain
+/// `to_vec` doubles its buffer as it grows, so a 64 MiB payload briefly
+/// holds 64 + 128 MiB (and leaves 192 MiB of touched pages behind); this
+/// pays one cheap counting pass to allocate once.
+pub fn to_vec_exact<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(json_len(value)?);
+    serde_json::to_writer(&mut out, value)?;
+    Ok(out)
+}
+
 /// `serde_json::from_slice`, except that a line rejected only for exceeding
 /// serde_json's 128-level recursion limit is re-read without it when it is
 /// at most [`MAX_JSON_DEPTH`] deep.
@@ -1073,6 +1103,22 @@ pub struct HookResult {
     pub stderr_summary: Option<String>,
     /// Wall-clock milliseconds.
     pub duration_ms: u64,
+}
+
+#[cfg(test)]
+mod exact_json_tests {
+    use super::*;
+
+    #[test]
+    fn exact_serialization_matches_to_vec_and_sizes_the_buffer_once() {
+        let value =
+            serde_json::json!({"a": "x\u{1F600}\n\"", "b": [1, 2.5, null], "c": {"d": true}});
+        let plain = serde_json::to_vec(&value).unwrap();
+        assert_eq!(json_len(&value).unwrap(), plain.len());
+        let exact = to_vec_exact(&value).unwrap();
+        assert_eq!(exact, plain);
+        assert_eq!(exact.capacity(), plain.len());
+    }
 }
 
 #[cfg(test)]

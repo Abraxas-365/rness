@@ -107,9 +107,7 @@ def huge_tool_json_rss(t, fp, mb):
                 f"rc={p.returncode} {out[-200:]}")
         ratio = peak / 1024 / mb if mb else 0
         print(f"      huge tool JSON {mb} MiB: peak RSS {peak / 1024:.0f} MiB ({ratio:.1f}x payload)")
-        t.xcheck(f"huge tool JSON {mb} MiB: peak RSS < 6x payload", ratio < 6,
-                 "B5-8 args held ~N times (args_json + chunks Vec + parsed Value + log line + request replay)",
-                 f"{ratio:.1f}x")
+        t.check(f"huge tool JSON {mb} MiB: peak RSS < 6x payload", ratio < 6, f"{ratio:.1f}x")
         log_mb = (r.root / sess / "session.v1.jsonl").stat().st_size / 1048576 if sess else 0
         print(f"      session log {log_mb:.1f} MiB")
         return peak

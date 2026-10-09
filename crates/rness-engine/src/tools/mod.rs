@@ -830,7 +830,7 @@ impl ToolRegistry {
                 .expect("registry lock")
                 .clone()
                 .filter(|_| tool.as_ref().is_none_or(|tool| tool.spills_output()));
-            let call = call.clone();
+            let mut call = call.clone();
             let session = session.clone();
             let cancel = cancel.clone();
             handles.push(tokio::spawn(async move {
@@ -841,6 +841,9 @@ impl ToolRegistry {
                     _ = cancel.cancelled() => None,
                 };
                 let started = Instant::now();
+                // One copy of the arguments shared by the hook event, the
+                // approval request and the body: they can be tens of MiB.
+                let args = Arc::new(std::mem::take(&mut call.args));
                 let mut plan_review = None;
                 let mut presentation = None;
                 let mut failure_kind = "execution_failed";
@@ -848,7 +851,7 @@ impl ToolRegistry {
                     session: session.clone(),
                     call: call.call.clone(),
                     tool: call.name.clone(),
-                    args: call.args.clone(),
+                    args: Arc::clone(&args),
                     turn: hook_state.current_turn.load(std::sync::atomic::Ordering::Relaxed),
                 };
                 // dsh: a throwing pre-tool hook (or an unknown tool) is a
@@ -898,7 +901,7 @@ impl ToolRegistry {
                             session: session.clone(),
                             call: call.call.clone(),
                             tool: call.name.clone(),
-                            args: call.args.clone(),
+                            args: Arc::clone(&args),
                             reason,
                         };
                         // The question must not outlive the turn: a cancel
@@ -948,15 +951,15 @@ impl ToolRegistry {
                         // tool_execute wrapper; side data follows the last run.
                         let body = Arc::new(Mutex::new(BodyRun::default()));
                         let run_body = {
-                            let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), call.call.clone(), call.args.clone(), cancel.clone(), call.name.clone());
+                            let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), call.call.clone(), Arc::clone(&args), cancel.clone(), call.name.clone());
                             move || -> hooks::ExecuteFuture {
-                                let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), id.clone(), args.clone(), cancel.clone(), name.clone());
+                                let (body, t, session, id, args, cancel, name) = (Arc::clone(&body), Arc::clone(&t), session.clone(), id.clone(), Arc::clone(&args), cancel.clone(), name.clone());
                                 Box::pin(async move {
                                     let mut run = BodyRun::default();
                                     let result = if t.plan_config().is_some() {
-                                        t.review_plan(&session, &id, args, &cancel).await.map(|(output, review)| { run.plan_review = Some(review); (vec![ToolResultContentPart::Text { text: output }], false) })
+                                        t.review_plan(&session, &id, (*args).clone(), &cancel).await.map(|(output, review)| { run.plan_review = Some(review); (vec![ToolResultContentPart::Text { text: output }], false) })
                                     } else {
-                                        t.execute_presented(&session, &id, args, &cancel).await.map(|(content, tasks, error, metadata)| {
+                                        t.execute_presented(&session, &id, (*args).clone(), &cancel).await.map(|(content, tasks, error, metadata)| {
                                             run.tasks = tasks;
                                             run.presentation = metadata.filter(|value| {
                                                 let valid = serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= 256 * 1024);

@@ -109,7 +109,13 @@ impl Meter {
     fn part(&self, part: &ContentPart) -> u64 {
         match part {
             ContentPart::Image { .. } => self.image_tokens,
-            _ => self.text(&serde_json::to_string(part).expect("content serialization")),
+            // Only the serialized length matters: count it without
+            // materializing the string (a tool call's arguments can be
+            // tens of MiB, and this runs twice per step).
+            _ => {
+                let len = rness_protocol::events::json_len(part).expect("content serialization");
+                (len as u64).div_ceil(self.bytes_per_token.max(1))
+            }
         }
     }
     fn turn(&self, turn: &ModelTurn) -> u64 {
