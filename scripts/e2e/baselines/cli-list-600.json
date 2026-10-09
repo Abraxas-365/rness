@@ -1,0 +1,16 @@
+{
+  "probe": "cli-list-600",
+  "commit": "22490f1",
+  "written": "2026-10-08T19:04:24",
+  "metrics": {
+    "list_600_ms": {
+      "median": 40.13308300636709,
+      "unit": "ms"
+    },
+    "list_600_plus_2x50MB_ms": {
+      "median": 44.99187500914559,
+      "unit": "ms"
+    }
+  },
+  "note": "WP-0 initial baseline, frozen release binary 22490f1"
+}
