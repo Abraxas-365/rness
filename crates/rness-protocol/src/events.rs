@@ -83,6 +83,61 @@ pub const KNOWN_TYPES: &[&str] = &[
     "session/repair",
 ];
 
+/// Deepest JSON nesting a log line may have. serde_json's own reader stops
+/// at 128 levels, which an event's envelope (+ content array + part) eats
+/// 3–4 of, so arguments nested ~125 deep used to commit fine and then fail
+/// to parse. The reader retries past that limit up to this depth (bounded,
+/// so the recursion cannot overflow the stack); the writer refuses lines
+/// deeper than this, so every committed line stays readable.
+pub const MAX_JSON_DEPTH: usize = 512;
+
+/// Maximum bracket nesting of the JSON text in `bytes` (string-aware; does
+/// not validate).
+pub fn json_depth(bytes: &[u8]) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+/// `serde_json::from_slice`, except that a line rejected only for exceeding
+/// serde_json's 128-level recursion limit is re-read without it when it is
+/// at most [`MAX_JSON_DEPTH`] deep.
+fn from_slice_deep<'a, T: Deserialize<'a>>(line: &'a [u8]) -> Result<T, serde_json::Error> {
+    match serde_json::from_slice(line) {
+        Err(error)
+            if error.to_string().starts_with("recursion limit exceeded")
+                && json_depth(line) <= MAX_JSON_DEPTH =>
+        {
+            let mut de = serde_json::Deserializer::from_slice(line);
+            de.disable_recursion_limit();
+            let value = T::deserialize(&mut de)?;
+            de.end()?;
+            Ok(value)
+        }
+        other => other,
+    }
+}
+
 /// Derived fast path for log lines of a known type.
 #[derive(Deserialize)]
 struct KnownEnvelope {
@@ -99,13 +154,13 @@ impl Envelope {
     /// (invalid JSON, known type with bad fields, missing `id`/`at`) is the
     /// original parse error.
     pub fn parse_line(line: &[u8]) -> Result<Envelope, serde_json::Error> {
-        match serde_json::from_slice::<KnownEnvelope>(line) {
+        match from_slice_deep::<KnownEnvelope>(line) {
             Ok(known) => Ok(Envelope {
                 id: known.id,
                 at: known.at,
                 event: known.event,
             }),
-            Err(error) => match serde_json::from_slice::<serde_json::Value>(line) {
+            Err(error) => match from_slice_deep::<serde_json::Value>(line) {
                 Ok(value) => match Self::unknown_from_value(value) {
                     Some(envelope) => Ok(envelope),
                     None => Err(error),

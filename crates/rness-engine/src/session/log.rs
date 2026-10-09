@@ -273,7 +273,21 @@ impl SessionLog {
                 at: at.clone(),
                 event,
             };
+            let start = bytes.len();
             serde_json::to_writer(&mut bytes, &envelope)?;
+            // Refuse what `Envelope::parse_line` could not read back: a
+            // committed event must stay readable.
+            if rness_protocol::events::json_depth(&bytes[start..])
+                > rness_protocol::events::MAX_JSON_DEPTH
+            {
+                return Err(LogError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "event nests JSON deeper than {} levels; not logged",
+                        rness_protocol::events::MAX_JSON_DEPTH
+                    ),
+                )));
+            }
             bytes.push(b'\n');
             envelopes.push(envelope);
         }
@@ -498,7 +512,16 @@ fn classify_line(bytes: &[u8]) -> LineClass {
     if Envelope::parse_line(bytes).is_ok() {
         return LineClass::Valid;
     }
+    // Our own writer starts every committed line with `{"id":"`. Never
+    // quarantine such a line, however it fails to parse (e.g. serde_json's
+    // recursion limit, which the plain parse below would also trip over).
+    if bytes.starts_with(br#"{"id":""#) {
+        return LineClass::Suspicious;
+    }
     match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Err(error) if error.to_string().starts_with("recursion limit exceeded") => {
+            LineClass::Suspicious
+        }
         Ok(value)
             if value.get("id").is_some_and(serde_json::Value::is_string)
                 && value.get("type").is_some_and(serde_json::Value::is_string) =>
@@ -1279,6 +1302,88 @@ mod tests {
         let len = fs::metadata(&path).unwrap().len();
         drop(SessionLog::open(root.path(), &sid).unwrap());
         assert_eq!(fs::metadata(&path).unwrap().len(), len);
+    }
+
+    fn deep_tool_call(depth: usize) -> SessionEvent {
+        let mut args = serde_json::json!("leaf");
+        for _ in 0..depth {
+            args = serde_json::json!([args]);
+        }
+        SessionEvent::AssistantMessage(AssistantMessage {
+            model: "m".into(),
+            content: vec![ContentPart::ToolUse {
+                call: "c1".into(),
+                name: "t".into(),
+                args,
+            }],
+            stop: rness_protocol::events::StopReason::EndTurn,
+            usage: Default::default(),
+            estimated_input: 0,
+            chunks: vec![],
+        })
+    }
+
+    #[test]
+    fn deeply_nested_tool_args_survive_reopen_and_stay_readable() {
+        for depth in [125, 126, 127, 200] {
+            let root = tempfile::tempdir().unwrap();
+            let sid: SessionId = "01DEEP".into();
+            let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+            let event = deep_tool_call(depth);
+            let committed = log.append(&event).unwrap();
+            let path = log.path().to_path_buf();
+            drop(log);
+            let before = fs::read(&path).unwrap();
+            // Reopen heals the tail: the deep event is the last line.
+            let log = SessionLog::open(root.path(), &sid).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "depth {depth}: file changed"
+            );
+            let events = log.read_all().unwrap();
+            assert_eq!(events.len(), 2, "depth {depth}");
+            assert_eq!(events[1], committed, "depth {depth}");
+            assert!(read_session(root.path(), &sid).is_ok());
+            let sidecars = fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("quarantine-")
+                })
+                .count();
+            assert_eq!(sidecars, 0, "depth {depth}");
+        }
+    }
+
+    #[test]
+    fn nesting_too_deep_to_read_back_is_refused_at_append() {
+        let root = tempfile::tempdir().unwrap();
+        let sid: SessionId = "01TOODEEP".into();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let before = fs::metadata(log.path()).unwrap().len();
+        let result = log.append(&deep_tool_call(rness_protocol::events::MAX_JSON_DEPTH));
+        assert!(matches!(result, Err(LogError::Io(_))), "{result:?}");
+        assert_eq!(fs::metadata(log.path()).unwrap().len(), before);
+        // The handle is still usable.
+        log.append(&user_msg("after")).unwrap();
+        assert_eq!(log.read_all().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn id_prefixed_or_recursion_limited_lines_are_never_garbage() {
+        let deep = format!("{}1{}", "[".repeat(300), "]".repeat(300));
+        // Too deep even for the bounded retry, and not our writer's prefix.
+        assert!(matches!(
+            classify_line(deep.as_bytes()),
+            LineClass::Suspicious
+        ));
+        let ours = br#"{"id":"01X","at":"t","type":"user/message","oops"#;
+        assert!(matches!(classify_line(ours), LineClass::Suspicious));
+        assert!(matches!(classify_line(b"not json"), LineClass::Garbage));
     }
 
     #[test]
