@@ -8,6 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::core::highlight::highlight_code;
+use crate::core::terminal_text::expand_tabs;
 use crate::theme::Theme;
 
 /// Render markdown into wrapped, styled lines.
@@ -36,9 +37,10 @@ pub fn render_markdown_configured(
 ) -> Vec<Line<'static>> {
     // Model/tool text may carry terminal escapes and control characters;
     // strip them before parsing (escapes can span Text events, and `\r`
-    // changes parsing) so every caller renders terminal-safe lines. The
-    // clean text is also the cache key.
-    let clean = crate::core::terminal_text::sanitize_text(source);
+    // changes parsing) so every caller renders terminal-safe lines. Tabs
+    // are markdown syntax and stay; they are expanded per Text/Code event.
+    // The clean text is also the cache key.
+    let clean = crate::core::terminal_text::sanitize_markdown(source);
     let source = &*clean;
     if let Some(lines) = MARKDOWN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -275,45 +277,33 @@ fn render_markdown_uncached(
                 _ => {}
             },
             Event::Text(text) => {
+                // Tabs desync ratatui's cell accounting: expand them here
+                // (8-col stops), after parsing, so they keep their markdown
+                // meaning. Code block text starts at a line start.
+                let text = match expand_tabs(&text) {
+                    std::borrow::Cow::Borrowed(_) => text.into_string(),
+                    std::borrow::Cow::Owned(expanded) => expanded,
+                };
                 if in_table {
                     table_cell.push(Span::styled(
-                        text.into_string(),
+                        text,
                         *style_stack.last().expect("style stack"),
                     ));
                 } else if in_code_block {
-                    // Tabs desync ratatui's cell accounting — expand here
-                    // (8-col stops) so highlight/plain paths are both safe.
-                    if text.contains('\t') {
-                        for (i, l) in text.split('\n').enumerate() {
-                            if i > 0 {
-                                code_buf.push('\n');
-                            }
-                            let mut col = 0usize;
-                            for ch in l.chars() {
-                                if ch == '\t' {
-                                    let next = (col / 8 + 1) * 8;
-                                    for _ in col..next {
-                                        code_buf.push(' ');
-                                    }
-                                    col = next;
-                                } else {
-                                    code_buf.push(ch);
-                                    col += 1;
-                                }
-                            }
-                        }
-                    } else {
-                        code_buf.push_str(&text);
-                    }
+                    code_buf.push_str(&text);
                 } else {
                     inline.push(Span::styled(
-                        text.into_string(),
+                        text,
                         *style_stack.last().expect("style stack"),
                     ));
                 }
             }
             Event::Code(code) => {
-                let span = Span::styled(code.into_string(), inline_code);
+                let code = match expand_tabs(&code) {
+                    std::borrow::Cow::Borrowed(_) => code.into_string(),
+                    std::borrow::Cow::Owned(expanded) => expanded,
+                };
+                let span = Span::styled(code, inline_code);
                 if in_table {
                     table_cell.push(span);
                 } else {
@@ -564,6 +554,48 @@ mod tests {
         assert!(text.iter().any(|l| l == "let a = 1;"), "{text:?}");
         assert!(text.iter().any(|l| l == "        b"), "{text:?}");
         assert_terminal_safe("`in\x1bline` \u{9b}31m and\tprose\r\nnext\rline");
+    }
+
+    /// Tabs are markdown syntax: sanitizing must not change the parse.
+    /// Each case renders like the raw, unsanitized source, and no tab
+    /// reaches a line.
+    #[test]
+    fn tabs_keep_their_markdown_meaning() {
+        let theme = Theme::default();
+        let raw = |source: &str| {
+            plain(&render_markdown_uncached(
+                source,
+                40,
+                &theme,
+                &serde_json::Value::Null,
+            ))
+        };
+        for (source, expected) in [
+            ("- a\n\t- b\n\t- c", vec!["- a", "  - b", "  - c"]),
+            ("-\titem", vec!["- item"]),
+            (
+                "1. x\n\t```\n\tfn f() {}\n\t```",
+                vec!["- x", "", "```", "fn f() {}", "```"],
+            ),
+            (
+                "para\n\n\tindented code",
+                vec!["para", "", "```", "indented code", "```"],
+            ),
+        ] {
+            let text = assert_terminal_safe(source);
+            assert_eq!(text, expected, "{source:?}");
+            assert_eq!(text, raw(source), "{source:?}");
+            assert!(text.iter().all(|l| !l.contains('\t')), "{source:?}");
+        }
+        // Tabs inside text, inline code and code blocks are still expanded.
+        assert_eq!(
+            assert_terminal_safe("a\tb `c\td`"),
+            vec!["a       b c       d"]
+        );
+        assert_eq!(
+            assert_terminal_safe("```\n\tx\n界\ty\n```"),
+            vec!["```", "        x", "界      y", "```"]
+        );
     }
 
     #[test]

@@ -5,6 +5,9 @@
 //! desync. Two layers keep it out:
 //! - [`sanitize`] / [`sanitize_text`] at the text sources (precise: drops
 //!   whole escape sequences, expands tabs to the right columns);
+//!   [`sanitize_markdown`] keeps tabs for the markdown parser (they are
+//!   CommonMark syntax) and the renderer expands them per text event
+//!   ([`expand_tabs`]);
 //! - [`scrub_buffer`] at the final buffer (guard for unlisted paths).
 
 use std::borrow::Cow;
@@ -33,6 +36,8 @@ struct Sanitizer {
     col: usize,
     /// 0 none, 1 after ESC, 2 CSI, 3 OSC/string, 4 ESC inside OSC.
     escape: u8,
+    /// Pass `\t` through instead of expanding it (markdown source).
+    keep_tabs: bool,
 }
 
 impl Sanitizer {
@@ -76,6 +81,7 @@ impl Sanitizer {
         }
         match ch {
             '\u{1b}' => self.escape = 1,
+            '\t' if self.keep_tabs => out.push('\t'),
             '\t' => {
                 let next = (self.col / 8 + 1) * 8;
                 for _ in self.col..next {
@@ -110,9 +116,19 @@ pub fn sanitize(line: &str) -> String {
 /// (UTF-8 `C2 80..9F`) and bidi controls (`E2 80 AA..AE`, `E2 81 A6..A9`).
 /// No char decoding, so clean text costs one pass over the bytes.
 fn needs_sanitizing(text: &str) -> bool {
+    needs_sanitizing_except(text, b'\n')
+}
+
+/// [`needs_sanitizing`] that also accepts `\t` ([`sanitize_markdown`]).
+fn needs_sanitizing_markdown(text: &str) -> bool {
+    needs_sanitizing_except(text, b'\t')
+}
+
+fn needs_sanitizing_except(text: &str, allowed: u8) -> bool {
     let bytes = text.as_bytes();
     bytes.iter().enumerate().any(|(i, &b)| match b {
         b'\n' => false,
+        b if b == allowed => false,
         0x00..=0x1f | 0x7f => true,
         0xc2 => matches!(bytes.get(i + 1), Some(0x80..=0x9f)),
         0xe2 => matches!(
@@ -131,8 +147,40 @@ pub fn sanitize_text(text: &str) -> Cow<'_, str> {
     if !needs_sanitizing(text) {
         return Cow::Borrowed(text);
     }
+    sanitize_lines(text, Sanitizer::default())
+}
+
+/// [`sanitize_text`] for markdown source: drops escapes and controls but
+/// keeps `\t`, which is CommonMark syntax (list nesting, indented code,
+/// marker spacing). Expanding tabs to 8-column stops before parsing would
+/// change the structure (CommonMark uses 4-column tab stops), so the
+/// renderer expands them in the parsed text instead ([`expand_tabs`]).
+/// Borrows when the text is clean apart from tabs.
+pub fn sanitize_markdown(text: &str) -> Cow<'_, str> {
+    if !needs_sanitizing_markdown(text) {
+        return Cow::Borrowed(text);
+    }
+    sanitize_lines(
+        text,
+        Sanitizer {
+            keep_tabs: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Expand tabs to 8-column stops, restarting columns at each `\n`
+/// (columns count display width). Borrows when there is no tab. The
+/// input must already be sanitized.
+pub fn expand_tabs(text: &str) -> Cow<'_, str> {
+    if !text.contains('\t') {
+        return Cow::Borrowed(text);
+    }
+    sanitize_lines(text, Sanitizer::default())
+}
+
+fn sanitize_lines(text: &str, mut state: Sanitizer) -> Cow<'_, str> {
     let mut out = String::with_capacity(text.len());
-    let mut state = Sanitizer::default();
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
@@ -251,7 +299,37 @@ mod tests {
                 "U+{:04X}",
                 c as u32
             );
+            assert_eq!(
+                needs_sanitizing_markdown(&text),
+                c != '\n' && c != '\t' && is_unsafe(c),
+                "U+{:04X}",
+                c as u32
+            );
         }
+    }
+
+    #[test]
+    fn markdown_variant_keeps_tabs_and_strips_the_rest() {
+        // Tabs are markdown syntax: kept, and the text still borrows.
+        for text in ["-\titem", "- a\n\t- b", "\tcode\n"] {
+            assert!(
+                matches!(sanitize_markdown(text), Cow::Borrowed(t) if t == text),
+                "{text:?}"
+            );
+        }
+        assert_eq!(
+            sanitize_markdown("-\ta\x1b[31m\tb\r\n\x1b]0;t\x07\tc\u{202e}"),
+            "-\ta\tb\n\tc"
+        );
+        // Expansion after parsing matches the plain sanitizer.
+        for text in ["\tx", "12345678\tx", "界\tx", "1234\n\tx", "a\x1b[1m\tb"] {
+            assert_eq!(
+                expand_tabs(&sanitize_markdown(text)),
+                clean(text),
+                "{text:?}"
+            );
+        }
+        assert!(matches!(expand_tabs("no tabs"), Cow::Borrowed(_)));
     }
 
     #[test]
@@ -281,6 +359,15 @@ mod tests {
             assert_eq!(clean(&once), once, "{text:?}");
             let line = sanitize(&text);
             assert!(line.chars().all(|c| !is_unsafe(c)), "{text:?} -> {line:?}");
+            let markdown = sanitize_markdown(&text);
+            assert!(
+                markdown
+                    .chars()
+                    .all(|c| c == '\n' || c == '\t' || !is_unsafe(c)),
+                "{text:?} -> {markdown:?}"
+            );
+            assert_eq!(sanitize_markdown(&markdown), markdown, "{text:?}");
+            assert_eq!(expand_tabs(&markdown), once, "{text:?}");
         }
     }
 
