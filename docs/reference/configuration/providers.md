@@ -211,7 +211,9 @@ rness.providers.set_stream_idle_timeout("router", 1200000)
 Establishing the connection (TCP and TLS) has its own bound: 10 seconds, or half
 the idle deadline when that is shorter. A host that never answers fails with a
 retryable `TIMEOUT: connect timeout to <host>` instead of waiting out the idle
-deadline. OAuth token requests use the 10-second connect bound too.
+deadline. OAuth token requests (login, refresh) use the 10-second connect
+bound too, and a 30-second limit on the whole request, so a stalled token
+endpoint fails the refresh instead of holding the cross-process refresh lock.
 
 Like DSH, this is not a timeout for AskUser, approval, or tool execution. OAuth
 credential acquisition uses its own transport and is not covered by this setting.
