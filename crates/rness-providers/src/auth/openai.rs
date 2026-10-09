@@ -153,6 +153,9 @@ impl CodexOAuthClient {
         let response = self.http.post(&self.token_url).form(form).send().await?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        if super::is_invalid_grant(status, &text) {
+            return Err(AuthError::InvalidGrant(format!("http {status}: {text}")));
+        }
         if !status.is_success() {
             return Err(AuthError::OAuth(format!(
                 "token endpoint http {status}: {text}"
@@ -344,25 +347,21 @@ impl CodexCredentialSource {
     }
 
     async fn refresh(&self, old: Tokens) -> Result<Tokens, AuthError> {
+        // Lock order: in-process mutex, then the cross-process lease.
         let _guard = self.refresh_lock.lock().await;
-        // Double-check: another task may have refreshed while we waited.
-        if let Some(current) = self.store.tokens(&self.credential)? {
-            if current.access_token != old.access_token && !current.is_expired(REFRESH_BUFFER_SECS)
-            {
-                return Ok(current);
+        super::refresh_shared(&self.store, &self.credential, old, |old| async move {
+            let mut new = self.client.refresh(&old.refresh_token).await?.into_tokens();
+            if new.refresh_token.is_empty() {
+                new.refresh_token = old.refresh_token;
             }
-        }
-        let mut new = self.client.refresh(&old.refresh_token).await?.into_tokens();
-        if new.refresh_token.is_empty() {
-            new.refresh_token = old.refresh_token;
-        }
-        // Preserve fields the refresh response doesn't return (accountId,
-        // email live in extra).
-        for (k, v) in old.extra {
-            new.extra.entry(k).or_insert(v);
-        }
-        self.store.save_tokens(&self.credential, &new)?;
-        Ok(new)
+            // Preserve fields the refresh response doesn't return (accountId,
+            // email live in extra).
+            for (k, v) in old.extra {
+                new.extra.entry(k).or_insert(v);
+            }
+            Ok(new)
+        })
+        .await
     }
 }
 

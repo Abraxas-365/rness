@@ -668,6 +668,9 @@ fn auth_message(e: AuthError) -> String {
         AuthError::NoCredentials => {
             "no ChatGPT credentials: run `rness auth login --provider openai-chatgpt`".to_string()
         }
+        AuthError::InvalidGrant(detail) => format!(
+            "ChatGPT refresh token revoked or already used: run `rness auth login --provider openai-chatgpt` ({detail})"
+        ),
         other => format!("auth: {other}"),
     }
 }

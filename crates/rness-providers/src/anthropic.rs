@@ -915,7 +915,7 @@ impl Provider for AnthropicProvider {
         let mut credential = match self.credential().await {
             Ok(c) => c,
             Err(e) => {
-                let retryable = !matches!(e, AuthError::NoCredentials);
+                let retryable = !matches!(e, AuthError::NoCredentials | AuthError::InvalidGrant(_));
                 return StepOutcome::Failed {
                     error: ProviderError {
                         code: "PROVIDER",

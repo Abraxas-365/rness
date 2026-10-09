@@ -94,8 +94,10 @@ impl FileData {
 }
 
 /// Guard for the store's sidecar lock (`<file>.lock`); unlocks on drop.
-/// `file` is `None` where the filesystem has no locking.
-struct StoreLock {
+/// `file` is `None` where the filesystem has no locking. Hold it across a
+/// token refresh with [`CredentialStore::lock_for_refresh`] and save with
+/// [`CredentialStore::save_tokens_locked`] (never a locking method).
+pub struct StoreLock {
     file: Option<std::fs::File>,
 }
 
@@ -180,9 +182,7 @@ impl CredentialStore {
         self.path.with_file_name(name)
     }
 
-    /// Exclusive cross-process lock on the store (blocking). Held only
-    /// around read-modify-write; released on drop.
-    fn lock_exclusive(&self) -> Result<StoreLock, TokensError> {
+    fn open_lock_file(&self) -> Result<std::fs::File, TokensError> {
         let path = self.lock_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -194,21 +194,65 @@ impl CredentialStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&path)?;
+        Ok(options.open(&path)?)
+    }
+
+    /// Network filesystems without flock: still atomic, not exclusive.
+    fn unlocked_fallback(&self) -> StoreLock {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                path = %self.lock_path().display(),
+                "file locking unsupported; credential saves are atomic but not exclusive"
+            )
+        });
+        StoreLock { file: None }
+    }
+
+    /// Exclusive cross-process lock on the store (blocking). Held only
+    /// around read-modify-write; released on drop.
+    fn lock_exclusive(&self) -> Result<StoreLock, TokensError> {
+        let file = self.open_lock_file()?;
         match file.lock() {
             Ok(()) => Ok(StoreLock { file: Some(file) }),
-            // Network filesystems without flock: still atomic, not exclusive.
-            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                static WARNED: std::sync::Once = std::sync::Once::new();
-                WARNED.call_once(|| {
-                    tracing::warn!(
-                        path = %path.display(),
-                        "file locking unsupported; credential saves are atomic but not exclusive"
-                    )
-                });
-                Ok(StoreLock { file: None })
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(self.unlocked_fallback()),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The same exclusive lock for holding across an OAuth refresh (one
+    /// network round trip), so only one process spends a rotating refresh
+    /// token. Polls without blocking the runtime; gives up after `wait`
+    /// with a clear error instead of hanging behind a stuck process.
+    pub async fn lock_for_refresh(
+        &self,
+        wait: std::time::Duration,
+    ) -> Result<StoreLock, TokensError> {
+        let file = self.open_lock_file()?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(StoreLock { file: Some(file) }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e))
+                    if e.kind() == std::io::ErrorKind::Unsupported =>
+                {
+                    return Ok(self.unlocked_fallback())
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {}s waiting for {} (another rness process is refreshing a token)",
+                        wait.as_secs(),
+                        self.lock_path().display()
+                    ),
+                )
+                .into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
 
@@ -216,7 +260,16 @@ impl CredentialStore {
     /// (`<file>.corrupt-<unix-ts>`) and replaced, so saving self-heals;
     /// read-only paths keep returning [`TokensError::Corrupt`].
     fn update<R>(&self, f: impl FnOnce(&mut FileData) -> R) -> Result<R, TokensError> {
-        let _lock = self.lock_exclusive()?;
+        let lock = self.lock_exclusive()?;
+        self.update_locked(&lock, f)
+    }
+
+    /// [`Self::update`] for a caller already holding the store lock.
+    fn update_locked<R>(
+        &self,
+        _lock: &StoreLock,
+        f: impl FnOnce(&mut FileData) -> R,
+    ) -> Result<R, TokensError> {
         let mut data = match self.read() {
             Ok(data) => data,
             Err(TokensError::Corrupt { source, .. }) => {
@@ -394,6 +447,21 @@ impl CredentialStore {
             .get(provider)
             .map(|p| p.api_key.clone())
             .filter(|k| !k.is_empty()))
+    }
+
+    /// [`Self::save_tokens`] while holding the store lock (refresh lease).
+    pub fn save_tokens_locked(
+        &self,
+        lock: &StoreLock,
+        provider: &str,
+        tokens: &Tokens,
+    ) -> Result<(), TokensError> {
+        self.update_locked(lock, |data| {
+            data.providers
+                .entry(provider.into())
+                .or_default()
+                .oauth_tokens = Some(tokens.clone());
+        })
     }
 
     pub fn save_api_key(&self, provider: &str, key: &str) -> Result<(), TokensError> {
@@ -617,6 +685,31 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o600);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn refresh_lease_excludes_other_stores_and_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let a = CredentialStore::new(&path);
+        let b = CredentialStore::new(&path);
+        let lease = a
+            .lock_for_refresh(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        a.save_tokens_locked(&lease, "x", &Tokens::default())
+            .unwrap();
+        let err = b
+            .lock_for_refresh(std::time::Duration::from_millis(50))
+            .await
+            .err()
+            .expect("lease is exclusive");
+        assert!(err.to_string().contains("timed out"), "{err}");
+        drop(lease);
+        b.lock_for_refresh(std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(a.tokens("x").unwrap().is_some());
     }
 
     #[test]

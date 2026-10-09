@@ -6,7 +6,7 @@
 //!   ... -- --ignored --nocapture   (refresh latency perf)
 
 use rness_providers::auth::{
-    Credential, CredentialSource, CredentialStore, OAuthClient, OAuthConfig, Tokens,
+    AuthError, Credential, CredentialSource, CredentialStore, OAuthClient, OAuthConfig, Tokens,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,17 +160,12 @@ async fn cross_process_refresh_race_with_rotating_refresh_tokens() {
         ra.as_ref().err().map(|e| e.to_string()),
         rb.as_ref().err().map(|e| e.to_string())
     );
-    let loser_failed = ra.is_err() || rb.is_err();
-    if loser_failed {
-        println!("WP5 BUG auth.cross_process: one process fails with invalid_grant instead of re-reading the store");
-        // Does the loser recover on its next call (it re-reads the file)?
-        let again = if ra.is_err() {
-            a.resolve().await
-        } else {
-            b.resolve().await
-        };
-        println!("WP5 auth.cross_process loser_retry_ok={}", again.is_ok());
-    }
+    // The refresh lease serialises the two processes: the second adopts
+    // the first's tokens instead of spending the rotated refresh token.
+    assert!(ra.is_ok() && rb.is_ok(), "{ra:?} {rb:?}");
+    assert_eq!(grants.load(Ordering::SeqCst), 1);
+    assert_eq!(rejected.load(Ordering::SeqCst), 0);
+    assert_eq!(ra.unwrap(), rb.unwrap());
     // The stored refresh token must be the latest valid one; otherwise the
     // user is logged out for good.
     let next = source(&path, &url).handle_unauthorized().await;
@@ -182,6 +177,83 @@ async fn cross_process_refresh_race_with_rotating_refresh_tokens() {
         next.is_ok(),
         "stored refresh token was clobbered by a stale one: {stored:?}"
     );
+}
+
+/// Token endpoint that always answers 400 `invalid_grant`, after running
+/// `before_reply` (e.g. another client rotating the stored tokens).
+async fn invalid_grant_server(before_reply: impl FnOnce() + Send + 'static) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            buf.extend_from_slice(&tmp[..n]);
+            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..i]).to_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                if n == 0 || buf.len() >= i + 4 + len {
+                    break;
+                }
+            }
+        }
+        before_reply();
+        let body = r#"{"error":"invalid_grant","error_description":"refresh token already used"}"#;
+        let _ = sock
+            .write_all(format!("HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes())
+            .await;
+    });
+    url
+}
+
+#[tokio::test]
+async fn invalid_grant_adopts_tokens_rotated_by_a_lease_free_client() {
+    // A client that does not take the lease (an older rness, another
+    // tool sharing the file) rotates the tokens while our grant is in
+    // flight: adopt its result instead of failing the turn.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials.json");
+    CredentialStore::new(path.clone())
+        .save_tokens("anthropic", &expired_tokens())
+        .unwrap();
+    let rotated = Tokens {
+        access_token: "at-other".into(),
+        refresh_token: "rt-other".into(),
+        expires_at: Some(
+            (jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3600)).to_string(),
+        ),
+        ..Default::default()
+    };
+    let other = rotated.clone();
+    let other_path = path.clone();
+    let url = invalid_grant_server(move || {
+        let raw = json!({"providers": {"anthropic": {"oauthTokens": other}}});
+        std::fs::write(&other_path, raw.to_string()).unwrap();
+    })
+    .await;
+    let got = source(&path, &url).resolve().await.unwrap();
+    assert_eq!(got, Credential::OAuth("at-other".into()));
+}
+
+#[tokio::test]
+async fn invalid_grant_without_rotation_is_a_clear_relogin_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials.json");
+    CredentialStore::new(path.clone())
+        .save_tokens("anthropic", &expired_tokens())
+        .unwrap();
+    let url = invalid_grant_server(|| {}).await;
+    let err = source(&path, &url).resolve().await.unwrap_err();
+    assert!(matches!(err, AuthError::InvalidGrant(_)), "{err:?}");
+    assert!(err.to_string().contains("rness auth login"), "{err}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

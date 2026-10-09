@@ -39,6 +39,87 @@ pub enum AuthError {
     OAuth(String),
     #[error("no credentials: run `rness auth login` or set ANTHROPIC_API_KEY")]
     NoCredentials,
+    /// The token endpoint rejected the refresh token (`invalid_grant`):
+    /// revoked, expired, or already spent by another client.
+    #[error("refresh token revoked or already used: run `rness auth login` ({0})")]
+    InvalidGrant(String),
+}
+
+/// Does a token-endpoint error response say the grant itself is bad?
+/// Standard OAuth `{"error":"invalid_grant"}`, plus the `refresh_token_*`
+/// codes some issuers put in `error` or `error.code`.
+pub(crate) fn is_invalid_grant(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST && status != reqwest::StatusCode::UNAUTHORIZED {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let code = match &value["error"] {
+        serde_json::Value::String(code) => code.as_str(),
+        serde_json::Value::Object(error) => error
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default(),
+        _ => "",
+    };
+    code == "invalid_grant" || code.starts_with("refresh_token_")
+}
+
+/// How long a refresh waits for another process's refresh to finish.
+pub const REFRESH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cross-process OAuth refresh for the tokens under `key`.
+///
+/// Holds the store's refresh lease (sidecar file lock) across the grant so
+/// only one process spends a rotating refresh token. Under the lease it
+/// re-reads the store: tokens another process already refreshed are
+/// adopted; otherwise `grant` runs with the freshest stored tokens and the
+/// result is saved before the lease is released. If the endpoint still
+/// says `invalid_grant` (a client that does not take the lease rotated
+/// it), tokens rotated in the store meanwhile are adopted.
+pub(crate) async fn refresh_shared<F, Fut>(
+    store: &CredentialStore,
+    key: &str,
+    old: Tokens,
+    grant: F,
+) -> Result<Tokens, AuthError>
+where
+    F: FnOnce(Tokens) -> Fut,
+    Fut: std::future::Future<Output = Result<Tokens, AuthError>>,
+{
+    let lease = store.lock_for_refresh(REFRESH_LOCK_WAIT).await?;
+    let base = match store.tokens(key)? {
+        Some(current)
+            if current.access_token != old.access_token
+                && !current.access_token.is_empty()
+                && !current.is_expired(REFRESH_BUFFER_SECS) =>
+        {
+            return Ok(current);
+        }
+        // Someone rotated the refresh token but the access token is stale
+        // again: spend the newest refresh token, not ours.
+        Some(current) if !current.refresh_token.is_empty() => current,
+        _ => old,
+    };
+    let sent = base.refresh_token.clone();
+    match grant(base).await {
+        Ok(new) => {
+            store.save_tokens_locked(&lease, key, &new)?;
+            Ok(new)
+        }
+        Err(AuthError::InvalidGrant(detail)) => match store.tokens(key)? {
+            Some(current)
+                if current.refresh_token != sent
+                    && !current.access_token.is_empty()
+                    && !current.is_expired(REFRESH_BUFFER_SECS) =>
+            {
+                Ok(current)
+            }
+            _ => Err(AuthError::InvalidGrant(detail)),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 // -- config -----------------------------------------------------------------
@@ -161,6 +242,9 @@ impl OAuthClient {
             .await?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
+        if is_invalid_grant(status, &text) {
+            return Err(AuthError::InvalidGrant(format!("http {status}: {text}")));
+        }
         if !status.is_success() {
             return Err(AuthError::OAuth(format!(
                 "token endpoint http {status}: {text}"
@@ -472,31 +556,28 @@ impl CredentialSource {
     }
 
     async fn refresh(&self, old: Tokens) -> Result<Tokens, AuthError> {
+        // Lock order: in-process mutex, then the cross-process lease.
         let _guard = self.refresh_lock.lock().await;
-        // Double-check: another task may have refreshed while we waited.
-        if let Some(current) = self.store.tokens(self.token_key())? {
-            if current.access_token != old.access_token && !current.is_expired(REFRESH_BUFFER_SECS)
-            {
-                return Ok(current);
+        refresh_shared(&self.store, self.token_key(), old, |old| async move {
+            let mut new = self.client.refresh(&old.refresh_token, &old.scopes).await?;
+            // Preserve fields the refresh response does not return. In
+            // particular, an OAuth server may not rotate refresh tokens on
+            // every grant.
+            if new.refresh_token.is_empty() {
+                new.refresh_token = old.refresh_token.clone();
             }
-        }
-        let mut new = self.client.refresh(&old.refresh_token, &old.scopes).await?;
-        // Preserve fields the refresh response does not return. In particular,
-        // an OAuth server may not rotate refresh tokens on every grant.
-        if new.refresh_token.is_empty() {
-            new.refresh_token = old.refresh_token.clone();
-        }
-        if new.subscription_type.is_empty() {
-            new.subscription_type = old.subscription_type;
-        }
-        if new.rate_limit_tier.is_empty() {
-            new.rate_limit_tier = old.rate_limit_tier;
-        }
-        for (k, v) in old.extra {
-            new.extra.entry(k).or_insert(v);
-        }
-        self.store.save_tokens(self.token_key(), &new)?;
-        Ok(new)
+            if new.subscription_type.is_empty() {
+                new.subscription_type = old.subscription_type;
+            }
+            if new.rate_limit_tier.is_empty() {
+                new.rate_limit_tier = old.rate_limit_tier;
+            }
+            for (k, v) in old.extra {
+                new.extra.entry(k).or_insert(v);
+            }
+            Ok(new)
+        })
+        .await
     }
 }
 
@@ -513,6 +594,27 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
         assert!(url.contains("scope=user%3Aprofile+user%3Ainference"));
+    }
+
+    #[test]
+    fn invalid_grant_detection() {
+        use reqwest::StatusCode as S;
+        let bad = S::BAD_REQUEST;
+        assert!(is_invalid_grant(bad, r#"{"error":"invalid_grant"}"#));
+        assert!(is_invalid_grant(
+            S::UNAUTHORIZED,
+            r#"{"error":{"code":"refresh_token_reused"}}"#
+        ));
+        assert!(is_invalid_grant(
+            bad,
+            r#"{"error":"refresh_token_expired"}"#
+        ));
+        assert!(!is_invalid_grant(bad, r#"{"error":"invalid_request"}"#));
+        assert!(!is_invalid_grant(bad, "not json"));
+        assert!(!is_invalid_grant(
+            S::INTERNAL_SERVER_ERROR,
+            r#"{"error":"invalid_grant"}"#
+        ));
     }
 
     #[test]
