@@ -60,9 +60,14 @@ def heartbeat_forever(t, fp, seconds):
         with with_rness(WP, provider=fp, shape=shape, init_append=init, tag=f"hb-{shape}") as r:
             p = r.spawn_headless("hi", scenario="heartbeat-forever:200")
             done = wait_until(lambda: p.poll() is not None, seconds, 0.2)
-            t.xcheck(f"{shape} heartbeat-only stream ends (idle=1s) within {seconds}s", done,
-                     "B5-6 comments reset the idle timer forever; no first-content/total deadline",
-                     f"still running after {seconds}s" if not done else "")
+            t.check(f"{shape} heartbeat-only stream ends (idle=1s) within {seconds}s", done,
+                    f"still running after {seconds}s" if not done else "")
+            if done:
+                sess = r.latest_session()
+                a = attempts(r.log(sess)) if sess else []
+                t.check(f"{shape} heartbeat-only stream: 3 retryable TIMEOUT attempts",
+                        len(a) == 3 and all(x.get("code") == "TIMEOUT" and x.get("retryable") for x in a),
+                        json.dumps(a)[:300])
             if not done:
                 with contextlib.suppress(OSError):
                     os.killpg(p.pid, signal.SIGKILL)
@@ -147,7 +152,9 @@ def main():
     try:
         groups = {
             "gateway": lambda: gateway_shapes(t, fp),
-            "heartbeat": lambda: heartbeat_forever(t, fp, 6 if a.quick else 12),
+            # Each attempt is capped at 2x idle before the first event: 3 x 2 s
+            # + 0.5 s + 1 s backoff ~ 7.5 s, plus startup.
+            "heartbeat": lambda: heartbeat_forever(t, fp, 12),
             "blackhole": lambda: blackhole(t, fp),
             "huge": lambda: huge_tool_json_rss(t, fp, 16 if a.quick else 64),
             "utf8": lambda: split_utf8_tui(t, fp),

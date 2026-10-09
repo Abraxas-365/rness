@@ -306,8 +306,8 @@ async fn split_utf8_inside_every_multibyte_char_reassembles_exactly() {
 #[tokio::test]
 async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
     // Idle timeout 300 ms; server sends `: ping` every 100 ms and nothing else.
-    // Expected by design: comments count as activity, so the step never ends
-    // on its own (there is no total/first-token deadline). We observe 2 s.
+    // B5-6: before the first event, comments extend the deadline only up to
+    // 2 × idle, so the step fails with TIMEOUT after ~600 ms (not never).
     let dir = tempfile::tempdir().unwrap();
     for shape in SHAPES {
         let script: Script = Arc::new(|| {
@@ -322,11 +322,21 @@ async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
         let cancel = CancellationToken::new();
         let t0 = Instant::now();
         let r = tokio::time::timeout(Duration::from_secs(2), step(p.as_ref(), &cancel)).await;
+        let ms = t0.elapsed().as_millis();
         println!(
-            "WP5 heartbeat_forever {shape:?}: still_running_after_2s={} (idle=300ms)",
+            "WP5 heartbeat_forever {shape:?}: still_running_after_2s={} took_ms={ms} (idle=300ms)",
             r.is_err()
         );
-        assert!(r.is_err(), "{shape:?}: {}", describe(&r.unwrap()));
+        let out = r.expect("a comment-only stream must time out");
+        assert!(
+            matches!(&out, StepOutcome::Failed { error, .. } if error.code == "TIMEOUT" && error.retryable),
+            "{shape:?}: {}",
+            describe(&out)
+        );
+        assert!(
+            ms >= 550,
+            "{shape:?}: comments extended the deadline ({ms} ms)"
+        );
         // Cancel still works promptly.
         let c2 = cancel.clone();
         tokio::spawn(async move {
@@ -335,34 +345,48 @@ async fn heartbeat_comments_keep_a_contentless_stream_alive_forever() {
         });
         let out = step(p.as_ref(), &cancel).await;
         assert!(matches!(out, StepOutcome::Cancelled { .. }));
-        let _ = t0;
     }
 }
 
 #[tokio::test]
 async fn heartbeat_without_trailing_blank_line_still_resets_idle() {
     // ":" lines without the blank line terminator (`:x\n` only) are comments too.
+    // After the first event they keep a stream alive indefinitely (1 s of
+    // comments vs a 300 ms idle timeout); before it, up to 2 × idle (B5-6).
     let dir = tempfile::tempdir().unwrap();
-    let script: Script = Arc::new(|| {
-        let mut v = vec![Piece(sse_head(), 0)];
-        for _ in 0..10 {
-            v.push(Piece(b":x\n".to_vec(), 100));
-        }
-        for e in text_stream(Shape::Anthropic, &["late"]) {
-            v.push(Piece(e.into_bytes(), 0));
-        }
-        v
-    });
-    let (base, _) = raw_server(script).await;
-    let p = provider(
-        Shape::Anthropic,
-        &base,
-        Some(Duration::from_millis(300)),
-        dir.path(),
-    );
-    let out = step(p.as_ref(), &CancellationToken::new()).await;
-    println!("WP5 heartbeat_no_blank: {}", describe(&out));
-    assert_eq!(text_of(&out), "late");
+    for (after_first_event, comments) in [(true, 10), (false, 4)] {
+        let script: Script = Arc::new(move || {
+            let mut events = text_stream(Shape::Anthropic, &["late"]).into_iter();
+            let mut v = vec![Piece(sse_head(), 0)];
+            if after_first_event {
+                v.push(Piece(events.next().unwrap().into_bytes(), 0));
+            }
+            for _ in 0..comments {
+                v.push(Piece(b":x\n".to_vec(), 100));
+            }
+            for e in events {
+                v.push(Piece(e.into_bytes(), 0));
+            }
+            v
+        });
+        let (base, _) = raw_server(script).await;
+        let p = provider(
+            Shape::Anthropic,
+            &base,
+            Some(Duration::from_millis(300)),
+            dir.path(),
+        );
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        println!(
+            "WP5 heartbeat_no_blank after_first_event={after_first_event}: {}",
+            describe(&out)
+        );
+        assert_eq!(
+            text_of(&out),
+            "late",
+            "after_first_event={after_first_event}"
+        );
+    }
 }
 
 // -- headers never arrive / black-holed connect -----------------------------

@@ -32,6 +32,13 @@ pub fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     ))
 }
 
+async fn sleep_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn idle_deadline(timeout: Option<Duration>) {
     match timeout {
         Some(timeout) => tokio::time::sleep(timeout).await,
@@ -47,6 +54,9 @@ pub const MAX_EVENT_BYTES: usize = 128 * 1024 * 1024;
 pub struct SseReader {
     inner: Pin<Box<dyn Stream<Item = Result<Frame, String>> + Send>>,
     timeout: Option<Duration>,
+    /// Until the first event, keep-alive comments cannot push the deadline
+    /// past this (`2 × timeout` after the reader was created).
+    first_event_by: Option<tokio::time::Instant>,
 }
 
 /// One decoded unit: a dispatched event, or a complete comment line (a
@@ -499,12 +509,15 @@ mod tests {
 
     #[tokio::test]
     async fn comments_reset_watchdog_and_consumer_time_is_excluded() {
+        // After the first event, comments restart the deadline indefinitely
+        // (10 × 10 ms of comments outlast both 50 ms and the 100 ms cap that
+        // applies before the first event).
         let stream = futures_util::stream::unfold(0, |n| async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let data = if n < 10 {
-                b": alive\n\n".as_slice()
-            } else {
+            let data = if n == 0 || n > 15 {
                 b"data: hello\n\n".as_slice()
+            } else {
+                b": alive\n\n".as_slice()
             };
             Some((
                 Ok::<_, std::io::Error>(bytes::Bytes::from_static(data)),
@@ -514,8 +527,57 @@ mod tests {
         let mut reader = SseReader::new(stream, Some(Duration::from_millis(50)));
         let cancel = CancellationToken::new();
         assert!(matches!(reader.pull(&cancel).await, SsePull::Event { .. }));
+        assert!(matches!(reader.pull(&cancel).await, SsePull::Event { .. }));
         tokio::time::sleep(Duration::from_millis(75)).await;
         assert!(matches!(reader.pull(&cancel).await, SsePull::Event { .. }));
+    }
+
+    #[tokio::test]
+    async fn comments_before_the_first_event_are_capped_at_twice_the_timeout() {
+        let stream = futures_util::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b": ping\n\n")),
+                (),
+            ))
+        });
+        let mut reader = SseReader::new(stream, Some(Duration::from_millis(50)));
+        let t0 = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            Duration::from_secs(2),
+            reader.pull(&CancellationToken::new()),
+        )
+        .await
+        .expect("heartbeats alone must not keep the stream alive");
+        assert!(matches!(out, SsePull::Timeout));
+        assert!(
+            t0.elapsed() >= Duration::from_millis(95),
+            "{:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_first_event_within_twice_the_timeout_is_accepted() {
+        // Comments every 10 ms, the first event at ~80 ms: past the 50 ms
+        // idle timeout (comments restarted it) but within the 100 ms cap.
+        let stream = futures_util::stream::unfold(0, |n| async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let data = if n == 7 {
+                b"data: first\n\n".as_slice()
+            } else {
+                b": ping\n\n".as_slice()
+            };
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(data)),
+                n + 1,
+            ))
+        });
+        let mut reader = SseReader::new(stream, Some(Duration::from_millis(50)));
+        assert!(matches!(
+            reader.pull(&CancellationToken::new()).await,
+            SsePull::Event { .. }
+        ));
     }
 }
 
@@ -536,23 +598,33 @@ impl SseReader {
         Self {
             inner: Box::pin(SseDecoder::new(bytes, MAX_EVENT_BYTES)),
             timeout,
+            first_event_by: timeout.map(|t| tokio::time::Instant::now() + t * 2),
         }
     }
 
     /// Next event. Each wait has a fresh idle deadline; a complete comment
-    /// line (keep-alive) restarts it, fragmentary bytes do not.
+    /// line (keep-alive) restarts it, fragmentary bytes do not. Before the
+    /// first event, keep-alives restart it only up to `2 × timeout` after
+    /// the stream started, so a stream of nothing but comments still ends.
     pub async fn pull(&mut self, cancel: &CancellationToken) -> SsePull {
         loop {
+            let deadline = self.timeout.map(|t| {
+                let idle = tokio::time::Instant::now() + t;
+                self.first_event_by.map_or(idle, |cap| idle.min(cap))
+            });
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return SsePull::Cancelled,
                 next = self.inner.next() => return match next {
                     None => SsePull::Done,
                     Some(Err(e)) => SsePull::Error(e),
-                    Some(Ok(Frame::Event { event, data })) => SsePull::Event { event, data },
+                    Some(Ok(Frame::Event { event, data })) => {
+                        self.first_event_by = None;
+                        SsePull::Event { event, data }
+                    }
                     Some(Ok(Frame::Activity)) => continue,
                 },
-                _ = idle_deadline(self.timeout) => return SsePull::Timeout,
+                _ = sleep_until(deadline) => return SsePull::Timeout,
             }
         }
     }

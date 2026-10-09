@@ -186,8 +186,11 @@ All three HTTP adapters (Anthropic, OpenAI chat-compatible, ChatGPT Responses)
 use an explicit iterator watchdog. Each pull has a fresh deadline; complete SSE
 comment lines reset it while waiting. Fragmentary bytes do not count as progress.
 Time spent processing a returned event is excluded. This is **not** a total turn
-or generation duration limit: a healthy stream can run indefinitely. Keepalives
-can keep it alive even without tokens. Waiting for initial HTTP response headers
+or generation duration limit: a healthy stream can run indefinitely. Once the
+first event has arrived, keepalives can keep it alive even without tokens.
+Before the first event, keepalives extend the deadline only up to twice the
+timeout from the start of the stream, so a stream of nothing but comments fails
+with a retryable timeout instead of hanging. Waiting for initial HTTP response headers
 also has the configured deadline.
 
 Establishing the connection (TCP and TLS) has its own bound: 10 seconds, or half
