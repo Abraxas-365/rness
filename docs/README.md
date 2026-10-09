@@ -35,6 +35,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Customize messages and tool cards | [Messagebox presentation](guides/plugins/example-recipes.md#messagebox-presentation) |
 | Hide or relabel hook, AGENTS.md, and job messages | [Injected messages](guides/plugins/example-recipes.md#injected-messages-hooks-agentsmd-jobs) |
 | Register commands and use session context | [Lua commands](reference/lua/commands.md) |
+| Encode/decode JSON from Lua, and the Lua↔JSON nesting limit | [Lua JSON reference](reference/lua/json.md) |
 | Write native extensions | [Native extension contracts](contributing/native-extensions.md) |
 | Contribute to the codebase | [Contributor documentation](contributing/README.md) |
 

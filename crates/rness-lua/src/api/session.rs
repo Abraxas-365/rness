@@ -33,6 +33,7 @@
 use mlua::LuaSerdeExt;
 use std::sync::Arc;
 
+use crate::json_guard::LuaJsonExt;
 use mlua::{Lua, Table};
 use rness_engine::inbox::{Disposition, Phase};
 use rness_engine::service::SessionService;
@@ -85,7 +86,7 @@ pub fn install(
     images.set(
         "configure",
         lua.create_function(move |lua, options: Table| {
-            let update: serde_json::Value = lua.from_value(mlua::Value::Table(options))?;
+            let update: serde_json::Value = lua.from_value_guarded(mlua::Value::Table(options))?;
             let policy = image_service.image_policy(Some(update)).map_err(err)?;
             lua.to_value(&policy)
         })?,
@@ -168,7 +169,7 @@ pub fn install(
             let prepare = lua.create_function(
                 move |lua, (caller, operation, args): (String, String, Table)| {
                     let request: rness_engine::session_search::QueryRequest =
-                        lua.from_value(mlua::Value::Table(args))?;
+                        lua.from_value_guarded(mlua::Value::Table(args))?;
                     let sessions = sessions.clone();
                     let provider = provider.clone();
                     let runtime = runtime.clone();
@@ -249,7 +250,7 @@ pub fn install(
     session.set(
         "model_capabilities",
         lua.create_function(move |lua, selection: Table| {
-            let selection = lua.from_value(mlua::Value::Table(selection))?;
+            let selection = lua.from_value_guarded(mlua::Value::Table(selection))?;
             lua.to_value(&s.model_capabilities(&selection))
         })?,
     )?;
@@ -567,10 +568,9 @@ pub fn install(
         "config",
         lua.create_function(move |lua, (id, new): (String, Option<Table>)| {
             if let Some(new) = new {
-                let config = mlua::LuaSerdeExt::from_value::<rness_protocol::events::CallConfig>(
-                    lua,
-                    mlua::Value::Table(new),
-                )?;
+                let config = crate::json_guard::LuaJsonExt::from_value_guarded::<
+                    rness_protocol::events::CallConfig,
+                >(lua, mlua::Value::Table(new))?;
                 let permit = lua
                     .app_data_ref::<rness_engine::service::CommandPermit>()
                     .map(|permit| permit.clone());
@@ -620,7 +620,7 @@ pub fn install(
                 sources: Vec<rness_protocol::events::EventId>,
                 policy: rness_engine::turn::compaction::Policy,
             }
-            let opts: Options = lua.from_value(mlua::Value::Table(opts))?;
+            let opts: Options = lua.from_value_guarded(mlua::Value::Table(opts))?;
             if opts.start == 0 || opts.end < opts.start {
                 return Err(err("region uses one-based inclusive message indices"));
             }
@@ -655,7 +655,7 @@ pub fn install(
             sources: Vec<rness_protocol::events::EventId>,
             policy: rness_engine::turn::compaction::Policy,
         }
-        let opts: Options = lua.from_value(mlua::Value::Table(opts))?;
+        let opts: Options = lua.from_value_guarded(mlua::Value::Table(opts))?;
         if opts.start == 0 || opts.end < opts.start {
             return Err(err("region uses one-based inclusive message indices"));
         }

@@ -6,6 +6,7 @@
 //! Lua functions on demand. Nothing here is shared across threads — the
 //! actor owns it all.
 
+use crate::json_guard::LuaJsonExt;
 use mlua::{Function, Lua, LuaSerdeExt, RegistryKey, Table, Value as LuaValue};
 use std::collections::HashMap;
 
@@ -317,7 +318,7 @@ impl LuaRuntime {
             self.lua
                 .create_function(move |lua, options: Option<Table>| {
                     let mut config: crate::api::config::QuestionOverlayConfig = match options {
-                        Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                        Some(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                         None => Default::default(),
                     };
                     config.validate().map_err(mlua::Error::runtime)?;
@@ -455,7 +456,7 @@ impl LuaRuntime {
             match declaration {
                 LuaValue::Table(table) => {
                     let config: crate::api::config::QuestionOverlayConfig =
-                        self.lua.from_value(LuaValue::Table(table))?;
+                        self.lua.from_value_guarded(LuaValue::Table(table))?;
                     qs.set_overlay_config(rness_engine::questions::OverlayConfig {
                         priority: config.priority,
                         height: config.height,
@@ -511,7 +512,7 @@ impl LuaRuntime {
             LuaValue::Table(table) => {
                 self.references = Some((
                     name.to_owned(),
-                    self.lua.from_value(LuaValue::Table(table))?,
+                    self.lua.from_value_guarded(LuaValue::Table(table))?,
                 ))
             }
             LuaValue::Boolean(false) => self.references = None,
@@ -776,7 +777,9 @@ impl LuaRuntime {
         if value.is_nil() {
             return Ok(Vec::new());
         }
-        self.lua.from_value(value).map_err(|e| e.to_string())
+        self.lua
+            .from_value_guarded(value)
+            .map_err(|e| e.to_string())
     }
 
     pub fn validate_bindings(&self, allow_missing: bool) -> Result<(), String> {
@@ -1111,7 +1114,10 @@ impl LuaRuntime {
                 message: text.to_str().map_err(|e| e.to_string())?.to_owned(),
                 ..Default::default()
             }),
-            value => self.lua.from_value(value).map_err(|e| e.to_string()),
+            value => self
+                .lua
+                .from_value_guarded(value)
+                .map_err(|e| e.to_string()),
         }
     }
 
@@ -1280,7 +1286,7 @@ impl LuaRuntime {
         let style = |value: LuaValue| -> mlua::Result<serde_json::Value> {
             match value {
                 LuaValue::Nil => Ok(serde_json::Value::Null),
-                LuaValue::String(_) | LuaValue::Table(_) => self.lua.from_value(value),
+                LuaValue::String(_) | LuaValue::Table(_) => self.lua.from_value_guarded(value),
                 _ => Err(mlua::Error::runtime(
                     "app line style must be a theme name or style table",
                 )),
@@ -1366,7 +1372,7 @@ impl LuaRuntime {
                 let payload = if payload.is_nil() {
                     serde_json::Value::Null
                 } else {
-                    self.lua.from_value(payload)?
+                    self.lua.from_value_guarded(payload)?
                 };
                 AppKeyOutcome::Action {
                     name: action,
@@ -1459,7 +1465,7 @@ impl LuaRuntime {
         let presentation = if matches!(metadata, LuaValue::Nil) {
             None
         } else {
-            self.lua.from_value(metadata).ok()
+            self.lua.from_value_guarded(metadata).ok()
         };
         Ok(ToolStep::Complete((output, presentation)))
     }
@@ -1505,7 +1511,7 @@ impl LuaRuntime {
                 let presentation = if matches!(metadata, LuaValue::Nil) {
                     None
                 } else {
-                    match self.lua.from_value(metadata) {
+                    match self.lua.from_value_guarded(metadata) {
                         Ok(value) => Some(value),
                         Err(error) => {
                             tracing::warn!(
@@ -1540,17 +1546,17 @@ impl LuaRuntime {
                     .collect::<mlua::Result<Vec<_>>>()?,
                 None => Vec::new(),
             };
-            let ev = self.lua.to_value(payload)?;
+            let ev = self.lua.json_to_lua(payload)?;
             if event == GUARD_EVENT {
                 for handler in handlers {
                     let returned: LuaValue = handler.call((ev.clone(), LuaValue::Nil))?;
                     if !returned.is_nil() {
-                        return self.lua.from_value(returned);
+                        return self.lua.from_value_guarded(returned);
                     }
                 }
                 return Ok(default.clone());
             }
-            let fallback = self.lua.to_value(default)?;
+            let fallback = self.lua.json_to_lua(default)?;
             let mut next = {
                 let fallback = fallback.clone();
                 self.lua
@@ -1568,7 +1574,7 @@ impl LuaRuntime {
             if returned.is_nil() {
                 return Ok(default.clone());
             }
-            self.lua.from_value(returned)
+            self.lua.from_value_guarded(returned)
         };
         run().map_err(|e| user_message(&e))
     }
@@ -1619,7 +1625,7 @@ impl LuaRuntime {
                     "#,
                 )
                 .set_name("=rness.hook.tool_execute")
-                .call((handlers, self.lua.to_value(payload)?, sentinel.clone()))?;
+                .call((handlers, self.lua.json_to_lua(payload)?, sentinel.clone()))?;
             Ok(ExecuteThread {
                 thread: CommandThread {
                     thread: self.lua.create_thread(start)?,
@@ -1679,7 +1685,7 @@ impl LuaRuntime {
             LuaValue::Nil => Ok(ExecuteStep::Done(serde_json::Value::Null)),
             value => self
                 .lua
-                .from_value(value)
+                .from_value_guarded(value)
                 .map(ExecuteStep::Done)
                 .map_err(|e| e.to_string()),
         }
@@ -1718,7 +1724,7 @@ impl LuaRuntime {
             let Some(handlers) = hooks.get::<Option<Table>>(event)? else {
                 return Ok(Vec::new());
             };
-            let payload = self.lua.to_value(payload)?;
+            let payload = self.lua.json_to_lua(payload)?;
             let mut errs = Vec::new();
             for f in handlers.sequence_values::<Function>().collect::<Vec<_>>() {
                 if let Err(e) = f.and_then(|f| f.call::<()>(&payload)) {
@@ -1805,7 +1811,7 @@ impl LuaRuntime {
             };
             let f: Function = self.lua.registry_value(key)?;
             let value: LuaValue = f.call(self.lua.to_value(&context)?)?;
-            self.lua.from_value(value)
+            self.lua.from_value_guarded(value)
         })();
         match result {
             Ok(serde_json::Value::Null) => None,
@@ -1992,7 +1998,7 @@ impl LuaRuntime {
                         if !matches!(kind.as_str(), "code" | "diff") {
                             return None;
                         }
-                        row.block = Some(self.lua.from_value(LuaValue::Table(t)).ok()?);
+                        row.block = Some(self.lua.from_value_guarded(LuaValue::Table(t)).ok()?);
                         return Some(row);
                     }
                     row.text = t.get::<Option<String>>("text").ok()?.unwrap_or_default();
@@ -2002,7 +2008,7 @@ impl LuaRuntime {
                     } else if !matches!(style, LuaValue::Nil) {
                         row.spans.push(rness_kernel::presentation::StyledSpan {
                             text: row.text.clone(),
-                            style: self.lua.from_value(style).ok()?,
+                            style: self.lua.from_value_guarded(style).ok()?,
                         });
                     }
                     for (field, target) in [("spans", &mut row.spans), ("right", &mut row.right)] {
@@ -2019,7 +2025,7 @@ impl LuaRuntime {
                                     text: span.get("text").ok()?,
                                     style: self
                                         .lua
-                                        .from_value(span.get::<LuaValue>("style").ok()?)
+                                        .from_value_guarded(span.get::<LuaValue>("style").ok()?)
                                         .ok()?,
                                 });
                             }
@@ -2086,7 +2092,7 @@ impl LuaRuntime {
         let staged_bindings = bindings
             .clone()
             .sequence_values::<LuaValue>()
-            .map(|value| self.lua.from_value::<LuaBindingSpec>(value?))
+            .map(|value| self.lua.from_value_guarded::<LuaBindingSpec>(value?))
             .collect::<mlua::Result<Vec<_>>>()?;
         self.bindings.extend(staged_bindings);
         bindings.clear()?;
@@ -2102,7 +2108,7 @@ impl LuaRuntime {
                 name.clone(),
                 (
                     entry.get("usage")?,
-                    self.lua.from_value(arguments)?,
+                    self.lua.from_value_guarded(arguments)?,
                     entry.get("allow_busy")?,
                 ),
             );
@@ -2149,13 +2155,13 @@ impl LuaRuntime {
                 input_schema: if schema.is_nil() {
                     serde_json::json!({ "type": "object" })
                 } else {
-                    self.lua.from_value(schema)?
+                    self.lua.from_value_guarded(schema)?
                 },
                 plan: entry
                     .get::<Option<Table>>("plan_config")?
                     .map(|table| -> mlua::Result<_> {
                         Ok(std::sync::Arc::new(rness_engine::plan::ExitPlan {
-                            config: self.lua.from_value(LuaValue::Table(table))?,
+                            config: self.lua.from_value_guarded(LuaValue::Table(table))?,
                             store: self.plan_store.clone().ok_or_else(|| {
                                 mlua::Error::runtime("Plan requires session services")
                             })?,
@@ -2170,7 +2176,7 @@ impl LuaRuntime {
                     .get::<Option<Table>>("read_image_config")?
                     .map(|table| {
                         let config: ImageReaderConfig =
-                            self.lua.from_value(LuaValue::Table(table))?;
+                            self.lua.from_value_guarded(LuaValue::Table(table))?;
                         config.validate().map_err(mlua::Error::runtime)?;
                         Ok::<ImageReaderConfig, mlua::Error>(config)
                     })
@@ -2178,7 +2184,7 @@ impl LuaRuntime {
                 sessions: self.image_sessions.clone(),
                 tasks: entry
                     .get::<Option<Table>>("tasks_config")?
-                    .map(|table| self.lua.from_value(LuaValue::Table(table)))
+                    .map(|table| self.lua.from_value_guarded(LuaValue::Table(table)))
                     .transpose()?,
                 sensitive: entry.get::<Option<bool>>("sensitive")?.unwrap_or(false),
                 prompt: entry
@@ -2224,7 +2230,7 @@ impl LuaRuntime {
                     .unwrap_or(false),
                 config: entry
                     .get::<Option<Table>>("config")?
-                    .map(|v| self.lua.from_value(LuaValue::Table(v)))
+                    .map(|v| self.lua.from_value_guarded(LuaValue::Table(v)))
                     .transpose()?
                     .unwrap_or_default(),
             };
@@ -2601,7 +2607,7 @@ fn install_image_reader(lua: &Lua, rness: &Table, defaults: ImageReaderConfig) -
         lua.create_function(move |lua, options: Option<Table>| {
             require_declaration_phase(lua)?;
             let config: ImageReaderConfig = options
-                .map(|table| lua.from_value(LuaValue::Table(table)))
+                .map(|table| lua.from_value_guarded(LuaValue::Table(table)))
                 .transpose()?
                 .unwrap_or_else(|| defaults.clone());
             config.validate().map_err(mlua::Error::runtime)?;
@@ -2665,7 +2671,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         lua.create_function(
             |lua, (command, timeout, payload): (String, u64, LuaValue)| {
                 let payload_json = match serde_json::to_string(
-                    &lua.from_value::<serde_json::Value>(payload)?,
+                    &lua.from_value_guarded::<serde_json::Value>(payload)?,
                 ) {
                     Ok(j) => j,
                     Err(e) => {
@@ -3021,7 +3027,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                 let schema: serde_json::Value = if schema.is_nil() {
                     serde_json::json!({ "type": "object" })
                 } else {
-                    lua.from_value(schema)?
+                    lua.from_value_guarded(schema)?
                 };
                 let exists = declared
                     .get::<Option<bool>>(name.as_str())?
@@ -3069,7 +3075,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                 ));
             }
             let config: rness_engine::file_references::Config = match options {
-                Some(t) => lua.from_value(LuaValue::Table(t))?,
+                Some(t) => lua.from_value_guarded(LuaValue::Table(t))?,
                 None => Default::default(),
             };
             config.validate().map_err(mlua::Error::runtime)?;
@@ -3103,7 +3109,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     let plan = lua.create_table()?;
     plan.set("enable", lua.create_function(|lua, options: Option<Table>| {
         require_declaration_phase(lua)?;
-        let mut config: rness_engine::plan::PlanConfig = options.map(|table| lua.from_value(LuaValue::Table(table))).transpose()?.unwrap_or_default();
+        let mut config: rness_engine::plan::PlanConfig = options.map(|table| lua.from_value_guarded(LuaValue::Table(table))).transpose()?.unwrap_or_default();
         config.review.normalize();
         config.review.validate().map_err(mlua::Error::runtime)?;
         let pending: Table = lua.globals().get("__rness_pending")?;
@@ -3156,7 +3162,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
         lua.create_function(|lua, options: Option<Table>| {
             require_declaration_phase(lua)?;
             let config: rness_engine::tasks::TasksConfig = options
-                .map(|table| lua.from_value(LuaValue::Table(table)))
+                .map(|table| lua.from_value_guarded(LuaValue::Table(table)))
                 .transpose()?
                 .unwrap_or_default();
             let pending: Table = lua.globals().get("__rness_pending")?;
@@ -3589,7 +3595,8 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
                 // Freeze the validated data before user Lua resumes executing.
                 let config = config
                     .map(|table| -> mlua::Result<LuaValue> {
-                        let value: serde_json::Value = lua.from_value(LuaValue::Table(table))?;
+                        let value: serde_json::Value =
+                            lua.from_value_guarded(LuaValue::Table(table))?;
                         lua.to_value(&value)
                     })
                     .transpose()?;
@@ -3665,7 +3672,7 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     json.set(
         "encode",
         lua.create_function(|lua, v: LuaValue| {
-            let j: serde_json::Value = lua.from_value(v)?;
+            let j: serde_json::Value = lua.from_value_guarded(v)?;
             Ok(j.to_string())
         })?,
     )?;
@@ -3696,7 +3703,7 @@ fn lua_display(lua: &Lua, v: LuaValue) -> Result<String, LuaError> {
     Ok(match v {
         LuaValue::String(s) => s.to_string_lossy().to_string(),
         LuaValue::Table(_) => {
-            let j: serde_json::Value = lua.from_value(v)?;
+            let j: serde_json::Value = lua.from_value_guarded(v)?;
             j.to_string()
         }
         other => format!("{other:?}"),

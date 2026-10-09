@@ -16,6 +16,7 @@
 
 pub mod api;
 pub mod hooks_json;
+pub(crate) mod json_guard;
 pub mod loader;
 pub mod packages;
 pub mod plugin_host;
