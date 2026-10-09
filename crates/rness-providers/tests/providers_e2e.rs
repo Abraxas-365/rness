@@ -642,6 +642,27 @@ async fn openai_finish_reason_without_done_commits() {
     assert_eq!(text_of(&out), "all here", "{}", describe(&out));
 }
 
+/// The server closes right after the terminal event's last `data:` line,
+/// without the blank line that would dispatch it: still a complete answer.
+#[tokio::test]
+async fn terminal_event_without_trailing_blank_line_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    for shape in SHAPES {
+        let mut events = text_stream(shape, &["all ", "here"]);
+        if matches!(shape, Shape::OpenAi) {
+            // The finish_reason chunk is the terminal event here.
+            assert_eq!(events.pop().as_deref(), Some("data: [DONE]\n\n"));
+        }
+        let last = events.last_mut().unwrap();
+        assert!(last.ends_with("\n\n"), "{last:?}");
+        last.pop();
+        let base = serve_once(sse_head(), events.concat()).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(5)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        assert_eq!(text_of(&out), "all here", "{shape:?}: {}", describe(&out));
+    }
+}
+
 #[tokio::test]
 async fn responses_bad_json_event_fails() {
     let dir = tempfile::tempdir().unwrap();

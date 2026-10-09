@@ -74,8 +74,9 @@ enum Frame {
 /// Only the incomplete current line is buffered, and only new bytes are
 /// scanned, so a line split into k chunks costs O(line), not O(k·line).
 /// Lines are UTF-8-decoded only once complete, so a multibyte character
-/// split across chunks is never decoded early. An unterminated tail at EOF
-/// is dropped. All state lives in the struct: a `next()` future dropped by
+/// split across chunks is never decoded early. At EOF a pending event whose
+/// last line ended with a terminator is dispatched even without the closing
+/// blank line; an unterminated last line is dropped with its event. All state lives in the struct: a `next()` future dropped by
 /// `select!` loses nothing.
 struct SseDecoder<S> {
     bytes: Pin<Box<S>>,
@@ -155,6 +156,17 @@ impl<S> SseDecoder<S> {
         Ok(())
     }
 
+    /// End of input. A pending event whose last line was complete but whose
+    /// closing blank line never arrived is dispatched (servers that close
+    /// right after the final `data:` line); an unterminated last line
+    /// discards the event, since its data may be cut short.
+    fn eof(&mut self) {
+        if self.line.is_empty() && !self.data.is_empty() {
+            // Same as the blank line that would have ended it.
+            let _ = self.line_done(b"");
+        }
+    }
+
     fn check_size(&self, pending: usize) -> Result<(), String> {
         let size = self.data.len() + self.line.len() + pending;
         if size > self.max_event_bytes {
@@ -228,7 +240,10 @@ where
             }
             match this.bytes.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => this.finished = true,
+                Poll::Ready(None) => {
+                    this.finished = true;
+                    this.eof();
+                }
                 Poll::Ready(Some(Err(e))) => {
                     this.finished = true;
                     return Poll::Ready(Some(Err(format!("Transport error: {e}"))));
@@ -414,10 +429,27 @@ mod tests {
     #[test]
     fn decoder_many_events_in_one_chunk_and_unterminated_tail_dropped() {
         assert_split_invariant(
-            b"data: a\n\ndata: b\n\ndata: c\n\ndata: tail-without-blank-line\n",
+            b"data: a\n\ndata: b\n\ndata: c\n\ndata: d\ndata: cut",
             &[ev("message", "a"), ev("message", "b"), ev("message", "c")],
         );
         assert_split_invariant(b"data: no newline", &[]);
+    }
+
+    #[test]
+    fn decoder_eof_dispatches_a_complete_event_missing_its_blank_line() {
+        for (input, expected) in [
+            (&b"data: a\n\nevent: stop\ndata: last\n"[..], "last"),
+            (
+                &b"data: a\n\nevent: stop\ndata: x\r\ndata: y\r\n"[..],
+                "x\ny",
+            ),
+            (&b"data: a\n\nevent: stop\ndata: last\r"[..], "last"),
+        ] {
+            assert_split_invariant(input, &[ev("message", "a"), ev("stop", expected)]);
+        }
+        // Nothing pending, or only an event type / comment: nothing to dispatch.
+        assert_split_invariant(b"data: a\n\nevent: stop\n", &[ev("message", "a")]);
+        assert_split_invariant(b"data: a\n\n", &[ev("message", "a")]);
     }
 
     #[test]
