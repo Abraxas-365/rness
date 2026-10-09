@@ -126,9 +126,10 @@ async fn drain_stream(
 
 /// The shell's session (`setsid`: pid == sid == pgid). It is registered
 /// with the reaper helper at spawn, so it dies with rness however rness
-/// ends. `disarm` keeps that registration: `&` children of a finished
-/// shell are swept when rness exits (normally or not); the helper forgets
-/// sessions that emptied. TODO(windows): no group; a Job Object with
+/// ends. `disarm`, once the shell has been reaped, tells the helper to keep
+/// sweeping only the members the session has then (`&` children of a
+/// finished shell), so a later session that reuses the number is never
+/// touched. TODO(windows): no group; a Job Object with
 /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would give the same guarantee.
 struct ShellGroup {
     #[cfg(unix)]
@@ -136,10 +137,14 @@ struct ShellGroup {
 }
 
 impl ShellGroup {
+    /// The shell exited and was reaped: stop owning its group.
     fn disarm(&mut self) {
         #[cfg(unix)]
-        {
-            self.pid = None;
+        if let Some(pid) = self.pid.take() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            crate::terminal::reaper::end(pid);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let _ = pid;
         }
     }
 

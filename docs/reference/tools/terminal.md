@@ -187,7 +187,7 @@ Built-in withholding applies regardless of `env_deny`: `API_KEY` and names endin
 | Idle for `idle_close_secs` (when set) | That terminal closed as above |
 | One-shot subagent finishes | Its terminals closed as above. Continuable agents keep theirs |
 | rness ended by TERM, HUP, INT or QUIT | Terminal settings restored, every terminal closed as above, then rness exits with that signal |
-| rness killed (KILL) or crashed | The cleanup helper (`rness __rness-terminal-reaper`, started with the first terminal) sees its pipe close and ends every process still in the open terminals' sessions: HUP, 0.5 s, KILL. A session id is only acted on while its leader is the original shell or gone (checked by start time) |
+| rness killed (KILL) or crashed | The cleanup helper (`rness __rness-terminal-reaper`, started with the first terminal) sees its pipe close and ends every process still in the open terminals' sessions: HUP, 0.5 s, KILL. A session id is only acted on while it is provably the same session: its leader is the original shell (checked by start time), or a process recorded in it earlier (pid and start time, refreshed every second) is still there |
 | Process started its own session (`setsid`, daemons) | Never reached |
 
 ## Related

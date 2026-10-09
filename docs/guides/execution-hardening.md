@@ -175,7 +175,15 @@ __rness-terminal-reaper`, started on first use). If rness dies in any way,
 including `kill -9`, OOM or abort, the helper ends every process still in a
 registered session: background jobs, foreground commands and their `&`
 children (`SIGHUP`, 0.5 s, `SIGKILL`). A command's `&` children that outlive
-it are also ended when rness exits normally. Background job records store the
+it are also ended when rness exits normally. When a command's shell exits,
+rness tells the helper, which records the processes left in the session (pid
+and start time) and forgets the session if none are left. A session is only
+ended while it is provably still the same one: its shell is alive with the
+start time recorded at registration, or one of the recorded processes is
+still in it. A session id whose shell is gone with nothing recorded may have
+been reused by another program, for example another rness's command, so it is
+never touched. The helper also drops sessions with nothing left to end every
+second. Background job records store the
 session id and the leader's start time. If the helper died too, the next rness
 start kills the session when the leader is still the same process. It also
 marks the newest crashed run's jobs `interrupted` synchronously (150 ms budget)
