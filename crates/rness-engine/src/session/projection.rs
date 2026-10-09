@@ -228,7 +228,11 @@ pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelCo
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
             | SessionEvent::HookResult(_)
-            | SessionEvent::Title(_) => {}
+            | SessionEvent::Title(_)
+            | SessionEvent::Repair(_) => {}
+            // Written by a newer rness: never projected here. The turn loop
+            // refuses to build a request for a session holding one.
+            SessionEvent::Unknown(_) => {}
         }
     }
     flush_tools(&mut ctx, &mut pending_tools);
@@ -353,7 +357,11 @@ pub fn transcript<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Transcript
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
             | SessionEvent::HookResult(_)
-            | SessionEvent::Title(_) => {}
+            | SessionEvent::Title(_)
+            | SessionEvent::Repair(_) => {}
+            // Written by a newer rness: never projected here. The turn loop
+            // refuses to build a request for a session holding one.
+            SessionEvent::Unknown(_) => {}
         }
     }
     t

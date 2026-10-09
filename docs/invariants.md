@@ -10,7 +10,10 @@ invariant without an ADR in `docs/decisions/`.
    reconstructable from the session's event log. No hidden context.
    Asserted at request-build time.
 2. **Append-only.** Committed events are never mutated or deleted. New
-   truth = new events.
+   truth = new events. Bytes that never formed an event (a torn tail, or a
+   trailing run of non-envelope lines such as a zero-filled extent) are not
+   committed events: open truncates the former and moves the latter
+   byte-for-byte to a quarantine sidecar, recorded by `session/repair`.
 3. **Committed generations are never rewritten.** Migrations write
    `session.v(N+1).jsonl` beside `session.vN.jsonl`; old generations stay.
 4. **Branch lineage is acyclic** and fork points reference events that

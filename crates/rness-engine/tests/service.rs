@@ -867,6 +867,41 @@ async fn send_while_idle_runs_a_turn_to_completion() {
     assert_eq!(transcript.items.len(), 2);
 }
 
+/// A session holding an event from a newer rness is readable (transcript)
+/// but a send is refused before the prompt is logged (plan 05, B1-2).
+#[tokio::test]
+async fn send_refuses_sessions_with_newer_events_without_logging() {
+    use rness_engine::service::ServiceError;
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(vec![]);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    let path = dir.path().join(&sid).join("session.v1.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"{\"id\":\"01FUTURE\",\"at\":\"2026-01-01T00:00:00.000Z\",\"type\":\"x/new\"}\n",
+    )
+    .unwrap();
+    drop(f);
+    let before = std::fs::read(&path).unwrap();
+    let svc = service(dir.path(), provider.clone());
+    assert!(svc.transcript(&sid).is_ok());
+    let err = svc
+        .send(&sid, UserIntent::Followup, text("hello"))
+        .unwrap_err();
+    assert!(
+        matches!(&err, ServiceError::NewerEvents { types } if types == &["x/new".to_string()]),
+        "{err}"
+    );
+    assert!(err.to_string().contains("upgrade rness"));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(provider.seen().is_empty());
+}
+
 #[tokio::test]
 async fn followup_while_running_queues_and_runs_after() {
     let dir = tempfile::tempdir().unwrap();

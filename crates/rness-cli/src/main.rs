@@ -477,9 +477,26 @@ async fn main() -> anyhow::Result<()> {
     }
     let mut creation_seed = if let Some(session) = &cli.session {
         let store = rness_engine::session::branch::SessionStore::new(root.clone());
-        rness_engine::session::replay::replay(&store, session)?
-            .context
-            .config
+        match rness_engine::session::replay::replay(&store, session) {
+            Ok(replayed) => replayed.context.config,
+            // A damaged tail is only healed (quarantined) by the writer's
+            // open; readers never guess. Heal once, then read again. If the
+            // session is locked or damaged elsewhere, report the read error.
+            Err(error) => {
+                drop(store);
+                let healed = rness_engine::session::branch::SessionStore::new(root.clone())
+                    .open(session)
+                    .map(drop);
+                let store = rness_engine::session::branch::SessionStore::new(root.clone());
+                match (
+                    healed,
+                    rness_engine::session::replay::replay(&store, session),
+                ) {
+                    (Ok(()), Ok(replayed)) => replayed.context.config,
+                    _ => return Err(error.into()),
+                }
+            }
+        }
     } else {
         CallConfig::default()
     };

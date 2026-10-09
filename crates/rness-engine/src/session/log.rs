@@ -2,9 +2,19 @@
 //!
 //! One session = one directory: `<root>/<session-id>/session.v1.jsonl`.
 //! Writers append a line and fsync; committed lines are never touched
-//! (invariant #2). A torn tail (crash mid-write) is detected on open and
-//! truncated away — the only mutation ever performed, and it only removes
-//! bytes that were never acknowledged as committed.
+//! (invariant #2). On open the writer repairs only bytes that were never
+//! acknowledged as committed, and never loses them silently:
+//! - a torn tail (unterminated last line, crash mid-write) is truncated;
+//! - a trailing region of terminated-but-unparseable lines (a crash that
+//!   persisted the newline but not the payload, a NUL-filled extent, a stray
+//!   editor write) is moved to a `quarantine-<ULID>.bin` sidecar and a
+//!   `session/repair` audit event is appended. `append` always writes a
+//!   valid envelope, so such a line can never hold a committed event.
+//!
+//! An invalid line FOLLOWED by valid lines is mid-file corruption: it is
+//! never repaired automatically; readers report it with line and offset.
+//! A failed append rolls the file back to its previous length, so a partial
+//! write never glues onto the next event.
 //!
 //! The file carries an OS advisory lock (std `File::try_lock`) for the
 //! writer's lifetime: one writer per session, any number of readers.
@@ -15,7 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rness_protocol::branch::{Delegation, ForkRef};
-use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
+use rness_protocol::events::{
+    Envelope, EventId, Header, LogRepair, SessionEvent, SessionId, FORMAT_VERSION,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
@@ -29,8 +41,97 @@ pub enum LogError {
     NotFound(SessionId),
     #[error("session '{0}' is locked by another writer")]
     Locked(SessionId),
-    #[error("corrupt log at line {line}: {reason}")]
-    Corrupt { line: usize, reason: String },
+    /// `offset` is the byte offset of the offending line (0 when the error
+    /// is not about one line).
+    #[error("corrupt log at line {line}: {reason}{}", offset_note(.offset))]
+    Corrupt {
+        line: usize,
+        offset: u64,
+        reason: String,
+    },
+    /// The header names a format version this build cannot read (written by
+    /// a newer — or a much older — rness). Not data loss: upgrade rness.
+    #[error(
+        "session log format v{found} is not supported by this rness (reads v{supported}); {}",
+        version_advice(*.found, *.supported)
+    )]
+    UnsupportedVersion { found: u32, supported: u32 },
+}
+
+fn version_advice(found: u32, supported: u32) -> &'static str {
+    if found > supported {
+        "it was written by a newer rness — upgrade rness to open it"
+    } else {
+        "it was written by an older rness and has no migration"
+    }
+}
+
+fn offset_note(offset: &u64) -> String {
+    if *offset == 0 {
+        String::new()
+    } else {
+        format!(
+            " (byte offset {offset}; a damaged tail is quarantined when the session \
+             is next opened for writing, damage before valid events needs a \
+             restore from backup)"
+        )
+    }
+}
+
+/// Upper bound on the header line read by `open` and header probes.
+const MAX_HEADER_BYTES: u64 = 4 << 20;
+/// Bounds of the trailing invalid region `open` quarantines automatically.
+/// Anything larger is left alone (reads report it as corruption).
+const MAX_QUARANTINE_LINES: u64 = 1024;
+const MAX_QUARANTINE_BYTES: u64 = 64 << 20;
+
+/// Parse one committed log line (see [`Envelope::parse_line`]): unknown
+/// event types are data, anything else unparseable is `Corrupt`.
+pub(crate) fn parse_line(bytes: &[u8], line: usize, offset: u64) -> Result<Envelope, LogError> {
+    Envelope::parse_line(bytes).map_err(|error| LogError::Corrupt {
+        line,
+        offset,
+        reason: error.to_string(),
+    })
+}
+
+/// Parse the first committed line, which must be a `session/header` of the
+/// supported format version. A header of another version is reported as
+/// [`LogError::UnsupportedVersion`] even if its shape no longer parses.
+pub(crate) fn parse_header_line(bytes: &[u8], line: usize) -> Result<Envelope, LogError> {
+    let version_of = |bytes: &[u8]| -> Option<u32> {
+        let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        if value.get("type")?.as_str()? != "session/header" {
+            return None;
+        }
+        u32::try_from(value.get("version")?.as_u64()?).ok()
+    };
+    let envelope = match parse_line(bytes, line, 0) {
+        Ok(envelope) => envelope,
+        Err(error) => {
+            return Err(match version_of(bytes) {
+                Some(found) if found != FORMAT_VERSION => LogError::UnsupportedVersion {
+                    found,
+                    supported: FORMAT_VERSION,
+                },
+                _ => error,
+            })
+        }
+    };
+    match &envelope.event {
+        SessionEvent::Header(header) if header.version != FORMAT_VERSION => {
+            Err(LogError::UnsupportedVersion {
+                found: header.version,
+                supported: FORMAT_VERSION,
+            })
+        }
+        SessionEvent::Header(_) => Ok(envelope),
+        _ => Err(LogError::Corrupt {
+            line,
+            offset: 0,
+            reason: "first event is not session/header".into(),
+        }),
+    }
 }
 
 /// Current-generation filename.
@@ -80,8 +181,12 @@ impl SessionLog {
         Ok(log)
     }
 
-    /// Open an existing session for appending. Detects and truncates a
-    /// torn tail before returning.
+    /// Open an existing session for appending. Validates the header
+    /// (present, supported version, matching session id), then repairs the
+    /// tail: a torn last line is truncated, a trailing run of complete but
+    /// unparseable lines is quarantined to a sidecar (see module docs).
+    /// O(header + tail), never a full read. A log that fails validation is
+    /// left byte-for-byte unchanged.
     pub fn open(root: &Path, session: &SessionId) -> Result<Self, LogError> {
         let path = log_file(&root.join(session));
         if !path.exists() {
@@ -89,7 +194,8 @@ impl SessionLog {
         }
         let file = OpenOptions::new().append(true).read(true).open(&path)?;
         let mut log = Self::lock(session, file, path)?;
-        log.heal_torn_tail()?;
+        let header_end = log.check_header()?;
+        log.heal_tail(header_end)?;
         Ok(log)
     }
 
@@ -131,9 +237,41 @@ impl SessionLog {
         };
         let mut line = serde_json::to_string(&envelope)?;
         line.push('\n');
-        self.file.write_all(line.as_bytes())?;
-        self.file.sync_data()?;
+        self.write_durable(line.as_bytes())?;
         Ok(envelope)
+    }
+
+    /// Write `bytes` (whole lines) at the end and fsync. On any failure the
+    /// file is rolled back (best effort) to its previous length, so a
+    /// partial write never glues onto the next append.
+    pub(crate) fn write_durable(&mut self, bytes: &[u8]) -> Result<(), LogError> {
+        self.write_durable_with(bytes, |file, bytes| {
+            file.write_all(bytes)?;
+            file.sync_data()
+        })
+    }
+
+    fn write_durable_with(
+        &mut self,
+        bytes: &[u8],
+        write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), LogError> {
+        let before = self.file.metadata()?.len();
+        let result = write(&mut self.file, bytes);
+        if let Err(error) = result {
+            let rolled_back = self
+                .file
+                .set_len(before)
+                .and_then(|()| self.file.sync_data());
+            tracing::warn!(
+                session = %self.session,
+                %error,
+                rolled_back = rolled_back.is_ok(),
+                "session append failed"
+            );
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     /// Read every committed envelope (header included), in order.
@@ -147,30 +285,208 @@ impl SessionLog {
         read_envelopes_with(&self.path, true)
     }
 
-    /// Truncate an unterminated last line (crash artifact). A
-    /// complete-but-invalid line is corruption and surfaces on read instead.
-    fn heal_torn_tail(&mut self) -> Result<(), LogError> {
-        let mut content = Vec::new();
+    /// Validate the first committed line (bounded read). Returns the byte
+    /// offset just past it.
+    fn check_header(&mut self) -> Result<u64, LogError> {
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.read_to_end(&mut content)?;
-        if content.is_empty() || content.ends_with(b"\n") {
-            return Ok(());
+        let mut reader = BufReader::new((&self.file).take(MAX_HEADER_BYTES));
+        let mut bytes = Vec::new();
+        let mut offset = 0u64;
+        let mut line = 0usize;
+        loop {
+            bytes.clear();
+            let n = reader.read_until(b'\n', &mut bytes)?;
+            line += 1;
+            if n == 0 || !bytes.ends_with(b"\n") {
+                return Err(LogError::Corrupt {
+                    line: if offset == 0 && n == 0 { 0 } else { line },
+                    offset,
+                    reason: if offset == 0 && n == 0 {
+                        "empty log (no session header)".into()
+                    } else {
+                        "session header line is incomplete".into()
+                    },
+                });
+            }
+            offset += n as u64;
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            let envelope = parse_header_line(&bytes, line)?;
+            let SessionEvent::Header(header) = &envelope.event else {
+                unreachable!("parse_header_line returns headers only");
+            };
+            if header.session != self.session {
+                return Err(LogError::Corrupt {
+                    line,
+                    offset: 0,
+                    reason: format!(
+                        "session header identity '{}' does not match '{}'",
+                        header.session, self.session
+                    ),
+                });
+            }
+            return Ok(offset);
         }
-        let keep = content
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|i| i + 1)
-            .unwrap_or(0);
+    }
+
+    /// Repair the tail (writer lock held): truncate a torn last line, then
+    /// quarantine a trailing run of terminated-but-invalid lines. Never
+    /// reads more than the last valid line plus the repaired region.
+    fn heal_tail(&mut self, header_end: u64) -> Result<(), LogError> {
+        let len = self.file.metadata()?.len();
+        let mut end = len;
+        if end > header_end && read_byte(&mut self.file, end - 1)? != b'\n' {
+            let keep = line_start_before(&mut self.file, end)?.max(header_end);
+            tracing::warn!(
+                session = %self.session,
+                dropped = end - keep,
+                "healing torn tail"
+            );
+            self.file.set_len(keep)?;
+            self.file.sync_data()?;
+            end = keep;
+        }
+        // Walk complete lines backwards from EOF while they are invalid.
+        let mut region_start = None;
+        let mut lines = 0u64;
+        let mut cursor = end;
+        while cursor > header_end {
+            let start = line_start_before(&mut self.file, cursor - 1)?.max(header_end);
+            let too_big = || {
+                tracing::warn!(
+                    session = %self.session,
+                    "invalid log tail exceeds the quarantine bound; left in place"
+                );
+            };
+            if end - start > MAX_QUARANTINE_BYTES {
+                // Never load an oversized line just to classify it. It may be
+                // a large valid event; quarantining only what follows it is
+                // unsafe if it is garbage, so leave everything in place.
+                if region_start.is_some() {
+                    too_big();
+                }
+                return Ok(());
+            }
+            let bytes = read_range(&mut self.file, start, cursor)?;
+            match classify_line(&bytes) {
+                LineClass::Blank => {}
+                LineClass::Valid | LineClass::Suspicious => break,
+                LineClass::Garbage => {
+                    region_start = Some(start);
+                    lines += 1;
+                    if lines > MAX_QUARANTINE_LINES {
+                        too_big();
+                        return Ok(());
+                    }
+                }
+            }
+            cursor = start;
+        }
+        let Some(start) = region_start else {
+            return Ok(());
+        };
+        let region = read_range(&mut self.file, start, end)?;
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let sidecar = format!("quarantine-{}.bin", ulid::Ulid::new());
+        {
+            let mut out = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dir.join(&sidecar))?;
+            out.write_all(&region)?;
+            out.sync_data()?;
+        }
+        sync_dir(dir)?;
         tracing::warn!(
             session = %self.session,
-            dropped = content.len() - keep,
-            "healing torn tail"
+            bytes = region.len(),
+            lines,
+            sidecar = %sidecar,
+            "quarantined invalid log tail"
         );
-        self.file.set_len(keep as u64)?;
-        self.file.seek(SeekFrom::End(0))?;
+        self.file.set_len(start)?;
         self.file.sync_data()?;
+        self.append(&SessionEvent::Repair(LogRepair {
+            bytes: region.len() as u64,
+            lines,
+            sidecar,
+            reason: "complete but unparseable trailing lines (never acknowledged appends)".into(),
+        }))?;
         Ok(())
     }
+}
+
+enum LineClass {
+    Blank,
+    /// Parses (known or unknown event type).
+    Valid,
+    /// Envelope-shaped JSON (string `id` and `type`) that fails to parse:
+    /// possibly a real event with a schema problem — never auto-repaired.
+    Suspicious,
+    /// Not JSON, or not envelope-shaped: cannot be an acknowledged append.
+    Garbage,
+}
+
+fn classify_line(bytes: &[u8]) -> LineClass {
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return LineClass::Blank;
+    }
+    if Envelope::parse_line(bytes).is_ok() {
+        return LineClass::Valid;
+    }
+    match serde_json::from_slice::<serde_json::Value>(bytes) {
+        Ok(value)
+            if value.get("id").is_some_and(serde_json::Value::is_string)
+                && value.get("type").is_some_and(serde_json::Value::is_string) =>
+        {
+            LineClass::Suspicious
+        }
+        _ => LineClass::Garbage,
+    }
+}
+
+fn read_byte(file: &mut File, at: u64) -> std::io::Result<u8> {
+    let mut byte = [0u8];
+    file.seek(SeekFrom::Start(at))?;
+    file.read_exact(&mut byte)?;
+    Ok(byte[0])
+}
+
+fn read_range(file: &mut File, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = vec![0u8; (end - start) as usize];
+    file.seek(SeekFrom::Start(start))?;
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Offset just past the last `\n` in `[0, before)`, or 0. Scans backwards
+/// in 64 KiB chunks.
+fn line_start_before(file: &mut File, before: u64) -> std::io::Result<u64> {
+    const CHUNK: u64 = 64 << 10;
+    let mut buf = vec![0u8; CHUNK as usize];
+    let mut end = before;
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let chunk = &mut buf[..(end - start) as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(chunk)?;
+        if let Some(i) = chunk.iter().rposition(|&b| b == b'\n') {
+            return Ok(start + i as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
+}
+
+/// Make a new directory entry durable (no-op where directories can't be
+/// opened for sync).
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    File::open(dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 impl Drop for SessionLog {
@@ -229,49 +545,44 @@ fn read_envelopes_with(path: &Path, elide: bool) -> Result<Vec<Envelope>, LogErr
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut out = Vec::new();
-    let mut buf = String::new();
+    let mut bytes = Vec::new();
     let mut line_no = 0usize;
+    let mut offset = 0u64;
     loop {
-        buf.clear();
-        let n = reader.read_line(&mut buf)?;
+        bytes.clear();
+        let n = reader.read_until(b'\n', &mut bytes)?;
         if n == 0 {
             break;
         }
         line_no += 1;
         // An unterminated final line is a torn tail: the committed prefix
         // ends at the previous line.
-        if !buf.ends_with('\n') {
+        if !bytes.ends_with(b"\n") {
             break;
         }
-        let trimmed = buf.trim_end();
-        if trimmed.is_empty() {
+        let line_offset = offset;
+        offset += n as u64;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let mut envelope: Envelope =
-            serde_json::from_str(trimmed).map_err(|e| LogError::Corrupt {
-                line: line_no,
-                reason: e.to_string(),
-            })?;
+        let mut envelope = if out.is_empty() {
+            parse_header_line(&bytes, line_no)?
+        } else {
+            parse_line(&bytes, line_no, line_offset)?
+        };
         if elide {
             elide_payloads(&mut envelope.event);
         }
         out.push(envelope);
     }
-    // First line must be a header.
-    match out.first() {
-        Some(Envelope {
-            event: SessionEvent::Header(_),
-            ..
-        }) => Ok(out),
-        Some(_) => Err(LogError::Corrupt {
-            line: 1,
-            reason: "first event is not session/header".into(),
-        }),
-        None => Err(LogError::Corrupt {
+    if out.is_empty() {
+        return Err(LogError::Corrupt {
             line: 0,
+            offset: 0,
             reason: "empty log".into(),
-        }),
+        });
     }
+    Ok(out)
 }
 
 /// Incremental reader for an immutable committed prefix. Incomplete tails are
@@ -354,18 +665,12 @@ impl SessionReader {
                 break;
             }
             if !bytes.iter().all(u8::is_ascii_whitespace) {
-                let mut event: Envelope =
-                    serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
-                        line: self.line + 1,
-                        reason: error.to_string(),
-                    })?;
+                let mut event = if self.events.is_empty() {
+                    parse_header_line(&bytes, self.line + 1)?
+                } else {
+                    parse_line(&bytes, self.line + 1, self.offset)?
+                };
                 elide_payloads(&mut event.event);
-                if self.events.is_empty() && !matches!(event.event, SessionEvent::Header(_)) {
-                    return Err(LogError::Corrupt {
-                        line: 1,
-                        reason: "first event is not session/header".into(),
-                    });
-                }
                 self.positions.insert(event.id.clone(), self.events.len());
                 self.events.push(Arc::new(event));
             }
@@ -375,6 +680,7 @@ impl SessionReader {
         if self.events.is_empty() {
             return Err(LogError::Corrupt {
                 line: 0,
+                offset: 0,
                 reason: "empty log".into(),
             });
         }
@@ -810,15 +1116,77 @@ mod tests {
         let log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
         let path = log.path().to_path_buf();
         drop(log);
+        let committed = fs::read(&path).unwrap();
 
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"not json at all\n").unwrap();
         drop(f);
 
+        // Lockless readers report it (they must not guess)...
         assert!(matches!(
             read_session(root.path(), &sid),
             Err(LogError::Corrupt { line: 2, .. })
         ));
+        // ...the writer quarantines it: bytes to a sidecar, audit event.
+        let log = SessionLog::open(root.path(), &sid).unwrap();
+        let events = log.read_all().unwrap();
+        assert_eq!(events.len(), 2);
+        let SessionEvent::Repair(repair) = &events[1].event else {
+            panic!("expected repair, got {:?}", events[1]);
+        };
+        assert!(fs::read(&path).unwrap().starts_with(&committed));
+        assert_eq!(
+            fs::read(path.parent().unwrap().join(&repair.sidecar)).unwrap(),
+            b"not json at all\n"
+        );
+        // Idempotent: a second open has nothing to repair.
+        drop(log);
+        let len = fs::metadata(&path).unwrap().len();
+        drop(SessionLog::open(root.path(), &sid).unwrap());
+        assert_eq!(fs::metadata(&path).unwrap().len(), len);
+    }
+
+    #[test]
+    fn nul_run_tail_and_multiple_garbage_lines_are_quarantined_together() {
+        let root = tempfile::tempdir().unwrap();
+        let sid: SessionId = "01NUL".into();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        log.append(&user_msg("kept")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let mut tail = vec![0u8; 4096];
+        tail.extend_from_slice(b"\n\n  \nxx\n");
+        tail.extend_from_slice(&[0u8; 100]); // torn: no newline
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&tail).unwrap();
+        drop(f);
+        let log = SessionLog::open(root.path(), &sid).unwrap();
+        let events = log.read_all().unwrap();
+        assert_eq!(events.len(), 3);
+        let SessionEvent::Repair(repair) = &events[2].event else {
+            panic!("expected repair");
+        };
+        // The torn part is truncated; the terminated region is quarantined.
+        assert_eq!(repair.bytes, 4096 + 8);
+        assert_eq!(repair.lines, 2);
+    }
+
+    #[test]
+    fn failed_partial_append_is_rolled_back() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "partial".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let before = fs::read(log.path()).unwrap();
+        // A write that persists half the line, then fails (ENOSPC, EIO).
+        let result = log.write_durable_with(b"{\"id\":\"half\",\"at\":\"t\"}\n", |file, bytes| {
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(std::io::Error::other("disk full"))
+        });
+        assert!(matches!(result, Err(LogError::Io(_))));
+        assert_eq!(fs::read(log.path()).unwrap(), before);
+        // The next append starts on a clean line.
+        log.append(&user_msg("next")).unwrap();
+        assert_eq!(log.read_all().unwrap().len(), 2);
     }
 
     #[test]

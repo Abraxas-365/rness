@@ -1669,6 +1669,8 @@ async fn tool_roundtrip_turn_commits_and_replays() {
             SessionEvent::HookInvoked(_) => "hook-invoked",
             SessionEvent::HookResult(_) => "hook-result",
             SessionEvent::Title(_) => "title",
+            SessionEvent::Repair(_) => "repair",
+            SessionEvent::Unknown(_) => "unknown",
         })
         .collect();
     assert_eq!(

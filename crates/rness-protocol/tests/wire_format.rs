@@ -181,3 +181,68 @@ fn reader_tolerates_unknown_fields() {
     let env: Envelope = serde_json::from_str(line).unwrap();
     assert_eq!(env.event, SessionEvent::TurnStarted { turn: 3 });
 }
+
+#[test]
+fn known_types_cover_every_variant() {
+    use rness_protocol::events::KNOWN_TYPES;
+    let samples = [
+        SessionEvent::TurnStarted { turn: 1 },
+        SessionEvent::Repair(LogRepair {
+            bytes: 3,
+            lines: 1,
+            sidecar: "quarantine-x.bin".into(),
+            reason: "r".into(),
+        }),
+        SessionEvent::Title(SessionTitle {
+            title: "t".into(),
+            source: TitleSource::Fallback,
+        }),
+        SessionEvent::PlanMode { active: true },
+        SessionEvent::ToolsActivated { names: vec![] },
+    ];
+    for event in &samples {
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["type"], event.kind());
+        assert!(KNOWN_TYPES.contains(&event.kind()), "{}", event.kind());
+        assert_eq!(&roundtrip(event), event);
+    }
+    // Every tag is distinct and none is parsed as Unknown.
+    let mut tags = KNOWN_TYPES.to_vec();
+    tags.sort_unstable();
+    tags.dedup();
+    assert_eq!(tags.len(), KNOWN_TYPES.len());
+}
+
+#[test]
+fn unknown_type_reads_as_unknown_and_serializes_verbatim() {
+    let line = r#"{"id":"01ID","at":"t","type":"future/event","nested":{"a":[1,"b"]},"n":1.5}"#;
+    let env = Envelope::parse_line(line.as_bytes()).unwrap();
+    let SessionEvent::Unknown(unknown) = &env.event else {
+        panic!("expected Unknown, got {:?}", env.event);
+    };
+    assert_eq!(unknown.kind, "future/event");
+    assert_eq!(env.event.kind(), "future/event");
+    // Generic serde path agrees with parse_line.
+    let via_serde: Envelope = serde_json::from_str(line).unwrap();
+    assert_eq!(via_serde, env);
+    let back: serde_json::Value = serde_json::to_value(&env).unwrap();
+    assert_eq!(
+        back,
+        serde_json::from_str::<serde_json::Value>(line).unwrap()
+    );
+}
+
+#[test]
+fn known_type_with_bad_fields_is_still_an_error() {
+    // Real corruption must not hide behind the Unknown fallback.
+    for line in [
+        r#"{"id":"01ID","at":"t","type":"turn/started","turn":"x"}"#,
+        r#"{"id":"01ID","at":"t","type":"user/message"}"#,
+        r#"{"at":"t","type":"future/event"}"#,
+        r#"{"id":"01ID","at":"t"}"#,
+        "not json",
+    ] {
+        assert!(Envelope::parse_line(line.as_bytes()).is_err(), "{line}");
+        assert!(serde_json::from_str::<Envelope>(line).is_err(), "{line}");
+    }
+}

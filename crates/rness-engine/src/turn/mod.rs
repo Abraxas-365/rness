@@ -46,6 +46,13 @@ pub enum TurnError {
     SandboxWorkspaceRequired,
     #[error("model failed after {attempts} attempts: {last}")]
     ModelExhausted { attempts: u32, last: String },
+    /// The session holds events this build does not understand; any of them
+    /// could be model-visible, so no request is built (invariant #1).
+    #[error(
+        "session contains events from a newer rness ({}); upgrade rness to continue it",
+        .types.join(", ")
+    )]
+    NewerEvents { types: Vec<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -189,6 +196,14 @@ pub async fn run_turn(
     frames: &FrameSink<'_>,
     loop_hooks: Option<&dyn LoopHooks>,
 ) -> Result<TurnOutcome, TurnError> {
+    // Refuse before anything is logged: events from a newer rness may be
+    // model-visible, and dropping them would break invariant #1.
+    let history = store.history(log.session()).map_err(ReplayError::from)?;
+    let unknown = crate::session::replay::unknown_kinds(&history);
+    drop(history);
+    if !unknown.is_empty() {
+        return Err(TurnError::NewerEvents { types: unknown });
+    }
     log.append(&SessionEvent::TurnStarted { turn: turn_no })?;
     let outcome = drive(
         store, log, provider, tools, config, cancel, steers, turn_no, frames, loop_hooks,

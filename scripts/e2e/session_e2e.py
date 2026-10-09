@@ -7,6 +7,7 @@ re-injection, against the FROZEN binary with the fake provider.
 Sections: lock (two processes / serve / TUI on one session, kill -9 holder),
 crash (kill -9 mid-stream, mid-compaction summary, mid-5MB tool result;
 reopen: torn tail healed, spans closed, next request == replay),
+corrupt (garbled tail quarantined, unknown event type / newer version refused),
 instructions (AGENTS.md change / compaction / truncation / invalid UTF-8,
 via --record request bodies).
 PASS/FAIL/XFAIL per check; exit code = FAIL count. XFAIL = confirmed bug
@@ -290,6 +291,58 @@ rness.compaction = { default = {
 
 # -- 6. instructions ------------------------------------------------------------
 
+# -- 2b. corrupt / unknown / newer-version logs (plan 05) ---------------------
+
+def sec_corrupt(c):
+    with with_rness(wp=WP, tag="corrupt", scenario="ok", record=True) as r:
+        # (a) garbled complete tail (zero-filled extent + newline): resume
+        # quarantines it, the turn runs, the request has the history.
+        sid = new_session(r)
+        path = log_path(r, sid)
+        committed = path.read_bytes()
+        garbage = b"\0" * 512 + b"\nnot json\n"
+        with open(path, "ab") as f:
+            f.write(garbage)
+        n_req = len(requests(r))
+        res = r.headless("after-garbage", session=sid, scenario="echo/corrupt-a", timeout=60)
+        c.check("corrupt: resume after garbled tail ok", res.rc == 0, repr(res))
+        data = path.read_bytes()
+        c.check("corrupt: committed prefix untouched", data.startswith(committed))
+        log = read_log(r.root, sid)
+        repairs = [e for e in log if e["type"] == "session/repair"]
+        c.check("corrupt: one session/repair event", len(repairs) == 1, repairs)
+        if repairs:
+            side = path.parent / repairs[0]["sidecar"]
+            c.check("corrupt: sidecar holds the garbage byte-for-byte",
+                    side.exists() and side.read_bytes() == garbage)
+        reqs = [load(p) for p in requests(r)[n_req:] if "-title" not in p.name and "-compaction" not in p.name]
+        c.check("corrupt: resumed request contains earlier history",
+                bool(reqs) and "seed" in body_text(reqs[-1]) and "after-garbage" in body_text(reqs[-1]),
+                f"{len(reqs)} reqs, {[p.name for p in requests(r)]}")
+        # (b) unknown event type from a newer rness: refused, nothing logged.
+        sid2 = new_session(r)
+        path2 = log_path(r, sid2)
+        with open(path2, "ab") as f:
+            f.write(b'{"id":"01FUTURE000000000000000000","at":"2026-01-01T00:00:00.000Z",'
+                    b'"type":"future/event","x":1}\n')
+        size = path2.stat().st_size
+        res = r.headless("on-future", session=sid2, scenario="ok", timeout=60)
+        msg = res.stderr + res.stdout
+        c.check("corrupt: unknown event type refuses the turn", res.rc != 0 and "newer rness" in msg,
+                msg[-300:])
+        c.check("corrupt: refused turn appends nothing", path2.stat().st_size == size)
+        # (c) newer header version: refused with an upgrade message, untouched.
+        sid3 = new_session(r)
+        path3 = log_path(r, sid3)
+        text = path3.read_bytes().replace(b'"version":1', b'"version":2', 1)
+        path3.write_bytes(text)
+        res = r.headless("on-v2", session=sid3, scenario="ok", timeout=60)
+        msg = res.stderr + res.stdout
+        c.check("corrupt: newer format version refused with upgrade hint",
+                res.rc != 0 and "format v2" in msg and "corrupt" not in msg.lower(), msg[-300:])
+        c.check("corrupt: v2 log untouched", path3.read_bytes() == text)
+
+
 def instr_reminders(body):
     """Instruction baseline blocks in an anthropic request body."""
     out = []
@@ -382,7 +435,7 @@ def main():
     a = ap.parse_args()
     c = Suite()
     for name, fn in [("lock", sec_lock), ("crash", lambda c: sec_crash(c, a.crash_rounds)),
-                     ("instructions", sec_instructions)]:
+                     ("corrupt", sec_corrupt), ("instructions", sec_instructions)]:
         if a.k and a.k not in name:
             continue
         print(f"== {name}", flush=True)

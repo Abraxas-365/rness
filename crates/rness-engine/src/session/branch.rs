@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
-use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, FORMAT_VERSION};
+use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId};
 
 use super::log::{LogError, SessionLog};
 
@@ -187,32 +187,21 @@ impl SessionStore {
             if reader.read_until(b'\n', &mut bytes)? == 0 || !bytes.ends_with(b"\n") {
                 return Err(LogError::Corrupt {
                     line: 0,
+                    offset: 0,
                     reason: "empty log".into(),
                 });
             }
             if bytes.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let envelope: Envelope =
-                serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
-                    line,
-                    reason: error.to_string(),
-                })?;
+            let envelope = super::log::parse_header_line(&bytes, line)?;
             let SessionEvent::Header(header) = envelope.event else {
-                return Err(LogError::Corrupt {
-                    line: 1,
-                    reason: "first event is not session/header".into(),
-                });
+                unreachable!("parse_header_line returns headers only");
             };
-            if header.version != FORMAT_VERSION {
-                return Err(LogError::Corrupt {
-                    line,
-                    reason: format!("unsupported session header version {}", header.version),
-                });
-            }
             if &header.session != session {
                 return Err(LogError::Corrupt {
                     line,
+                    offset: 0,
                     reason: format!(
                         "session header identity '{}' does not match '{session}'",
                         header.session
@@ -484,6 +473,7 @@ impl SessionStore {
         if lines == 0 {
             return Err(LogError::Corrupt {
                 line: 0,
+                offset: 0,
                 reason: "empty log".into(),
             }
             .into());
@@ -536,6 +526,7 @@ impl SessionStore {
             let event: UsageLine =
                 serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
                     line,
+                    offset: offset - n as u64,
                     reason: error.to_string(),
                 })?;
             match event.kind.as_str() {
@@ -561,6 +552,7 @@ impl SessionStore {
             if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
                 return Err(LogError::Corrupt {
                     line: 0,
+                    offset: 0,
                     reason: "invalid search session ID".into(),
                 }
                 .into());
@@ -571,6 +563,7 @@ impl SessionStore {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| LogError::Corrupt {
                 line: 0,
+                offset: 0,
                 reason: "session search requires a caller workspace".into(),
             })?;
         if let Some(target) = target {
@@ -579,6 +572,7 @@ impl SessionStore {
                 Err(BranchError::Log(LogError::NotFound(_))) => {
                     return Err(LogError::Corrupt {
                         line: 0,
+                        offset: 0,
                         reason: format!(
                             "session '{target}' not found in this workspace"
                         ),
@@ -590,6 +584,7 @@ impl SessionStore {
             if target_workspace.as_deref() != Some(workspace.as_str()) {
                 return Err(LogError::Corrupt {
                     line: 0,
+                    offset: 0,
                     reason: "target session is outside the caller workspace".into(),
                 }
                 .into());
@@ -614,6 +609,7 @@ impl SessionStore {
         {
             return Err(LogError::Corrupt {
                 line: 1,
+                offset: 0,
                 reason: "search session identity changed".into(),
             }
             .into());
@@ -637,6 +633,7 @@ impl SessionStore {
         {
             return Err(LogError::Corrupt {
                 line: 0,
+                offset: 0,
                 reason: "search refuses symlinked logs".into(),
             }
             .into());
@@ -680,6 +677,7 @@ impl SessionStore {
         {
             return Err(LogError::Corrupt {
                 line: 1,
+                offset: 0,
                 reason: "session identity or workspace changed during read".into(),
             }
             .into());
@@ -741,6 +739,7 @@ impl SessionStore {
             {
                 return Err(LogError::Corrupt {
                     line: 1,
+                    offset: 0,
                     reason: "session identity or workspace changed during search".into(),
                 }
                 .into());
@@ -1000,11 +999,19 @@ mod tests {
                     .collect::<std::collections::HashSet<_>>(),
                 cached
             );
-            // A fresh full-history reader still reports the corrupt body.
-            assert!(matches!(
-                SessionStore::new(dir.path()).history(&sid),
-                Err(BranchError::Log(LogError::Corrupt { line: 2, .. }))
-            ));
+            // A fresh full-history reader still reports the corrupt body;
+            // an unknown (newer) event type is data, not corruption.
+            let history = SessionStore::new(dir.path()).history(&sid);
+            if contents.windows(6).any(|w| w == b"future") {
+                let history = history.unwrap();
+                assert!(matches!(&history.last().unwrap().event,
+                    SessionEvent::Unknown(u) if u.kind == "future/event"));
+            } else {
+                assert!(matches!(
+                    history,
+                    Err(BranchError::Log(LogError::Corrupt { line: 2, .. }))
+                ));
+            }
         }
     }
 
@@ -1019,7 +1026,7 @@ mod tests {
         drop(log);
         let value: serde_json::Value = serde_json::from_str(&header).unwrap();
         let mut wrong_version = value.clone();
-        wrong_version["version"] = serde_json::json!(FORMAT_VERSION + 1);
+        wrong_version["version"] = serde_json::json!(rness_protocol::events::FORMAT_VERSION + 1);
         let mut wrong_session = value.clone();
         wrong_session["session"] = serde_json::json!("different-session");
         let mut missing_version = value.clone();
@@ -1036,7 +1043,6 @@ mod tests {
                 "{\"id\":\"e\",\"at\":\"now\",\"type\":\"turn/started\",\"turn\":1}\n".into(),
                 1,
             ),
-            (format!("{wrong_version}\n"), 1),
             (format!("{wrong_session}\n"), 1),
             (format!("{missing_version}\n"), 1),
             (format!("{missing_session}\n"), 1),
@@ -1054,6 +1060,19 @@ mod tests {
                 );
             }
             assert!(store.readers.lock().unwrap().is_empty());
+        }
+        // A newer format version is not corruption: say so (B1-6).
+        std::fs::write(&path, format!("{wrong_version}\n")).unwrap();
+        for result in [
+            store.delegation(&sid).map(|_| ()),
+            store.parent(&sid).map(|_| ()),
+            store.workspace(&sid).map(|_| ()),
+        ] {
+            assert!(
+                matches!(result, Err(BranchError::Log(LogError::UnsupportedVersion { found, .. }))
+                    if found == rness_protocol::events::FORMAT_VERSION + 1),
+                "{result:?}"
+            );
         }
         let missing = "missing".to_string();
         for result in [

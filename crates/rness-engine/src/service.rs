@@ -60,6 +60,13 @@ pub enum ServiceError {
     },
     #[error("invalid request config: {0}")]
     InvalidConfig(String),
+    /// See [`crate::turn::TurnError::NewerEvents`]: refused before the
+    /// prompt is accepted, so nothing is logged.
+    #[error(
+        "session contains events from a newer rness ({}); upgrade rness to continue it",
+        .types.join(", ")
+    )]
+    NewerEvents { types: Vec<String> },
 }
 
 // -- bus events (live notifications, invariant #9: never persisted) --------
@@ -1712,6 +1719,10 @@ impl SessionService {
         let command = live.command.lock().unwrap();
         if command.is_some() {
             return Err(ServiceError::Busy);
+        }
+        let unknown = crate::session::replay::unknown_kinds(&self.store.history(session)?);
+        if !unknown.is_empty() {
+            return Err(ServiceError::NewerEvents { types: unknown });
         }
         let request_config = self.config(session)?;
         let images_forbidden = request_config
