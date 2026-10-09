@@ -7,6 +7,20 @@
 //! Output reads are incremental: `job_output` returns only what arrived
 //! since the previous read, and every response ends with a
 //! `[status: ...]` marker.
+//!
+//! Durability (persistent registries). Process crash / kill -9 loses
+//! nothing already appended: output goes straight to the open `.output`
+//! file (page cache), and recovery measures the file length. Against OS
+//! crash or power loss, a durable job's output is `sync_data`-ed at settle
+//! and, while running, by the first append at least
+//! [`OUTPUT_SYNC_INTERVAL`] after the previous sync. There is no timer: a
+//! job that goes quiet keeps its last chunks unsynced until it writes again
+//! or settles, so power loss can lose any output since the last sync.
+//! Settled and `delivered` records are fsynced (file and directory),
+//! because they drive exactly-once completion notices. Running records are
+//! written atomically (rename) but not fsynced: a lost start record only
+//! means an unknown job. Foreground `bash-output` captures never notify;
+//! they write one record at settle and are never fsynced.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +35,100 @@ pub use retention::Retention;
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_INSPECT_BYTES: usize = 8 * 1024;
+/// Least time between `sync_data` calls on a durable running job's output.
+/// Checked on append only (no timer), so it is not an upper bound on how
+/// long output stays unsynced: a quiet job's tail waits for its next
+/// append or settle. Matters for power loss / OS crash only.
+const OUTPUT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// fsync calls made on this thread (tests assert durability costs).
+    static FSYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn counted<T>(result: std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(test)]
+    FSYNCS.with(|n| n.set(n.get() + 1));
+    result
+}
+
+/// Synchronous share of stale-dir recovery at startup (Pass A).
+const RECOVERY_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// A dead host's job left running: if its shell's session leader is still
+/// the process recorded at spawn (same start time), kill the session. The
+/// reaper helper normally did this already; this covers a helper that died
+/// too (e.g. the whole process group was killed).
+fn kill_leftover_session(state: &JobState) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let (Some(sid), Some(start)) = (state.pid, state.pid_start) {
+        if sid > 1 && crate::terminal::reaper::start_time(sid) == Some(start) {
+            crate::terminal::reaper::kill_session(sid);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = state;
+}
+
+/// A persistent job's open output file: one fd for the job's run, closed
+/// at settle. `synced` is when its data last reached stable storage.
+struct OutputFile {
+    file: std::fs::File,
+    synced: std::time::Instant,
+}
+
+/// Ephemeral (non-persistent) job output. Small outputs stay in memory;
+/// past [`MAX_READ_BYTES`] they spill to an anonymous temp file, so the
+/// common foreground call costs no fd at all.
+enum Spool {
+    Memory(Vec<u8>),
+    File(std::fs::File),
+}
+
+impl Spool {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if let Spool::Memory(buffer) = self {
+            if buffer.len() + bytes.len() <= MAX_READ_BYTES {
+                buffer.extend_from_slice(bytes);
+                return Ok(());
+            }
+            let mut file = tempfile::tempfile()?;
+            file.write_all(buffer)?;
+            *self = Spool::File(file);
+        }
+        let Spool::File(file) = self else {
+            unreachable!()
+        };
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(bytes)
+    }
+
+    /// Up to `limit` bytes from `offset`.
+    fn read_at(&mut self, offset: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        match self {
+            Spool::Memory(buffer) => {
+                let start = (offset as usize).min(buffer.len());
+                let end = start.saturating_add(limit as usize).min(buffer.len());
+                Ok(buffer[start..end].to_vec())
+            }
+            Spool::File(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(limit).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn len(&mut self) -> std::io::Result<u64> {
+        match self {
+            Spool::Memory(buffer) => Ok(buffer.len() as u64),
+            Spool::File(file) => Ok(file.metadata()?.len()),
+        }
+    }
+}
 
 pub(crate) fn retain_tail(output: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     if bytes.len() >= limit {
@@ -110,6 +218,12 @@ struct JobState {
     settled_at_ms: Option<u64>,
     #[serde(default)]
     output_error: Option<String>,
+    /// Session id of a Bash job's shell and its leader's start time, so a
+    /// later rness can verify and kill a crashed host's leftover session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_start: Option<u64>,
 }
 
 impl JobState {
@@ -133,10 +247,17 @@ impl JobState {
 
 struct Job {
     budget: Arc<Mutex<retention::Budget>>,
+    /// For evicting old artifacts when the total quota is reached.
+    registry: std::sync::Weak<Registry>,
     path: Option<std::path::PathBuf>,
     state: Mutex<JobState>,
-    /// Ephemeral compositions still spool full output to disk without JSON metadata.
-    spool: Mutex<Option<std::fs::File>>,
+    /// Ephemeral compositions keep full output without JSON metadata.
+    spool: Mutex<Option<Spool>>,
+    /// Persistent jobs: the `.output` file, open while running.
+    out: Mutex<Option<OutputFile>>,
+    /// Whether settle fsyncs output and record (see module docs). False
+    /// for foreground captures, which never deliver a notice.
+    durable: bool,
     /// Requests cancellation; the drain task settles status when the
     /// process actually dies.
     cancel: tokio_util::sync::CancellationToken,
@@ -160,6 +281,8 @@ struct Registry {
     directory: Mutex<Option<std::path::PathBuf>>,
     locks: Mutex<Vec<std::fs::File>>,
     next_id: AtomicU64,
+    /// Foreground captures started (drives opportunistic eviction).
+    captures: AtomicU64,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     sessions: Mutex<std::sync::Weak<rness_engine::service::SessionService>>,
     /// Background job recovery thread handle; joined on demand.
@@ -215,11 +338,14 @@ impl Job {
         true
     }
 
+    /// Atomically replace the record. Only settled records of durable jobs
+    /// (final status, `delivered`) are fsynced, with their directory.
     fn persist(&self, state: &JobState) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         use std::io::Write;
+        let durable = self.durable && state.settled;
         let temporary = path.with_extension("tmp");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -227,34 +353,80 @@ impl Job {
             .truncate(true)
             .open(&temporary)?;
         file.write_all(&serde_json::to_vec(state)?)?;
-        file.sync_all()?;
+        if durable {
+            counted(file.sync_all())?;
+        }
         std::fs::rename(temporary, path)?;
-        sync_directory(path.parent().unwrap())
+        if durable {
+            sync_directory(path.parent().unwrap())?;
+        }
+        Ok(())
     }
     fn reconcile_output(&self, state: &mut JobState) {
-        use std::io::{Read, Seek, SeekFrom};
-        let recover = |file: &mut std::fs::File| -> std::io::Result<(usize, Vec<u8>)> {
-            let len = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
-            file.seek(SeekFrom::Start(len.saturating_sub(MAX_READ_BYTES) as u64))?;
-            let mut tail = Vec::new();
-            file.take(MAX_READ_BYTES as u64).read_to_end(&mut tail)?;
-            Ok((len, tail))
-        };
-        let result = if let Some(path) = &self.path {
-            std::fs::File::open(path.with_extension("output"))
-                .and_then(|mut file| recover(&mut file))
-        } else {
-            self.spool
-                .lock()
-                .unwrap()
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("output spool unavailable"))
-                .and_then(recover)
-        };
-        if let Ok((len, tail)) = result {
+        if let Ok((len, tail)) = self.stored_tail() {
             state.output_bytes = len;
             state.output = tail;
             state.read_from = state.read_from.min(len);
+        }
+    }
+
+    /// Stored output length and its last [`MAX_READ_BYTES`].
+    fn stored_tail(&self) -> std::io::Result<(usize, Vec<u8>)> {
+        let len = usize::try_from(self.stored_len()?).map_err(std::io::Error::other)?;
+        let start = len.saturating_sub(MAX_READ_BYTES) as u64;
+        Ok((len, self.read_stored(start, MAX_READ_BYTES as u64)?))
+    }
+
+    fn stored_len(&self) -> std::io::Result<u64> {
+        match &self.path {
+            Some(path) => Ok(std::fs::metadata(path.with_extension("output"))?.len()),
+            None => self
+                .spool
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                .len(),
+        }
+    }
+
+    /// Up to `limit` stored output bytes from `offset`.
+    fn read_stored(&self, offset: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        match &self.path {
+            Some(path) => {
+                let mut file = std::fs::File::open(path.with_extension("output"))?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(limit).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+            None => self
+                .spool
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                .read_at(offset, limit),
+        }
+    }
+
+    /// The RAM tail, re-read from storage when it was released (settled,
+    /// delivered jobs keep none). Empty if storage is unreadable.
+    fn tail<'a>(&self, state: &'a JobState) -> std::borrow::Cow<'a, [u8]> {
+        if state.output.len() >= state.output_bytes.min(MAX_READ_BYTES) {
+            return std::borrow::Cow::Borrowed(&state.output);
+        }
+        let start = state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64;
+        let limit = (state.output_bytes as u64).saturating_sub(start);
+        std::borrow::Cow::Owned(self.read_stored(start, limit).unwrap_or_default())
+    }
+
+    /// Settled and delivered: nobody waits on the tail any more, so it
+    /// leaves RAM; readers fetch it from storage.
+    fn release_tail(state: &mut JobState) {
+        if state.settled && state.delivered {
+            state.output = Vec::new();
         }
     }
 
@@ -270,7 +442,7 @@ fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
     // Windows does not expose portable directory fsync through std::fs.
     #[cfg(unix)]
     {
-        std::fs::File::open(path)?.sync_all()
+        counted(std::fs::File::open(path)?.sync_all())
     }
     #[cfg(not(unix))]
     {
@@ -285,8 +457,30 @@ impl JobWriter {
         if state.settled || state.output_error.is_some() {
             return;
         }
-        let mut budget = self.job.budget.lock().unwrap();
         let count = bytes.len() as u64;
+        let mut evicted = false;
+        let mut budget = loop {
+            let budget = self.job.budget.lock().unwrap();
+            let max = budget.policy.max_total_bytes;
+            if evicted || max == 0 || budget.used.saturating_add(count) <= max {
+                break budget;
+            }
+            // Over the total quota: make room by evicting the oldest
+            // settled, delivered artifacts (never this job or pending
+            // output) before refusing. The registry lock comes before job
+            // locks, so release ours first.
+            let need = budget.used.saturating_add(count) - max;
+            drop(budget);
+            drop(state);
+            if let Some(registry) = self.job.registry.upgrade() {
+                (JobRegistry { inner: registry }).evict(need);
+            }
+            evicted = true;
+            state = self.job.state.lock().expect("job lock");
+            if state.settled || state.output_error.is_some() {
+                return;
+            }
+        };
         let reason = if budget.policy.max_job_bytes != 0
             && (state.output_bytes as u64).saturating_add(count) > budget.policy.max_job_bytes
         {
@@ -312,14 +506,28 @@ impl JobWriter {
         budget.used = budget.used.saturating_add(count);
         state.charged_bytes = state.charged_bytes.saturating_add(count);
         drop(budget);
-        if let Some(path) = &self.job.path {
+        if self.job.path.is_some() {
             use std::io::Write;
             let append = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(path.with_extension("output"))?;
-                file.write_all(bytes)?;
-                file.sync_data()
+                let mut out = self.job.out.lock().unwrap();
+                let out = out
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("output file unavailable"))?;
+                // Readers open by path: bytes written to a removed file are
+                // lost to them, so a removal fails the job like any I/O error.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if out.file.metadata()?.nlink() == 0 {
+                        return Err(std::io::Error::other("output file was removed"));
+                    }
+                }
+                out.file.write_all(bytes)?;
+                if self.job.durable && out.synced.elapsed() >= OUTPUT_SYNC_INTERVAL {
+                    counted(out.file.sync_data())?;
+                    out.synced = std::time::Instant::now();
+                }
+                Ok(())
             })();
             if let Err(error) = append {
                 state.output_error = Some(format!(
@@ -332,14 +540,14 @@ impl JobWriter {
                 return;
             }
         } else {
-            use std::io::{Seek, SeekFrom, Write};
             let append = (|| -> std::io::Result<()> {
-                let mut spool = self.job.spool.lock().unwrap();
-                let file = spool
+                self.job
+                    .spool
+                    .lock()
+                    .unwrap()
                     .as_mut()
-                    .ok_or_else(|| std::io::Error::other("output spool unavailable"))?;
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(bytes)
+                    .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                    .write_all(bytes)
             })();
             if let Err(error) = append {
                 state.output_error = Some(format!(
@@ -370,7 +578,17 @@ impl JobWriter {
         } else {
             status
         };
+        // Output reaches stable storage before the record that settles it;
+        // then the fd closes (nothing appends after settle).
+        if let Some(out) = self.job.out.lock().unwrap().take() {
+            if self.job.durable {
+                if let Err(error) = counted(out.file.sync_data()) {
+                    tracing::warn!(%error, "job output sync failed at settle");
+                }
+            }
+        }
         self.job.checkpoint(&state);
+        Job::release_tail(&mut state);
         let notice = format!(
             "Background {} job finished {}. Read its output with job_output.",
             state.kind,
@@ -392,7 +610,11 @@ impl JobWriter {
                         let job = self.job.clone();
                         tokio::spawn(async move {
                             match sessions.notify_job_wait(&owner, text).await {
-                                Ok(_) => job.state.lock().unwrap().delivered = true,
+                                Ok(_) => {
+                                    let mut state = job.state.lock().unwrap();
+                                    state.delivered = true;
+                                    Job::release_tail(&mut state);
+                                }
                                 Err(error) => {
                                     tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed")
                                 }
@@ -402,10 +624,25 @@ impl JobWriter {
                     Err(error) => {
                         tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed")
                     }
-                    Ok(_) => self.job.state.lock().unwrap().delivered = true,
+                    Ok(_) => {
+                        let mut state = self.job.state.lock().unwrap();
+                        state.delivered = true;
+                        Job::release_tail(&mut state);
+                    }
                 }
             }
         }
+    }
+
+    /// Record the job's process session (see `JobState::pid`).
+    pub(crate) fn set_process(&self, sid: i32, start: u64) {
+        let mut state = self.job.state.lock().unwrap();
+        if state.settled {
+            return;
+        }
+        state.pid = Some(sid);
+        state.pid_start = Some(start);
+        self.job.checkpoint(&state);
     }
 
     pub fn output_error(&self) -> Option<String> {
@@ -429,32 +666,126 @@ impl JobRegistry {
         Ok(())
     }
 
-    /// Expire only settled, delivered artifacts, never active or pending output.
+    /// Expire only settled, delivered artifacts, never active or pending
+    /// output: those older than `max_age_secs`, and the oldest foreground
+    /// captures beyond `max_bash_captures`.
     pub fn cleanup(&self) -> Result<usize, String> {
         let policy = self.inner.budget.lock().unwrap().policy.clone();
-        if policy.max_age_secs == 0 {
+        if policy.max_age_secs == 0 && policy.max_bash_captures == 0 {
             return Ok(0);
         }
         let now = retention::now_ms();
         let mut jobs = self.inner.jobs.lock().unwrap();
+        let expired = |state: &JobState| {
+            policy.max_age_secs != 0
+                && state.settled_at_ms.is_some_and(|at| {
+                    now.saturating_sub(at) >= policy.max_age_secs.saturating_mul(1000)
+                })
+        };
+        // Captures over the cap, oldest first (ULID/counter ids sort by
+        // creation within one id scheme; settle time decides).
+        let mut captures: Vec<(u64, &String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                (state.kind == "bash-output" && state.settled)
+                    .then(|| (state.settled_at_ms.unwrap_or(0), id))
+            })
+            .collect();
+        let excess = if policy.max_bash_captures == 0 {
+            0
+        } else {
+            captures
+                .len()
+                .saturating_sub(policy.max_bash_captures as usize)
+        };
+        captures.sort();
+        let over_cap: std::collections::HashSet<String> = captures
+            .into_iter()
+            .take(excess)
+            .map(|(_, id)| id.clone())
+            .collect();
+        let candidates: Vec<String> = jobs
+            .iter()
+            .filter(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                expired(&state) || over_cap.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (removed, errors) = self.remove_artifacts(&mut jobs, candidates, u64::MAX);
+        if errors.is_empty() {
+            Ok(removed)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Make room for `need` more output bytes under the total quota by
+    /// removing the oldest settled artifacts nobody waits on (delivered, or
+    /// never owed a notice) and no reader holds. Returns the bytes freed.
+    fn evict(&self, need: u64) -> u64 {
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut oldest: Vec<(u64, String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                (state.charged_bytes > 0).then(|| (state.settled_at_ms.unwrap_or(0), id.clone()))
+            })
+            .collect();
+        oldest.sort();
+        let before = self.inner.budget.lock().unwrap().used;
+        let (removed, errors) =
+            self.remove_artifacts(&mut jobs, oldest.into_iter().map(|(_, id)| id), need);
+        drop(jobs);
+        let freed = before.saturating_sub(self.inner.budget.lock().unwrap().used);
+        if removed > 0 {
+            tracing::info!(removed, freed, "evicted old job output for the total quota");
+        }
+        if !errors.is_empty() {
+            tracing::warn!(errors = %errors.join("; "), "job output eviction incomplete");
+        }
+        freed
+    }
+
+    /// Remove the removable artifacts among `ids` (in order) until `limit`
+    /// charged bytes are freed: settled, not owed an undelivered notice,
+    /// and not held by a reader or producer. Returns how many left the
+    /// registry, and the errors met.
+    fn remove_artifacts(
+        &self,
+        jobs: &mut HashMap<String, Arc<Job>>,
+        ids: impl IntoIterator<Item = String>,
+        limit: u64,
+    ) -> (usize, Vec<String>) {
         let mut removed = Vec::new();
         let mut errors = Vec::new();
-        for (id, job) in jobs.iter() {
+        let mut freed = 0u64;
+        for id in ids {
+            if freed >= limit {
+                break;
+            }
+            let Some(job) = jobs.get(&id) else { continue };
             // The registry lock prevents acquisition of new readers. Existing
             // readers/producers must finish before either spool can disappear.
             if Arc::strong_count(job) > 1 {
                 continue;
             }
             let state = job.state.lock().unwrap();
-            if !state.settled
-                || (!state.delivered && state.owner.is_some())
-                || !state.settled_at_ms.is_some_and(|at| {
-                    now.saturating_sub(at) >= policy.max_age_secs.saturating_mul(1000)
-                })
-            {
+            if !state.settled || (!state.delivered && state.owner.is_some()) {
                 continue;
             }
-            if let Some(path) = &job.path {
+            if let (Some(path), false) = (&job.path, job.durable) {
+                // Captures were never synced: unlink the record, then its
+                // output (recovery removes an output left without record).
+                for path in [path.clone(), path.with_extension("output")] {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            errors.push(e.to_string());
+                        }
+                    }
+                }
+            } else if let Some(path) = &job.path {
                 // Rename to a tombstone first. Recovery resumes interrupted GC.
                 if let Err(error) = job.persist(&state) {
                     tracing::warn!(%error, "artifact cleanup metadata restore failed");
@@ -488,6 +819,7 @@ impl JobRegistry {
                 // The job must leave the registry once its output is removed.
                 if let Err(e) = sync_directory(path.parent().unwrap()) {
                     errors.push(e.to_string());
+                    freed = freed.saturating_add(state.charged_bytes);
                     removed.push((id.clone(), state.charged_bytes));
                     continue;
                 }
@@ -498,6 +830,7 @@ impl JobRegistry {
                     }
                 }
             }
+            freed = freed.saturating_add(state.charged_bytes);
             removed.push((id.clone(), state.charged_bytes));
         }
         for (id, bytes) in &removed {
@@ -505,11 +838,7 @@ impl JobRegistry {
             let mut budget = self.inner.budget.lock().unwrap();
             budget.used = budget.used.saturating_sub(*bytes);
         }
-        if errors.is_empty() {
-            Ok(removed.len())
-        } else {
-            Err(errors.join("; "))
-        }
+        (removed.len(), errors)
     }
 
     pub fn enable_persistence(&self, root: &std::path::Path) -> Result<(), String> {
@@ -543,6 +872,17 @@ impl JobRegistry {
         *directory = Some(path);
         drop(directory);
 
+        // Pass A: owner dirs are ULIDs, so the newest (a run that just
+        // crashed) come first. Recover them synchronously within a small
+        // budget, so even a short run marks them interrupted (and kills
+        // their leftover sessions); the rest go to the background thread.
+        stale_dirs.sort();
+        let started = std::time::Instant::now();
+        while started.elapsed() < RECOVERY_SYNC_BUDGET {
+            let Some(dir) = stale_dirs.pop() else { break };
+            self.recover_stale_jobs(std::slice::from_ref(&dir));
+        }
+
         // Spawn background recovery for old job directories.
         if !stale_dirs.is_empty() {
             let registry = self.clone();
@@ -562,8 +902,24 @@ impl JobRegistry {
     }
 
     /// Background: recover settled jobs from stale owner directories.
+    ///
+    /// Each directory is locked only while it is scanned. The lock is kept
+    /// only when the directory still holds owned completions that were never
+    /// delivered, so no other instance delivers them as well. Records that
+    /// were already settled are never rewritten, tails load lazily, records
+    /// already past `max_age_secs` are deleted directly, and directories left
+    /// empty are removed.
     fn recover_stale_jobs(&self, dirs: &[std::path::PathBuf]) {
         use fs2::FileExt;
+        let max_age_ms = self
+            .inner
+            .budget
+            .lock()
+            .unwrap()
+            .policy
+            .max_age_secs
+            .saturating_mul(1000);
+        let now = retention::now_ms();
         for dir in dirs {
             let lock = match std::fs::OpenOptions::new()
                 .create(true)
@@ -580,81 +936,134 @@ impl JobRegistry {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => continue,
             }
-            // Reconcile interrupted deletion only while holding this owner's
-            // exclusive lock. Never touch another live instance's artifacts.
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for file in entries {
-                    let Ok(file) = file else { continue };
-                    let path = file.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("deleted") {
-                        let _ = std::fs::remove_file(path.with_extension("output"));
-                        let _ = std::fs::remove_file(path.with_extension("json"));
-                        let _ = sync_directory(path.parent().unwrap());
-                        let _ = std::fs::remove_file(&path);
-                    }
+            // Reconcile only while holding this owner's exclusive lock.
+            // Never touch another live instance's artifacts.
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut names = std::collections::HashSet::new();
+            for entry in entries.flatten() {
+                names.insert(entry.path());
+            }
+            let has = |path: &std::path::Path, ext: &str| names.contains(&path.with_extension(ext));
+            let with_ext = |ext: &str| {
+                let mut paths: Vec<_> = names
+                    .iter()
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
+                    .cloned()
+                    .collect();
+                paths.sort();
+                paths
+            };
+            // Finish interrupted deletions: drop the data, sync once, then
+            // the tombstones.
+            let tombstones = with_ext("deleted");
+            for tombstone in &tombstones {
+                let _ = std::fs::remove_file(tombstone.with_extension("output"));
+                let _ = std::fs::remove_file(tombstone.with_extension("json"));
+            }
+            if !tombstones.is_empty() {
+                let _ = sync_directory(dir);
+                for tombstone in &tombstones {
+                    let _ = std::fs::remove_file(tombstone);
                 }
             }
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for file in entries {
-                    let Ok(file) = file else { continue };
-                    let path = file.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("output")
-                        && !path.with_extension("json").exists()
-                    {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
+            // A dead owner's half-written metadata (crash before rename).
+            for temporary in with_ext("tmp") {
+                let _ = std::fs::remove_file(temporary);
+            }
+            let tombstoned = |path: &std::path::Path| has(path, "deleted");
+            let mut remaining = 0usize;
+            let mut pending = false;
+            for path in with_ext("output") {
+                if tombstoned(&path) {
+                    continue;
+                }
+                if !has(&path, "json") {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    remaining += 1;
+                }
+            }
+            for path in with_ext("json") {
+                if tombstoned(&path) {
+                    continue;
+                }
+                remaining += 1;
+                let Ok(data) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(mut state) = serde_json::from_slice::<JobState>(&data) else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(path.with_extension("output")) else {
+                    continue;
+                };
+                state.output_bytes = meta.len() as usize;
+                // Output lost to a crash (never synced) can leave the cursor
+                // past the end: clamp it, so the record still loads, expires
+                // and lets its directory go like any other.
+                state.read_from = state.read_from.min(state.output_bytes);
+                let releasable = state.delivered || state.owner.is_none();
+                if state.settled
+                    && releasable
+                    && max_age_ms != 0
+                    && state
+                        .settled_at_ms
+                        .is_some_and(|at| now.saturating_sub(at) >= max_age_ms)
+                {
+                    // Expired before this run: delete without loading. The
+                    // record goes first so no record outlives its output.
+                    if std::fs::remove_file(&path).is_ok() {
+                        let _ = std::fs::remove_file(path.with_extension("output"));
+                        remaining -= 2;
                     }
-                    if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let Ok(data) = std::fs::read(&path) else {
-                        continue;
-                    };
-                    let Ok(mut state) = serde_json::from_slice::<JobState>(&data) else {
-                        continue;
-                    };
-                    use std::io::{Read, Seek, SeekFrom};
-                    let Ok(mut file) = std::fs::File::open(path.with_extension("output")) else {
-                        continue;
-                    };
-                    let Ok(meta) = file.metadata() else {
-                        continue;
-                    };
-                    state.output_bytes = meta.len() as usize;
-                    let _ = file.seek(SeekFrom::Start(
-                        state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64,
-                    ));
-                    let _ = file.take(MAX_READ_BYTES as u64).read_to_end(&mut state.output);
-                    if state.read_from > state.output_bytes {
-                        continue;
-                    }
-                    if !state.settled {
-                        state.status = JobStatus::Interrupted;
-                        state.settled = true;
-                    }
-                    let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    let id = id.to_owned();
-                    state.settled_at_ms.get_or_insert_with(retention::now_ms);
-                    state.charged_bytes = state.output_bytes as u64;
-                    self.inner.budget.lock().unwrap().used += state.charged_bytes;
-                    let job = Arc::new(Job {
-                        budget: self.inner.budget.clone(),
-                        spool: Mutex::new(None),
-                        path: Some(path),
-                        state: Mutex::new(state),
-                        cancel: Default::default(),
-                        changed: Arc::new(tokio::sync::Notify::new()),
-                        completion: None,
-                    });
+                    continue;
+                }
+                let interrupted = !state.settled;
+                if interrupted {
+                    state.status = JobStatus::Interrupted;
+                    state.settled = true;
+                    kill_leftover_session(&state);
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let id = id.to_owned();
+                state.settled_at_ms.get_or_insert_with(retention::now_ms);
+                state.charged_bytes = state.output_bytes as u64;
+                self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                pending |= !(state.delivered || state.owner.is_none());
+                let durable = state.kind != "bash-output";
+                let job = Arc::new(Job {
+                    budget: self.inner.budget.clone(),
+                    registry: Arc::downgrade(&self.inner),
+                    spool: Mutex::new(None),
+                    out: Mutex::new(None),
+                    durable,
+                    path: Some(path),
+                    state: Mutex::new(state),
+                    cancel: Default::default(),
+                    changed: Arc::new(tokio::sync::Notify::new()),
+                    completion: None,
+                });
+                // Only a record whose status changed is rewritten (and
+                // synced); settled records stay untouched.
+                if interrupted {
                     if let Ok(s) = job.state.lock() {
                         let _ = job.persist(&s);
                     }
-                    self.inner.jobs.lock().unwrap().insert(id, job);
                 }
+                self.inner.jobs.lock().unwrap().insert(id, job);
             }
-            self.inner.locks.lock().unwrap().push(lock);
+            if remaining == 0 {
+                // Nothing left but the lock (and stray files remove_dir
+                // refuses to drop): remove the directory while locked.
+                let _ = std::fs::remove_file(dir.join("owner.lock"));
+                let _ = std::fs::remove_dir(dir);
+            } else if pending {
+                self.inner.locks.lock().unwrap().push(lock);
+            }
         }
     }
 
@@ -677,6 +1086,7 @@ impl JobRegistry {
                 directory: Mutex::new(None),
                 locks: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(1),
+                captures: AtomicU64::new(0),
                 jobs: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(std::sync::Weak::new()),
                 recovery_handle: Mutex::new(None),
@@ -730,6 +1140,7 @@ impl JobRegistry {
                                 let mut state = job.state.lock().unwrap();
                                 state.delivered = true;
                                 job.checkpoint(&state);
+                                Job::release_tail(&mut state);
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -740,18 +1151,67 @@ impl JobRegistry {
                 }
             });
         }
+        // Teardown stops the background subagents of the torn-down session
+        // and every running job (Bash, terminals, subagents) owned by its
+        // delegated descendants. The root's own Bash jobs are left to the
+        // host's exit path.
+        let registry = Arc::downgrade(&self.inner);
+        let disposer = sessions
+            .bus()
+            .on::<rness_engine::service::SessionTeardownEv>(move |notice| {
+                let Some(inner) = registry.upgrade() else {
+                    return;
+                };
+                let jobs = JobRegistry { inner };
+                jobs.stop_owned_by(&notice.root, Some(&["subagent"]));
+                for session in &notice.descendants {
+                    jobs.stop_owned_by(session, None);
+                }
+            });
+        // The listener lives as long as the bus; it is inert once the
+        // registry is gone.
+        std::mem::forget(disposer);
+    }
+
+    /// Request a stop of every running job owned by `session`, optionally
+    /// only those of the given kinds. Returns how many stops were requested.
+    pub fn stop_owned_by(&self, session: &str, kinds: Option<&[&str]>) -> usize {
+        let owned: Vec<Arc<Job>> = self
+            .inner
+            .jobs
+            .lock()
+            .expect("jobs lock")
+            .values()
+            .filter(|job| {
+                let state = job.state.lock().expect("job lock");
+                !state.settled
+                    && state.owner.as_deref() == Some(session)
+                    && kinds.is_none_or(|kinds| kinds.contains(&state.kind.as_str()))
+            })
+            .cloned()
+            .collect();
+        owned.iter().filter(|job| job.request_stop()).count()
     }
 
     /// Foreground captures reuse the job artifact and ownership model, without
     /// issuing a second completion notice or advertising a running background job.
+    /// Its only record is written at settle (already `delivered`), never
+    /// fsynced: a crash mid-command leaves an orphan `.output` that
+    /// recovery removes.
     pub(crate) fn capture(&self, label: String, owner: Option<&String>) -> (String, JobWriter) {
-        let (id, writer) = self.start_owned("bash-output", label, owner);
-        {
-            let mut state = writer.job.state.lock().unwrap();
-            state.delivered = true;
-            writer.job.checkpoint(&state);
+        // Enforce the capture cap as captures arrive, not only on the
+        // cleanup tick: one cheap pass per `cap / 4` new captures.
+        let cap = self.inner.budget.lock().unwrap().policy.max_bash_captures;
+        if cap != 0 {
+            let every = (cap / 4).max(1);
+            let n = self.inner.captures.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(every) {
+                if let Err(error) = self.cleanup() {
+                    tracing::warn!(%error, "capture eviction failed");
+                }
+            }
         }
-        (id, writer)
+        self.start_job("bash-output", label, owner, true)
     }
 
     /// Register a new running job; returns its id and the producer handle.
@@ -765,21 +1225,29 @@ impl JobRegistry {
         label: String,
         owner: Option<&String>,
     ) -> (String, JobWriter) {
+        self.start_job(kind, label, owner, false)
+    }
+
+    fn start_job(
+        &self,
+        kind: &'static str,
+        label: String,
+        owner: Option<&String>,
+        capture: bool,
+    ) -> (String, JobWriter) {
         let id = if self.inner.directory.lock().unwrap().is_some() {
             format!("j{}", ulid::Ulid::new())
         } else {
             format!("j{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed))
         };
         let ephemeral = self.inner.directory.lock().unwrap().is_none();
-        let spool = if ephemeral {
-            tempfile::tempfile().ok()
-        } else {
-            None
-        };
-        let spool_failed = ephemeral && spool.is_none();
+        let spool = ephemeral.then(|| Spool::Memory(Vec::new()));
         let job = Arc::new(Job {
             budget: self.inner.budget.clone(),
+            registry: Arc::downgrade(&self.inner),
             spool: Mutex::new(spool),
+            out: Mutex::new(None),
+            durable: !capture,
             path: self
                 .inner
                 .directory
@@ -790,7 +1258,7 @@ impl JobRegistry {
             state: Mutex::new(JobState {
                 kind: kind.into(),
                 owner: owner.cloned(),
-                delivered: false,
+                delivered: capture,
                 label,
                 status: JobStatus::Running,
                 output: Vec::new(),
@@ -801,6 +1269,8 @@ impl JobRegistry {
                 started_at_ms: Some(retention::now_ms()),
                 settled_at_ms: None,
                 output_error: None,
+                pid: None,
+                pid_start: None,
             }),
             completion: owner.map(|owner| {
                 (
@@ -813,26 +1283,53 @@ impl JobRegistry {
             changed: Arc::new(tokio::sync::Notify::new()),
         });
         if let Some(path) = &job.path {
-            let created = std::fs::OpenOptions::new()
+            match std::fs::OpenOptions::new()
                 .create_new(true)
-                .write(true)
+                .append(true)
                 .open(path.with_extension("output"))
-                .and_then(|file| file.sync_all());
-            if let Err(error) = created {
-                job.cancel.cancel();
-                tracing::error!(%error,"job output creation failed");
+            {
+                Ok(file) => {
+                    *job.out.lock().unwrap() = Some(OutputFile {
+                        file,
+                        synced: std::time::Instant::now(),
+                    })
+                }
+                Err(error) => {
+                    job.cancel.cancel();
+                    tracing::error!(%error,"job output creation failed");
+                }
             }
         }
-        if spool_failed {
-            job.cancel.cancel();
+        // Background jobs get a start record so a crash recovers them as
+        // `interrupted` (and their notice is delivered); captures do not.
+        if !capture {
+            job.checkpoint(&job.state.lock().unwrap());
         }
-        job.checkpoint(&job.state.lock().unwrap());
         self.inner
             .jobs
             .lock()
             .expect("jobs lock")
             .insert(id.clone(), job.clone());
         (id, JobWriter { job })
+    }
+
+    /// Output bytes this registry holds in RAM (job tails and in-memory
+    /// spools); a diagnostic for retention, independent of allocator noise.
+    #[doc(hidden)]
+    pub fn resident_output_bytes(&self) -> usize {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|job| {
+                let spool = match job.spool.lock().unwrap().as_ref() {
+                    Some(Spool::Memory(buffer)) => buffer.len(),
+                    _ => 0,
+                };
+                job.state.lock().unwrap().output.len() + spool
+            })
+            .sum()
     }
 
     /// Count visible unsettled jobs without reading or copying their output.
@@ -877,7 +1374,8 @@ impl JobRegistry {
         let job = self.get_for_session(id, Some(session))?;
         let state = job.state.lock().expect("job lock");
         let output_bytes = state.output_bytes;
-        let tail = &state.output[state.output.len().saturating_sub(MAX_INSPECT_BYTES)..];
+        let tail = job.tail(&state);
+        let tail = &tail[tail.len().saturating_sub(MAX_INSPECT_BYTES)..];
         let mut output = String::from_utf8_lossy(tail).into_owned();
         // Lossy decoding can expand invalid bytes; retain a UTF-8-safe bounded tail.
         if output.len() > MAX_INSPECT_BYTES {
@@ -916,6 +1414,29 @@ impl JobRegistry {
             .cloned()
             .ok_or_else(|| format!("no job '{id}' — list jobs with job_list"))
     }
+}
+
+/// "Restart": a fresh registry over `root` once every previous owner lock
+/// is free. Parallel tests fork (pre_exec) and a forked child holds a
+/// duplicate of every fd, owner locks included, until it execs.
+#[cfg(test)]
+pub(crate) fn restart_for_test(root: &std::path::Path) -> JobRegistry {
+    use fs2::FileExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for dir in std::fs::read_dir(root).unwrap() {
+        let lock = dir.unwrap().path().join("owner.lock");
+        let Ok(file) = std::fs::File::open(&lock) else {
+            continue;
+        };
+        while file.try_lock_exclusive().is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = FileExt::unlock(&file);
+    }
+    let registry = JobRegistry::new();
+    registry.enable_persistence(root).unwrap();
+    registry.wait_recovery();
+    registry
 }
 
 #[cfg(test)]
@@ -978,6 +1499,51 @@ mod inspection_tests {
     }
 
     #[test]
+    fn total_quota_evicts_oldest_settled_delivered_output_before_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = JobRegistry::new();
+        jobs.configure_retention(Retention {
+            max_total_bytes: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        jobs.enable_persistence(dir.path()).unwrap();
+        let owner = String::from("owner");
+        // Oldest: settled and delivered (an unowned job owes no notice).
+        let (old, writer) = jobs.start("test", "old".into());
+        writer.append(b"1234");
+        writer.settle(JobStatus::Exited(Some(0)));
+        writer.job.state.lock().unwrap().settled_at_ms = Some(1);
+        let old_output = writer.job.path.clone().unwrap().with_extension("output");
+        drop(writer);
+        // Settled but its notice is still owed: never evicted.
+        let (pending, writer) = jobs.start_owned("test", "pending".into(), Some(&owner));
+        writer.append(b"123");
+        writer.settle(JobStatus::Exited(Some(0)));
+        writer.job.state.lock().unwrap().settled_at_ms = Some(0);
+        drop(writer);
+        // Still running: never evicted.
+        let (_, running) = jobs.start("test", "running".into());
+        running.append(b"12");
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 9);
+
+        let (_, new) = jobs.start("test", "new".into());
+        new.append(b"123");
+        assert!(new.output_error().is_none(), "{:?}", new.output_error());
+        assert!(!new.cancelled().is_cancelled());
+        assert!(jobs.get(&old).is_err(), "oldest delivered output evicted");
+        assert!(!old_output.exists());
+        assert!(jobs.get(&pending).is_ok(), "undelivered output kept");
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 8);
+
+        // Nothing evictable left: refuse as before.
+        new.append(b"123");
+        assert!(new.output_error().unwrap().contains("total"));
+        assert!(jobs.get(&pending).is_ok());
+        assert!(!running.cancelled().is_cancelled());
+    }
+
+    #[test]
     fn cleanup_preserves_running_and_undelivered_artifacts_and_recovers_quota() {
         let dir = tempfile::tempdir().unwrap();
         let jobs = JobRegistry::new();
@@ -1031,9 +1597,7 @@ mod inspection_tests {
         std::fs::write(&orphan, b"orphan").unwrap();
         drop(writer);
         drop(jobs);
-        let jobs = JobRegistry::new();
-        jobs.enable_persistence(dir.path()).unwrap();
-        jobs.wait_recovery();
+        let jobs = restart_for_test(dir.path());
         assert!(jobs.get(&id).is_err());
         assert!(!orphan.exists());
         assert!(!path.with_extension("deleted").exists());
@@ -1088,6 +1652,33 @@ mod inspection_tests {
         assert!(settled.settled_at_ms >= settled.started_at_ms);
     }
 
+    #[test]
+    fn stop_owned_by_filters_owner_kind_and_settled_jobs() {
+        let jobs = JobRegistry::new();
+        let owner = String::from("owner");
+        let (bash, _bash_writer) = jobs.start_owned("bash", "sleep".into(), Some(&owner));
+        let (sub, _sub_writer) = jobs.start_owned("subagent", "child".into(), Some(&owner));
+        let (done, done_writer) = jobs.start_owned("subagent", "done".into(), Some(&owner));
+        done_writer.settle(JobStatus::Exited(Some(0)));
+        let (other, _other_writer) =
+            jobs.start_owned("subagent", "other".into(), Some(&"other".into()));
+        assert_eq!(jobs.stop_owned_by("owner", Some(&["subagent"])), 1);
+        let status = |id: &str, session: &str| {
+            jobs.list(session)
+                .into_iter()
+                .find(|j| j.job_id == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(&sub, "owner"), "cancelling");
+        assert_eq!(status(&bash, "owner"), "running");
+        assert_eq!(status(&done, "owner"), "exited");
+        assert_eq!(status(&other, "other"), "running");
+        // Already requested: no second request; Bash now included.
+        assert_eq!(jobs.stop_owned_by("owner", None), 1);
+        assert_eq!(status(&bash, "owner"), "cancelling");
+    }
+
     #[tokio::test]
     async fn turn_cancel_stops_a_blocking_wait_but_not_the_job() {
         let jobs = JobRegistry::new();
@@ -1123,9 +1714,7 @@ mod inspection_tests {
         writer.append(b"retained");
         drop(writer);
         drop(jobs);
-        let jobs = JobRegistry::new();
-        jobs.enable_persistence(directory.path()).unwrap();
-        jobs.wait_recovery();
+        let jobs = restart_for_test(directory.path());
         assert_eq!(jobs.count("owner"), 0);
         assert!(jobs.list("foreign").is_empty());
         let inspection = jobs.inspect("owner", &id).unwrap();
@@ -1139,6 +1728,274 @@ mod inspection_tests {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+
+    #[test]
+    fn recovery_leaves_settled_records_untouched_and_drops_stale_dirs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (settled, path, empty) = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "done".into());
+            writer.append(b"out");
+            writer.settle(JobStatus::Exited(Some(0)));
+            let path = writer.job.path.clone().unwrap();
+            // A second, empty owner directory from another past run.
+            let empty = JobRegistry::new();
+            empty.enable_persistence(directory.path()).unwrap();
+            let empty = empty.inner.directory.lock().unwrap().clone().unwrap();
+            (id, path, empty)
+        };
+        std::fs::write(path.with_extension("tmp"), b"{partial").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let recovered = restart_for_test(directory.path());
+        // A rewrite (tmp + rename + fsync) would replace the inode's mtime.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "settled records are not rewritten"
+        );
+        assert!(!path.with_extension("tmp").exists());
+        assert!(!empty.exists(), "empty owner dir removed");
+        assert!(path.parent().unwrap().exists());
+        let (text, status, _) = drain_output(&recovered.get(&settled).unwrap());
+        assert_eq!((text.as_str(), status), ("out", JobStatus::Exited(Some(0))));
+        // Delivered (no owner): the stale dir's lock is released at once.
+        assert_eq!(recovered.inner.locks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovery_deletes_expired_records_and_their_dir_without_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let (id, dir) = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let id = capture(&registry, b"old");
+            let job = registry.get(&id).unwrap();
+            let mut state = job.state.lock().unwrap();
+            state.settled_at_ms = Some(retention::now_ms() - 8 * 24 * 3600 * 1000);
+            job.persist(&state).unwrap();
+            let dir = job.path.clone().unwrap().parent().unwrap().to_path_buf();
+            (id, dir)
+        };
+        let recovered = restart_for_test(directory.path());
+        assert!(recovered.get(&id).is_err());
+        assert!(!dir.exists(), "dir of expired records removed");
+    }
+
+    #[test]
+    fn recovery_clamps_a_cursor_past_lost_output_and_still_cleans_the_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = |expired: bool| {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "x".into());
+            writer.append(b"0123456789");
+            writer.settle(JobStatus::Exited(Some(0)));
+            let job = registry.get(&id).unwrap();
+            {
+                let mut state = job.state.lock().unwrap();
+                state.read_from = 10;
+                if expired {
+                    state.settled_at_ms = Some(retention::now_ms() - 8 * 24 * 3600 * 1000);
+                }
+                job.persist(&state).unwrap();
+            }
+            let path = job.path.clone().unwrap();
+            // The crash lost the unsynced tail of the output.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.with_extension("output"))
+                .unwrap()
+                .set_len(4)
+                .unwrap();
+            (id, path.parent().unwrap().to_path_buf())
+        };
+        let (id, _) = record(false);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered
+            .get(&id)
+            .expect("record with a stale cursor loads");
+        let state = job.state.lock().unwrap();
+        assert_eq!((state.read_from, state.output_bytes), (4, 4));
+        drop(state);
+        drop(job);
+        drop(recovered);
+
+        let (id, dir) = record(true);
+        let recovered = restart_for_test(directory.path());
+        assert!(recovered.get(&id).is_err(), "expired record deleted");
+        assert!(!dir.exists(), "its directory is cleaned up");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_kills_a_dead_hosts_session_only_if_the_leader_matches() {
+        fn session() -> std::process::Child {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "trap '' HUP; while :; do sleep 0.05; done"]);
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn().unwrap()
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut ours = session();
+        let mut other = session();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            for (child, skew) in [(&ours, 0), (&other, 1)] {
+                let sid = child.id() as i32;
+                let start = crate::terminal::reaper::start_time(sid).unwrap();
+                let (_, writer) = registry.start("bash", "left running".into());
+                writer.set_process(sid, start + skew);
+                // Crash: never settled.
+                std::mem::forget(writer);
+            }
+        }
+        let _recovered = restart_for_test(directory.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ours.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            ours.try_wait().unwrap().is_some(),
+            "leftover session killed"
+        );
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "a session whose leader started at another time is not ours"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[test]
+    fn startup_recovers_the_newest_stale_dir_synchronously() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "crashed".into());
+            std::mem::forget(writer);
+            id
+        };
+        // No wait_recovery: Pass A already marked it.
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let job = registry.get(&id).expect("recovered synchronously");
+        assert_eq!(job.state.lock().unwrap().status, JobStatus::Interrupted);
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(record["status"], "Interrupted");
+        registry.wait_recovery();
+    }
+
+    #[test]
+    fn recovery_keeps_lock_of_dirs_with_undelivered_completions() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let owner = "owner".to_string();
+            let (_, writer) = registry.start_owned("bash", "pending".into(), Some(&owner));
+            writer.settle(JobStatus::Exited(Some(0)));
+        }
+        let recovered = restart_for_test(directory.path());
+        assert_eq!(recovered.inner.locks.lock().unwrap().len(), 2);
+    }
+
+    fn capture(registry: &JobRegistry, bytes: &[u8]) -> String {
+        let (id, writer) = registry.capture("cmd".into(), None);
+        writer.append(bytes);
+        writer.settle(JobStatus::Exited(Some(0)));
+        id
+    }
+
+    #[test]
+    fn default_retention_evicts_oldest_captures_beyond_200() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (bg, writer) = registry.start("bash", "bg".into());
+        let dir = writer.job.path.clone().unwrap();
+        let dir = dir.parent().unwrap().to_path_buf();
+        writer.append(b"kept");
+        writer.settle(JobStatus::Exited(Some(0)));
+        let first = capture(&registry, b"first");
+        let ids: Vec<String> = (0..299).map(|_| capture(&registry, b"x")).collect();
+        let records = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        };
+        // Opportunistic eviction (every cap/4 captures) keeps the count
+        // near the cap between cleanup ticks.
+        assert!(records() <= 1 + 200 + 50, "{}", records());
+        registry.cleanup().unwrap();
+        assert!(registry.get(&first).is_err(), "oldest capture evicted");
+        assert!(registry.get(ids.last().unwrap()).is_ok());
+        assert!(
+            registry.get(&bg).is_ok(),
+            "background jobs are not captures"
+        );
+        assert_eq!(records(), 1 + 200);
+        let outputs = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "output"))
+            .count();
+        assert_eq!(outputs, 1 + 200);
+    }
+
+    #[test]
+    fn ephemeral_small_output_needs_no_spool_file_and_large_output_spills() {
+        let registry = JobRegistry::new();
+        let (_, writer) = registry.capture("cmd".into(), None);
+        writer.append(b"small");
+        assert!(matches!(
+            writer.job.spool.lock().unwrap().as_ref(),
+            Some(Spool::Memory(_))
+        ));
+        writer.append(&vec![b'a'; MAX_READ_BYTES]);
+        assert!(matches!(
+            writer.job.spool.lock().unwrap().as_ref(),
+            Some(Spool::File(_))
+        ));
+        assert_eq!(
+            writer.job.read_stored(0, 5).unwrap(),
+            b"small",
+            "spilled bytes keep their offsets"
+        );
+        assert_eq!(writer.job.stored_len().unwrap(), 5 + MAX_READ_BYTES as u64);
+    }
+
+    #[test]
+    fn settled_delivered_jobs_drop_ram_tail_but_stay_readable() {
+        for persistent in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let registry = JobRegistry::new();
+            if persistent {
+                registry.enable_persistence(directory.path()).unwrap();
+            }
+            let id = capture(&registry, b"captured tail");
+            let job = registry.get(&id).unwrap();
+            assert!(job.state.lock().unwrap().output.is_empty());
+            let inspection = registry.inspect("any", &id).unwrap();
+            assert_eq!(inspection.output, "captured tail");
+            let (text, _, _) = drain_output(&job);
+            assert_eq!(text, "captured tail");
+        }
+    }
+
     #[test]
     fn output_append_does_not_rewrite_metadata_and_recovers_before_settlement() {
         let directory = tempfile::tempdir().unwrap();
@@ -1158,16 +2015,13 @@ mod durability_tests {
         std::fs::write(path.with_extension("tmp"), b"{partial metadata").unwrap();
         drop(writer);
         drop(registry);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         let (output, status, _) = drain_output(&recovered.get(&id).unwrap());
         assert_eq!(output, "firstsecond");
         assert_eq!(status, JobStatus::Interrupted);
     }
     #[tokio::test]
     async fn partial_output_failure_reconciles_pagination() {
-        use std::io::Write;
         let registry = JobRegistry::new();
         let (id, writer) = registry.start("bash", "partial".into());
         writer.append(b"first");
@@ -1207,12 +2061,109 @@ mod durability_tests {
         registry.enable_persistence(directory.path()).unwrap();
         let (_, writer) = registry.start("bash", "test".into());
         let output = writer.job.path.as_ref().unwrap().with_extension("output");
-        std::fs::remove_file(&output).unwrap();
-        std::fs::create_dir(&output).unwrap();
+        // The open output file starts failing writes (read-only handle).
+        writer.job.out.lock().unwrap().as_mut().unwrap().file =
+            std::fs::File::open(&output).unwrap();
         writer.append(b"not persisted");
         assert!(writer.cancelled().is_cancelled());
         assert!(writer.job.state.lock().unwrap().output.is_empty());
     }
+    fn fsyncs() -> usize {
+        FSYNCS.with(|n| n.get())
+    }
+
+    #[test]
+    fn foreground_capture_writes_one_unsynced_record_at_settle() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let before = fsyncs();
+        let (id, writer) = registry.capture("echo hi".into(), Some(&"s".into()));
+        let path = writer.job.path.clone().unwrap();
+        assert!(!path.exists(), "no record while the command runs");
+        for _ in 0..100 {
+            writer.append(&[b'a'; 8192]);
+        }
+        writer.settle(JobStatus::Exited(Some(0)));
+        assert_eq!(fsyncs(), before, "captures never fsync");
+        let record: JobState = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(record.settled && record.delivered);
+        assert_eq!(record.kind, "bash-output");
+        assert!(
+            writer.job.out.lock().unwrap().is_none(),
+            "fd closed at settle"
+        );
+        let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 3, "owner.lock + one record + its output");
+        // Still readable after a restart.
+        drop(writer);
+        drop(registry);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered.get(&id).unwrap();
+        assert_eq!(job.state.lock().unwrap().output_bytes, 819_200);
+    }
+
+    #[test]
+    fn background_output_is_not_fsynced_per_chunk_but_settle_is_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let before = fsyncs();
+        let (_, writer) = registry.start_owned("bash", "flood".into(), Some(&"s".into()));
+        assert!(writer.job.path.as_ref().unwrap().exists(), "start record");
+        for _ in 0..1000 {
+            writer.append(&[b'a'; 8192]);
+        }
+        // Within the sync interval: no fsync at start or per chunk.
+        assert_eq!(fsyncs(), before);
+        writer.settle(JobStatus::Exited(Some(0)));
+        // Output data, record file and directory.
+        assert_eq!(fsyncs(), before + 3);
+        // The timer: a chunk after the interval syncs once.
+        let (_, slow) = registry.start_owned("bash", "slow".into(), Some(&"s".into()));
+        slow.job.out.lock().unwrap().as_mut().unwrap().synced -= OUTPUT_SYNC_INTERVAL;
+        let before = fsyncs();
+        slow.append(b"x");
+        slow.append(b"y");
+        assert_eq!(fsyncs(), before + 1);
+    }
+
+    #[test]
+    fn quiet_running_output_is_synced_on_the_next_append_or_settle_only() {
+        // OUTPUT_SYNC_INTERVAL is a minimum gap checked on append, not a
+        // timer: a job that goes quiet past it is not synced meanwhile.
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (_, writer) = registry.start_owned("bash", "quiet".into(), Some(&"s".into()));
+        let before = fsyncs();
+        writer.append(b"tail");
+        writer.job.out.lock().unwrap().as_mut().unwrap().synced -= OUTPUT_SYNC_INTERVAL * 2;
+        assert_eq!(fsyncs(), before, "no sync without an append");
+        writer.settle(JobStatus::Exited(Some(0)));
+        assert!(fsyncs() > before, "settle syncs the tail");
+    }
+
+    #[test]
+    fn crash_without_any_fsync_recovers_all_appended_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (id, writer) = registry.start_owned("bash", "x".into(), Some(&"s".into()));
+        for _ in 0..10 {
+            writer.append(&[b'z'; 1000]);
+        }
+        // kill -9: the producer never settles (its fd is leaked, never
+        // synced); the owner lock goes away with the process.
+        std::mem::forget(writer);
+        drop(registry);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered.get(&id).unwrap();
+        let state = job.state.lock().unwrap();
+        assert_eq!(state.status, JobStatus::Interrupted);
+        assert_eq!(state.output_bytes, 10_000);
+    }
+
     #[test]
     fn interrupted_recovery_preserves_output_cursor_and_live_owner_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -1220,6 +2171,7 @@ mod durability_tests {
         first.enable_persistence(directory.path()).unwrap();
         let (id, writer) = first.start_owned("bash", "command".into(), Some(&"session".into()));
         writer.append(b"recorded");
+        // `first` is alive: its directory must not be recovered.
         let second = JobRegistry::new();
         second.enable_persistence(directory.path()).unwrap();
         second.wait_recovery();
@@ -1227,9 +2179,7 @@ mod durability_tests {
         drop(second);
         drop(writer);
         drop(first);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         let job = recovered.get(&id).unwrap();
         assert_eq!(job.state.lock().unwrap().owner.as_deref(), Some("session"));
         let (output, status, _) = drain_output(&job);
@@ -1237,9 +2187,7 @@ mod durability_tests {
         assert_eq!(status, JobStatus::Interrupted);
         drop(job);
         drop(recovered);
-        let again = JobRegistry::new();
-        again.enable_persistence(directory.path()).unwrap();
-        again.wait_recovery();
+        let again = restart_for_test(directory.path());
         assert_eq!(drain_output(&again.get(&id).unwrap()).0, "");
     }
 }
@@ -1399,9 +2347,7 @@ mod isolation_tests {
         writer.append(b"secret");
         drop(writer);
         drop(registry);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         assert!(recovered.get_for_session(&id, Some("foreign")).is_err());
         assert!(recovered.get_for_session(&id, None).is_err());
         assert!(recovered.get_for_session(&id, Some("owner")).is_ok());
@@ -1417,12 +2363,14 @@ impl Default for JobRegistry {
 /// Consume the unread output window (bounded), advancing the read cursor.
 fn drain_output(job: &Job) -> (String, JobStatus, Value) {
     let mut state = job.state.lock().expect("job lock");
+    let tail = job.tail(&state);
     let start = state
         .read_from
-        .max(state.output_bytes.saturating_sub(state.output.len()));
+        .max(state.output_bytes.saturating_sub(tail.len()));
     let skipped = start - state.read_from;
-    let window = &state.output[start - (state.output_bytes - state.output.len())..];
+    let window = &tail[start - (state.output_bytes - tail.len())..];
     let mut text = String::from_utf8_lossy(window).into_owned();
+    drop(tail);
     if skipped > 0 {
         text = format!("… {skipped} bytes skipped …\n{text}");
     }
@@ -1531,7 +2479,6 @@ impl JobOutputTool {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get_for_session(id, session)?;
         if let Some(offset) = args.get("offset") {
-            use std::io::{Read, Seek, SeekFrom};
             let offset = offset
                 .as_u64()
                 .ok_or("offset must be a nonnegative byte offset")?;
@@ -1539,29 +2486,9 @@ impl JobOutputTool {
             if offset > state.output_bytes as u64 {
                 return Err("offset exceeds retained output".into());
             }
-            let read = |file: &mut std::fs::File| -> Result<String, String> {
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|e| e.to_string())?;
-                let mut bytes = Vec::new();
-                file.take((state.output_bytes as u64 - offset).min(MAX_READ_BYTES as u64))
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| e.to_string())?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            };
-            let text = if let Some(path) = &job.path {
-                read(
-                    &mut std::fs::File::open(path.with_extension("output"))
-                        .map_err(|e| e.to_string())?,
-                )?
-            } else {
-                read(
-                    job.spool
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .ok_or("output spool unavailable")?,
-                )?
-            };
+            let limit = (state.output_bytes as u64 - offset).min(MAX_READ_BYTES as u64);
+            let bytes = job.read_stored(offset, limit).map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
             let end = (offset + MAX_READ_BYTES as u64).min(state.output_bytes as u64);
             let metadata = json!({"version":1,"kind":"job_output","job_id":id,"start_byte":offset,"end_byte":end,"total_bytes":state.output_bytes,"truncated":end < state.output_bytes as u64});
             return Ok((

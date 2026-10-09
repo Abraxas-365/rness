@@ -106,7 +106,27 @@ pub struct SessionStore {
     usage: std::sync::Mutex<std::collections::HashMap<SessionId, UsageCursor>>,
     /// `rness.record_stream`, applied to every writer this store opens.
     record_stream: std::sync::atomic::AtomicBool,
+    /// Parent -> delegated children, so teardown and kills don't scan
+    /// every header. See [`Self::delegated_descendants`].
+    children: std::sync::Mutex<Option<ChildIndex>>,
 }
+
+/// In-memory delegation tree from one header scan, valid while the store
+/// root's mtime is unchanged: creating or removing a session directory (by
+/// any process) moves it. Headers never change, so nothing else can.
+struct ChildIndex {
+    by_parent: std::collections::HashMap<SessionId, Vec<SessionId>>,
+    /// Root mtime read before the scan.
+    root_mtime: std::time::SystemTime,
+    /// When the scan started. An mtime this close to it may hide a later
+    /// creation on a filesystem with coarse timestamps.
+    scanned_at: std::time::SystemTime,
+    #[cfg(test)]
+    scans: usize,
+}
+
+/// Index reuse needs the root mtime at least this far behind the scan.
+const INDEX_MTIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl SessionStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -118,6 +138,7 @@ impl SessionStore {
             replays: Default::default(),
             usage: Default::default(),
             record_stream: Default::default(),
+            children: Default::default(),
         }
     }
 
@@ -170,10 +191,7 @@ impl SessionStore {
             }
             order.push_back(session.clone());
         }
-        readers
-            .get_mut(session)
-            .unwrap()
-            .read(session)
+        readers.get_mut(session).unwrap().read(session)
     }
 
     /// Read through the first committed event only, without touching the
@@ -242,9 +260,7 @@ impl SessionStore {
     /// Create a root session (no parent).
     pub fn create(&self, workspace: Option<String>) -> Result<SessionLog, BranchError> {
         let sid = ulid::Ulid::new().to_string();
-        Ok(self.writer(SessionLog::create(
-            &self.root, &sid, workspace, None, None,
-        )?))
+        Ok(self.writer(SessionLog::create(&self.root, &sid, workspace, None, None)?))
     }
 
     /// Create a session on behalf of a delegating agent (subagent spawn):
@@ -982,6 +998,63 @@ impl SessionStore {
         Ok(out)
     }
 
+    /// Delegated descendants of `root` (children, grandchildren, ...),
+    /// breadth-first, children in id order. Served from an in-memory
+    /// parent -> children index: the store-wide header scan runs only the
+    /// first time and after a session directory came or went (the store
+    /// root's mtime moved), so teardown and kills cost a `stat` while the
+    /// store is quiet.
+    pub fn delegated_descendants(&self, root: &SessionId) -> Result<Vec<SessionId>, BranchError> {
+        let mtime = std::fs::metadata(&self.root)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let mut index = self.children.lock().unwrap();
+        let fresh = match (index.as_ref(), mtime) {
+            (Some(index), Some(mtime)) => {
+                index.root_mtime == mtime
+                    && index
+                        .scanned_at
+                        .duration_since(mtime)
+                        .is_ok_and(|age| age >= INDEX_MTIME_SLACK)
+            }
+            _ => false,
+        };
+        if !fresh {
+            // The mtime is read before the scan: a directory created during
+            // it moves the mtime again and forces the next rebuild.
+            let scanned_at = std::time::SystemTime::now();
+            let mut by_parent: std::collections::HashMap<SessionId, Vec<SessionId>> =
+                std::collections::HashMap::new();
+            for (id, delegation) in self.delegations()? {
+                by_parent.entry(delegation.parent).or_default().push(id);
+            }
+            #[cfg(test)]
+            let scans = index.as_ref().map_or(0, |index| index.scans) + 1;
+            *index = Some(ChildIndex {
+                by_parent,
+                root_mtime: mtime.unwrap_or(std::time::UNIX_EPOCH),
+                scanned_at,
+                #[cfg(test)]
+                scans,
+            });
+        }
+        let by_parent = &index.as_ref().expect("index built").by_parent;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::from([root.clone()]);
+        let mut queue = VecDeque::from([root.clone()]);
+        while let Some(node) = queue.pop_front() {
+            let mut children = by_parent.get(&node).cloned().unwrap_or_default();
+            children.sort();
+            for child in children {
+                if seen.insert(child.clone()) {
+                    out.push(child.clone());
+                    queue.push_back(child);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Every delegated session with its lineage, from one directory scan.
     /// Headers come from the immutable-header cache, so repeated calls cost
     /// a `read_dir` plus one open per session not seen before.
@@ -1513,5 +1586,57 @@ mod tests {
 
         // Missing sessions still error like replay did.
         assert!(store.usage_summary(&"missing".to_string()).is_err());
+    }
+
+    #[test]
+    fn delegated_descendants_scan_once_while_the_store_is_quiet() {
+        use rness_protocol::branch::DelegationMode;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let delegate = |parent: &SessionId, depth| {
+            store
+                .create_delegated(
+                    None,
+                    Delegation {
+                        parent: parent.clone(),
+                        call: None,
+                        depth,
+                        mode: DelegationMode::Continuable,
+                    },
+                )
+                .unwrap()
+                .session()
+                .clone()
+        };
+        let root = store.create(None).unwrap().session().clone();
+        let child = delegate(&root, 1);
+        let grandchild = delegate(&child, 2);
+        let other = store.create(None).unwrap().session().clone();
+        let _foreign = delegate(&other, 1);
+        let scans = |store: &SessionStore| store.children.lock().unwrap().as_ref().unwrap().scans;
+        assert_eq!(
+            store.delegated_descendants(&root).unwrap(),
+            vec![child.clone(), grandchild.clone()]
+        );
+        // Make the root's mtime old enough to trust, as on a quiet store.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::open(dir.path())
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        store.delegated_descendants(&root).unwrap();
+        let after_rebuild = scans(&store);
+        for _ in 0..100 {
+            store.delegated_descendants(&child).unwrap();
+        }
+        assert_eq!(scans(&store), after_rebuild, "quiet store: no rescans");
+        // Another process (or this one) adds a child: the root's mtime
+        // moves and the next query sees it.
+        let late = delegate(&grandchild, 3);
+        assert_eq!(
+            store.delegated_descendants(&root).unwrap(),
+            vec![child.clone(), grandchild.clone(), late]
+        );
+        assert_eq!(scans(&store), after_rebuild + 1);
     }
 }

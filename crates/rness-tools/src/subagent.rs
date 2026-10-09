@@ -43,10 +43,10 @@ fn render(run: &rness_engine::subagent::SubagentRun) -> Result<String, String> {
         StopReason::Error => Err(format!(
             "subagent run {} failed{}",
             run.session,
-            if run.output.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", run.output)
+            match (&run.error, run.output.is_empty()) {
+                (Some(error), true) => format!(": {error}"),
+                (_, true) => String::new(),
+                (_, false) => format!(": {}", run.output),
             }
         )),
     }
@@ -256,11 +256,34 @@ impl SubagentTool {
         );
         let (id, writer) = self.jobs.start_owned("subagent", label, Some(session));
         let runtime = Arc::clone(&self.runtime);
+        let jobs = self.jobs.clone();
         tokio::spawn(async move {
-            match runtime
-                .start_presented(&provider, request, presentation)
-                .await
-            {
+            // job_kill / teardown fire the job's token; the engine watcher
+            // turns it into a cancel of the child's turn.
+            let cancel = writer.cancelled();
+            let result = runtime
+                .start_with(
+                    &provider,
+                    request,
+                    rness_engine::subagent::RunOptions {
+                        presentation,
+                        cancel: Some(cancel.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            if cancel.is_cancelled() {
+                if let Ok(run) = &result {
+                    // Killed: close the child's tree and stop the background
+                    // subagents in it (jobs owned by the child or deeper).
+                    // Their Bash jobs keep running; teardown stops those.
+                    let tree = runtime.close_one_shot(&run.session);
+                    for session in std::iter::once(&run.session).chain(&tree) {
+                        jobs.stop_owned_by(session, Some(&["subagent"]));
+                    }
+                }
+            }
+            match result {
                 Ok(run) => match render(&run) {
                     Ok(text) => {
                         writer.append(text.as_bytes());
@@ -268,9 +291,17 @@ impl SubagentTool {
                     }
                     Err(e) => {
                         writer.append(e.as_bytes());
-                        writer.settle(JobStatus::Exited(Some(1)));
+                        writer.settle(if run.stop == StopReason::Aborted {
+                            JobStatus::Killed
+                        } else {
+                            JobStatus::Exited(Some(1))
+                        });
                     }
                 },
+                Err(rness_engine::subagent::SubagentError::Cancelled) => {
+                    writer.append(b"subagent cancelled before it started");
+                    writer.settle(JobStatus::Killed);
+                }
                 Err(e) => {
                     writer.append(format!("subagent failed: {e}").as_bytes());
                     writer.settle(JobStatus::Exited(Some(1)));
@@ -280,5 +311,40 @@ impl SubagentTool {
         Ok((format!(
              "started background subagent as job {id} — completion notifies this session; read with job_output, cancel with job_kill. This is a one-shot job: its job_id cannot be used with send_message. For a messageable child, use background_mode='continuable' instead. This is a launch acknowledgement, not the child's answer. Do only work that does not depend on that answer. If your next action needs it and no independent work remains, end your turn now with a brief waiting update; completion will resume this session. Then read job_output before dependent work. Do not guess the result, duplicate the delegated task, or poll for completion."
         ), json!({"version":1,"kind":"subagent","mode":"background","job_id":id,"accepted":true})))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rness_engine::subagent::SubagentRun;
+
+    fn run(stop: StopReason, output: &str, error: Option<&str>) -> SubagentRun {
+        SubagentRun {
+            session: "child".into(),
+            stop,
+            output: output.into(),
+            structured: None,
+            error: error.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn failed_run_reports_the_reason() {
+        let err = render(&run(
+            StopReason::Error,
+            "",
+            Some("CONTEXT_OVERFLOW: prompt is too long"),
+        ))
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "subagent run child failed: CONTEXT_OVERFLOW: prompt is too long"
+        );
+        // Assistant output, when present, stays the primary detail.
+        let err = render(&run(StopReason::Error, "partial", Some("x"))).unwrap_err();
+        assert_eq!(err, "subagent run child failed: partial");
+        let err = render(&run(StopReason::Error, "", None)).unwrap_err();
+        assert_eq!(err, "subagent run child failed");
     }
 }

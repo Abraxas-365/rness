@@ -19,7 +19,7 @@
 //! code. `shell = "login"` opts into the user's own shell instead, where
 //! completion is inferred from the terminal's foreground process group.
 
-mod reaper;
+pub(crate) mod reaper;
 mod sanitize;
 
 pub use reaper::{configure as configure_reaper, run as run_reaper};
@@ -1308,7 +1308,12 @@ impl TerminalRegistry {
             let session = owned(&mut inner, id, owner)?;
             let state = session.state();
             let buf = session.output.lock().expect("output lock");
-            (state, buf.data.clone(), buf.total_written(), buf.base_offset > 0)
+            (
+                state,
+                buf.data.clone(),
+                buf.total_written(),
+                buf.base_offset > 0,
+            )
         };
         let rendered = sanitize::render(&data);
         let mut lines: Vec<&str> = rendered.split('\n').collect();
@@ -1351,7 +1356,10 @@ impl TerminalRegistry {
             text.push('\n');
         }
         if cut > 0 {
-            text.push_str(&format!("[line {} truncated: first {cut} bytes omitted]\n", begin + 1));
+            text.push_str(&format!(
+                "[line {} truncated: first {cut} bytes omitted]\n",
+                begin + 1
+            ));
         }
         let range = if begin == end {
             format!("no lines in range; {total} retained")
@@ -3379,14 +3387,21 @@ mod tests {
         assert_eq!(body[0], "499", "{tail}");
         assert_eq!(body[1], "500");
         assert!(body[2].starts_with("rness$"), "{tail}");
-        assert!(body[3].starts_with(&format!("[{id}: idle at prompt; lines ")), "{tail}");
+        assert!(
+            body[3].starts_with(&format!("[{id}: idle at prompt; lines ")),
+            "{tail}"
+        );
         assert!(body[3].ends_with(" of 502]"), "{tail}");
         assert_eq!(next, registry.read(&id, None, OWNER).unwrap().1);
 
         // Page back: skip the prompt + 10 numbers → 481..=490.
         let (page, _) = registry.read_lines(&id, 10, 11, OWNER).unwrap();
         let body: Vec<_> = page.lines().collect();
-        assert_eq!(&body[..10], &(481..=490).map(|n| n.to_string()).collect::<Vec<_>>()[..], "{page}");
+        assert_eq!(
+            &body[..10],
+            &(481..=490).map(|n| n.to_string()).collect::<Vec<_>>()[..],
+            "{page}"
+        );
         assert!(body[10].ends_with("; 11 newer]"), "{page}");
 
         // Past the start: empty range, clearly reported.
@@ -3405,19 +3420,38 @@ mod tests {
         let registry = TerminalRegistry::new();
         let id = open_bash(&registry);
         // ~390 KB of 78-byte lines: overflows the 256 KB scrollback.
-        send(&registry, &id, "for i in $(seq 1 5000); do printf '%05d %072d\\n' $i 0; done", 30000);
+        send(
+            &registry,
+            &id,
+            "for i in $(seq 1 5000); do printf '%05d %072d\\n' $i 0; done",
+            30000,
+        );
         let (text, _) = registry.read_lines(&id, MAX_READ_LINES, 0, OWNER).unwrap();
         assert!(text.len() <= MAX_READ_BYTES + 200, "{}", text.len());
-        let (all, _) = registry.read_lines(&id, MAX_READ_LINES, 1500, OWNER).unwrap();
+        let (all, _) = registry
+            .read_lines(&id, MAX_READ_LINES, 1500, OWNER)
+            .unwrap();
         // Oldest line in a deep page is whole: 5 digits, space, 72 zeros.
         let first = all.lines().next().unwrap();
-        assert!(first.len() == 78 && first[..5].chars().all(|c| c.is_ascii_digit()), "{first:?}");
+        assert!(
+            first.len() == 78 && first[..5].chars().all(|c| c.is_ascii_digit()),
+            "{first:?}"
+        );
         // Oldest retained line overall is whole too (evicted partial dropped).
         let retained = registry.read_lines(&id, 1, 0, OWNER).unwrap().0;
-        let total: usize = retained.rsplit(" of ").next().unwrap().trim_end_matches(|c: char| !c.is_ascii_digit()).parse().unwrap();
+        let total: usize = retained
+            .rsplit(" of ")
+            .next()
+            .unwrap()
+            .trim_end_matches(|c: char| !c.is_ascii_digit())
+            .parse()
+            .unwrap();
         let (first_line, _) = registry.read_lines(&id, 1, total - 1, OWNER).unwrap();
         let first_line = first_line.lines().next().unwrap();
-        assert!(first_line.len() == 78 && first_line[..5].chars().all(|c| c.is_ascii_digit()), "{first_line:?}");
+        assert!(
+            first_line.len() == 78 && first_line[..5].chars().all(|c| c.is_ascii_digit()),
+            "{first_line:?}"
+        );
         registry.close(&id, OWNER).unwrap();
     }
 
@@ -3426,13 +3460,30 @@ mod tests {
         let registry = TerminalRegistry::new();
         let id = open_bash(&registry);
         // One 100 KB line: longer than the 64 KiB read cap, within scrollback.
-        send(&registry, &id, "head -c 100000 /dev/zero | tr '\\0' x; echo; echo END", 30000);
+        send(
+            &registry,
+            &id,
+            "head -c 100000 /dev/zero | tr '\\0' x; echo; echo END",
+            30000,
+        );
         let (text, _) = registry.read_lines(&id, 3, 0, OWNER).unwrap();
-        assert!(text.contains("END"), "{}", &text[text.len().saturating_sub(300)..]);
+        assert!(
+            text.contains("END"),
+            "{}",
+            &text[text.len().saturating_sub(300)..]
+        );
         let (long, _) = registry.read_lines(&id, 1, 2, OWNER).unwrap();
         assert!(long.len() <= MAX_READ_BYTES + 300, "{}", long.len());
-        assert!(long.contains("xxxxxxxxxx") && long.contains("truncated: first "), "{}", &long[long.len().saturating_sub(300)..]);
-        assert!(!long.contains("no lines in range"), "{}", &long[long.len().saturating_sub(300)..]);
+        assert!(
+            long.contains("xxxxxxxxxx") && long.contains("truncated: first "),
+            "{}",
+            &long[long.len().saturating_sub(300)..]
+        );
+        assert!(
+            !long.contains("no lines in range"),
+            "{}",
+            &long[long.len().saturating_sub(300)..]
+        );
         registry.close(&id, OWNER).unwrap();
     }
 
@@ -3442,12 +3493,21 @@ mod tests {
         let id = open_bash(&registry);
         let tool = TerminalReadTool::new(registry.clone());
         let session: SessionId = OWNER.into();
-        let ok = tool.execute_in(&session, json!({"session_id": id, "lines": 2})).await.unwrap();
-        assert!(ok.contains("lines ") && ok.contains("[next_offset: "), "{ok}");
+        let ok = tool
+            .execute_in(&session, json!({"session_id": id, "lines": 2}))
+            .await
+            .unwrap();
+        assert!(
+            ok.contains("lines ") && ok.contains("[next_offset: "),
+            "{ok}"
+        );
         for (args, needle) in [
             (json!({"session_id": id, "lines": 0}), "at least 1"),
             (json!({"session_id": id, "lines": -3}), "non-negative"),
-            (json!({"session_id": id, "lines": 2, "offset": 0}), "not both"),
+            (
+                json!({"session_id": id, "lines": 2, "offset": 0}),
+                "not both",
+            ),
         ] {
             let err = tool.execute_in(&session, args).await.unwrap_err();
             assert!(err.contains(needle), "{needle}: {err}");

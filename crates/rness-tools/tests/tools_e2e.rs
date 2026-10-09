@@ -105,6 +105,24 @@ impl RssPeak {
     }
 }
 
+/// Wait until no process holds a stale owner lock under `root`. A child
+/// that another test forks concurrently holds a duplicate of every fd,
+/// owner locks included, until it execs; recovery would then (correctly)
+/// treat that directory as live and keep it.
+fn wait_owner_locks_released(root: &std::path::Path) {
+    use fs2::FileExt;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for dir in std::fs::read_dir(root).unwrap() {
+        let Ok(file) = std::fs::File::open(dir.unwrap().path().join("owner.lock")) else {
+            continue;
+        };
+        while file.try_lock_exclusive().is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = FileExt::unlock(&file);
+    }
+}
+
 fn fd_count() -> usize {
     std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
 }
@@ -372,9 +390,9 @@ async fn wait_settled(jobs: &JobRegistry, id: &str, limit: Duration) -> bool {
     false
 }
 
-/// Core default retention is 0 = unlimited: a 100 MB background flood is
-/// fully retained on disk. With the default flavor's 256 MiB per-job quota
-/// a bigger flood is cancelled with an explicit output error.
+/// A 100 MB background flood is fully retained on disk under the core
+/// default (256 MiB per job); a 10 MB per-job quota cancels a bigger flood
+/// with an explicit output error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jobs_flood_unlimited_by_default_and_quota_cancels() {
     // (a) core default: unlimited, persistent (fsync per chunk!).
@@ -410,6 +428,7 @@ async fn jobs_flood_unlimited_by_default_and_quota_cancels() {
         max_job_bytes: 10_000_000,
         max_total_bytes: 0,
         max_age_secs: 0,
+        max_bash_captures: 0,
         cleanup_interval_secs: 60,
     })
     .unwrap();
@@ -495,12 +514,24 @@ async fn jobs_200_concurrent_background() {
         assert_eq!(e.jobs.inspect("s", id).unwrap().job.status, "killed");
     }
     let kill_ms = t.elapsed().as_millis();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let fds_after = fd_count();
+    // Killed jobs release their pipes and output files. Poll briefly: other
+    // tests in this binary open fds concurrently, so take the lowest sample.
+    let mut fds_after = usize::MAX;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline && fds_after > fds0 + 10 {
+        fds_after = fds_after.min(fd_count());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     report(
         "jobs_200",
         json!({"start_ms":start_ms,"fds_before":fds0,"fds_running":fds,"fds_per_job":(fds as f64 - fds0 as f64)/200.0,
                "fds_after_kill":fds_after,"list_ms":list_ms,"list_bytes":list.output.len(),"kill_all_ms":kill_ms}),
+    );
+    // Alone this is <= 10 (measured 0); the bound tolerates parallel tests
+    // while still catching one leaked fd per killed job.
+    assert!(
+        fds_after < fds0 + 100,
+        "fds still open after kill: {fds0} -> {fds_after}"
     );
 }
 
@@ -1196,11 +1227,11 @@ fn terminal_retired_reasons_reset_after_64() {
     assert!(err_last.contains("owner finished"));
 }
 
-/// Recovery locks every stale owner directory it visits and keeps the lock
-/// (and the fd) for the life of the process; empty directories are never
-/// removed. N past runs => N open fds in every new rness process.
+/// P2 phase 3 (was a bug pin): recovery locks a stale owner directory only
+/// while scanning it and removes directories left empty, so N past runs
+/// leave neither N open fds nor N directories behind.
 #[test]
-fn bug_job_recovery_holds_one_fd_per_stale_dir_forever() {
+fn job_recovery_releases_stale_dir_locks_and_removes_empty_dirs() {
     let dir = tmp("recover-fds");
     let jobs_root = dir.path().join("jobs");
     let runs = 300;
@@ -1210,6 +1241,7 @@ fn bug_job_recovery_holds_one_fd_per_stale_dir_forever() {
         jobs.wait_recovery();
         drop(jobs);
     }
+    wait_owner_locks_released(&jobs_root);
     let fds0 = fd_count();
     let t = Instant::now();
     let jobs = JobRegistry::new();
@@ -1220,12 +1252,14 @@ fn bug_job_recovery_holds_one_fd_per_stale_dir_forever() {
     let dirs = std::fs::read_dir(&jobs_root).unwrap().count();
     report(
         "job_recovery_fds",
-        json!({"stale_dirs":dirs,"recovery_ms":ms,"fds_before":fds0,"fds_after":fds,"fds_held":fds - fds0}),
+        json!({"stale_dirs":dirs,"recovery_ms":ms,"fds_before":fds0,"fds_after":fds,"fds_held":fds as i64 - fds0 as i64}),
     );
-    assert!(dirs > runs, "empty owner dirs are never removed");
+    // Only this registry's own directory remains.
+    assert!(dirs <= 1, "empty owner dirs are not removed: {dirs}");
+    // Concurrent tests open fds too; 300 leaked locks would dwarf that.
     assert!(
-        fds - fds0 >= runs,
-        "expected one held lock fd per stale dir"
+        (fds as i64 - fds0 as i64) <= 5 + 50,
+        "lock fds held per stale dir: {fds0} -> {fds}"
     );
 }
 
@@ -1270,12 +1304,12 @@ async fn job_recovery_after_simulated_crash_and_offset_paging() {
     let _ = JobStatus::Running;
 }
 
-/// Plan §4 #11: retention defaults to unlimited. Every foreground Bash call
-/// creates a `bash-output` capture job that is never evicted: its tail
-/// (<= 64 KiB) stays in RAM and, without persistence, an unlinked spool fd
-/// stays open, for the life of the process.
+/// Plan §4 #11 (fixed by P2 phase 2): every foreground Bash call creates a
+/// `bash-output` capture. Retention is bounded by default (200 captures,
+/// tails of settled+delivered jobs leave RAM) and small ephemeral captures
+/// need no spool fd, so RAM, fds and records stay flat across many calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bug_unlimited_retention_grows_ram_and_fds_per_bash_call() {
+async fn retention_bounded_ram_and_fds_per_bash_call() {
     let n: usize = std::env::var("RNESS_BENCH_BASH_CALLS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1293,7 +1327,11 @@ async fn bug_unlimited_retention_grows_ram_and_fds_per_bash_call() {
         let fds0 = fd_count();
         let rss0 = rss_bytes();
         let t = Instant::now();
-        for _ in 0..n {
+        let mut rss_half = 0;
+        for i in 0..n {
+            if i == n / 2 {
+                rss_half = rss_bytes();
+            }
             let r = call(
                 &registry,
                 "Bash",
@@ -1306,20 +1344,64 @@ async fn bug_unlimited_retention_grows_ram_and_fds_per_bash_call() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         let retained = jobs.list("s").len();
         let swept = jobs.cleanup().unwrap_or(0);
+        // Concurrent tests open fds briefly; the lowest of a few samples
+        // measures what this registry keeps.
+        let mut fd_growth = i64::MAX;
+        for _ in 0..5 {
+            fd_growth = fd_growth.min(fd_count() as i64 - fds0 as i64);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let records = count_ext(&dir.path().join("jobs"), "json");
         rows.insert(
             if persistent { "persistent" } else { "ephemeral" }.into(),
-            json!({"calls":n,"ms":ms,"ms_per_call":ms as f64 / n as f64,"fd_growth":fd_count() as i64 - fds0 as i64,
-                   "rss_growth_mb":(rss_bytes() as f64 - rss0 as f64)/1e6,"listed":retained,"cleanup_removed":swept,
-                   "disk_bytes":walk_size(dir.path())}),
+            json!({"calls":n,"ms":ms,"ms_per_call":ms as f64 / n as f64,"fd_growth":fd_growth,
+                   "rss_growth_mb":(rss_bytes() as f64 - rss0 as f64)/1e6,
+                   "rss_growth_second_half_mb":(rss_bytes() as f64 - rss_half as f64)/1e6,
+                   "listed":retained,"cleanup_removed":swept,"records":records,
+                   "resident_output_mb":jobs.resident_output_bytes() as f64 / 1e6,"disk_bytes":walk_size(dir.path())}),
         );
     }
-    report("retention_unlimited", Value::Object(rows.clone()));
+    report("retention_bounded", Value::Object(rows.clone()));
+    for row in ["ephemeral", "persistent"] {
+        let row = &rows[row];
+        assert!(row["fd_growth"].as_i64().unwrap() <= 10, "fds leak: {row}");
+        // RSS is reported but too noisy to assert while other tests run in
+        // parallel; RAM held by the registry is measured exactly instead.
+        // Ephemeral captures (<= 64 KiB) stay in memory up to the 200 cap.
+        let resident = row["resident_output_mb"].as_f64().unwrap();
+        let cap_mb = if row == &rows["ephemeral"] {
+            200.0 * 0.06
+        } else {
+            0.0
+        };
+        assert!(resident <= cap_mb + 0.5, "RAM grows per call: {row}");
+        assert!(row["listed"].as_u64().unwrap() <= 200, "{row}");
+    }
     assert!(
-        rows["ephemeral"]["fd_growth"].as_i64().unwrap() >= n as i64 - 5,
-        "spool fds no longer leak"
+        rows["persistent"]["records"].as_u64().unwrap() <= 200,
+        "captures not evicted: {}",
+        rows["persistent"]
     );
     assert!(
-        rows["ephemeral"]["rss_growth_mb"].as_f64().unwrap() > n as f64 * 0.04,
-        "tails no longer retained in RAM"
+        rows["persistent"]["ms_per_call"].as_f64().unwrap() < 25.0,
+        "{}",
+        rows["persistent"]
     );
+}
+
+/// Files with extension `ext` anywhere under `p`.
+fn count_ext(p: &Path, ext: &str) -> u64 {
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    rd.flatten()
+        .map(|e| {
+            let path = e.path();
+            if path.is_dir() {
+                count_ext(&path, ext)
+            } else {
+                u64::from(path.extension().is_some_and(|x| x == ext))
+            }
+        })
+        .sum()
 }

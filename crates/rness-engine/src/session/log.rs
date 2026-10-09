@@ -607,6 +607,87 @@ pub fn read_session(root: &Path, session: &SessionId) -> Result<Vec<Envelope>, L
     read_envelopes(&path)
 }
 
+/// State of the last turn in a session's own log, from its tail.
+#[derive(Debug)]
+pub enum TailTurn {
+    /// The log ends inside turn `turn`: no `turn/ended` after its
+    /// `turn/started`. `events` starts with that `turn/started` and holds
+    /// everything committed after it (payloads elided).
+    Open { turn: u32, events: Vec<Envelope> },
+    /// The last turn ended, or the log never started one.
+    Closed,
+    /// No turn marker within `max_bytes` of the end.
+    Unknown,
+}
+
+/// Find the last turn marker by reading the log backwards in growing
+/// windows, never more than `max_bytes`. Only this session's own file is
+/// read (no fork ancestors), and a torn final line is ignored.
+pub fn read_tail_turn(
+    root: &Path,
+    session: &SessionId,
+    max_bytes: u64,
+) -> Result<TailTurn, LogError> {
+    let path = log_file(&root.join(session));
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LogError::NotFound(session.clone()))
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let len = file.metadata()?.len();
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let window_now = window.min(len).min(max_bytes.max(1));
+        let start = len - window_now;
+        let mut bytes = vec![0; window_now as usize];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        // Drop the torn final line, and a partial first line mid-file.
+        let end = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let begin = if start == 0 {
+            0
+        } else {
+            match bytes[..end].iter().position(|&b| b == b'\n') {
+                Some(i) => i + 1,
+                None => end,
+            }
+        };
+        let lines: Vec<&[u8]> = bytes[begin..end]
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.iter().all(u8::is_ascii_whitespace))
+            .collect();
+        let has = |line: &[u8], needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
+        let parse = |line: &[u8]| -> Result<Envelope, LogError> { parse_line(line, 0, 0) };
+        for (i, line) in lines.iter().enumerate().rev() {
+            if !has(line, b"turn/started") && !has(line, b"turn/ended") {
+                continue;
+            }
+            match parse(line)?.event {
+                SessionEvent::TurnEnded { .. } => return Ok(TailTurn::Closed),
+                SessionEvent::TurnStarted { turn } => {
+                    let mut events = Vec::with_capacity(lines.len() - i);
+                    for line in &lines[i..] {
+                        let mut envelope = parse(line)?;
+                        elide_payloads(&mut envelope.event);
+                        events.push(envelope);
+                    }
+                    return Ok(TailTurn::Open { turn, events });
+                }
+                _ => {}
+            }
+        }
+        if start == 0 {
+            return Ok(TailTurn::Closed);
+        }
+        if window_now >= max_bytes {
+            return Ok(TailTurn::Unknown);
+        }
+        window = window.saturating_mul(4);
+    }
+}
+
 /// Write-side policy when `record_stream` is off: a committed output drops
 /// its timed stream, because the result is already in the event
 /// (`assistant/message.content`, the `compaction/summary` text). Failed,

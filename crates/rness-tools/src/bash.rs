@@ -124,16 +124,27 @@ async fn drain_stream(
     }
 }
 
+/// The shell's session (`setsid`: pid == sid == pgid). It is registered
+/// with the reaper helper at spawn, so it dies with rness however rness
+/// ends. `disarm`, once the shell has been reaped, tells the helper to keep
+/// sweeping only the members the session has then (`&` children of a
+/// finished shell), so a later session that reuses the number is never
+/// touched. TODO(windows): no group; a Job Object with
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` would give the same guarantee.
 struct ShellGroup {
     #[cfg(unix)]
     pid: Option<i32>,
 }
 
 impl ShellGroup {
+    /// The shell exited and was reaped: stop owning its group.
     fn disarm(&mut self) {
         #[cfg(unix)]
-        {
-            self.pid = None;
+        if let Some(pid) = self.pid.take() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            crate::terminal::reaper::end(pid);
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            let _ = pid;
         }
     }
 
@@ -144,7 +155,19 @@ impl ShellGroup {
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            crate::terminal::reaper::unwatch(pid);
         }
+    }
+
+    /// Session id and leader start time, recorded with background jobs so
+    /// a later rness can verify and kill a dead host's leftover session.
+    fn identity(&self) -> Option<(i32, u64)> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(pid) = self.pid {
+            return crate::terminal::reaper::start_time(pid).map(|start| (pid, start));
+        }
+        None
     }
 }
 
@@ -179,6 +202,12 @@ fn spawn_shell(
         #[cfg(unix)]
         pid: child.id().map(|id| id as i32),
     };
+    // Registered before anything else can fail, so a crash from here on
+    // leaves no orphan (a crash between spawn and here may leak one).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(sid) = group.pid {
+        crate::terminal::reaper::watch(sid);
+    }
     Ok((child, group, lease))
 }
 
@@ -321,6 +350,9 @@ impl BashTool {
             let (mut child, mut group, lease) =
                 spawn_shell(command, &workdir, sandbox_policy, &self.process)?;
             let (id, writer) = self.jobs.start_owned("bash", command.to_string(), owner);
+            if let Some((sid, start)) = group.identity() {
+                writer.set_process(sid, start);
+            }
             let mut stdout_pipe = child.stdout.take().expect("piped stdout");
             let mut stderr_pipe = child.stderr.take().expect("piped stderr");
             // Drain task: stream both pipes into the job, then settle.

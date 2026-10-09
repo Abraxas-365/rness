@@ -102,7 +102,7 @@ def kill9_group(c, fp):
                                         "reapers_matching_binary": len(reapers)}
             c.check(f"kill9/{name}: helpers started", got and len(before) >= 1,
                     f"before={len(before)} rc={p.returncode} err={Path(p.err_path).read_text()[-400:]}")
-            c.check(f"kill9/{name}: no orphans 5 s after kill -9 (expected-to-fail = bug)", not after,
+            c.check(f"kill9/{name}: no orphans 5 s after kill -9", not after,
                     f"{len(after)} of {len(before)} survived")
             # Restart in the same HOME: does recovery mark the jobs interrupted?
             if name == "bg_jobs_20":
@@ -145,6 +145,8 @@ def flood_group(c, fp):
         c.check("flood: rness RSS stays < 300 MB with 250 MB of tool output", peak < 300 * 1024, f"peak={peak} KiB")
         c.check("flood: request bodies stay small (tail-bounded tool results)",
                 all((q.get("bytes") or 0) < 1_000_000 for q in reqs), str([q.get("bytes") for q in reqs]))
+        # P2: no per-chunk fsync of persisted job output (was 130 s).
+        c.check("flood: 250 MB headless flood finishes < 10 s", el < 10, f"elapsed={el:.1f}s")
 
 
 def read_zero_group(c, fp):
