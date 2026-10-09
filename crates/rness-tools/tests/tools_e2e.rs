@@ -627,54 +627,32 @@ async fn bug_grep_cancel_is_abandoned_but_keeps_burning_cpu() {
     }
 }
 
-/// Read of a FIFO blocks inside tokio::fs::read (a blocking-pool thread)
-/// with no reader-side timeout: cancel abandons it after 2 s and the thread
-/// stays stuck until a writer appears. (Uncancellable Read.)
+/// Read refuses a FIFO (and any non-regular file) at once instead of
+/// blocking a blocking-pool thread until a writer appears (B2-5).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bug_read_fifo_blocks_and_is_abandoned_thread_leaks() {
+async fn read_fifo_is_refused_without_blocking() {
     let e = env("fifo");
     let fifo = e.root.join("pipe");
     let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    let cancel = CancellationToken::new();
-    let c2 = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        c2.cancel();
-    });
     let t = Instant::now();
-    let r = call_with(&e.registry, "Read", json!({"path":"pipe"}), &cancel).await;
-    let settle = t.elapsed();
-    assert!(r.is_error && r.output.contains("abandoned"), "{}", r.output);
-    // Without cancel it would hang forever: no timeout on Read.
-    let uncancelled = tokio::time::timeout(
+    let r = tokio::time::timeout(
         Duration::from_secs(3),
         call(&e.registry, "Read", json!({"path":"pipe"})),
     )
-    .await;
-    // Unblock the stuck threads so the test runtime can shut down.
-    for _ in 0..4 {
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags_nonblock()
-            .open(&fifo);
-    }
+    .await
+    .expect("Read of a FIFO must not block");
+    let settle = t.elapsed();
     report(
         "read_fifo",
-        json!({"settled_after_ms":settle.as_millis(),"output":r.output,
-               "uncancelled_read_still_blocked_after_3s":uncancelled.is_err()}),
+        json!({"settled_after_ms":settle.as_millis(),"output":r.output}),
     );
-    assert!(uncancelled.is_err(), "Read of a FIFO returned on its own?");
-}
-
-trait NonBlock {
-    fn custom_flags_nonblock(&mut self) -> &mut Self;
-}
-impl NonBlock for std::fs::OpenOptions {
-    fn custom_flags_nonblock(&mut self) -> &mut Self {
-        use std::os::unix::fs::OpenOptionsExt;
-        self.custom_flags(libc::O_NONBLOCK)
-    }
+    assert!(
+        r.is_error && r.output.contains("not a regular file"),
+        "{}",
+        r.output
+    );
+    assert!(settle < Duration::from_secs(1), "{settle:?}");
 }
 
 /// Foreground Bash honours cancel promptly and kills its process group

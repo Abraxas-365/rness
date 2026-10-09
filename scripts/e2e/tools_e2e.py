@@ -164,9 +164,13 @@ def read_zero_group(c, fp):
                 kill_tree(p.pid)
             p.wait()
             RESULTS[f"read{path.replace('/', '_')}"] = {"rss_peak_mb": round(peak / 1024), "killed_at_limit": killed,
-                                                         "seconds_to_limit": round(el, 2)}
-            c.check(f"read {path}: rness does not exceed {limit_mb} MB (expected-to-fail = §4 #12)",
+                                                         "seconds_to_limit": round(el, 2), "rc": p.returncode}
+            c.check(f"read {path}: rness does not exceed {limit_mb} MB (B2-5, §4 #12)",
                     not killed, f"peak {peak // 1024} MB after {el:.1f}s")
+            reqs = [q for q in fp.requests if q.get("key", "").startswith(f"script:{script}")]
+            c.check(f"read {path}: refused as not a regular file; turn completes within 10 s",
+                    p.returncode == 0 and el < 10 and len(reqs) >= 2,
+                    f"rc={p.returncode} el={el:.1f}s requests={len(reqs)}")
 
 
 def main():

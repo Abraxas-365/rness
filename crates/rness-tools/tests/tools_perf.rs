@@ -235,7 +235,8 @@ async fn perf_grep_massive_matches_single_file() {
     }
 }
 
-/// Read loads the whole file before applying limits (plan §4 #12).
+/// Read of a large file (plan §4 #12, B2-5): one streaming pass, so peak RSS
+/// is bounded by the requested window (200 MB file: ~1.4 MB, was ~202 MB).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn perf_read_large_file_no_size_cap() {
