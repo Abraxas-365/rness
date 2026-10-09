@@ -266,15 +266,30 @@ enum AuthAction {
 
 /// Process exit status: `run`'s code on success; 1 (with anyhow's usual
 /// `Error: …` report) on a startup/config error. See `headless_exit`.
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
-    match run().await {
+///
+/// The runtime is shut down with a timeout: a blocking task still parked
+/// on a busy Lua VM (or any other stuck worker) must not keep the process
+/// alive after the user quit. The Lua VM is a plain detached thread.
+fn main() -> std::process::ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let code = match runtime.block_on(run()) {
         Ok(code) => std::process::ExitCode::from(code),
         Err(e) => {
             eprintln!("Error: {e:?}");
             std::process::ExitCode::FAILURE
         }
-    }
+    };
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    code
 }
 
 async fn run() -> anyhow::Result<u8> {

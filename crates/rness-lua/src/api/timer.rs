@@ -156,7 +156,7 @@ fn create(lua: &Lua, seconds: f64, callback: Function, every: bool) -> mlua::Res
     Ok(id)
 }
 
-fn cancel(lua: &Lua, id: u64) -> mlua::Result<bool> {
+pub(crate) fn cancel(lua: &Lua, id: u64) -> mlua::Result<bool> {
     let timers: Table = lua.globals().get(TIMERS)?;
     let existed = timers.get::<Option<Table>>(id)?.is_some();
     timers.set(id, LuaValue::Nil)?;

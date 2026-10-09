@@ -376,7 +376,8 @@ async fn task_cap_enforced() {
 }
 
 /// Hook registration storm: K handlers (RNESS_BENCH_HOOKS, default 5000) on one event.
-/// Registration is quadratic (see wp-3.md B3-10); 100k takes > 280 s.
+/// Was quadratic (wp-3.md B3-10, 100k > 280 s); unsubscribe now marks and
+/// compacts lazily (100k register+fire+unload ≈ 2 s in release).
 #[tokio::test(flavor = "multi_thread")]
 async fn hook_registration_storm() {
     let k: usize = std::env::var("RNESS_BENCH_HOOKS")

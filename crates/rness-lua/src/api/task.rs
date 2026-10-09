@@ -34,8 +34,6 @@ pub enum TaskWake {
 
 const TASKS: &str = "__rness_tasks";
 const MARKS: &str = "__rness_task_marks";
-/// Cooperative per-resume budget (instruction hook every 1000 steps).
-const RESUME_BUDGET: usize = 30_000;
 /// Concurrent tasks per VM; guards against unbounded spawn loops.
 const MAX_TASKS: usize = 256;
 
@@ -238,22 +236,11 @@ pub fn wake(lua: &Lua, wake: TaskWake) -> Result<(), String> {
         let prev_depth: LuaValue = globals.get("__rness_callback_depth")?;
         globals.set("__rness_callback_owner", owner)?;
         globals.set("__rness_callback_depth", 1)?;
-        let budget = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let hook_token = token.clone();
-        thread.set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(1000),
-            move |_, _| {
-                if hook_token.is_cancelled() {
-                    Err(mlua::Error::runtime("task cancelled"))
-                } else if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= RESUME_BUDGET {
-                    Err(mlua::Error::runtime("task exceeded its instruction budget between awaits"))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        );
-        // Replaced on every resume; dropped with the finished thread.
-        let result = thread.resume::<mlua::MultiValue>(args);
+        // Per-resume instruction allowance (budget::Budget::Task) + cancel.
+        let result = crate::budget::Scope::new(crate::budget::Budget::Task)
+            .cancel(&token)
+            .run(lua, || thread.resume::<mlua::MultiValue>(args))
+            .0;
         globals.set("__rness_callback_owner", prev_owner)?;
         globals.set("__rness_callback_depth", prev_depth)?;
         let finished = |lua: &Lua| -> mlua::Result<()> {

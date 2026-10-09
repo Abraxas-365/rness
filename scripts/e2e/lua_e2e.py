@@ -7,11 +7,11 @@ Groups:
   smoke        default flavor boots, statusline renders, a turn completes, clean quit
   hook         §4 #1: runaway `prompt` notification hook mid-session -> what freezes
   statusline   §4 #1: runaway statusline provider at startup / after a reload
-  timer        runaway timer (30 s HOOK_TIMEOUT) -> statusline frozen for 30 s
+  timer        runaway timer (1 s budget) -> statusline stalls about 1 s
   reload       hot reload in the TUI: require cache, broken rewrite, plugin edit applied
 tmux: rness-e2e-wp3-*; tmp: $TMPDIR/rness-e2e-wp3-*; fake provider only; ports 8730-8739.
-Prints PASS/FAIL/SKIP (a FAIL on a check named "BUG ..." is a confirmed bug) and
-JSON probe lines; exit code = failures.
+Prints PASS/FAIL/SKIP and JSON probe lines; exit code = failures. These checks
+pin the fixed behaviour of plan 04 (Lua execution budgets, B3-1..B3-7).
 """
 import argparse
 import json
@@ -123,7 +123,7 @@ def group_hook(c, keep):
                 turn is not None, tm.capture()[-400:])
         time.sleep(2)
         idle = IDLE.search(tm.capture())
-        c.check("BUG hook: statusline returns to idle after the turn (VM wedged => stale)",
+        c.check("hook: statusline returns to idle after the turn",
                 idle is not None, status_row(tm.capture()))
         rows = []
         for _ in range(4):
@@ -132,7 +132,7 @@ def group_hook(c, keep):
         probe("hook_statusline_rows", rows=rows)
         cpu = cpu_percent(r.pid)
         probe("hook_cpu_percent", value=cpu)
-        c.check("BUG hook: rness not pinned at ~100% CPU by the runaway handler",
+        c.check("hook: rness not pinned at ~100% CPU by the runaway handler",
                 cpu is not None and cpu < 80, f"cpu={cpu}")
         # Input still echoes? (TUI thread independent of the VM)
         tm.type("typed-while-wedged")
@@ -157,16 +157,16 @@ def group_hook(c, keep):
               seconds=round(time.monotonic() - t, 2))
         c.check("hook: a later turn completes while the VM is wedged (no Lua hooks on the turn path)", second,
                 tm.capture()[-500:])
-        c.check("BUG hook: statusline shows the later turn as busy (VM wedged => frozen at 'idle')", busy_seen,
+        c.check("hook: statusline shows the later turn as busy", busy_seen,
                 status_row(tm.capture()))
-        # A Lua slash command needs the VM.
+        # A Lua slash command needs the VM. "Command running" is only the
+        # admission ack; /project then prints the work dir.
         tm.say("/project")
         time.sleep(5)
         cap = tm.capture(history=60)
         probe("hook_lua_command_tail", tail=cap.strip()[-200:])
-        stuck = "Command running" in cap
-        c.check("BUG hook: Lua slash command (/project) completes while the VM is wedged",
-                not stuck and "/project" not in cap.strip().splitlines()[-3:], cap[-300:])
+        stuck = "Command running" in cap and str(r.base.name) not in cap.rsplit("Command running", 1)[-1]
+        c.check("hook: Lua slash command (/project) completes after a runaway hook", not stuck, cap[-300:])
         if stuck:
             tm.keys("C-c")
             time.sleep(1)
@@ -202,7 +202,7 @@ def group_statusline(c, keep):
         drawn = bool(cap.strip()) and ("fake" in cap or "idle" in cap or "›" in cap or ">" in cap)
         probe("statusline_startup_drawn_after_12s", drawn=drawn, cpu=cpu_percent(r.pid),
               tail=cap.strip()[-120:])
-        c.check("BUG statusline: runaway statusline at startup still lets the TUI draw", drawn, cap[-300:])
+        c.check("statusline: runaway statusline at startup still lets the TUI draw", drawn, cap[-300:])
         if alive(r.pid):
             t = time.monotonic()
             tm.keys("C-c")
@@ -210,7 +210,7 @@ def group_statusline(c, keep):
             gone = wait_until(lambda: not alive(r.pid), 5)
             probe("statusline_startup_ctrl_c_exit", exited=bool(gone),
                   seconds=round(time.monotonic() - t, 2) if gone else None)
-            c.check("BUG statusline: Ctrl-C/Ctrl-D exits a startup-wedged rness", gone)
+            c.check("statusline: Ctrl-C/Ctrl-D exits a startup-wedged rness", gone)
     # (2) runaway begins mid-session (flag file).
     with with_rness(wp=WP, mode="none", tag="status-later", keep=keep) as r:
         flag = r.base / "SPIN"
@@ -222,7 +222,7 @@ def group_statusline(c, keep):
         time.sleep(2)
         tm.say("hello after statusline wedge")
         turn = tm.wait_for(PARTIAL, 25)
-        c.check("BUG statusline: turn completes after statusline provider wedged the VM",
+        c.check("statusline: turn completes after statusline provider wedged the VM",
                 turn is not None, tm.capture()[-400:])
         tm.type("still-typing")
         c.check("statusline: input still echoes", tm.wait_for("still-typing", 5) is not None)
@@ -268,8 +268,8 @@ def group_timer(c, keep):
         if frozen_since is not None:
             longest = max(longest, time.monotonic() - frozen_since)
         probe("timer_statusline_longest_freeze_s", value=round(longest, 1), samples=seen[-6:])
-        c.check("timer: statusline resumes after the 30 s timer deadline", longest < 40, f"longest={longest}")
-        c.check("B3-7 timer: statusline freeze under 5 s", longest < 5, f"froze {longest:.1f}s")
+        c.check("timer: statusline resumes after the runaway timer", longest < 40, f"longest={longest}")
+        c.check("timer: statusline freeze under 5 s (B3-7)", longest < 5, f"froze {longest:.1f}s")
         quit_tui(tm, r, c, "timer")
 
 
@@ -317,19 +317,20 @@ def group_reload(c, keep):
               in_log=bool(re.search(r"(?i)wp3reload|reload", log)))
         c.check("reload: broken rewrite is reported to the user (pane or log)",
                 re.search(r"(?i)reload|error|syntax|wp3reload", cap + log), log[-300:])
-        # runaway rewrite: hot reload of `while true do end` (B3-3)
+        # runaway rewrite: hot reload of `while true do end` (B3-3). The 5 s load
+        # budget stops it; turns submitted meanwhile are rejected as busy.
         plugin.write_text("while true do end")
-        time.sleep(3)
+        time.sleep(8)
         tm.say("turn after runaway reload")
         turn = tm.wait_for(PARTIAL, 20)
         cpu = cpu_percent(r.pid)
         probe("reload_runaway", turn_completed=turn is not None, cpu=cpu, status=status_row(tm.capture()))
         c.check("reload: turn still completes after a runaway hot reload", turn is not None, tm.capture()[-300:])
-        c.check("BUG reload: a runaway plugin chunk on hot reload does not pin a core forever",
+        c.check("reload: a runaway plugin chunk on hot reload does not pin a core forever",
                 cpu is not None and cpu < 80, f"cpu={cpu}")
         plugin.write_text(RELOAD_PLUGIN % "d")
         time.sleep(3)
-        c.check("BUG reload: fixing the runaway plugin file recovers the session",
+        c.check("reload: fixing the runaway plugin file recovers the session",
                 "WP3-HV-one-d" in tm.capture(), status_row(tm.capture()))
         quit_tui(tm, r, c, "reload")
 

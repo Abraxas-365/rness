@@ -164,6 +164,37 @@ async fn broken_reload_keeps_hooks_statusline_and_tools() {
     assert_eq!(tool(&host, "hits").await, "3");
 }
 
+/// A reloaded chunk that never finishes (even one hiding the loop behind
+/// pcall) is stopped by the load budget; the previous set stays live and a
+/// fixed file reloads normally.
+#[tokio::test(flavor = "multi_thread")]
+async fn reload_to_runaway_chunk_keeps_previous_set_and_recovers() {
+    let host = LuaHost::spawn().unwrap();
+    let good = "rness.ui.statusline(function() return 'good' end)";
+    host.reload(vec![src("p", good)]).await.unwrap();
+    let t = std::time::Instant::now();
+    let r = host
+        .reload(vec![src(
+            "p",
+            "while true do pcall(function() while true do end end) end",
+        )])
+        .await;
+    assert!(r.is_err() || matches!(&r, Ok(e) if !e.is_empty()), "{r:?}");
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(15),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(host.statusline().await.as_deref(), Some("good"));
+    host.reload(vec![src(
+        "p",
+        "rness.ui.statusline(function() return 'fixed' end)",
+    )])
+    .await
+    .unwrap();
+    assert_eq!(host.statusline().await.as_deref(), Some("fixed"));
+}
+
 /// Reloading N times must not duplicate hook handlers or timers.
 #[tokio::test(flavor = "multi_thread")]
 async fn repeated_reload_does_not_duplicate_hooks_or_timers() {

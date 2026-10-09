@@ -49,7 +49,7 @@ Stops a timer. This is idempotent: cancelling an unknown, finished or already ca
 ## Execution model
 
 - Deadlines are tracked on a background `lua-timer` thread. Callbacks always run on the Lua host thread, between other plugin work. They never run concurrently with hooks, tools or other callbacks.
-- A slow callback delays all other Lua work, so keep callbacks short. One that runs longer than 30 seconds of Lua execution is aborted with `timer callback timed out`. The limit counts Lua instructions. It does not bound blocking native calls such as `rness.process`, or coroutines started inside the callback.
+- A slow callback delays all other Lua work, so keep callbacks short. One that runs longer than 1 second is stopped with `timer callback exceeded its 1000 ms time budget`; a timer whose callback overruns 3 times in a row is cancelled. `pcall` cannot catch the budget error, and blocking calls such as `rness.process.run` are clamped to the time left. See [execution budgets](budgets.md).
 - Callbacks are synchronous and cannot yield. APIs that need to yield, such as `rness.llm.complete`, fail inside a timer callback. Start a [background task](task.md) with `rness.task.spawn` for async work, or use `rness.session.send`/`steer` to hand work to a model turn.
 - Timers are process-local and in memory only. They do not survive a restart. In headless `-p` mode they stop when the process exits. Persist your own state (for example, a JSON file) if work must survive restarts.
 

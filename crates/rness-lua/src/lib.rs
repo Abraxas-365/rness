@@ -15,6 +15,7 @@
 //! implementation is not.
 
 pub mod api;
+pub(crate) mod budget;
 pub mod hooks_json;
 pub(crate) mod json_guard;
 pub mod loader;

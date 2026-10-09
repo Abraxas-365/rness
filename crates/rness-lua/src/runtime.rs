@@ -152,7 +152,9 @@ impl LuaRuntime {
         &mut self,
         path: &std::path::Path,
     ) -> Result<crate::api::config::StartupConfig, String> {
-        let config = crate::api::config::evaluate(&self.lua, path).map_err(|e| e.to_string())?;
+        let (config, _) = crate::budget::Scope::new(crate::budget::Budget::Startup)
+            .run(&self.lua, || crate::api::config::evaluate(&self.lua, path));
+        let config = config.map_err(|e| e.to_string())?;
         self.drain_registrations(None).map_err(|e| e.to_string())?;
         let capture = || -> mlua::Result<()> {
             let ui: Table = self.lua.globals().get::<Table>("rness")?.get("ui")?;
@@ -267,6 +269,12 @@ impl LuaRuntime {
 
     pub fn new() -> Result<Self, LuaError> {
         let lua = Lua::new();
+        // B3-11: a runaway plugin allocation fails with a memory error
+        // instead of taking the whole process down. Plugin state is
+        // normally a few MiB; this leaves two orders of magnitude.
+        lua.set_memory_limit(VM_MEMORY_LIMIT)?;
+        // First: every thread created from here on inherits the budget hook.
+        crate::budget::install(&lua)?;
         lua.set_app_data(HookCounts::default());
         install_api(&lua)?;
         Ok(Self {
@@ -393,7 +401,10 @@ impl LuaRuntime {
             .globals()
             .set("__rness_loading_hooks", hook_cleanup.clone())?;
         self.lua.globals().set("__rness_loading_plugin", name)?;
-        let execution = self.lua.load(source).set_name(format!("@{name}")).exec();
+        let (execution, _) = crate::budget::Scope::new(crate::budget::Budget::Load)
+            .run(&self.lua, || {
+                self.lua.load(source).set_name(format!("@{name}")).exec()
+            });
         self.lua
             .globals()
             .set("__rness_loading_hooks", LuaValue::Nil)?;
@@ -920,7 +931,8 @@ impl LuaRuntime {
                 context.set("app", app)?;
             }
             let run: Function = self.lua.registry_value(key)?;
-            let result = run.call::<()>(context);
+            let (result, _) = crate::budget::Scope::new(crate::budget::Budget::Action)
+                .run(&self.lua, || run.call::<()>(context));
             active.store(false, std::sync::atomic::Ordering::Relaxed);
             result?;
             let result = operations.lock().unwrap().clone();
@@ -1020,21 +1032,15 @@ impl LuaRuntime {
             globals.set("__rness_callback_depth", command.depth.clone())?;
             self.lua.set_app_data(permit);
             self.lua.set_app_data(cancel.clone());
-            let token = cancel.clone();
-            command.thread.set_hook(
-                mlua::HookTriggers::new().every_nth_instruction(1000),
-                move |_, _| {
-                    if token.is_cancelled() {
-                        Err(mlua::Error::runtime("command cancelled"))
-                    } else {
-                        Ok(mlua::VmState::Continue)
-                    }
-                },
-            );
             let mut result = if cancel.is_cancelled() {
                 Err(mlua::Error::runtime("command cancelled"))
             } else {
-                command.thread.resume::<mlua::MultiValue>(args)
+                crate::budget::Scope::new(crate::budget::Budget::Command)
+                    .cancel(cancel)
+                    .run(&self.lua, || {
+                        command.thread.resume::<mlua::MultiValue>(args)
+                    })
+                    .0
             };
             // Decide cancellation while command context is installed so every
             // cancelled exit goes through coroutine cleanup below. Cancellation
@@ -1053,27 +1059,13 @@ impl LuaRuntime {
                 // Cancellation closes the coroutine rather than running arbitrary
                 // post-yield command code (including pcall-based cleanup).
                 // Close abandoned Lua 5.4 frames while their command context is
-                // still installed. This cooperative instruction budget stops ordinary
-                // runaway closers; trusted Lua can catch hook errors or block in
-                // native calls, so it is not a hard execution-time sandbox.
-                let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                command.thread.set_hook(
-                    mlua::HookTriggers::new().every_nth_instruction(1000),
-                    move |_, _| {
-                        if budget.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 10 {
-                            Err(mlua::Error::runtime(
-                                "command cleanup instruction limit exceeded",
-                            ))
-                        } else {
-                            Ok(mlua::VmState::Continue)
-                        }
-                    },
-                );
+                // still installed, under a small instruction allowance.
                 if let Ok(noop) = self.lua.create_function(|_, ()| Ok(())) {
-                    let _ = command.thread.reset(noop);
+                    let _ = crate::budget::Scope::new(crate::budget::Budget::Cleanup)
+                        .run(&self.lua, || command.thread.reset(noop))
+                        .0;
                 }
             }
-            self.lua.remove_hook();
             self.lua
                 .remove_app_data::<tokio_util::sync::CancellationToken>();
             self.lua
@@ -1269,6 +1261,29 @@ impl LuaRuntime {
             .collect())
     }
 
+    /// Run one app callback (`view` / `on_key`) under the app budget. An app
+    /// whose callbacks overrun [`crate::budget::STRIKES`] times in a row is
+    /// disabled until its plugin reloads.
+    fn app_call<R>(&self, name: &str, f: impl FnOnce() -> mlua::Result<R>) -> Result<R, LuaError> {
+        use crate::budget::{self, Budget, Scope};
+        let key = format!("app:{name}");
+        if budget::is_disabled(&self.lua, &key) {
+            return Err(mlua::Error::runtime(format!(
+                "app '{name}' is disabled: it exceeded its time budget repeatedly"
+            ))
+            .into());
+        }
+        let (result, expiry) = Scope::new(Budget::App).run(&self.lua, f);
+        if budget::strike(&self.lua, || key, expiry.as_ref()) {
+            budget::notice(
+                &self.lua,
+                None,
+                budget::disabled_text(&format!("app '{name}'"), Budget::App),
+            );
+        }
+        Ok(result?)
+    }
+
     /// Evaluate an app's `view(ctx)`. Each line is a string, a span
     /// `{text=, style=}`, or a row: an array of strings/spans with optional
     /// `right` (array of strings/spans, right-aligned) and `style` (row fill).
@@ -1282,7 +1297,7 @@ impl LuaRuntime {
             return Err(LuaError::UnknownApp(name.to_string()));
         };
         let f: Function = self.lua.registry_value(view)?;
-        let lines: Table = f.call(self.lua.to_value(ctx)?)?;
+        let lines: Table = self.app_call(name, || f.call(self.lua.to_value(ctx)?))?;
         let style = |value: LuaValue| -> mlua::Result<serde_json::Value> {
             match value {
                 LuaValue::Nil => Ok(serde_json::Value::Null),
@@ -1361,7 +1376,7 @@ impl LuaRuntime {
             return Ok(AppKeyOutcome::Pass);
         };
         let f: Function = self.lua.registry_value(on_key)?;
-        let out: LuaValue = f.call((key, self.lua.to_value(ctx)?))?;
+        let out: LuaValue = self.app_call(name, || f.call((key, self.lua.to_value(ctx)?)))?;
         Ok(match out {
             LuaValue::Nil | LuaValue::Boolean(false) => AppKeyOutcome::Pass,
             LuaValue::Boolean(true) => AppKeyOutcome::Consumed,
@@ -1412,20 +1427,10 @@ impl LuaRuntime {
         if cancel.is_cancelled() {
             return Err("tool call cancelled".into());
         }
-        let token = cancel.clone();
-        command.thread.set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(1000),
-            move |_, _| {
-                if token.is_cancelled() {
-                    Err(mlua::Error::runtime("tool call cancelled"))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        );
         self.lua.set_app_data(cancel.clone());
-        let values = self.resume_thread(command, args);
-        self.lua.remove_hook();
+        let (values, _) = crate::budget::Scope::new(crate::budget::Budget::Tool)
+            .cancel(cancel)
+            .run(&self.lua, || self.resume_thread(command, args));
         self.lua
             .remove_app_data::<tokio_util::sync::CancellationToken>();
         let values = values?;
@@ -1647,19 +1652,6 @@ impl LuaRuntime {
         cancel: &tokio_util::sync::CancellationToken,
         deadline: std::time::Instant,
     ) -> Result<ExecuteStep, String> {
-        let token = cancel.clone();
-        exec.thread.thread.set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(1000),
-            move |_, _| {
-                if token.is_cancelled() || std::time::Instant::now() >= deadline {
-                    Err(mlua::Error::runtime(
-                        "tool_execute hook cancelled or timed out",
-                    ))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        );
         let result = if cancel.is_cancelled() {
             Err("tool_execute hook cancelled".to_string())
         } else {
@@ -1668,10 +1660,15 @@ impl LuaRuntime {
                 .transpose()
                 .map_err(|e| e.to_string())
                 .and_then(|value| {
-                    self.resume_thread(&mut exec.thread, value.unwrap_or(LuaValue::Nil))
+                    crate::budget::Scope::new(crate::budget::Budget::Execute)
+                        .cancel(cancel)
+                        .deadline(deadline)
+                        .run(&self.lua, || {
+                            self.resume_thread(&mut exec.thread, value.unwrap_or(LuaValue::Nil))
+                        })
+                        .0
                 })
         };
-        self.lua.remove_hook();
         let values = result?;
         if exec.thread.thread.status() == mlua::ThreadStatus::Resumable {
             return match values.front() {
@@ -1718,7 +1715,12 @@ impl LuaRuntime {
     /// Handlers live in the Lua-side `__rness_hooks` table so that
     /// `rness.events.emit` dispatches to exactly the same set.
     pub fn fire_hook(&self, event: &str, payload: &serde_json::Value) -> Vec<String> {
+        use crate::budget::{self, Budget, Scope};
         let mut errors = Vec::new();
+        let session = payload
+            .get("session")
+            .and_then(|s| s.as_str())
+            .map(str::to_owned);
         let run = || -> Result<Vec<String>, mlua::Error> {
             let hooks: Table = self.lua.globals().get("__rness_hooks")?;
             let Some(handlers) = hooks.get::<Option<Table>>(event)? else {
@@ -1727,8 +1729,31 @@ impl LuaRuntime {
             let payload = self.lua.json_to_lua(payload)?;
             let mut errs = Vec::new();
             for f in handlers.sequence_values::<Function>().collect::<Vec<_>>() {
-                if let Err(e) = f.and_then(|f| f.call::<()>(&payload)) {
+                let f = match f {
+                    Ok(f) => f,
+                    Err(e) => {
+                        errs.push(user_message(&e));
+                        continue;
+                    }
+                };
+                // Each handler gets its own budget; a slow one cannot
+                // starve the rest, and repeat offenders are unsubscribed.
+                let (result, expiry) =
+                    Scope::new(Budget::Hook).run(&self.lua, || f.call::<()>(&payload));
+                if let Err(e) = result {
                     errs.push(user_message(&e));
+                }
+                if budget::strike(
+                    &self.lua,
+                    || format!("hook:{:p}", f.to_pointer()),
+                    expiry.as_ref(),
+                ) {
+                    disable_hook(&self.lua, &f)?;
+                    budget::notice(
+                        &self.lua,
+                        session.clone(),
+                        budget::disabled_text(&format!("'{event}' hook handler"), Budget::Hook),
+                    );
                 }
             }
             Ok(errs)
@@ -1747,8 +1772,21 @@ impl LuaRuntime {
     }
 
     /// Run one due timer callback. Errors are returned, not propagated.
+    /// A callback that overruns its budget [`crate::budget::STRIKES`] times
+    /// in a row is cancelled.
     pub fn fire_timer(&self, id: u64) -> Result<(), String> {
-        crate::api::timer::fire(&self.lua, id).map_err(|e| user_message(&e))
+        use crate::budget::{self, Budget, Scope};
+        let (result, expiry) =
+            Scope::new(Budget::Timer).run(&self.lua, || crate::api::timer::fire(&self.lua, id));
+        if budget::strike(&self.lua, || format!("timer:{id}"), expiry.as_ref()) {
+            let _ = crate::api::timer::cancel(&self.lua, id);
+            budget::notice(
+                &self.lua,
+                None,
+                budget::disabled_text(&format!("timer {id}"), Budget::Timer),
+            );
+        }
+        result.map_err(|e| user_message(&e))
     }
 
     /// Route `rness.task` wake-ups to `sink` (the host forwards them back
@@ -1805,17 +1843,22 @@ impl LuaRuntime {
     }
 
     pub fn status_view(&self, context: serde_json::Value) -> Option<serde_json::Value> {
-        let result = (|| -> mlua::Result<serde_json::Value> {
-            let Some(key) = &self.statusline else {
-                return Ok(serde_json::Value::Null);
-            };
-            let f: Function = self.lua.registry_value(key)?;
-            let value: LuaValue = f.call(self.lua.to_value(&context)?)?;
-            self.lua.from_value_guarded(value)
-        })();
+        use crate::budget::{self, Budget, Scope};
+        let key = self.statusline.as_ref()?;
+        if budget::is_disabled(&self.lua, "statusline") {
+            return None;
+        }
+        let (result, expiry) = Scope::new(Budget::Statusline).run(&self.lua, || {
+            (|| -> mlua::Result<serde_json::Value> {
+                let f: Function = self.lua.registry_value(key)?;
+                let value: LuaValue = f.call(self.lua.to_value(&context)?)?;
+                self.lua.from_value_guarded(value)
+            })()
+        });
+        self.statusline_strike(expiry);
         match result {
             Ok(serde_json::Value::Null) => None,
-            Ok(value) => Some(value),
+            Ok(value) => bound_status_view(value),
             Err(error) => {
                 tracing::warn!("lua statusline failed: {}", user_message(&error));
                 None
@@ -1823,12 +1866,30 @@ impl LuaRuntime {
         }
     }
 
+    fn statusline_strike(&self, expiry: Option<crate::budget::Expiry>) {
+        use crate::budget::{self, Budget};
+        if budget::strike(&self.lua, || "statusline".into(), expiry.as_ref()) {
+            budget::notice(
+                &self.lua,
+                None,
+                budget::disabled_text("statusline provider", Budget::Statusline),
+            );
+        }
+    }
+
     /// Evaluate the registered statusline provider, if any.
     pub fn statusline(&self) -> Option<String> {
+        use crate::budget::{self, Budget, Scope};
         let key = self.statusline.as_ref()?;
+        if budget::is_disabled(&self.lua, "statusline") {
+            return None;
+        }
         let f: Function = self.lua.registry_value(key).ok()?;
-        match f.call::<Option<String>>(()) {
-            Ok(s) => s,
+        let (result, expiry) =
+            Scope::new(Budget::Statusline).run(&self.lua, || f.call::<Option<String>>(()));
+        self.statusline_strike(expiry);
+        match result {
+            Ok(s) => s.map(|s| truncate_bytes(s, STATUS_VIEW_MAX)),
             Err(e) => {
                 tracing::warn!("lua statusline failed: {}", user_message(&e));
                 None
@@ -1895,21 +1956,8 @@ impl LuaRuntime {
             .lua
             .set_memory_limit(self.lua.used_memory().saturating_add(16 * 1024 * 1024))
             .ok()?;
-        let started = std::time::Instant::now();
-        self.lua.set_hook(
-            mlua::HookTriggers::new().every_nth_instruction(10000),
-            move |_, _| {
-                if started.elapsed() > std::time::Duration::from_millis(100) {
-                    Err(mlua::Error::runtime(
-                        "tool card instruction deadline exceeded",
-                    ))
-                } else {
-                    Ok(mlua::VmState::Continue)
-                }
-            },
-        );
-        let result = f.call(call);
-        self.lua.remove_hook();
+        let (result, _) =
+            crate::budget::Scope::new(crate::budget::Budget::Card).run(&self.lua, || f.call(call));
         let _ = self.lua.set_memory_limit(previous_limit);
         let lines: LuaValue = match result {
             Ok(v) => v,
@@ -2406,6 +2454,42 @@ impl HookFilter {
 /// Shared by `rness.hook.on` and `rness.hook.guard`. Handlers are stored
 /// as `wrapper(ev, next)` in `__rness_hooks[event]`; a filtered-out
 /// wrapper is transparent (delegates to `next`, or returns nil).
+/// Drop unsubscribed wrappers from one event's handler list, in order.
+fn compact_hooks(lua: &Lua, list: &Table) -> mlua::Result<()> {
+    let meta: Table = lua.globals().get("__rness_hook_meta")?;
+    let mut live = Vec::new();
+    for wrapper in list.sequence_values::<Function>() {
+        let wrapper = wrapper?;
+        let alive = match meta.raw_get::<Option<Table>>(&wrapper)? {
+            Some(entry) => entry
+                .raw_get::<Table>("cell")?
+                .raw_get::<Option<Function>>(1)?
+                .is_some(),
+            None => true,
+        };
+        if alive {
+            live.push(wrapper);
+        }
+    }
+    let len = list.raw_len();
+    for (index, wrapper) in live.iter().enumerate() {
+        list.raw_set(index + 1, wrapper)?;
+    }
+    for index in (live.len() + 1..=len).rev() {
+        list.raw_set(index, LuaValue::Nil)?;
+    }
+    Ok(())
+}
+
+/// Unsubscribe the handler behind `wrapper` (an entry of `__rness_hooks`).
+pub(crate) fn disable_hook(lua: &Lua, wrapper: &Function) -> mlua::Result<()> {
+    let meta: Table = lua.globals().get("__rness_hook_meta")?;
+    if let Some(entry) = meta.raw_get::<Option<Table>>(wrapper)? {
+        entry.raw_get::<Function>("unsubscribe")?.call::<bool>(())?;
+    }
+    Ok(())
+}
+
 fn register_hook(
     lua: &Lua,
     event: String,
@@ -2452,23 +2536,34 @@ fn register_hook(
         .call((cell.clone(), accepts))?;
     handlers.push(wrapper.clone())?;
     HookCounts::adjust(lua, &event, true);
+    // Unsubscribe marks the cell dead and compacts the list only once half
+    // of it is dead: unloading K handlers is O(K) overall, not O(K²).
+    // It must not capture `wrapper` (see __rness_hook_meta below).
+    let list = handlers.clone();
+    let dead_cell = cell.clone();
     let unsubscribe = lua.create_function(move |lua, ()| {
-        let removed = cell.raw_get::<Option<Function>>(1)?.is_some();
+        let removed = dead_cell.raw_get::<Option<Function>>(1)?.is_some();
         if removed {
-            cell.raw_set(1, LuaValue::Nil)?;
+            dead_cell.raw_set(1, LuaValue::Nil)?;
             HookCounts::adjust(lua, &event, false);
-            for index in 1..=handlers.raw_len() {
-                if handlers.raw_get::<Function>(index)? == wrapper {
-                    for next in index + 1..=handlers.raw_len() {
-                        handlers.raw_set(next - 1, handlers.raw_get::<Function>(next)?)?;
-                    }
-                    handlers.raw_set(handlers.raw_len(), LuaValue::Nil)?;
-                    break;
-                }
+            let dead: Table = lua.globals().get("__rness_hook_dead")?;
+            let count = dead.raw_get::<Option<usize>>(&list)?.unwrap_or(0) + 1;
+            if count * 2 >= list.raw_len() {
+                compact_hooks(lua, &list)?;
+                dead.raw_set(&list, LuaValue::Nil)?;
+            } else {
+                dead.raw_set(&list, count)?;
             }
         }
         Ok(removed)
     })?;
+    // wrapper → {cell, unsubscribe}; weak keys, so an entry lives exactly
+    // as long as its wrapper is still listed somewhere.
+    let meta: Table = lua.globals().get("__rness_hook_meta")?;
+    let entry = lua.create_table()?;
+    entry.raw_set("cell", cell)?;
+    entry.raw_set("unsubscribe", unsubscribe.clone())?;
+    meta.raw_set(wrapper, entry)?;
     let loading: Option<Table> = lua.globals().get("__rness_loading_hooks")?;
     let owner: Option<Table> = lua.globals().get("__rness_callback_owner")?;
     let owner = owner.or(lua.globals().get::<Option<Table>>("__rness_load_owner")?);
@@ -2662,6 +2757,14 @@ fn install_api(lua: &Lua) -> Result<(), LuaError> {
     // event name → array of handlers. Lua-side so rness.events.emit and
     // host-fired hooks dispatch to the same table.
     lua.globals().set("__rness_hooks", lua.create_table()?)?;
+    // Hook bookkeeping (see register_hook): weak-keyed so dropped wrappers
+    // and handler lists are collected.
+    for name in ["__rness_hook_meta", "__rness_hook_dead"] {
+        let weak: Table = lua
+            .load("return setmetatable({}, { __mode = 'k' })")
+            .eval()?;
+        lua.globals().set(name, weak)?;
+    }
 
     // Command hook runner for hooks.json bridge. Runs a shell command
     // synchronously (the Lua actor is a plain OS thread), writes the
@@ -3708,6 +3811,60 @@ fn lua_display(lua: &Lua, v: LuaValue) -> Result<String, LuaError> {
         }
         other => format!("{other:?}"),
     })
+}
+
+/// Heap cap of the plugin VM (see `LuaRuntime::new`).
+const VM_MEMORY_LIMIT: usize = 384 * 1024 * 1024;
+
+/// The statusline is one terminal row: cap what a provider can hand the
+/// renderer (B3-9).
+const STATUS_VIEW_MAX: usize = 4 * 1024;
+
+fn truncate_bytes(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+/// Bound a status view: strings to [`STATUS_VIEW_MAX`] bytes, arrays and
+/// objects to 64 entries, nesting to 4 levels; a view still larger than
+/// 4 × the cap is dropped.
+fn bound_status_view(value: serde_json::Value) -> Option<serde_json::Value> {
+    fn walk(value: serde_json::Value, depth: usize) -> serde_json::Value {
+        use serde_json::Value;
+        match value {
+            Value::String(s) => Value::String(truncate_bytes(s, STATUS_VIEW_MAX)),
+            Value::Array(items) if depth < 4 => Value::Array(
+                items
+                    .into_iter()
+                    .take(64)
+                    .map(|v| walk(v, depth + 1))
+                    .collect(),
+            ),
+            Value::Object(map) if depth < 4 => Value::Object(
+                map.into_iter()
+                    .take(64)
+                    .map(|(k, v)| (truncate_bytes(k, 256), walk(v, depth + 1)))
+                    .collect(),
+            ),
+            Value::Array(_) | Value::Object(_) => Value::Null,
+            other => other,
+        }
+    }
+    let value = walk(value, 0);
+    let len = serde_json::to_string(&value)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX);
+    if len > 4 * STATUS_VIEW_MAX {
+        tracing::warn!("lua statusline view dropped: {len} bytes");
+        return None;
+    }
+    Some(value)
 }
 
 /// A Lua error's message without the Rust wrapper noise.

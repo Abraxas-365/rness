@@ -29,6 +29,8 @@ fn do_request(lua: &Lua, spec: Table) -> Result<Table, mlua::Error> {
         .app_data_ref::<CancellationToken>()
         .map(|token| token.clone())
         .unwrap_or_default();
+    // A blocking call must not outlive the budget of the code calling it.
+    let (deadline, tokens) = crate::budget::limits(lua);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -37,6 +39,9 @@ fn do_request(lua: &Lua, spec: Table) -> Result<Table, mlua::Error> {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(mlua::Error::runtime("command cancelled")),
+            timed_out = crate::budget::expired(deadline, tokens) => Err(mlua::Error::runtime(
+                if timed_out { "http request exceeded the caller's time budget" } else { "http request cancelled" },
+            )),
             result = async move {
                 let response = request.send().await.map_err(mlua::Error::external)?;
                 let status = response.status().as_u16();

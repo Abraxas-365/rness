@@ -11,7 +11,7 @@ impl rness_kernel::presentation::TextProvider for LuaHost {
     async fn status(&self, context: serde_json::Value) -> Option<serde_json::Value> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx.send(Cmd::StatusView { context, reply }).ok()?;
-        rx.await.ok().flatten()
+        ui_wait(rx).await.flatten()
     }
 
     async fn text(&self) -> Option<String> {
@@ -841,6 +841,22 @@ use std::sync::mpsc;
 use crate::json_guard::LuaJsonExt;
 use crate::runtime::{AppKeyOutcome, LuaAppSpec, LuaRuntime, LuaToolSpec};
 
+/// Show queued budget notices ("handler disabled") to the user: in the
+/// notice's own session, else the last session the actor saw. Without a
+/// mounted engine they stay in the log only (`budget::notice` logged them).
+fn deliver_notices(rt: &LuaRuntime, binding: Option<&SessionBinding>, last: &Option<String>) {
+    let notices = crate::budget::take_notices(rt.lua());
+    let Some(binding) = binding else { return };
+    for (session, text) in notices {
+        let Some(session) = session.or_else(|| last.clone()) else {
+            continue;
+        };
+        let _ = binding
+            .sessions
+            .notify(&rness_protocol::events::SessionId::from(session), &text);
+    }
+}
+
 /// The engine services `rness.session` bridges to. Kept by the actor so
 /// every fresh VM (hot reload) gets the same injection.
 #[derive(Clone)]
@@ -1098,12 +1114,12 @@ impl rness_engine::interaction::Command for LuaCommand {
         }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
+        let input_cancel = input.cancel.clone();
         self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Complete {
             name: self.name.clone(), context: serde_json::json!({"session":input.session,"workspace":workspace,"raw_input":input.raw_input}), cancel: input.cancel, reply,
         }).map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
-        receive
-            .recv()
-            .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
+        receive_cancellable(&receive, &input_cancel)
+            .map_err(ServiceError::InvalidConfig)?
             .map_err(ServiceError::InvalidConfig)
     }
     fn execute(
@@ -1119,13 +1135,52 @@ impl rness_engine::interaction::Command for LuaCommand {
         }
         let workspace = service.store().workspace(input.session)?;
         let (reply, receive) = mpsc::channel();
+        let input_cancel = input.cancel.clone();
         self.tx.upgrade().ok_or_else(|| ServiceError::InvalidConfig("Lua host unavailable".into()))?.send(Cmd::Command { name: self.name.clone(), context: serde_json::json!({"session":input.session,"raw_input":input.raw_input,"workspace":workspace}), permit: input.permit, cancel: input.cancel, reply })
             .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?;
-        receive
-            .recv()
-            .map_err(|_| ServiceError::InvalidConfig("Lua host unavailable".into()))?
+        receive_cancellable(&receive, &input_cancel)
+            .map_err(ServiceError::InvalidConfig)?
             .map_err(ServiceError::InvalidConfig)
     }
+}
+
+/// Wait for a VM reply on a plain worker thread without parking it forever:
+/// once `cancel` fires, the VM gets [`CANCEL_GRACE`] to notice (budget
+/// scopes stop Lua on cancel) before the caller gives up. A VM stuck in one
+/// long native call then no longer pins the worker; the queued request
+/// still sees the cancelled token when the VM reaches it.
+fn receive_cancellable<T>(
+    receive: &mpsc::Receiver<T>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<T, String> {
+    let mut cancelled_at = None;
+    loop {
+        match receive.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(value) => return Ok(value),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("Lua host unavailable".into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.is_cancelled() {
+                    let since = *cancelled_at.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= CANCEL_GRACE {
+                        return Err("command cancelled (Lua VM did not respond)".into());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How long a cancelled caller waits for the VM to acknowledge.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Startup gives up on init.lua after this (its Lua budget is 30 s).
+const STARTUP_WAIT: std::time::Duration = std::time::Duration::from_secs(45);
+/// Interactive UI waits (statusline, tool card, app view/key, action): the
+/// renderer falls back instead of freezing behind a busy VM.
+const UI_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Await a VM reply for a UI request, giving up after [`UI_WAIT`].
+async fn ui_wait<T>(rx: tokio::sync::oneshot::Receiver<T>) -> Option<T> {
+    tokio::time::timeout(UI_WAIT, rx).await.ok()?.ok()
 }
 
 fn sync_commands(
@@ -1372,17 +1427,18 @@ impl LuaHost {
                 let mut next_command_id = 0u64;
                 let mut pending_executes: std::collections::HashMap<u64, crate::runtime::ExecuteThread> = std::collections::HashMap::new();
                 let mut next_execute_id = 0u64;
+                // Last session seen in a hook payload: where budget notices
+                // without a session of their own are shown.
+                let mut last_session: Option<String> = None;
                 while let Ok(cmd) = rx.recv() {
+                    deliver_notices(&rt, session_binding.as_ref(), &last_session);
                     match cmd {
                         Cmd::ValidateBindings { reply } => { let _ = reply.send(rt.validate_bindings(false)); }
                         Cmd::Complete { name, context, cancel, reply } => {
-                            let token = cancel.clone();
                             rt.lua().set_app_data(cancel.clone());
-                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-                                if token.is_cancelled() { Err(mlua::Error::runtime("completion cancelled")) } else { Ok(mlua::VmState::Continue) }
+                            let (result, _) = crate::budget::Scope::new(crate::budget::Budget::Complete).cancel(&cancel).run(rt.lua(), || {
+                                if cancel.is_cancelled() { Err("completion cancelled".into()) } else { rt.complete_command_items(&name, context) }
                             });
-                            let result = if cancel.is_cancelled() { Err("completion cancelled".into()) } else { rt.complete_command_items(&name, context) };
-                            rt.lua().remove_hook();
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);
                         }
@@ -1500,17 +1556,13 @@ impl LuaHost {
                             if event == crate::runtime::CONTEXT_EVENT {
                                 add_workspace(session_binding.as_ref(), &mut payload);
                             }
-                            let token = cancel.clone();
-                            let deadline = std::time::Instant::now() + HOOK_TIMEOUT;
-                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-                                if token.is_cancelled() || std::time::Instant::now() >= deadline { Err(mlua::Error::runtime("hook cancelled or timed out")) } else { Ok(mlua::VmState::Continue) }
+                            let (result, _) = crate::budget::Scope::new(crate::budget::Budget::Intercept).cancel(&cancel).run(rt.lua(), || {
+                                if cancel.is_cancelled() || reply.is_closed() {
+                                    Err("hook cancelled".into())
+                                } else {
+                                    rt.intercept(&event, &payload, &default)
+                                }
                             });
-                            let result = if cancel.is_cancelled() || reply.is_closed() {
-                                Err("hook cancelled".into())
-                            } else {
-                                rt.intercept(&event, &payload, &default)
-                            };
-                            rt.lua().remove_hook();
                             let _ = reply.send(result.map_err(|e| format!("{event} hook: {e}")));
                         }
                         Cmd::ExecuteStart { mut payload, cancel, reply } => {
@@ -1543,20 +1595,14 @@ impl LuaHost {
                             pending_executes.remove(&id);
                         }
                         Cmd::WebTransform { operation, phase, value, context, cancel, reply } => {
-                            let token = cancel.clone();
-                            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                             rt.lua().set_app_data(cancel.clone());
-                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-                                if token.is_cancelled() || std::time::Instant::now() >= deadline { Err(mlua::Error::runtime("web hook cancelled or timed out")) } else { Ok(mlua::VmState::Continue) }
-                            });
-                            let result = (|| -> mlua::Result<serde_json::Value> {
+                            let (result, _) = crate::budget::Scope::new(crate::budget::Budget::Web).cancel(&cancel).run(rt.lua(), || (|| -> mlua::Result<serde_json::Value> {
                                 if cancel.is_cancelled() || reply.is_closed() { return Err(mlua::Error::runtime("web hook cancelled")); }
                                 let Some(callback) = rt.web_hook(&operation, &phase)? else { return Ok(value); };
                                 let returned: mlua::Value = callback.call((rt.lua().json_to_lua(&value)?, rt.lua().json_to_lua(&context)?))?;
                                 if !matches!(returned, mlua::Value::Table(_)) { return Err(mlua::Error::runtime("web hook must return a table")); }
                                 rt.lua().from_value_guarded(returned)
-                            })().map_err(|e| format!("web.{operation}.{phase}: {e}"));
-                            rt.lua().remove_hook();
+                            })().map_err(|e| format!("web.{operation}.{phase}: {e}")));
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);
                         }
@@ -1588,9 +1634,13 @@ impl LuaHost {
                             // Add delegation lineage for opts.agent scoping
                             // on any hook payload that carries a session field.
                             add_lineage(session_binding.as_ref(), &mut payload);
+                            if let Some(session) = payload.get("session").and_then(|s| s.as_str()) {
+                                if last_session.as_deref() != Some(session) { last_session = Some(session.to_owned()); }
+                            }
                             for err in rt.fire_hook(&event, &payload) {
                                 tracing::warn!(target: "lua", "hook '{event}' failed: {err}");
                             }
+                            deliver_notices(&rt, session_binding.as_ref(), &last_session);
                         }
                         Cmd::Task { wake } => {
                             if let Err(err) = rt.wake_task(wake) {
@@ -1598,12 +1648,7 @@ impl LuaHost {
                             }
                         }
                         Cmd::FireTimer { id } => {
-                            let deadline = std::time::Instant::now() + HOOK_TIMEOUT;
-                            rt.lua().set_hook(mlua::HookTriggers::new().every_nth_instruction(1000), move |_, _| {
-                                if std::time::Instant::now() >= deadline { Err(mlua::Error::runtime("timer callback timed out")) } else { Ok(mlua::VmState::Continue) }
-                            });
                             let result = rt.fire_timer(id);
-                            rt.lua().remove_hook();
                             if let Err(err) = result {
                                 tracing::warn!(target: "lua", "timer {id} failed: {err}");
                             }
@@ -1737,9 +1782,16 @@ impl LuaHost {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let (config, hook_counts) = ready_rx
-            .recv()
-            .map_err(|_| "lua vm thread died".to_string())??;
+        // init.lua runs under Budget::Startup; the extra margin covers one
+        // long native call (B3-6) so startup can never hang silently.
+        let (config, hook_counts) =
+            ready_rx.recv_timeout(STARTUP_WAIT).map_err(|e| match e {
+                mpsc::RecvTimeoutError::Timeout => format!(
+                    "init.lua did not finish within {} s",
+                    STARTUP_WAIT.as_secs()
+                ),
+                mpsc::RecvTimeoutError::Disconnected => "lua vm thread died".to_string(),
+            })??;
         Ok((
             Self {
                 tx,
@@ -1889,7 +1941,7 @@ impl LuaHost {
     pub async fn statusline(&self) -> Option<String> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.tx.send(Cmd::Statusline { reply }).ok()?;
-        rx.await.ok().flatten()
+        ui_wait(rx).await.flatten()
     }
 
     /// Render a finished tool call through the Lua card renderer.
@@ -1924,7 +1976,7 @@ impl LuaHost {
                 reply,
             })
             .ok()?;
-        rx.await.ok().flatten()
+        ui_wait(rx).await.flatten()
     }
 
     pub async fn action_specs(&self) -> Vec<crate::runtime::LuaActionSpec> {
@@ -2000,7 +2052,9 @@ impl LuaHost {
                 reply,
             })
             .map_err(|_| "Lua host stopped".to_owned())?;
-        rx.await.map_err(|_| "Lua host stopped".to_owned())?
+        ui_wait(rx)
+            .await
+            .ok_or("Lua host busy: action did not answer")?
     }
 
     pub async fn app_specs(&self) -> Vec<LuaAppSpec> {
@@ -2048,7 +2102,9 @@ impl LuaHost {
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        ui_wait(rx)
+            .await
+            .ok_or("lua vm busy: app callback did not answer")?
     }
 
     pub async fn app_key(
@@ -2067,7 +2123,9 @@ impl LuaHost {
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        ui_wait(rx)
+            .await
+            .ok_or("lua vm busy: app callback did not answer")?
     }
 
     /// Check activation/context on the VM thread immediately before calling Lua.
@@ -2086,7 +2144,9 @@ impl LuaHost {
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        ui_wait(rx)
+            .await
+            .ok_or("lua vm busy: app callback did not answer")?
     }
 
     /// A queued key must not run side effects after its activation expires.
@@ -2107,7 +2167,9 @@ impl LuaHost {
                 reply,
             })
             .map_err(|_| "lua vm gone")?;
-        rx.await.map_err(|_| "lua vm gone")?
+        ui_wait(rx)
+            .await
+            .ok_or("lua vm busy: app callback did not answer")?
     }
 
     /// Replace runtime registrations from `sources`, preserving startup state.
