@@ -7,6 +7,17 @@
 //! Output reads are incremental: `job_output` returns only what arrived
 //! since the previous read, and every response ends with a
 //! `[status: ...]` marker.
+//!
+//! Durability (persistent registries). Process crash / kill -9 loses
+//! nothing already appended: output goes straight to the open `.output`
+//! file (page cache), and recovery measures the file length. Against OS
+//! crash or power loss, a durable job's output is `sync_data`-ed at most
+//! once per [`OUTPUT_SYNC_INTERVAL`] while running and once at settle, and
+//! its settled and `delivered` records are fsynced (file and directory),
+//! because they drive exactly-once completion notices. Running records are
+//! written atomically (rename) but not fsynced: a lost start record only
+//! means an unknown job. Foreground `bash-output` captures never notify;
+//! they write one record at settle and are never fsynced.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,6 +32,26 @@ pub use retention::Retention;
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_INSPECT_BYTES: usize = 8 * 1024;
+/// Longest a durable running job's output stays unsynced (power loss only).
+const OUTPUT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(test)]
+thread_local! {
+    /// fsync calls made on this thread (tests assert durability costs).
+    static FSYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn counted<T>(result: std::io::Result<T>) -> std::io::Result<T> {
+    #[cfg(test)]
+    FSYNCS.with(|n| n.set(n.get() + 1));
+    result
+}
+
+/// A persistent job's open output file: one fd for the job's run, closed
+/// at settle. `synced` is when its data last reached stable storage.
+struct OutputFile {
+    file: std::fs::File,
+    synced: std::time::Instant,
+}
 
 pub(crate) fn retain_tail(output: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     if bytes.len() >= limit {
@@ -137,6 +168,11 @@ struct Job {
     state: Mutex<JobState>,
     /// Ephemeral compositions still spool full output to disk without JSON metadata.
     spool: Mutex<Option<std::fs::File>>,
+    /// Persistent jobs: the `.output` file, open while running.
+    out: Mutex<Option<OutputFile>>,
+    /// Whether settle fsyncs output and record (see module docs). False
+    /// for foreground captures, which never deliver a notice.
+    durable: bool,
     /// Requests cancellation; the drain task settles status when the
     /// process actually dies.
     cancel: tokio_util::sync::CancellationToken,
@@ -215,11 +251,14 @@ impl Job {
         true
     }
 
+    /// Atomically replace the record. Only settled records of durable jobs
+    /// (final status, `delivered`) are fsynced, with their directory.
     fn persist(&self, state: &JobState) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
         use std::io::Write;
+        let durable = self.durable && state.settled;
         let temporary = path.with_extension("tmp");
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -227,9 +266,14 @@ impl Job {
             .truncate(true)
             .open(&temporary)?;
         file.write_all(&serde_json::to_vec(state)?)?;
-        file.sync_all()?;
+        if durable {
+            counted(file.sync_all())?;
+        }
         std::fs::rename(temporary, path)?;
-        sync_directory(path.parent().unwrap())
+        if durable {
+            sync_directory(path.parent().unwrap())?;
+        }
+        Ok(())
     }
     fn reconcile_output(&self, state: &mut JobState) {
         use std::io::{Read, Seek, SeekFrom};
@@ -270,7 +314,7 @@ fn sync_directory(path: &std::path::Path) -> std::io::Result<()> {
     // Windows does not expose portable directory fsync through std::fs.
     #[cfg(unix)]
     {
-        std::fs::File::open(path)?.sync_all()
+        counted(std::fs::File::open(path)?.sync_all())
     }
     #[cfg(not(unix))]
     {
@@ -312,14 +356,28 @@ impl JobWriter {
         budget.used = budget.used.saturating_add(count);
         state.charged_bytes = state.charged_bytes.saturating_add(count);
         drop(budget);
-        if let Some(path) = &self.job.path {
+        if self.job.path.is_some() {
             use std::io::Write;
             let append = (|| -> std::io::Result<()> {
-                let mut file = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(path.with_extension("output"))?;
-                file.write_all(bytes)?;
-                file.sync_data()
+                let mut out = self.job.out.lock().unwrap();
+                let out = out
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::other("output file unavailable"))?;
+                // Readers open by path: bytes written to a removed file are
+                // lost to them, so a removal fails the job like any I/O error.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if out.file.metadata()?.nlink() == 0 {
+                        return Err(std::io::Error::other("output file was removed"));
+                    }
+                }
+                out.file.write_all(bytes)?;
+                if self.job.durable && out.synced.elapsed() >= OUTPUT_SYNC_INTERVAL {
+                    counted(out.file.sync_data())?;
+                    out.synced = std::time::Instant::now();
+                }
+                Ok(())
             })();
             if let Err(error) = append {
                 state.output_error = Some(format!(
@@ -370,6 +428,15 @@ impl JobWriter {
         } else {
             status
         };
+        // Output reaches stable storage before the record that settles it;
+        // then the fd closes (nothing appends after settle).
+        if let Some(out) = self.job.out.lock().unwrap().take() {
+            if self.job.durable {
+                if let Err(error) = counted(out.file.sync_data()) {
+                    tracing::warn!(%error, "job output sync failed at settle");
+                }
+            }
+        }
         self.job.checkpoint(&state);
         let notice = format!(
             "Background {} job finished {}. Read its output with job_output.",
@@ -641,9 +708,12 @@ impl JobRegistry {
                     state.settled_at_ms.get_or_insert_with(retention::now_ms);
                     state.charged_bytes = state.output_bytes as u64;
                     self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                    let durable = state.kind != "bash-output";
                     let job = Arc::new(Job {
                         budget: self.inner.budget.clone(),
                         spool: Mutex::new(None),
+                        out: Mutex::new(None),
+                        durable,
                         path: Some(path),
                         state: Mutex::new(state),
                         cancel: Default::default(),
@@ -783,15 +853,14 @@ impl JobRegistry {
             .collect();
         owned.iter().filter(|job| job.request_stop()).count()
     }
+
+    /// Foreground captures reuse the job artifact and ownership model, without
     /// issuing a second completion notice or advertising a running background job.
+    /// Its only record is written at settle (already `delivered`), never
+    /// fsynced: a crash mid-command leaves an orphan `.output` that
+    /// recovery removes.
     pub(crate) fn capture(&self, label: String, owner: Option<&String>) -> (String, JobWriter) {
-        let (id, writer) = self.start_owned("bash-output", label, owner);
-        {
-            let mut state = writer.job.state.lock().unwrap();
-            state.delivered = true;
-            writer.job.checkpoint(&state);
-        }
-        (id, writer)
+        self.start_job("bash-output", label, owner, true)
     }
 
     /// Register a new running job; returns its id and the producer handle.
@@ -804,6 +873,16 @@ impl JobRegistry {
         kind: &'static str,
         label: String,
         owner: Option<&String>,
+    ) -> (String, JobWriter) {
+        self.start_job(kind, label, owner, false)
+    }
+
+    fn start_job(
+        &self,
+        kind: &'static str,
+        label: String,
+        owner: Option<&String>,
+        capture: bool,
     ) -> (String, JobWriter) {
         let id = if self.inner.directory.lock().unwrap().is_some() {
             format!("j{}", ulid::Ulid::new())
@@ -820,6 +899,8 @@ impl JobRegistry {
         let job = Arc::new(Job {
             budget: self.inner.budget.clone(),
             spool: Mutex::new(spool),
+            out: Mutex::new(None),
+            durable: !capture,
             path: self
                 .inner
                 .directory
@@ -830,7 +911,7 @@ impl JobRegistry {
             state: Mutex::new(JobState {
                 kind: kind.into(),
                 owner: owner.cloned(),
-                delivered: false,
+                delivered: capture,
                 label,
                 status: JobStatus::Running,
                 output: Vec::new(),
@@ -853,20 +934,31 @@ impl JobRegistry {
             changed: Arc::new(tokio::sync::Notify::new()),
         });
         if let Some(path) = &job.path {
-            let created = std::fs::OpenOptions::new()
+            match std::fs::OpenOptions::new()
                 .create_new(true)
-                .write(true)
+                .append(true)
                 .open(path.with_extension("output"))
-                .and_then(|file| file.sync_all());
-            if let Err(error) = created {
-                job.cancel.cancel();
-                tracing::error!(%error,"job output creation failed");
+            {
+                Ok(file) => {
+                    *job.out.lock().unwrap() = Some(OutputFile {
+                        file,
+                        synced: std::time::Instant::now(),
+                    })
+                }
+                Err(error) => {
+                    job.cancel.cancel();
+                    tracing::error!(%error,"job output creation failed");
+                }
             }
         }
         if spool_failed {
             job.cancel.cancel();
         }
-        job.checkpoint(&job.state.lock().unwrap());
+        // Background jobs get a start record so a crash recovers them as
+        // `interrupted` (and their notice is delivered); captures do not.
+        if !capture {
+            job.checkpoint(&job.state.lock().unwrap());
+        }
         self.inner
             .jobs
             .lock()
@@ -956,6 +1048,29 @@ impl JobRegistry {
             .cloned()
             .ok_or_else(|| format!("no job '{id}' — list jobs with job_list"))
     }
+}
+
+/// "Restart": a fresh registry over `root` once every previous owner lock
+/// is free. Parallel tests fork (pre_exec) and a forked child holds a
+/// duplicate of every fd, owner locks included, until it execs.
+#[cfg(test)]
+pub(crate) fn restart_for_test(root: &std::path::Path) -> JobRegistry {
+    use fs2::FileExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    for dir in std::fs::read_dir(root).unwrap() {
+        let lock = dir.unwrap().path().join("owner.lock");
+        let Ok(file) = std::fs::File::open(&lock) else {
+            continue;
+        };
+        while file.try_lock_exclusive().is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = FileExt::unlock(&file);
+    }
+    let registry = JobRegistry::new();
+    registry.enable_persistence(root).unwrap();
+    registry.wait_recovery();
+    registry
 }
 
 #[cfg(test)]
@@ -1071,9 +1186,7 @@ mod inspection_tests {
         std::fs::write(&orphan, b"orphan").unwrap();
         drop(writer);
         drop(jobs);
-        let jobs = JobRegistry::new();
-        jobs.enable_persistence(dir.path()).unwrap();
-        jobs.wait_recovery();
+        let jobs = restart_for_test(dir.path());
         assert!(jobs.get(&id).is_err());
         assert!(!orphan.exists());
         assert!(!path.with_extension("deleted").exists());
@@ -1190,9 +1303,7 @@ mod inspection_tests {
         writer.append(b"retained");
         drop(writer);
         drop(jobs);
-        let jobs = JobRegistry::new();
-        jobs.enable_persistence(directory.path()).unwrap();
-        jobs.wait_recovery();
+        let jobs = restart_for_test(directory.path());
         assert_eq!(jobs.count("owner"), 0);
         assert!(jobs.list("foreign").is_empty());
         let inspection = jobs.inspect("owner", &id).unwrap();
@@ -1206,6 +1317,7 @@ mod inspection_tests {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+
     #[test]
     fn output_append_does_not_rewrite_metadata_and_recovers_before_settlement() {
         let directory = tempfile::tempdir().unwrap();
@@ -1225,9 +1337,7 @@ mod durability_tests {
         std::fs::write(path.with_extension("tmp"), b"{partial metadata").unwrap();
         drop(writer);
         drop(registry);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         let (output, status, _) = drain_output(&recovered.get(&id).unwrap());
         assert_eq!(output, "firstsecond");
         assert_eq!(status, JobStatus::Interrupted);
@@ -1274,12 +1384,93 @@ mod durability_tests {
         registry.enable_persistence(directory.path()).unwrap();
         let (_, writer) = registry.start("bash", "test".into());
         let output = writer.job.path.as_ref().unwrap().with_extension("output");
-        std::fs::remove_file(&output).unwrap();
-        std::fs::create_dir(&output).unwrap();
+        // The open output file starts failing writes (read-only handle).
+        writer.job.out.lock().unwrap().as_mut().unwrap().file =
+            std::fs::File::open(&output).unwrap();
         writer.append(b"not persisted");
         assert!(writer.cancelled().is_cancelled());
         assert!(writer.job.state.lock().unwrap().output.is_empty());
     }
+    fn fsyncs() -> usize {
+        FSYNCS.with(|n| n.get())
+    }
+
+    #[test]
+    fn foreground_capture_writes_one_unsynced_record_at_settle() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let before = fsyncs();
+        let (id, writer) = registry.capture("echo hi".into(), Some(&"s".into()));
+        let path = writer.job.path.clone().unwrap();
+        assert!(!path.exists(), "no record while the command runs");
+        for _ in 0..100 {
+            writer.append(&[b'a'; 8192]);
+        }
+        writer.settle(JobStatus::Exited(Some(0)));
+        assert_eq!(fsyncs(), before, "captures never fsync");
+        let record: JobState = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(record.settled && record.delivered);
+        assert_eq!(record.kind, "bash-output");
+        assert!(
+            writer.job.out.lock().unwrap().is_none(),
+            "fd closed at settle"
+        );
+        let entries = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(entries, 3, "owner.lock + one record + its output");
+        // Still readable after a restart.
+        drop(writer);
+        drop(registry);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered.get(&id).unwrap();
+        assert_eq!(job.state.lock().unwrap().output_bytes, 819_200);
+    }
+
+    #[test]
+    fn background_output_is_not_fsynced_per_chunk_but_settle_is_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let before = fsyncs();
+        let (_, writer) = registry.start_owned("bash", "flood".into(), Some(&"s".into()));
+        assert!(writer.job.path.as_ref().unwrap().exists(), "start record");
+        for _ in 0..1000 {
+            writer.append(&[b'a'; 8192]);
+        }
+        // Within the sync interval: no fsync at start or per chunk.
+        assert_eq!(fsyncs(), before);
+        writer.settle(JobStatus::Exited(Some(0)));
+        // Output data, record file and directory.
+        assert_eq!(fsyncs(), before + 3);
+        // The timer: a chunk after the interval syncs once.
+        let (_, slow) = registry.start_owned("bash", "slow".into(), Some(&"s".into()));
+        slow.job.out.lock().unwrap().as_mut().unwrap().synced -= OUTPUT_SYNC_INTERVAL;
+        let before = fsyncs();
+        slow.append(b"x");
+        slow.append(b"y");
+        assert_eq!(fsyncs(), before + 1);
+    }
+
+    #[test]
+    fn crash_without_any_fsync_recovers_all_appended_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (id, writer) = registry.start_owned("bash", "x".into(), Some(&"s".into()));
+        for _ in 0..10 {
+            writer.append(&[b'z'; 1000]);
+        }
+        // kill -9: the producer never settles (its fd is leaked, never
+        // synced); the owner lock goes away with the process.
+        std::mem::forget(writer);
+        drop(registry);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered.get(&id).unwrap();
+        let state = job.state.lock().unwrap();
+        assert_eq!(state.status, JobStatus::Interrupted);
+        assert_eq!(state.output_bytes, 10_000);
+    }
+
     #[test]
     fn interrupted_recovery_preserves_output_cursor_and_live_owner_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -1287,6 +1478,7 @@ mod durability_tests {
         first.enable_persistence(directory.path()).unwrap();
         let (id, writer) = first.start_owned("bash", "command".into(), Some(&"session".into()));
         writer.append(b"recorded");
+        // `first` is alive: its directory must not be recovered.
         let second = JobRegistry::new();
         second.enable_persistence(directory.path()).unwrap();
         second.wait_recovery();
@@ -1294,9 +1486,7 @@ mod durability_tests {
         drop(second);
         drop(writer);
         drop(first);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         let job = recovered.get(&id).unwrap();
         assert_eq!(job.state.lock().unwrap().owner.as_deref(), Some("session"));
         let (output, status, _) = drain_output(&job);
@@ -1304,9 +1494,7 @@ mod durability_tests {
         assert_eq!(status, JobStatus::Interrupted);
         drop(job);
         drop(recovered);
-        let again = JobRegistry::new();
-        again.enable_persistence(directory.path()).unwrap();
-        again.wait_recovery();
+        let again = restart_for_test(directory.path());
         assert_eq!(drain_output(&again.get(&id).unwrap()).0, "");
     }
 }
@@ -1466,9 +1654,7 @@ mod isolation_tests {
         writer.append(b"secret");
         drop(writer);
         drop(registry);
-        let recovered = JobRegistry::new();
-        recovered.enable_persistence(directory.path()).unwrap();
-        recovered.wait_recovery();
+        let recovered = restart_for_test(directory.path());
         assert!(recovered.get_for_session(&id, Some("foreign")).is_err());
         assert!(recovered.get_for_session(&id, None).is_err());
         assert!(recovered.get_for_session(&id, Some("owner")).is_ok());
