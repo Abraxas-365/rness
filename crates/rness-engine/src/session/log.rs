@@ -721,17 +721,12 @@ pub fn drop_committed_stream(event: &mut SessionEvent) {
     }
 }
 
-/// Drop payloads that nothing reads once committed: legacy compaction audit
-/// bodies (`compaction/started.request`, `compaction/request.body` — no longer
-/// written, but present in older logs) and timed stream recordings
-/// (`chunks`). They stay on disk, untouched; `SessionLog::read_all` and
-/// `session_event_read` (which read the file directly) still return them.
-/// On a 58k-event session this halves the parsed log (~1.08 GB -> ~0.5 GB).
 /// `read_until(b'\n')` for a log line that may be tens of MiB. Past 1 MiB
 /// without a newline the buffer is grown once to the most the line can
 /// still be (the rest of the file, at most 1 GiB) instead of by doubling, which for a
 /// 64 MiB line holds 64 + 128 MiB at the peak. Untouched capacity costs no
-/// resident memory.
+/// resident memory; if the reservation is refused (strict overcommit) the
+/// read falls back to ordinary growth instead of aborting.
 pub(super) fn read_line_sized<R: BufRead>(
     reader: &mut R,
     bytes: &mut Vec<u8>,
@@ -741,7 +736,7 @@ pub(super) fn read_line_sized<R: BufRead>(
     let mut total = (&mut *reader).take(FIRST).read_until(b'\n', bytes)?;
     if total as u64 == FIRST && !bytes.ends_with(b"\n") {
         let rest = remaining.saturating_sub(total as u64);
-        bytes.reserve_exact(usize::try_from(rest.min(1 << 30)).unwrap_or(0));
+        let _ = bytes.try_reserve_exact(usize::try_from(rest.min(1 << 30)).unwrap_or(0));
         total += reader.read_until(b'\n', bytes)?;
     }
     Ok(total)
@@ -752,6 +747,12 @@ fn has_tool_use(event: &SessionEvent) -> bool {
         if m.content.iter().any(|p| matches!(p, rness_protocol::events::ContentPart::ToolUse { .. })))
 }
 
+/// Drop payloads that nothing reads once committed: legacy compaction audit
+/// bodies (`compaction/started.request`, `compaction/request.body` — no longer
+/// written, but present in older logs) and timed stream recordings
+/// (`chunks`). They stay on disk, untouched; `SessionLog::read_all` and
+/// `session_event_read` (which read the file directly) still return them.
+/// On a 58k-event session this halves the parsed log (~1.08 GB -> ~0.5 GB).
 pub fn elide_payloads(event: &mut SessionEvent) {
     match event {
         SessionEvent::AssistantMessage(message) => message.chunks = Vec::new(),
@@ -1032,7 +1033,11 @@ mod tests {
     #[test]
     fn read_line_sized_reads_long_and_short_lines_like_read_until() {
         let long = "x".repeat(3 << 20);
-        let data = format!("short\n{long}\nlast\nunterminated");
+        // Boundaries: a line of exactly 1 MiB with its newline, one of
+        // 1 MiB - 1 + newline, and an unterminated 1 MiB tail.
+        let mib = "m".repeat(1 << 20);
+        let below = "b".repeat((1 << 20) - 1);
+        let data = format!("short\n{long}\n{mib}\n{below}\nlast\n{mib}");
         let mut reader = std::io::BufReader::new(data.as_bytes());
         let mut buf = Vec::new();
         let mut got = Vec::new();
