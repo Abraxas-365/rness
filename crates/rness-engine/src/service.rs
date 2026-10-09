@@ -524,9 +524,35 @@ pub struct SessionService {
     /// [`crate::instructions`]; this only holds the caller's choices.
     instructions: Mutex<Option<crate::instructions::InstructionsConfig>>,
     loop_hooks: RwLock<Option<Arc<dyn crate::turn::hooks::LoopHooks>>>,
+    /// Counts a session's outstanding background work (installed by the
+    /// job owner). None = no job system: nothing is ever pending.
+    pending_jobs: RwLock<Option<Arc<PendingJobs>>>,
 }
 
+/// Background jobs owned by a session that are still running, or settled
+/// with a completion notice not yet delivered to it.
+pub type PendingJobs = dyn Fn(&SessionId) -> usize + Send + Sync;
+
 impl SessionService {
+    /// Install the probe behind [`Self::pending_jobs`].
+    pub fn set_pending_jobs(&self, probe: Arc<PendingJobs>) {
+        *self.pending_jobs.write().expect("pending jobs lock") = Some(probe);
+    }
+
+    /// Background jobs `session` still waits on (see [`PendingJobs`]).
+    /// A delegated child that goes idle with pending jobs has not settled:
+    /// their completions wake it again.
+    pub fn pending_jobs(&self, session: &SessionId) -> usize {
+        let probe = self.pending_jobs.read().expect("pending jobs lock").clone();
+        probe.map_or(0, |probe| probe(session))
+    }
+
+    /// True while `session` or one of its delegation ancestors is being
+    /// torn down: automatic wakes are suppressed in that tree.
+    pub fn is_closing(&self, session: &SessionId) -> bool {
+        self.tearing_down(&self.closing.lock().unwrap(), session)
+    }
+
     pub fn plan(
         &self,
         session: &SessionId,
@@ -777,6 +803,7 @@ impl SessionService {
             closing: Mutex::new(std::collections::HashSet::new()),
             instructions: Mutex::new(None),
             loop_hooks: RwLock::new(None),
+            pending_jobs: RwLock::new(None),
         }
     }
 
@@ -1535,6 +1562,19 @@ impl SessionService {
         session: &SessionId,
         text: String,
     ) -> Result<Disposition, ServiceError> {
+        self.notify_subagent_settled_as(session, text, None).await
+    }
+
+    /// [`Self::notify_subagent_settled`] with a durable source id
+    /// (`settle:<child>:<turn>`), recorded as `JobCompletion` so frontends
+    /// render it as a notice (not as typed input) and recovery can dedupe it.
+    pub async fn notify_subagent_settled_as(
+        &self,
+        session: &SessionId,
+        text: String,
+        id: Option<String>,
+    ) -> Result<Disposition, ServiceError> {
+        let source = id.map(|id| MessageSource::JobCompletion { id });
         let activity = self.lifecycle.clone().read_owned().await;
         let operation = self.live(session).operation.clone().lock_owned().await;
         let mut lineage = vec![session.clone()];
@@ -1557,13 +1597,14 @@ impl SessionService {
                     } else {
                         UserIntent::Steer
                     };
-                    return self.send_or_retry(
+                    return self.send_or_retry_sourced(
                         session,
                         intent,
                         vec![ContentPart::Text { text }],
                         false,
                         Notice::Subagent,
                         Some((activity, operation)),
+                        source,
                     );
                 }
             }

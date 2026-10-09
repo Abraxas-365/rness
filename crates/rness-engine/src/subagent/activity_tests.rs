@@ -28,6 +28,7 @@ fn run(recovered: bool) -> Run {
 fn activity() -> SubagentActivity {
     SubagentActivity {
         runs: Mutex::new(HashMap::from([("child".into(), run(false))])),
+        waiting: Default::default(),
     }
 }
 

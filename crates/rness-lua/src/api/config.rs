@@ -385,6 +385,7 @@ mod permission_tests {
             "hook": {"display":"collapsed","label":{"text":"Hook"},"tags":{"time":{"visible":false},"lint":{"label":{"text":"Lint"}}}},
             "instructions": {"display":"collapsed"},
             "job": {"label":{"text":"Job","style":"tool_name"}},
+            "agent": {"label":{"text":"Agent","style":"tool_name"}},
             "external": {"visible": false}
         });
         super::validate_messagebox(&config, "messagebox", "root").unwrap();
@@ -746,7 +747,7 @@ fn validate_messagebox(value: &serde_json::Value, path: &str, section: &str) -> 
             ("message", "sources") if path.ends_with(".user") && !path.contains(".sources.") => {
                 Some("sources")
             }
-            ("sources", "hook" | "instructions" | "context" | "job" | "external") => {
+            ("sources", "hook" | "instructions" | "context" | "job" | "agent" | "external") => {
                 Some("message")
             }
             ("message", "tags") if path.ends_with(".sources.hook") => Some("tags"),

@@ -212,9 +212,36 @@ impl Run {
 #[derive(Default)]
 pub struct SubagentActivity {
     runs: Mutex<HashMap<String, Run>>,
+    /// Children idle with their own background work still out: shown as
+    /// `waiting`, not as finished, until they actually settle.
+    waiting: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SubagentActivity {
+    pub(super) fn waiting_handle(
+        &self,
+    ) -> std::sync::Arc<Mutex<std::collections::HashSet<String>>> {
+        std::sync::Arc::clone(&self.waiting)
+    }
+
+    pub(super) fn set_waiting(&self, child: &str, waiting: bool) {
+        let mut set = self.waiting.lock().unwrap();
+        if waiting {
+            set.insert(child.into());
+        } else {
+            set.remove(child);
+        }
+    }
+
+    /// Run status for presentation, with deferred settles as `waiting`.
+    fn shown_status(&self, run: &Run) -> String {
+        if run.status == "completed" && self.waiting.lock().unwrap().contains(&run.child) {
+            "waiting".into()
+        } else {
+            run.status.clone()
+        }
+    }
+
     pub(super) fn register(
         &self,
         sessions: &SessionService,
@@ -462,8 +489,9 @@ impl SubagentActivity {
         let mut runs = self.runs.lock().unwrap();
         runs.values_mut().filter(|run| run.parent == parent).map(|run| {
             Self::refresh_run(run, sessions);
+            let status = self.shown_status(run);
             (run.call.clone(), run.args.clone(), json!({
-                "kind":"subagent_activity", "session":run.child, "status":run.status,
+                "kind":"subagent_activity", "session":run.child, "status":status,
                 "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
                 "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
                 "lines":run.lines, "live":run.live, "streams":run.streams, "tools":run.tools,
@@ -499,7 +527,7 @@ impl SubagentActivity {
                     run.call.clone(),
                     run.args.clone(),
                     json!({
-                        "kind":"subagent_activity", "session":run.child, "status":run.status,
+                        "kind":"subagent_activity", "session":run.child, "status":self.shown_status(run),
                         "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
                         "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
                         "live":tail(&run.live, MAX_CARD_LIVE_BYTES), "tools":card_tools,

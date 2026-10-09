@@ -213,10 +213,64 @@ pub struct SubagentRuntime {
     watchers: std::sync::Mutex<Vec<Disposer>>,
     /// Roots whose tree [`Self::spawn_reconcile_tree`] already visited.
     reconciled: std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    /// Outstanding background work per session, for settle gating.
+    work: Arc<PendingWork>,
+}
+
+/// Settle gating: a delegated child that ends its turn while its own
+/// background work is still out (jobs, a running continuable child, a
+/// settle notice on its way) has not settled. That work's completion wakes
+/// it, and only the idle after the last of it counts as its answer.
+#[derive(Default)]
+struct PendingWork {
+    /// Settle notices being delivered, by recipient (parent) session.
+    notices: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Continuable children whose settle was deferred: number of the first
+    /// unreported turn, so the eventual notice covers its output too.
+    deferred: std::sync::Mutex<HashMap<SessionId, u32>>,
+}
+
+impl PendingWork {
+    /// What `session` still waits on: its background jobs, notices in
+    /// flight to it, and continuable children that have not settled.
+    /// Depth is bounded by the delegation limit.
+    fn count(&self, sessions: &SessionService, session: &SessionId) -> usize {
+        let mut pending = sessions.pending_jobs(session)
+            + self
+                .notices
+                .lock()
+                .unwrap()
+                .get(session)
+                .copied()
+                .unwrap_or(0);
+        let children = sessions.descendants(session).unwrap_or_default();
+        for child in children {
+            let Ok(Some(d)) = sessions.store().delegation(&child) else {
+                continue;
+            };
+            if d.parent != *session || d.mode != DelegationMode::Continuable {
+                continue;
+            }
+            if sessions.phase(&child) != crate::inbox::Phase::Idle
+                || self.deferred.lock().unwrap().contains_key(&child)
+            {
+                pending += 1;
+            }
+        }
+        pending
+    }
+
+    /// Whether `child`, now idle, still has work that will wake it again.
+    /// Teardown suppresses those wakes, so a closing tree settles now.
+    fn outstanding(&self, sessions: &SessionService, child: &SessionId) -> bool {
+        sessions.phase(child) != crate::inbox::Phase::Idle
+            || (!sessions.is_closing(child) && self.count(sessions, child) > 0)
+    }
 }
 
 impl SubagentRuntime {
     pub fn new(sessions: Arc<SessionService>, max_depth: u32) -> Self {
+        let work = Arc::new(PendingWork::default());
         let rt = Self {
             sessions: Arc::clone(&sessions),
             providers: RwLock::new(HashMap::new()),
@@ -226,60 +280,23 @@ impl SubagentRuntime {
             activity: SubagentActivity::default(),
             watchers: std::sync::Mutex::new(Vec::new()),
             reconciled: Default::default(),
+            work: Arc::clone(&work),
         };
         // Settle watch (dsh: "when a resident Activation settles, the
         // manager tells the child's direct parent in the parent's own
-        // turn stream"): every idle of a CONTINUABLE child delivers its
+        // turn stream"): an idle of a CONTINUABLE child delivers its
         // final output to the parent, steering a busy turn or waking an idle
         // parent. Teardown only logs the notice. One-shot jobs are untouched.
+        // A completed turn that leaves the child's own background work
+        // outstanding is deferred (see [`PendingWork`]): the parent hears
+        // once, after the idle that follows the last of that work, with
+        // output covering every turn since the last notice.
         let watch_sessions = Arc::clone(&sessions);
+        let waiting = rt.activity.waiting_handle();
         let disposer = sessions
             .bus()
             .on::<SessionIdleEv>(move |child: &SessionId| {
-                let Ok(Some(d)) = watch_sessions.store().delegation(child) else {
-                    return;
-                };
-                if d.mode != DelegationMode::Continuable {
-                    return;
-                }
-                let run = match settle_last_turn(&watch_sessions, child) {
-                    Ok(run) => run,
-                    Err(e) => {
-                        tracing::error!(child = %child, error = %e, "settle read failed");
-                        return;
-                    }
-                };
-                let stop = match run.stop {
-                    StopReason::Completed => "completed",
-                    StopReason::Aborted => "aborted",
-                    StopReason::Error => "error",
-                };
-
-                watch_sessions.bus().emit::<crate::service::SubagentStopEv>(
-                    &crate::service::SubagentStopNotice {
-                        parent: d.parent.clone(),
-                        child: child.clone(),
-                        outcome: stop.to_string(),
-                        mode: DelegationMode::Continuable,
-                    },
-                );
-
-                let text = format!(
-                    "[subagent {child} settled: {stop}]\n{}",
-                    match (&run.error, run.output.is_empty()) {
-                        (Some(error), true) => format!("error: {error}"),
-                        (_, true) => "(no output)".into(),
-                        (_, false) => run.output.clone(),
-                    }
-                );
-                // Never block the child's idle event on a parent reservation (the
-                // parent may itself be waiting for this child to finish).
-                let sessions = Arc::clone(&watch_sessions);
-                tokio::spawn(async move {
-                    if let Err(e) = sessions.notify_subagent_settled(&d.parent, text).await {
-                        tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
-                    }
-                });
+                settle_continuable(&watch_sessions, &work, &waiting, child, false);
             });
         rt.watchers.lock().expect("watchers lock").push(disposer);
         rt
@@ -482,6 +499,7 @@ impl SubagentRuntime {
         // handle, so abandoning it midway would lose the settle wait.
         // `send` installed the burst's token synchronously, so a token that
         // fired before this point still cancels the turn immediately.
+        let kill = cancel.clone();
         let watcher = cancel.map(|token| {
             let (sessions, child) = (Arc::clone(&self.sessions), child.clone());
             tokio::spawn(async move {
@@ -489,12 +507,57 @@ impl SubagentRuntime {
                 sessions.cancel(&child);
             })
         });
-        self.sessions.join(&child).await;
+        // Settled = idle with nothing outstanding. A child that ends its
+        // turn "waiting on" its own background job is woken by that job's
+        // completion; its answer is the idle after the last of its work.
+        let idle = Arc::new(tokio::sync::Notify::new());
+        let _idle_watch = {
+            let (idle, child) = (Arc::clone(&idle), child.clone());
+            self.sessions
+                .bus()
+                .on::<SessionIdleEv>(move |session: &SessionId| {
+                    if *session == child {
+                        idle.notify_one();
+                    }
+                })
+        };
+        let mut waited = false;
+        loop {
+            self.sessions.join(&child).await;
+            let killed = kill.as_ref().is_some_and(|token| token.is_cancelled());
+            if killed
+                || settle_last_turn(&self.sessions, &child)?.stop != StopReason::Completed
+                || !self.work.outstanding(&self.sessions, &child)
+            {
+                self.activity.set_waiting(&child, false);
+                break;
+            }
+            waited = true;
+            self.activity.set_waiting(&child, true);
+            // Wake on the child's next idle, or re-check periodically (work
+            // can drain without a wake, e.g. a job killed during teardown).
+            let tick = tokio::time::sleep(std::time::Duration::from_millis(500));
+            let killed = async {
+                match &kill {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                _ = idle.notified() => {}
+                _ = tick => {}
+                _ = killed => {}
+            }
+        }
         if let Some(watcher) = watcher {
             watcher.abort();
         }
 
         let mut run = settle(&self.sessions, &child, boundary)?;
+        if waited && kill.as_ref().is_some_and(|token| token.is_cancelled()) {
+            // Killed while waiting on its own work: not a completed answer.
+            run.stop = StopReason::Aborted;
+        }
         if let Some(attached) = attached {
             run.structured = attached.attachment().captured();
             // dsh readResult: asked for structure, completed without it.
@@ -896,6 +959,19 @@ impl SubagentRuntime {
     pub fn interrupt(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
         self.authorize_descendant(caller, target)?;
         self.sessions.cancel(target);
+        // Idle but waiting on its own work: the interrupt ends the wait, so
+        // the parent hears now instead of after that work completes.
+        if self.sessions.phase(target) == crate::inbox::Phase::Idle
+            && self.work.deferred.lock().unwrap().contains_key(target)
+        {
+            settle_continuable(
+                &self.sessions,
+                &self.work,
+                &self.activity.waiting_handle(),
+                target,
+                true,
+            );
+        }
         Ok(())
     }
 
@@ -1010,6 +1086,121 @@ pub struct ChildAgent {
     pub depth: u32,
     /// Live phase: true while a turn burst runs.
     pub running: bool,
+}
+
+/// Settle watch body for one idle of a CONTINUABLE child (see
+/// [`SubagentRuntime::new`]). `force` reports a deferred settle now.
+fn settle_continuable(
+    sessions: &Arc<SessionService>,
+    work: &Arc<PendingWork>,
+    waiting: &std::sync::Mutex<std::collections::HashSet<SessionId>>,
+    child: &SessionId,
+    force: bool,
+) {
+    let Ok(Some(d)) = sessions.store().delegation(child) else {
+        return;
+    };
+    if d.mode != DelegationMode::Continuable {
+        return;
+    }
+    let history = match sessions.store().history(child) {
+        Ok(history) => history,
+        Err(e) => {
+            tracing::error!(child = %child, error = %e, "settle read failed");
+            return;
+        }
+    };
+    let last = history
+        .iter()
+        .rposition(|e| matches!(e.event, SessionEvent::TurnStarted { .. }));
+    let turn_at = |index: usize| match history[index].event {
+        SessionEvent::TurnStarted { turn } => turn,
+        _ => 0,
+    };
+    let turn = last.map_or(0, turn_at);
+    // A deferred settle reports every turn since the first unreported one.
+    let deferred = work.deferred.lock().unwrap().get(child).copied();
+    let boundary = deferred
+        .and_then(|first| {
+            history.iter().position(
+                |e| matches!(e.event, SessionEvent::TurnStarted { turn } if turn == first),
+            )
+        })
+        .or(last)
+        .unwrap_or(0);
+    let mut run = match settle_events(&history, boundary, child) {
+        Ok(run) => run,
+        Err(e) => {
+            tracing::error!(child = %child, error = %e, "settle read failed");
+            return;
+        }
+    };
+    if run.stop == StopReason::Completed && !force && work.outstanding(sessions, child) {
+        work.deferred
+            .lock()
+            .unwrap()
+            .entry(child.clone())
+            .or_insert(turn_at(boundary));
+        waiting.lock().unwrap().insert(child.clone());
+        return;
+    }
+    if force {
+        run.stop = StopReason::Aborted;
+    }
+    work.deferred.lock().unwrap().remove(child);
+    waiting.lock().unwrap().remove(child);
+    let stop = match run.stop {
+        StopReason::Completed => "completed",
+        StopReason::Aborted => "aborted",
+        StopReason::Error => "error",
+    };
+
+    sessions
+        .bus()
+        .emit::<crate::service::SubagentStopEv>(&crate::service::SubagentStopNotice {
+            parent: d.parent.clone(),
+            child: child.clone(),
+            outcome: stop.to_string(),
+            mode: DelegationMode::Continuable,
+        });
+
+    let text = format!(
+        "[subagent {child} settled: {stop}]\n{}",
+        match (&run.error, run.output.is_empty()) {
+            (Some(error), true) => format!("error: {error}"),
+            (_, true) => "(no output)".into(),
+            (_, false) => run.output.clone(),
+        }
+    );
+    // Never block the child's idle event on a parent reservation (the
+    // parent may itself be waiting for this child to finish). The
+    // in-flight count keeps the parent unsettled until delivery.
+    *work
+        .notices
+        .lock()
+        .unwrap()
+        .entry(d.parent.clone())
+        .or_default() += 1;
+    let sessions = Arc::clone(sessions);
+    let work = Arc::clone(work);
+    // Durable id: frontends render it as a notice, and reconcile's
+    // interrupted notice for the same turn deduplicates against it.
+    let id = format!("settle:{child}:{turn}");
+    tokio::spawn(async move {
+        if let Err(e) = sessions
+            .notify_subagent_settled_as(&d.parent, text, Some(id))
+            .await
+        {
+            tracing::error!(parent = %d.parent, error = %e, "settle notice failed");
+        }
+        let mut notices = work.notices.lock().unwrap();
+        if let Some(count) = notices.get_mut(&d.parent) {
+            *count -= 1;
+            if *count == 0 {
+                notices.remove(&d.parent);
+            }
+        }
+    });
 }
 
 /// Settle from the child's LAST turn only: boundary at the final
