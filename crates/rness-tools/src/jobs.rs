@@ -11,9 +11,12 @@
 //! Durability (persistent registries). Process crash / kill -9 loses
 //! nothing already appended: output goes straight to the open `.output`
 //! file (page cache), and recovery measures the file length. Against OS
-//! crash or power loss, a durable job's output is `sync_data`-ed at most
-//! once per [`OUTPUT_SYNC_INTERVAL`] while running and once at settle, and
-//! its settled and `delivered` records are fsynced (file and directory),
+//! crash or power loss, a durable job's output is `sync_data`-ed at settle
+//! and, while running, by the first append at least
+//! [`OUTPUT_SYNC_INTERVAL`] after the previous sync. There is no timer: a
+//! job that goes quiet keeps its last chunks unsynced until it writes again
+//! or settles, so power loss can lose any output since the last sync.
+//! Settled and `delivered` records are fsynced (file and directory),
 //! because they drive exactly-once completion notices. Running records are
 //! written atomically (rename) but not fsynced: a lost start record only
 //! means an unknown job. Foreground `bash-output` captures never notify;
@@ -32,7 +35,10 @@ pub use retention::Retention;
 
 const MAX_READ_BYTES: usize = 64 * 1024;
 const MAX_INSPECT_BYTES: usize = 8 * 1024;
-/// Longest a durable running job's output stays unsynced (power loss only).
+/// Least time between `sync_data` calls on a durable running job's output.
+/// Checked on append only (no timer), so it is not an upper bound on how
+/// long output stays unsynced: a quiet job's tail waits for its next
+/// append or settle. Matters for power loss / OS crash only.
 const OUTPUT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[cfg(test)]
@@ -2120,6 +2126,22 @@ mod durability_tests {
         slow.append(b"x");
         slow.append(b"y");
         assert_eq!(fsyncs(), before + 1);
+    }
+
+    #[test]
+    fn quiet_running_output_is_synced_on_the_next_append_or_settle_only() {
+        // OUTPUT_SYNC_INTERVAL is a minimum gap checked on append, not a
+        // timer: a job that goes quiet past it is not synced meanwhile.
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (_, writer) = registry.start_owned("bash", "quiet".into(), Some(&"s".into()));
+        let before = fsyncs();
+        writer.append(b"tail");
+        writer.job.out.lock().unwrap().as_mut().unwrap().synced -= OUTPUT_SYNC_INTERVAL * 2;
+        assert_eq!(fsyncs(), before, "no sync without an append");
+        writer.settle(JobStatus::Exited(Some(0)));
+        assert!(fsyncs() > before, "settle syncs the tail");
     }
 
     #[test]
