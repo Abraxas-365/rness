@@ -1289,3 +1289,152 @@ async fn settlement_during_running_teardown_is_logged_after_writer_retires() {
         if m.intent == UserIntent::Inject)
     );
 }
+
+/// Blocks until cancelled; fails non-retryably for prompts starting "fail".
+struct BlockOrFail;
+
+#[async_trait]
+impl Provider for BlockOrFail {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, request: StepRequest<'_>, cancel: &CancellationToken) -> StepOutcome {
+        let first = request.context.turns.iter().find_map(|t| match t {
+            rness_engine::session::projection::ModelTurn::User { content } => {
+                content.iter().find_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        });
+        if first.as_deref().is_some_and(|t| t.starts_with("fail")) {
+            return StepOutcome::Failed {
+                error: rness_engine::turn::provider::ProviderError {
+                    code: "CONTEXT_OVERFLOW",
+                    retry_after: None,
+                    message: "prompt is too long: 250000 tokens > 200000".into(),
+                    retryable: false,
+                },
+                partial: vec![],
+            };
+        }
+        cancel.cancelled().await;
+        StepOutcome::Cancelled { partial: vec![] }
+    }
+}
+
+fn blocking_service(dir: &std::path::Path) -> Arc<SessionService> {
+    Arc::new(SessionService::new(
+        SessionStore::new(dir),
+        Arc::new(BlockOrFail),
+        Arc::new(ToolRegistry::default()),
+        TurnConfig::default(),
+        Arc::new(EventBus::default()),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn teardown_cancels_running_descendants_and_reports_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = blocking_service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let root = sessions.create(None).unwrap();
+    let request = |parent: &SessionId| SubagentRequest {
+        agent: None,
+        parent: parent.clone(),
+        prompt: "block".into(),
+    };
+    let child = rt.start_continuable("spawn", request(&root)).unwrap();
+    let grandchild = rt.start_continuable("spawn", request(&child)).unwrap();
+    assert_eq!(
+        sessions.descendants(&root).unwrap(),
+        vec![child.clone(), grandchild.clone()]
+    );
+    let reported = Arc::new(std::sync::Mutex::new(None));
+    let seen = Arc::clone(&reported);
+    let _listener = sessions
+        .bus()
+        .on::<rness_engine::service::SessionTeardownEv>(move |notice| {
+            *seen.lock().unwrap() = Some((notice.root.clone(), notice.descendants.clone()));
+        });
+    sessions.begin_teardown(&root);
+    for s in [&child, &grandchild] {
+        tokio::time::timeout(std::time::Duration::from_secs(5), sessions.join(s))
+            .await
+            .expect("descendant cancelled");
+        let ends: Vec<_> = sessions
+            .store()
+            .history(s)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::TurnEnded { outcome, .. } => Some(*outcome),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, vec![TurnOutcome::Cancelled]);
+    }
+    assert_eq!(
+        reported.lock().unwrap().clone(),
+        Some((root.clone(), vec![child.clone(), grandchild.clone()]))
+    );
+    // Teardown settle notices are logged only: the root never runs a turn.
+    sessions.join(&root).await;
+    assert!(!sessions
+        .store()
+        .history(&root)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::TurnStarted { .. })));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancel_token_fired_before_start_creates_no_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = blocking_service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let err = rt
+        .start_with(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "block".into(),
+            },
+            rness_engine::subagent::RunOptions {
+                cancel: Some(token),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SubagentError::Cancelled), "{err}");
+    assert_eq!(sessions.list().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_child_run_carries_the_provider_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = blocking_service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    let run = rt
+        .start(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "fail please".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Error);
+    let error = run.error.expect("error detail");
+    assert!(error.contains("CONTEXT_OVERFLOW"), "{error}");
+    assert!(error.contains("prompt is too long"), "{error}");
+}

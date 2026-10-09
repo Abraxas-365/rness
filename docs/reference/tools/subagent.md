@@ -20,7 +20,7 @@ The generated schema includes enabled agent names and descriptions. By default `
 {"provider":"spawn","agent":"worker","prompt":"Inspect the requested files and report findings."}
 ```
 
-Waits for the child's turn to settle. Success returns its session ID and final assistant text. Aborted or failed runs become error tool results, allowing the principal to decide how to continue.
+Waits for the child's turn to settle. Success returns its session ID and final assistant text. Aborted or failed runs become error tool results, allowing the principal to decide how to continue. A failed run's result includes the child's last provider error (code and message, up to 500 characters) when the child produced no text.
 
 ## Background one-shot
 
@@ -36,6 +36,8 @@ Waits for the child's turn to settle. Success returns its session ID and final a
 
 Returns a job ID. Observe it with `job_output`. Role and generic-child policy validation occurs before accepting a background job. A returned job ID still does not prove child creation or execution succeeded; inspect the job's result.
 
+`job_kill` cancels the child's turn (it ends `cancelled`) and the job settles as `killed`, with one completion notice. The kill also stops the background subagents that child started. Its Bash jobs keep running. A kill that lands before the child exists creates no child.
+
 ## Continuable
 
 ```json
@@ -49,6 +51,10 @@ Returns a job ID. Observe it with `job_output`. Role and generic-child policy va
 ```
 
 Returns a durable child session ID. Use `send_message`, `interrupt_agent`, and `list_agents` for subsequent interaction. Settled child turns produce notices in the parent.
+
+## Teardown
+
+When the TUI exits, it tears down its session. The cancel reaches every delegated descendant: running child turns end `cancelled`, background subagent jobs of the session settle `killed`, and all jobs owned by descendants (Bash, terminal and subagent) are stopped. Continuable children remain resumable sessions. Settle and job notices that arrive during teardown are logged without waking the parent.
 
 Current parsing treats `background_mode = "continuable"` as sufficient to select this path even if `run_in_background` is omitted. Supply both fields to make intent explicit. Do not infer strict schema validation for every optional field from the advertised JSON Schema.
 

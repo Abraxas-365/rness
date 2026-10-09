@@ -211,6 +211,20 @@ impl Event for SubagentStopEv {
     type Payload = SubagentStopNotice;
 }
 
+/// Fired by [`SessionService::begin_teardown`] after it cancelled the
+/// session tree, so owners of per-session work (background jobs) can stop
+/// it too. `descendants` are the delegated descendants of `root`.
+#[derive(Debug, Clone)]
+pub struct SessionTeardownNotice {
+    pub root: SessionId,
+    pub descendants: Vec<SessionId>,
+}
+pub struct SessionTeardownEv;
+impl Event for SessionTeardownEv {
+    const NAME: &'static str = "session/teardown";
+    type Payload = SessionTeardownNotice;
+}
+
 /// Emitted by the hook host to durably record hook invocations/results.
 /// The burst loop subscribes and appends to the session log.
 /// `session` allows filtering when multiple sessions share a bus.
@@ -1531,10 +1545,90 @@ impl SessionService {
 
     /// Teardown is distinct from interrupting a turn: suppress automatic wakes
     /// for this session and its descendants for the remainder of this host.
+    ///
+    /// The cancel cascades to every delegated descendant (one-shot and
+    /// continuable): their current turns end `cancelled`, continuable
+    /// children stay resumable, and their settle notices are only logged.
+    /// [`SessionTeardownEv`] then lets job owners stop background work.
     pub fn begin_teardown(&self, session: &SessionId) {
-        let mut closing = self.closing.lock().unwrap();
-        closing.insert(session.clone());
-        self.cancel(session);
+        let descendants = self.close_tree(session);
+        self.bus.emit::<SessionTeardownEv>(&SessionTeardownNotice {
+            root: session.clone(),
+            descendants,
+        });
+    }
+
+    /// The session half of [`Self::begin_teardown`], without the job event:
+    /// mark `session` closing (no more automatic wakes in its tree) and
+    /// cancel its turn and its descendants' turns. Returns the descendants.
+    pub fn close_tree(&self, session: &SessionId) -> Vec<SessionId> {
+        {
+            let mut closing = self.closing.lock().unwrap();
+            closing.insert(session.clone());
+            self.cancel(session);
+        }
+        let descendants = self.descendants(session).unwrap_or_else(|error| {
+            tracing::warn!(session = %session, %error, "teardown could not list descendants");
+            Vec::new()
+        });
+        for child in &descendants {
+            self.cancel(child);
+        }
+        descendants
+    }
+
+    /// Delegated descendants of `root` (children, grandchildren, ...),
+    /// breadth-first, from one scan of the store's delegation headers.
+    pub fn descendants(&self, root: &SessionId) -> Result<Vec<SessionId>, ServiceError> {
+        let mut by_parent: HashMap<SessionId, Vec<SessionId>> = HashMap::new();
+        for (id, d) in self.store.delegations()? {
+            by_parent.entry(d.parent).or_default().push(id);
+        }
+        let mut out = Vec::new();
+        let mut queue = std::collections::VecDeque::from([root.clone()]);
+        while let Some(node) = queue.pop_front() {
+            for child in by_parent.remove(&node).unwrap_or_default() {
+                out.push(child.clone());
+                queue.push_back(child);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Cancel `root`'s current turn and those of all its delegated
+    /// descendants. Interrupt only: no session is closed.
+    pub fn cancel_tree(&self, root: &SessionId) -> Result<(), ServiceError> {
+        self.cancel(root);
+        for child in self.descendants(root)? {
+            self.cancel(&child);
+        }
+        Ok(())
+    }
+
+    /// True when `session` or one of its delegation ancestors is being torn
+    /// down (callers hold the `closing` lock through admission).
+    fn tearing_down(
+        &self,
+        closing: &std::collections::HashSet<SessionId>,
+        session: &SessionId,
+    ) -> bool {
+        if closing.is_empty() {
+            return false;
+        }
+        let mut node = session.clone();
+        let mut seen = vec![];
+        loop {
+            if closing.contains(&node) {
+                return true;
+            }
+            match self.store.delegation(&node) {
+                Ok(Some(d)) if !seen.contains(&d.parent) => {
+                    seen.push(node);
+                    node = d.parent;
+                }
+                _ => return false,
+            }
+        }
     }
 
     /// Continue a failed turn from durable context without appending user content.
@@ -1692,6 +1786,16 @@ impl SessionService {
                     .map_err(ServiceError::InvalidConfig)?;
             }
         }
+        // Job completions during teardown of this tree are only logged (no
+        // wake). Checked before the command/inbox locks: `closing` is taken first.
+        let intent = if notice == Notice::Job
+            && intent == UserIntent::Steer
+            && self.tearing_down(&self.closing.lock().unwrap(), session)
+        {
+            UserIntent::Inject
+        } else {
+            intent
+        };
         let live = self.live(session);
         let (activity, _operation) = match reservation {
             Some(reservation) => reservation,

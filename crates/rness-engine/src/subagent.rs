@@ -91,6 +91,9 @@ pub struct SubagentRun {
     /// Validated `structured_output` value, when a schema was requested
     /// and the child captured one. Never durable.
     pub structured: Option<serde_json::Value>,
+    /// Why the run failed: the last provider error recorded after the
+    /// activation boundary (`code: message`, at most 500 chars).
+    pub error: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +111,9 @@ pub enum SubagentError {
     NotAuthorized(String),
     #[error("unsupported output schema: {0}")]
     InvalidSchema(String),
+    /// The run's cancel token fired before the child existed.
+    #[error("cancelled before the child started")]
+    Cancelled,
     #[error(transparent)]
     Service(#[from] ServiceError),
     #[error(transparent)]
@@ -257,10 +263,10 @@ impl SubagentRuntime {
 
                 let text = format!(
                     "[subagent {child} settled: {stop}]\n{}",
-                    if run.output.is_empty() {
-                        "(no output)"
-                    } else {
-                        &run.output
+                    match (&run.error, run.output.is_empty()) {
+                        (Some(error), true) => format!("error: {error}"),
+                        (_, true) => "(no output)".into(),
+                        (_, false) => run.output.clone(),
                     }
                 );
                 // Never block the child's idle event on a parent reservation (the
@@ -397,6 +403,10 @@ impl SubagentRuntime {
             .get(provider)
             .cloned()
             .ok_or_else(|| SubagentError::UnknownProvider(provider.into()))?;
+        // Killed before launch: never create a child that nobody can stop.
+        if cancel.as_ref().is_some_and(|token| token.is_cancelled()) {
+            return Err(SubagentError::Cancelled);
+        }
 
         // Depth: parent's stamped depth + 1, enforced BEFORE creation.
         let parent_depth = self
@@ -467,6 +477,8 @@ impl SubagentRuntime {
             })?;
         // A watcher (not a select over `join`): `join` takes the burst
         // handle, so abandoning it midway would lose the settle wait.
+        // `send` installed the burst's token synchronously, so a token that
+        // fired before this point still cancels the turn immediately.
         let watcher = cancel.map(|token| {
             let (sessions, child) = (Arc::clone(&self.sessions), child.clone());
             tokio::spawn(async move {
@@ -688,6 +700,13 @@ impl SubagentRuntime {
     /// followups stay parked, descendants keep running, the child stays
     /// available. Caller must be a delegation ancestor of the target.
     /// Interrupting an idle child is an accepted no-op.
+    /// Close a killed ONE-SHOT child for good: its run is over, so its tree
+    /// is cancelled and nothing (e.g. a grandchild's job notice) wakes it
+    /// again. Returns the child's delegated descendants.
+    pub fn close_one_shot(&self, child: &SessionId) -> Vec<SessionId> {
+        self.sessions.close_tree(child)
+    }
+
     pub fn interrupt(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
         self.authorize_descendant(caller, target)?;
         self.sessions.cancel(target);
@@ -853,6 +872,24 @@ fn settle_events(
         })
         .unwrap_or(StopReason::Error);
 
+    let error = (stop == StopReason::Error)
+        .then(|| {
+            after.iter().rev().find_map(|e| match &e.event {
+                SessionEvent::AssistantAttempt(rness_protocol::events::AssistantAttempt {
+                    outcome: rness_protocol::events::AttemptOutcome::Error { message, code, .. },
+                    ..
+                }) => Some(truncate_chars(
+                    &match code {
+                        Some(code) => format!("{code}: {message}"),
+                        None => message.clone(),
+                    },
+                    500,
+                )),
+                _ => None,
+            })
+        })
+        .flatten();
+
     let output = after
         .iter()
         .rev()
@@ -882,5 +919,13 @@ fn settle_events(
         stop,
         output,
         structured: None,
+        error,
     })
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.to_string(),
+    }
 }

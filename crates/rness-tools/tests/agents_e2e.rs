@@ -102,6 +102,9 @@ fn subagent_calls(n: usize, prompt: &str, mode: &str) -> Vec<(String, &'static s
 /// - `child-i`: answer `ans-i` after 20 ms.
 /// - `block-i`: wait for cancellation.
 /// - `nest`: step 0 delegates `nest` in the foreground; then "done".
+/// - `bgnest`: step 0 starts one background child `nestchild`; then "ack".
+/// - `nestchild`: step 0 starts one background grandchild `block-g`, then
+///   waits for cancellation.
 /// - `workflow <script>`: step 0 calls `workflow` with that script.
 /// - `w...`: workflow member, answers "m".
 #[async_trait]
@@ -141,6 +144,26 @@ impl Provider for Scripted {
                     json!({"provider":"spawn","prompt":"nest"}),
                 )],
             ),
+            "bgnest" if step == 0 => reply(
+                "",
+                vec![(
+                    "call-bgnest".into(),
+                    "subagent",
+                    json!({"provider":"spawn","prompt":"nestchild","run_in_background":true}),
+                )],
+            ),
+            "nestchild" if step == 0 => reply(
+                "",
+                vec![(
+                    "call-grandchild".into(),
+                    "subagent",
+                    json!({"provider":"spawn","prompt":"block-g","run_in_background":true}),
+                )],
+            ),
+            "nestchild" => tokio::select! {
+                _ = cancel.cancelled() => StepOutcome::Cancelled { partial: vec![] },
+                _ = tokio::time::sleep(Duration::from_secs(60)) => reply("unblocked", vec![]),
+            },
             "workflow" if step == 0 => reply(
                 "",
                 vec![(
@@ -450,11 +473,39 @@ async fn parent_cancel_cancels_foreground_child() {
     assert_eq!(turn_outcomes(&h, &parent), vec![TurnOutcome::Cancelled]);
 }
 
+fn job_kill(h: &H, parent: &SessionId, job: &str) -> impl std::future::Future<Output = String> {
+    let (tools, parent, job) = (Arc::clone(&h.tools), parent.clone(), job.to_string());
+    async move {
+        let res = tools
+            .dispatch(
+                &parent,
+                &[ToolCall {
+                    call: "kill".into(),
+                    name: "job_kill".into(),
+                    args: json!({ "job_id": job }),
+                }],
+                1,
+                &Default::default(),
+            )
+            .await;
+        res[0].output.clone()
+    }
+}
+
+fn job_status(h: &H, owner: &SessionId, job: &str) -> (String, bool) {
+    h.jobs
+        .list(owner)
+        .into_iter()
+        .find(|j| j.job_id == job)
+        .map(|j| (j.status, j.running))
+        .expect("job listed")
+}
+
 /// Background one-shot children outlive the parent's turn by design; the
-/// documented way to stop one is `job_kill`. It must cancel the child.
+/// documented way to stop one is `job_kill`. It must cancel the child, and
+/// the job must leave `cancelling` for `killed` with exactly one notice.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "B6-1: job_kill on a background subagent job never cancels the child"]
-async fn bug_job_kill_cancels_background_subagent_child() {
+async fn job_kill_cancels_background_subagent_child() {
     let h = compose(true, None);
     let parent = h.sessions.create(None).unwrap();
     send(&h, &parent, "bgblock 1");
@@ -467,24 +518,8 @@ async fn bug_job_kill_cancels_background_subagent_child() {
     .await;
     let child = children_of(&h, &parent)[0].0.clone();
     let job = job_ids_from_results(&h, &parent)[0].clone();
-    let res = h
-        .tools
-        .dispatch(
-            &parent,
-            &[ToolCall {
-                call: "kill".into(),
-                name: "job_kill".into(),
-                args: json!({"job_id": job}),
-            }],
-            1,
-            &Default::default(),
-        )
-        .await;
-    assert!(
-        res[0].output.contains("cancellation requested"),
-        "{}",
-        res[0].output
-    );
+    let output = job_kill(&h, &parent, &job).await;
+    assert!(output.contains("cancellation requested"), "{output}");
     // Expectation: the child turn is cancelled within a few seconds.
     let start = Instant::now();
     while !idle(&h, &child) && start.elapsed() < Duration::from_secs(5) {
@@ -501,13 +536,114 @@ async fn bug_job_kill_cancels_background_subagent_child() {
             .collect::<Vec<_>>()
     );
     assert_eq!(turn_outcomes(&h, &child), vec![TurnOutcome::Cancelled]);
+    wait_until("job killed", Duration::from_secs(5), || {
+        job_status(&h, &parent, &job) == ("killed".into(), false)
+    })
+    .await;
+    println!(
+        "{}",
+        json!({"observation":"wp6.job_kill_child_idle_ms","ms":start.elapsed().as_secs_f64()*1e3})
+    );
+    // Exactly one completion notice (durable delivery runs on a 1 s tick).
+    wait_until("kill notice", Duration::from_secs(5), || {
+        job_notice_counts(&h, &parent).get(&job) == Some(&1)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(job_notice_counts(&h, &parent).get(&job), Some(&1));
+    // A second kill reports the settled state, not a new request.
+    let again = job_kill(&h, &parent, &job).await;
+    assert!(again.contains("already finished"), "{again}");
+    assert!(again.contains("killed"), "{again}");
 }
 
-/// Observation (not a contract): what parent teardown does to running
-/// background and continuable children. Prints JSON; asserts only that
-/// teardown itself completes.
+/// A kill that lands before the background task launched the child must not
+/// leave a running (unstoppable) child behind.
 #[tokio::test(flavor = "multi_thread")]
-async fn teardown_of_parent_with_running_children_observation() {
+async fn job_kill_immediately_after_launch_leaves_no_running_child() {
+    let h = compose(false, None);
+    let parent = h.sessions.create(None).unwrap();
+    let res = h
+        .tools
+        .dispatch(
+            &parent,
+            &subagent_calls(1, "block", "background")
+                .into_iter()
+                .map(|(call, name, args)| ToolCall {
+                    call,
+                    name: name.into(),
+                    args,
+                })
+                .collect::<Vec<_>>(),
+            1,
+            &Default::default(),
+        )
+        .await;
+    let job = res[0]
+        .output
+        .split("as job ")
+        .nth(1)
+        .and_then(|t| t.split_whitespace().next())
+        .expect("job id in launch acknowledgement")
+        .to_string();
+    let output = job_kill(&h, &parent, &job).await;
+    assert!(
+        output.contains("cancellation requested") || output.contains("already finished"),
+        "{output}"
+    );
+    wait_until("job killed", Duration::from_secs(5), || {
+        job_status(&h, &parent, &job) == ("killed".into(), false)
+    })
+    .await;
+    // Either no child was created, or it ended cancelled.
+    for (child, _) in children_of(&h, &parent) {
+        wait_until("child idle", Duration::from_secs(5), || idle(&h, &child)).await;
+        assert_eq!(turn_outcomes(&h, &child), vec![TurnOutcome::Cancelled]);
+    }
+}
+
+/// Killing a background child also kills the background grandchild it
+/// started (a job owned by the child), and the killed child is not woken by
+/// the grandchild's completion.
+#[tokio::test(flavor = "multi_thread")]
+async fn job_kill_of_background_child_kills_background_grandchild() {
+    let h = compose(false, None);
+    let parent = h.sessions.create(None).unwrap();
+    send(&h, &parent, "bgnest");
+    let mut tree = vec![];
+    wait_until("grandchild running", Duration::from_secs(10), || {
+        tree = h.sessions.descendants(&parent).unwrap();
+        tree.len() == 2 && tree.iter().all(|s| !idle(&h, s)) && idle(&h, &parent)
+    })
+    .await;
+    let (child, grandchild) = (tree[0].clone(), tree[1].clone());
+    let job = job_ids_from_results(&h, &parent)[0].clone();
+    let grand_job = job_ids_from_results(&h, &child)[0].clone();
+    let output = job_kill(&h, &parent, &job).await;
+    assert!(output.contains("cancellation requested"), "{output}");
+    wait_until("tree idle", Duration::from_secs(5), || {
+        idle(&h, &child) && idle(&h, &grandchild)
+    })
+    .await;
+    wait_until("both jobs killed", Duration::from_secs(5), || {
+        job_status(&h, &parent, &job) == ("killed".into(), false)
+            && job_status(&h, &child, &grand_job) == ("killed".into(), false)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(turn_outcomes(&h, &child), vec![TurnOutcome::Cancelled]);
+    assert_eq!(turn_outcomes(&h, &grandchild), vec![TurnOutcome::Cancelled]);
+    assert!(
+        idle(&h, &child),
+        "grandchild notice must not wake the killed child"
+    );
+}
+
+/// Parent teardown stops running background and continuable children:
+/// their turns end cancelled, background jobs settle killed, and the
+/// continuable children stay resumable sessions.
+#[tokio::test(flavor = "multi_thread")]
+async fn teardown_of_parent_cancels_running_children() {
     let h = compose(true, None);
     let parent = h.sessions.create(None).unwrap();
     send(&h, &parent, "bgblock 3");
@@ -541,6 +677,7 @@ async fn teardown_of_parent_with_running_children_observation() {
     })
     .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let parent_turns = turn_outcomes(&h, &parent).len();
     h.sessions.begin_teardown(&parent);
     tokio::time::timeout(Duration::from_secs(10), h.sessions.join(&parent))
         .await
@@ -556,6 +693,25 @@ async fn teardown_of_parent_with_running_children_observation() {
         "{}",
         json!({"observation":"wp6.teardown_children_running_after_2s","running":still_running})
     );
+    assert!(still_running.is_empty(), "{still_running:?}");
+    for (child, _) in children_of(&h, &parent) {
+        assert_eq!(turn_outcomes(&h, &child), vec![TurnOutcome::Cancelled]);
+    }
+    let jobs = h.jobs.list(&parent);
+    assert_eq!(jobs.len(), 3);
+    assert!(
+        jobs.iter().all(|j| j.status == "killed" && !j.running),
+        "{:?}",
+        jobs.iter().map(|j| &j.status).collect::<Vec<_>>()
+    );
+    // Teardown notices are logged, never wake the parent.
+    assert_eq!(turn_outcomes(&h, &parent).len(), parent_turns);
+    // Continuable children remain resumable sessions.
+    let (cont, _) = children_of(&h, &parent)
+        .into_iter()
+        .find(|(_, d)| d.mode == rness_protocol::branch::DelegationMode::Continuable)
+        .unwrap();
+    assert!(h.sessions.store().history(&cont).is_ok());
 }
 
 // -- 3. depth through the tool path ---------------------------------------------

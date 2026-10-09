@@ -434,6 +434,10 @@ def group_failures(t, fp, rep):
                 sub and outcomes(log) == ["completed"], (sub[:1], outcomes(log)))
         print(f"  overflow child result: is_error={sub[0].get('is_error') if sub else None} "
               f"out={(sub[0].get('output') or '')[:160] if sub else None!r}", flush=True)
+        # B6-5: the failed child's result carries the reason, not just "failed".
+        out = (sub[0].get("output") or "") if sub else ""
+        t.check("fail: child context overflow result includes the reason (B6-5)",
+                "failed:" in out and ("overflow" in out.lower() or "too long" in out.lower()), out[:200])
 
         res = r.headless("WP6:c:nest:0", timeout=120)
         chain = [res.session]

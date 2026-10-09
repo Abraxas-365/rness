@@ -624,7 +624,9 @@ impl JobRegistry {
                     let _ = file.seek(SeekFrom::Start(
                         state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64,
                     ));
-                    let _ = file.take(MAX_READ_BYTES as u64).read_to_end(&mut state.output);
+                    let _ = file
+                        .take(MAX_READ_BYTES as u64)
+                        .read_to_end(&mut state.output);
                     if state.read_from > state.output_bytes {
                         continue;
                     }
@@ -740,9 +742,47 @@ impl JobRegistry {
                 }
             });
         }
+        // Teardown stops the background subagents of the torn-down session
+        // and every running job (Bash, terminals, subagents) owned by its
+        // delegated descendants. The root's own Bash jobs are left to the
+        // host's exit path.
+        let registry = Arc::downgrade(&self.inner);
+        let disposer = sessions
+            .bus()
+            .on::<rness_engine::service::SessionTeardownEv>(move |notice| {
+                let Some(inner) = registry.upgrade() else {
+                    return;
+                };
+                let jobs = JobRegistry { inner };
+                jobs.stop_owned_by(&notice.root, Some(&["subagent"]));
+                for session in &notice.descendants {
+                    jobs.stop_owned_by(session, None);
+                }
+            });
+        // The listener lives as long as the bus; it is inert once the
+        // registry is gone.
+        std::mem::forget(disposer);
     }
 
-    /// Foreground captures reuse the job artifact and ownership model, without
+    /// Request a stop of every running job owned by `session`, optionally
+    /// only those of the given kinds. Returns how many stops were requested.
+    pub fn stop_owned_by(&self, session: &str, kinds: Option<&[&str]>) -> usize {
+        let owned: Vec<Arc<Job>> = self
+            .inner
+            .jobs
+            .lock()
+            .expect("jobs lock")
+            .values()
+            .filter(|job| {
+                let state = job.state.lock().expect("job lock");
+                !state.settled
+                    && state.owner.as_deref() == Some(session)
+                    && kinds.is_none_or(|kinds| kinds.contains(&state.kind.as_str()))
+            })
+            .cloned()
+            .collect();
+        owned.iter().filter(|job| job.request_stop()).count()
+    }
     /// issuing a second completion notice or advertising a running background job.
     pub(crate) fn capture(&self, label: String, owner: Option<&String>) -> (String, JobWriter) {
         let (id, writer) = self.start_owned("bash-output", label, owner);
@@ -1086,6 +1126,33 @@ mod inspection_tests {
         let settled = jobs.inspect("any", &id).unwrap().job;
         assert_eq!(settled.status, "killed");
         assert!(settled.settled_at_ms >= settled.started_at_ms);
+    }
+
+    #[test]
+    fn stop_owned_by_filters_owner_kind_and_settled_jobs() {
+        let jobs = JobRegistry::new();
+        let owner = String::from("owner");
+        let (bash, _bash_writer) = jobs.start_owned("bash", "sleep".into(), Some(&owner));
+        let (sub, _sub_writer) = jobs.start_owned("subagent", "child".into(), Some(&owner));
+        let (done, done_writer) = jobs.start_owned("subagent", "done".into(), Some(&owner));
+        done_writer.settle(JobStatus::Exited(Some(0)));
+        let (other, _other_writer) =
+            jobs.start_owned("subagent", "other".into(), Some(&"other".into()));
+        assert_eq!(jobs.stop_owned_by("owner", Some(&["subagent"])), 1);
+        let status = |id: &str, session: &str| {
+            jobs.list(session)
+                .into_iter()
+                .find(|j| j.job_id == id)
+                .unwrap()
+                .status
+        };
+        assert_eq!(status(&sub, "owner"), "cancelling");
+        assert_eq!(status(&bash, "owner"), "running");
+        assert_eq!(status(&done, "owner"), "exited");
+        assert_eq!(status(&other, "other"), "running");
+        // Already requested: no second request; Bash now included.
+        assert_eq!(jobs.stop_owned_by("owner", None), 1);
+        assert_eq!(status(&bash, "owner"), "cancelling");
     }
 
     #[tokio::test]
