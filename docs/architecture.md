@@ -184,6 +184,9 @@ data, the design is wrong. rness initially ships with no SQLite at all.
 - **One inbox, three intents:** user input while the agent runs is
   classified `followup` / `steer` / `inject`, with explicit phases
   (idle / running / maintenance), rather than ad-hoc queued messages.
+  A cancelled or failed burst parks its queued followups; the next send
+  delivers them first, in submission order, and the new message queues
+  behind them.
 - **Parallel tools, model-order commits:** bounded concurrent execution,
   deterministic history order.
 - **Durable events vs live frames:** committed history and streaming

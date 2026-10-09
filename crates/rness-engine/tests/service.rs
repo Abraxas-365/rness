@@ -1098,6 +1098,49 @@ async fn cancel_ends_the_burst_and_returns_to_idle() {
     assert_eq!(replayed.context.turns.len(), 1); // just the user message
 }
 
+/// B1-10: followups parked by a cancelled burst are delivered before a
+/// newer message sent afterwards (submission order), none lost or duplicated.
+#[tokio::test]
+async fn parked_followups_precede_a_newer_message_after_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Scripted::gated(scripted_answers(3), Arc::clone(&gate));
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+
+    svc.send(&sid, UserIntent::Followup, text("start")).unwrap();
+    while svc.phase(&sid) != Phase::Running {
+        tokio::task::yield_now().await;
+    }
+    for q in ["q1", "q2"] {
+        let d = svc.send(&sid, UserIntent::Followup, text(q)).unwrap();
+        assert_eq!(d, Disposition::Queued);
+    }
+    svc.cancel(&sid);
+    svc.join(&sid).await;
+    assert_eq!(svc.phase(&sid), Phase::Idle);
+
+    gate.add_permits(10);
+    svc.send(&sid, UserIntent::Followup, text("after")).unwrap();
+    svc.join(&sid).await;
+
+    let users: Vec<String> = svc
+        .store()
+        .history(&sid)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(UserMessage { content, .. }) => match &content[0] {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["start", "q1", "q2", "after"]);
+    assert_eq!(svc.phase(&sid), Phase::Idle);
+}
+
 #[tokio::test]
 async fn sessions_run_independently() {
     let dir = tempfile::tempdir().unwrap();

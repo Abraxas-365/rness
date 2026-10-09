@@ -148,9 +148,9 @@ def sec_inbox(c, turns):
         print(f"INFO  inbox-cancel: after next send, queued logged={q_logged}, order tail={texts[-5:]}")
         c.check("inbox-cancel: queued followups are not silently lost (logged by the next turn or before)",
                 len(q_logged) == 3, q_logged)
-        c.xcheck("inbox-cancel: parked followups delivered before a newer followup",
-                 texts.index("C-after") > max(texts.index(q) for q in q_logged) if len(q_logged) == 3 else False,
-                 "B1-10 parked followups reordered after the next send", texts[-5:])
+        c.check("inbox-cancel: parked followups delivered before a newer followup",
+                texts.index("C-after") > max(texts.index(q) for q in q_logged) if len(q_logged) == 3 else False,
+                texts[-5:])
 
 
 def sec_approvals(c):
