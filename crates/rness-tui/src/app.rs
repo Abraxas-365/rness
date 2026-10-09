@@ -227,6 +227,10 @@ impl Model {
             return;
         }
         self.history_epoch = self.history_epoch.wrapping_add(1);
+        // The extent was measured on the previous projection (another
+        // session, or rows before a compaction): unclamped until the chat
+        // renders this one.
+        self.scroll_extent.set(usize::MAX);
         self.cancelled_tools.clear();
         self.title = None;
         let old_entries = std::mem::take(&mut self.entries);
@@ -1647,6 +1651,9 @@ impl App {
                     .background_models
                     .remove(&session)
                     .unwrap_or_else(|| Model::new(session, self.model.model_name.clone()));
+                // A parked model keeps the extent of its last render, made
+                // with another chat layout: unclamped until rendered again.
+                next.scroll_extent.set(usize::MAX);
                 let previous = std::mem::replace(&mut self.model, next);
                 if let Some(ref mut displayed) = displayed {
                     **displayed = self.model.session.clone();
@@ -2149,6 +2156,59 @@ mod tests {
             .unwrap()
             .unwrap();
         thread.join().unwrap();
+    }
+
+    /// `scroll_extent` comes from the last render of the previous
+    /// projection; a reload or a session switch must not clamp scroll-up
+    /// to it before the chat has rendered the new one.
+    #[test]
+    fn scroll_extent_resets_on_session_switch_and_history_reload() {
+        let mut model = Model::new("s1".into(), "m".into());
+        model.load_history(&prior_history("s1"));
+        model.scroll_extent.set(3);
+        model.scroll_up(100);
+        assert_eq!(model.scroll_from_bottom, 3);
+        // Full reload (another session's log).
+        model.scroll_from_bottom = 0;
+        model.load_history(&prior_history("other"));
+        assert_eq!(model.scroll_extent.get(), usize::MAX);
+        model.scroll_up(100);
+        assert_eq!(model.scroll_from_bottom, 100);
+        // An append keeps the extent (same projection, the chat refines it).
+        let mut history = prior_history("s1");
+        let mut model = Model::new("s1".into(), "m".into());
+        model.load_history(&history);
+        model.scroll_extent.set(3);
+        history
+            .envelopes
+            .push(env(SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text {
+                    text: "more".into(),
+                }],
+                source: None,
+            })));
+        model.load_history(&history);
+        assert_eq!(model.scroll_extent.get(), 3);
+
+        // Switching back to a parked (busy) session.
+        let mut app = App::new(
+            Model::new("s1".into(), "m".into()),
+            Slots::default(),
+            Arc::new(FakeBackend {
+                history: prior_history("s1"),
+            }),
+        );
+        app.reconcile();
+        app.model.busy = true;
+        app.model.scroll_extent.set(3);
+        app.apply(Action::SwitchSession("s2".into()));
+        app.model.scroll_extent.set(5);
+        app.apply(Action::SwitchSession("s1".into()));
+        assert_eq!(app.model.session, "s1");
+        assert_eq!(app.model.scroll_extent.get(), usize::MAX);
+        app.apply(Action::ScrollUp(100));
+        assert_eq!(app.model.scroll_from_bottom, 100);
     }
 
     #[test]
