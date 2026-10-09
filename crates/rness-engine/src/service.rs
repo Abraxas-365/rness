@@ -1578,21 +1578,10 @@ impl SessionService {
     }
 
     /// Delegated descendants of `root` (children, grandchildren, ...),
-    /// breadth-first, from one scan of the store's delegation headers.
+    /// breadth-first, from the store's in-memory delegation index (a header
+    /// scan only when session directories came or went since the last one).
     pub fn descendants(&self, root: &SessionId) -> Result<Vec<SessionId>, ServiceError> {
-        let mut by_parent: HashMap<SessionId, Vec<SessionId>> = HashMap::new();
-        for (id, d) in self.store.delegations()? {
-            by_parent.entry(d.parent).or_default().push(id);
-        }
-        let mut out = Vec::new();
-        let mut queue = std::collections::VecDeque::from([root.clone()]);
-        while let Some(node) = queue.pop_front() {
-            for child in by_parent.remove(&node).unwrap_or_default() {
-                out.push(child.clone());
-                queue.push_back(child);
-            }
-        }
-        Ok(out)
+        Ok(self.store.delegated_descendants(root)?)
     }
 
     /// Cancel `root`'s current turn and those of all its delegated
@@ -1708,7 +1697,8 @@ impl SessionService {
         id: &str,
         text: String,
     ) -> Result<bool, ServiceError> {
-        self.notice_once(session, id, text, UserIntent::Inject).await
+        self.notice_once(session, id, text, UserIntent::Inject)
+            .await
     }
 
     async fn notice_once(

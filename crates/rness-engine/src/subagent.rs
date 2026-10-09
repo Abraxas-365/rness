@@ -730,24 +730,13 @@ impl SubagentRuntime {
         let root = root.clone();
         let mut open: Vec<(SessionId, Delegation, u32, String)> =
             tokio::task::spawn_blocking(move || -> Result<_, SubagentError> {
-                let mut by_parent: HashMap<SessionId, Vec<(SessionId, Delegation)>> =
-                    HashMap::new();
-                for (child, d) in sessions.store().delegations()? {
-                    by_parent
-                        .entry(d.parent.clone())
-                        .or_default()
-                        .push((child, d));
-                }
-                let mut tree = Vec::new();
-                let mut queue = std::collections::VecDeque::from([root]);
-                while let Some(node) = queue.pop_front() {
-                    for (child, d) in by_parent.remove(&node).unwrap_or_default() {
-                        queue.push_back(child.clone());
-                        tree.push((child, d));
-                    }
-                }
+                // Also warms the store's delegation index off the runtime,
+                // so the first teardown or kill needs no header scan.
                 let mut open = Vec::new();
-                for (child, d) in tree {
+                for child in sessions.store().delegated_descendants(&root)? {
+                    let Some(d) = sessions.store().delegation(&child)? else {
+                        continue;
+                    };
                     if sessions.phase(&child) != crate::inbox::Phase::Idle {
                         continue;
                     }
