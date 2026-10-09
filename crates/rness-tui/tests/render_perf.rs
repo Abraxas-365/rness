@@ -445,7 +445,7 @@ fn eviction_probe() {
                 app.apply(Action::ScrollUp(40));
                 render(&mut app, 169, 46);
                 f += 1;
-                if app.model.scroll_from_bottom == u16::MAX || f > 4000 {
+                if app.model.scroll_from_bottom == usize::MAX || f > 4000 {
                     break;
                 }
                 // Stop when the view no longer moves (top reached).

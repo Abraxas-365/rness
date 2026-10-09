@@ -1330,11 +1330,17 @@ impl Component for Input {
             } else {
                 "  "
             };
-            let text = &lines[row.line][row.start..row.end];
+            // The draft keeps pasted bytes verbatim (they are sent as-is);
+            // the display drops control/bidi characters, which count as
+            // zero cells in the caret math, so the caret stays aligned.
+            let text: String = lines[row.line][row.start..row.end]
+                .chars()
+                .filter(|c| !crate::core::terminal_text::is_terminal_unsafe(*c))
+                .collect();
             let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
             Line::from(vec![
                 Span::styled(prefix.to_string(), ctx.theme.editor_prompt),
-                Span::raw(text.to_string()),
+                Span::raw(text),
             ])
             .render(rect, buf);
             // Visible cursor: reverse-video the cell.

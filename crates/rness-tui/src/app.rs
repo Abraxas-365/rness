@@ -139,8 +139,14 @@ pub struct Model {
     pub model_name: String,
     pub profile_name: Option<String>,
     pub agent_name: Option<String>,
-    /// Scrollback offset from the bottom (0 = pinned to latest).
-    pub scroll_from_bottom: u16,
+    /// Scrollback offset from the bottom (0 = pinned to latest), in rows.
+    /// `usize`: long sessions exceed 65 535 rows.
+    pub scroll_from_bottom: usize,
+    /// Largest useful `scroll_from_bottom` (total rows − viewport height),
+    /// written by the chat module on each render; `usize::MAX` until the
+    /// first render. `scroll_up` clamps to it so presses past the top do
+    /// not pile up as dead offset.
+    pub scroll_extent: std::cell::Cell<usize>,
     /// A sensitive tool call paused for a decision. The approval overlay
     /// selects itself into `overlay` while this is Some (chain pattern —
     /// no shell-driven mount/unmount).
@@ -181,10 +187,27 @@ impl Model {
             profile_name: None,
             agent_name: None,
             scroll_from_bottom: 0,
+            scroll_extent: std::cell::Cell::new(usize::MAX),
             pending_approval: None,
             should_quit: false,
             title: None,
         }
+    }
+
+    /// Scroll up `n` rows, saturating and clamped to the last rendered
+    /// extent (an offset past it would show the same top frame). Never
+    /// lowers the offset: the chat's scroll anchor moves the view by the
+    /// offset delta, so a decrease would scroll down.
+    pub fn scroll_up(&mut self, n: usize) {
+        self.scroll_from_bottom = self
+            .scroll_from_bottom
+            .saturating_add(n)
+            .min(self.scroll_extent.get().max(self.scroll_from_bottom));
+    }
+
+    /// Scroll down `n` rows (towards the latest), saturating at 0.
+    pub fn scroll_down(&mut self, n: usize) {
+        self.scroll_from_bottom = self.scroll_from_bottom.saturating_sub(n);
     }
 
     /// Project an immutable, append-only session log. Session changes, shortened
@@ -204,6 +227,10 @@ impl Model {
             return;
         }
         self.history_epoch = self.history_epoch.wrapping_add(1);
+        // The extent was measured on the previous projection (another
+        // session, or rows before a compaction): unclamped until the chat
+        // renders this one.
+        self.scroll_extent.set(usize::MAX);
         self.cancelled_tools.clear();
         self.title = None;
         let old_entries = std::mem::take(&mut self.entries);
@@ -547,8 +574,8 @@ pub enum Action {
     PasteClipboard,
     Cancel,
     Quit,
-    ScrollUp(u16),
-    ScrollDown(u16),
+    ScrollUp(usize),
+    ScrollDown(usize),
     /// The pending approval was answered with this decision.
     ResolveApproval(rness_protocol::api::ApprovalDecision),
     /// Open extension point: named action + payload, broadcast to every
@@ -1507,12 +1534,8 @@ impl App {
                     )));
                 }
             }
-            Action::ScrollUp(n) => {
-                self.model.scroll_from_bottom = self.model.scroll_from_bottom.saturating_add(n)
-            }
-            Action::ScrollDown(n) => {
-                self.model.scroll_from_bottom = self.model.scroll_from_bottom.saturating_sub(n)
-            }
+            Action::ScrollUp(n) => self.model.scroll_up(n),
+            Action::ScrollDown(n) => self.model.scroll_down(n),
             Action::ResolveApproval(decision) => {
                 if let Some(pending) = self.model.pending_approval.take() {
                     let _ = pending.respond.send(decision);
@@ -1628,6 +1651,9 @@ impl App {
                     .background_models
                     .remove(&session)
                     .unwrap_or_else(|| Model::new(session, self.model.model_name.clone()));
+                // A parked model keeps the extent of its last render, made
+                // with another chat layout: unclamped until rendered again.
+                next.scroll_extent.set(usize::MAX);
                 let previous = std::mem::replace(&mut self.model, next);
                 if let Some(ref mut displayed) = displayed {
                     **displayed = self.model.session.clone();
@@ -1642,6 +1668,17 @@ impl App {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        self.render_unscrubbed(area, buf);
+        // Guard: whatever a module or plugin rendered, no control
+        // character leaves the process (the sources sanitize precisely;
+        // this catches unlisted paths).
+        crate::core::terminal_text::scrub_buffer(buf);
+    }
+
+    /// [`App::render`] without the final control-character scrub, so tests
+    /// can assert that the text sources themselves are terminal-safe.
+    #[doc(hidden)]
+    pub fn render_unscrubbed(&mut self, area: Rect, buf: &mut Buffer) {
         let ctx = Ctx {
             model: &self.model,
             theme: &self.theme,
@@ -1707,7 +1744,11 @@ fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
 /// normalized on write; control characters are stripped again because the
 /// log is a file anyone could edit.
 pub fn terminal_title_text(title: Option<&str>) -> String {
-    match title.map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>()) {
+    match title.map(|t| {
+        t.chars()
+            .filter(|c| !crate::core::terminal_text::is_terminal_unsafe(*c))
+            .collect::<String>()
+    }) {
         Some(t) if !t.trim().is_empty() => format!("{} — rness", t.trim()),
         _ => "rness".into(),
     }
@@ -2115,6 +2156,59 @@ mod tests {
             .unwrap()
             .unwrap();
         thread.join().unwrap();
+    }
+
+    /// `scroll_extent` comes from the last render of the previous
+    /// projection; a reload or a session switch must not clamp scroll-up
+    /// to it before the chat has rendered the new one.
+    #[test]
+    fn scroll_extent_resets_on_session_switch_and_history_reload() {
+        let mut model = Model::new("s1".into(), "m".into());
+        model.load_history(&prior_history("s1"));
+        model.scroll_extent.set(3);
+        model.scroll_up(100);
+        assert_eq!(model.scroll_from_bottom, 3);
+        // Full reload (another session's log).
+        model.scroll_from_bottom = 0;
+        model.load_history(&prior_history("other"));
+        assert_eq!(model.scroll_extent.get(), usize::MAX);
+        model.scroll_up(100);
+        assert_eq!(model.scroll_from_bottom, 100);
+        // An append keeps the extent (same projection, the chat refines it).
+        let mut history = prior_history("s1");
+        let mut model = Model::new("s1".into(), "m".into());
+        model.load_history(&history);
+        model.scroll_extent.set(3);
+        history
+            .envelopes
+            .push(env(SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text {
+                    text: "more".into(),
+                }],
+                source: None,
+            })));
+        model.load_history(&history);
+        assert_eq!(model.scroll_extent.get(), 3);
+
+        // Switching back to a parked (busy) session.
+        let mut app = App::new(
+            Model::new("s1".into(), "m".into()),
+            Slots::default(),
+            Arc::new(FakeBackend {
+                history: prior_history("s1"),
+            }),
+        );
+        app.reconcile();
+        app.model.busy = true;
+        app.model.scroll_extent.set(3);
+        app.apply(Action::SwitchSession("s2".into()));
+        app.model.scroll_extent.set(5);
+        app.apply(Action::SwitchSession("s1".into()));
+        assert_eq!(app.model.session, "s1");
+        assert_eq!(app.model.scroll_extent.get(), usize::MAX);
+        app.apply(Action::ScrollUp(100));
+        assert_eq!(app.model.scroll_from_bottom, 100);
     }
 
     #[test]

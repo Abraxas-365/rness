@@ -20,7 +20,7 @@ pub struct Chat {
     /// feeds it — zero magic, zero cost.
     selected_message: Option<String>,
     message_expanded: bool,
-    message_scroll: u16,
+    message_scroll: usize,
     cards: CardCache,
     config: serde_json::Value,
     focused_call: Option<String>,
@@ -37,7 +37,9 @@ pub struct Chat {
     /// Evicted entries whose `row_ends` height is an estimate, not a
     /// layout. Refilled when visible, otherwise a batch per frame.
     stale: std::collections::BTreeSet<usize>,
-    /// Adaptive number of stale entries laid out per idle frame.
+    /// Stale entries offered to the next idle frame: the number that fit
+    /// `REFILL_BUDGET` at the last measured rate (an upper bound; the
+    /// budget is enforced per entry).
     refill_batch: usize,
     refill: Vec<usize>,
     resident_bytes: std::collections::HashMap<usize, usize>,
@@ -46,7 +48,7 @@ pub struct Chat {
     cached_positions: std::collections::HashMap<String, usize>,
     scroll_anchor: Option<(String, usize)>,
     live_scroll_anchor: Option<(Option<usize>, usize)>,
-    last_scroll: u16,
+    last_scroll: usize,
     durable_stamp: Option<String>,
     cache_epoch: u64,
     cache_view: String,
@@ -62,6 +64,12 @@ pub struct Chat {
     cache_args: std::collections::HashMap<String, serde_json::Value>,
     #[cfg(test)]
     entry_visits: usize,
+    /// Passes over `row_ends` shifting refilled heights (one per frame).
+    #[cfg(test)]
+    row_shift_passes: usize,
+    /// Replaces `REFILL_BUDGET` so tests can force budget skips.
+    #[cfg(test)]
+    refill_budget: Option<std::time::Duration>,
     row_ends: Vec<usize>,
     cache_theme: Option<crate::theme::Theme>,
     cache_width: u16,
@@ -547,6 +555,104 @@ fn panel(
     out
 }
 
+/// Per-frame time spent laying out estimated (stale) entries in the
+/// background; visible refills and changed cards are not limited.
+const REFILL_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+/// Background refills per idle frame regardless of budget (progress floor).
+const MIN_REFILL: usize = 16;
+/// Upper bound on stale entries offered to one frame.
+const MAX_REFILL: usize = 4096;
+
+/// Apply the height changes of one refill pass. `pending` holds
+/// `(entry index, delta)` ascending; `laid_out` (ascending) are the entries
+/// laid out this pass, whose `card_rows` were written from already-shifted
+/// bases. One pass over `row_ends[first..]` and one over `cached_calls`,
+/// however many entries changed height.
+fn shift_rows(
+    row_ends: &mut [usize],
+    card_rows: &mut std::collections::HashMap<String, usize>,
+    cached_calls: &std::collections::HashMap<String, usize>,
+    pending: &[(usize, isize)],
+    laid_out: &[usize],
+) {
+    let Some(&(first, _)) = pending.first() else {
+        return;
+    };
+    let mut next = 0;
+    let mut sum: isize = 0;
+    for (index, end) in row_ends.iter_mut().enumerate().skip(first) {
+        while next < pending.len() && pending[next].0 <= index {
+            sum = sum.saturating_add(pending[next].1);
+            next += 1;
+        }
+        *end = end.saturating_add_signed(sum);
+    }
+    let prefix: Vec<isize> = pending
+        .iter()
+        .scan(0isize, |sum, (_, delta)| {
+            *sum = sum.saturating_add(*delta);
+            Some(*sum)
+        })
+        .collect();
+    for (call, &index) in cached_calls {
+        if index <= first || laid_out.binary_search(&index).is_ok() {
+            continue;
+        }
+        let above = pending.partition_point(|(i, _)| *i < index);
+        if let (Some(shift), Some(row)) = (
+            above.checked_sub(1).map(|n| prefix[n]),
+            card_rows.get_mut(call),
+        ) {
+            *row = row.saturating_add_signed(shift);
+        }
+    }
+}
+
+/// Width-only relayout: rescale every height from `old_width` to `width`
+/// in index order (the `estimate_rows` rule, without id lookups) and
+/// re-derive `card_rows`. Returns the first entry of the window
+/// (`target` rows from the bottom) that the caller lays out exactly.
+fn rescale_rows(
+    row_ends: &mut [usize],
+    card_rows: &mut std::collections::HashMap<String, usize>,
+    cached_calls: &std::collections::HashMap<String, usize>,
+    old_width: u16,
+    width: u16,
+    target: usize,
+) -> usize {
+    let (old, new) = (usize::from(old_width), usize::from(width.max(1)));
+    let (mut previous, mut total) = (0, 0);
+    for end in row_ends.iter_mut() {
+        let rows = *end - previous;
+        previous = *end;
+        total += if rows == 0 || old == new {
+            rows
+        } else {
+            (rows * old / new).max(1)
+        };
+        *end = total;
+    }
+    let mut start = row_ends.len();
+    while start > 0 && total - start.checked_sub(1).map_or(0, |i| row_ends[i]) < target {
+        start -= 1;
+    }
+    for (call, &index) in cached_calls {
+        if let Some(row) = card_rows.get_mut(call) {
+            *row = index.checked_sub(1).map_or(0, |i| row_ends[i]);
+        }
+    }
+    start
+}
+
+/// Signed `last - current` scroll movement (rows the view start moves down).
+fn scroll_delta(last: usize, current: usize) -> isize {
+    if last >= current {
+        isize::try_from(last - current).unwrap_or(isize::MAX)
+    } else {
+        isize::try_from(current - last).map_or(isize::MIN, |d| -d)
+    }
+}
+
 fn visual_rows(line: Line<'static>, width: usize, wrap: bool) -> Vec<Line<'static>> {
     visual_rows_limited(line, width, wrap, usize::MAX)
 }
@@ -676,7 +782,7 @@ fn panel_body(
         let label_style = theme
             .resolve_style(&options["label"]["style"], style)
             .unwrap_or(style);
-        content.insert(0, Line::styled(label.to_owned(), label_style));
+        content.insert(0, Line::styled(sanitize(label), label_style));
     }
     let mut output = Vec::new();
     for _ in 0..padding("top") {
@@ -1227,7 +1333,6 @@ impl Component for Chat {
                 self.total_rows
                     .saturating_sub(row.saturating_add(self.viewport_height))
             };
-            let target = target.min(u16::MAX as usize) as u16;
             let current = ctx.model.scroll_from_bottom;
             let action = if target >= current {
                 crate::app::Action::ScrollUp(target - current)
@@ -1437,33 +1542,55 @@ impl Component for Chat {
         } else {
             None
         };
-        // Progressive layout: while nothing else changed, lay out a batch of
-        // estimated (stale) entries per frame, newest first.
-        let progressive: Vec<usize> =
-            if !self.stale.is_empty() && dirty.as_ref().is_some_and(|calls| calls.is_empty()) {
-                self.stale
-                    .iter()
-                    .rev()
-                    .take(self.refill_batch.max(16))
-                    .copied()
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        // Progressive layout: on frames that touch at most some cards (none
+        // or a few dirty ones), lay out a batch of estimated (stale) entries
+        // too, newest first. Dirty cards are laid out first (required) and
+        // the batch takes what is left of the budget, so a card that
+        // changes every frame (spinner, progress) cannot starve the refill.
+        let progressive: Vec<usize> = if !self.stale.is_empty() && dirty.is_some() {
+            self.stale
+                .iter()
+                .rev()
+                .take(self.refill_batch.max(MIN_REFILL))
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let unchanged = base_unchanged && progressive.is_empty();
         let mut durable_rows = self.row_ends.last().copied().unwrap_or(0);
         let mut assistant_count = ctx.model.next_assistant_id;
         if !unchanged {
             let partial = dirty.is_some();
+            // Width-only change (same history, view state, theme and config):
+            // entry order, ids, calls and tool args are unchanged, so only
+            // heights are rescaled and the window near the viewport laid out.
+            let relayout = !append_only
+                && !partial
+                && !self.exact_layout
+                && ctx.model.history_revision != 0
+                && self.durable_stamp.as_ref() == Some(&stamp)
+                && self.cache_epoch == ctx.model.history_epoch
+                && self.entry_cache.len() == ctx.model.entries.len()
+                && self.row_ends.len() == ctx.model.entries.len()
+                && self.cached_ids.len() == ctx.model.entries.len()
+                && self.cache_width != width
+                && self.cache_theme.as_ref() == Some(theme)
+                && self.cache_config == self.config;
             let start_entry = if append_only || partial {
                 self.entry_cache.len()
             } else {
                 0
             };
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.cache_args.clear();
             }
-            for entry in &ctx.model.entries[start_entry..] {
+            let args_from = if relayout {
+                ctx.model.entries.len()
+            } else {
+                start_entry
+            };
+            for entry in &ctx.model.entries[args_from..] {
                 if let Entry::Assistant { content, .. } = entry {
                     for part in content {
                         if let ContentPart::ToolUse { call, args, .. } = part {
@@ -1473,17 +1600,71 @@ impl Component for Chat {
                 }
             }
             let tool_args = &self.cache_args;
-            let old_layout: Option<OldLayout> = (!append_only && !partial && !self.exact_layout)
-                .then(|| {
+            let old_layout: Option<OldLayout> =
+                (!append_only && !partial && !self.exact_layout && !relayout).then(|| {
                     (
                         self.cache_width,
                         std::mem::take(&mut self.cached_positions),
                         self.row_ends.clone(),
                     )
                 });
-            if self.cache_width != width
-                || self.cache_theme.as_ref() != Some(theme)
-                || self.cache_config != self.config
+            let relayout_window = relayout.then(|| {
+                let height = usize::from(area.height);
+                let start = rescale_rows(
+                    &mut self.row_ends,
+                    &mut self.card_rows,
+                    &self.cached_calls,
+                    self.cache_width,
+                    width,
+                    ctx.model.scroll_from_bottom.saturating_add(2 * height),
+                );
+                // A scrolled view is placed by its anchor (see the anchor
+                // block below), not by the offset from the bottom, so lay
+                // out ±2 screens around the anchor instead of everything
+                // between it and the bottom (O(scroll) at the top of a long
+                // session).
+                let anchored = (ctx.model.scroll_from_bottom != 0
+                    && self.last_scroll != 0
+                    && self.live_scroll_anchor.is_none())
+                .then_some(self.scroll_anchor.as_ref())
+                .flatten()
+                .and_then(|(id, row)| {
+                    let index = *self.cached_positions.get(id)?;
+                    Some(index.checked_sub(1).map_or(0, |i| self.row_ends[i]) + row)
+                });
+                let (start, end) = match anchored {
+                    Some(row) => (
+                        self.row_ends
+                            .partition_point(|end| *end <= row.saturating_sub(2 * height)),
+                        (self
+                            .row_ends
+                            .partition_point(|end| *end < row.saturating_add(3 * height))
+                            + 1)
+                        .min(self.row_ends.len()),
+                    ),
+                    None => (start, self.row_ends.len()),
+                };
+                // Rows outside the window are estimates until refilled; all
+                // cached rows are for the old width.
+                for cached in &mut self.entry_cache {
+                    if !cached.1.is_empty() || !cached.2.is_empty() {
+                        *cached = (0, String::new(), Vec::new());
+                    }
+                }
+                self.resident_bytes.clear();
+                self.retained_bytes = 0;
+                self.evicted.clear();
+                self.evicted
+                    .extend((0..start).chain(end..self.row_ends.len()));
+                self.stale = (0..start).chain(end..self.row_ends.len()).collect();
+                self.cache_width = width;
+                (start, end)
+            });
+            let relayout_start = relayout_window.map(|(start, _)| start);
+            if !relayout
+                && (self.cache_width != width
+                    || self.cache_theme.as_ref() != Some(theme)
+                    || self.cache_config != self.config)
             {
                 self.entry_cache.clear();
                 self.evicted.clear();
@@ -1499,9 +1680,13 @@ impl Component for Chat {
             // width/theme/config change) get estimated heights and are
             // refilled when they scroll into view or in later frames.
             let entry_id = |index: usize| ctx.model.entry_ids.get(index).map_or("", String::as_str);
-            let window_start = if old_layout.is_some() {
-                let target =
-                    usize::from(ctx.model.scroll_from_bottom) + 2 * usize::from(area.height);
+            let window_start = if let Some(start) = relayout_start {
+                start
+            } else if old_layout.is_some() {
+                let target = ctx
+                    .model
+                    .scroll_from_bottom
+                    .saturating_add(2 * usize::from(area.height));
                 let mut rows = 0;
                 let mut start = ctx.model.entries.len();
                 while start > 0 && rows < target {
@@ -1523,7 +1708,7 @@ impl Component for Chat {
                 }
                 self.cached_ids
                     .extend_from_slice(&ctx.model.entry_ids[start_entry..]);
-            } else if self.cached_ids != ctx.model.entry_ids {
+            } else if !relayout && self.cached_ids != ctx.model.entry_ids {
                 // Reordered slots cannot retain eviction indexes from the old order.
                 if !self.evicted.is_empty() {
                     self.entry_cache.clear();
@@ -1547,7 +1732,7 @@ impl Component for Chat {
                     .collect();
                 self.cached_ids = ctx.model.entry_ids.clone();
             }
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.cached_positions = self
                     .cached_ids
                     .iter()
@@ -1558,14 +1743,19 @@ impl Component for Chat {
                 self.cached_assistants.clear();
             }
             self.entry_cache.truncate(ctx.model.entries.len());
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.resident_bytes.clear();
                 self.retained_bytes = 0;
                 self.row_ends.clear();
                 self.card_rows.clear();
                 self.stale.clear();
             }
-            assistant_count = 0;
+            // Fallback ids for assistants missing from `assistant_ids`
+            // count from the first laid-out entry.
+            assistant_count = ctx.model.entries[..relayout_start.unwrap_or(0)]
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Assistant { .. }))
+                .count();
             let mut indices: Vec<usize> = if let Some(calls) = dirty {
                 let mut indices: Vec<_> = calls
                     .iter()
@@ -1609,10 +1799,19 @@ impl Component for Chat {
                     }
                 }
                 indices
+            } else if let Some((start, end)) = relayout_window {
+                (start..end).collect()
             } else {
                 (start_entry..ctx.model.entries.len()).collect()
             };
             indices.extend(self.refill.iter().copied());
+            // Everything but background (progressive) refills must be laid
+            // out this frame; those stop once the frame budget is spent.
+            let required: std::collections::HashSet<usize> = if progressive.is_empty() {
+                Default::default()
+            } else {
+                indices.iter().copied().collect()
+            };
             indices.extend(progressive.iter().copied());
             let forced: std::collections::HashSet<usize> = std::mem::take(&mut self.refill)
                 .into_iter()
@@ -1622,18 +1821,58 @@ impl Component for Chat {
             indices.sort_unstable();
             indices.dedup();
             let refill_started = std::time::Instant::now();
-            for entry_index in indices {
+            #[cfg(test)]
+            let budget = self.refill_budget.unwrap_or(REFILL_BUDGET);
+            #[cfg(not(test))]
+            let budget = REFILL_BUDGET;
+            // Height changes of in-place entries, applied to `row_ends` and
+            // `card_rows` once per frame (`flush_row_shifts`) instead of per
+            // entry. `indices` is ascending, so every pending delta lies
+            // above the current entry and shifts its base by `pending_sum`.
+            let mut pending: Vec<(usize, isize)> = Vec::new();
+            let mut pending_sum: isize = 0;
+            let (mut background_laid, mut background_skipped) = (0usize, 0usize);
+            // Entries laid out this frame (ascending); their `card_rows`
+            // already include the pending shifts.
+            let mut laid: Vec<usize> = Vec::new();
+            for &entry_index in &indices {
+                if !progressive.is_empty() && !required.contains(&entry_index) {
+                    // Stale entries stay valid estimates; leaving one keeps
+                    // its row slot (shifted by `pending`) untouched.
+                    if background_laid >= MIN_REFILL && refill_started.elapsed() >= budget {
+                        background_skipped += 1;
+                        continue;
+                    }
+                    background_laid += 1;
+                }
+                laid.push(entry_index);
                 let entry = &ctx.model.entries[entry_index];
                 // Refills (visible or background) and dirty cards replace an
                 // existing row slot; everything else appends a new one.
                 let in_place = entry_index < self.row_ends.len();
+                if !in_place && !pending.is_empty() {
+                    shift_rows(
+                        &mut self.row_ends,
+                        &mut self.card_rows,
+                        &self.cached_calls,
+                        &std::mem::take(&mut pending),
+                        &laid,
+                    );
+                    #[cfg(test)]
+                    {
+                        self.row_shift_passes += 1;
+                    }
+                    pending_sum = 0;
+                }
                 let base = if in_place {
-                    entry_index.checked_sub(1).map_or(0, |i| self.row_ends[i])
+                    entry_index
+                        .checked_sub(1)
+                        .map_or(0, |i| self.row_ends[i].saturating_add_signed(pending_sum))
                 } else {
                     self.row_ends.last().copied().unwrap_or(0)
                 };
                 let old_height = if in_place {
-                    self.row_ends[entry_index] - base
+                    self.row_ends[entry_index].saturating_add_signed(pending_sum) - base
                 } else {
                     0
                 };
@@ -1915,7 +2154,7 @@ impl Component for Chat {
                                             let prefix = if i == 0 { "> " } else { "  " };
                                             lines.push(Line::from(vec![
                                                 Span::styled(prefix.to_string(), theme.user_prefix),
-                                                Span::raw(l.to_string()),
+                                                Span::raw(sanitize(l)),
                                             ]));
                                         }
                                     }
@@ -1939,7 +2178,7 @@ impl Component for Chat {
                                         ContentPart::Thinking { text, .. } => {
                                             for l in text.lines().take(3) {
                                                 lines.push(Line::styled(
-                                                    format!("· {l}"),
+                                                    format!("· {}", sanitize(l)),
                                                     theme.thinking,
                                                 ));
                                             }
@@ -1953,7 +2192,7 @@ impl Component for Chat {
                                             }
                                             lines.push(Line::from(vec![
                                                 Span::styled("⚙ ".to_string(), theme.tool_name),
-                                                Span::styled(name.clone(), theme.tool_name),
+                                                Span::styled(sanitize(name), theme.tool_name),
                                             ]));
                                         }
                                     }
@@ -2059,7 +2298,7 @@ impl Component for Chat {
                                                 if options["header"]["show_name"] == false {
                                                     String::new()
                                                 } else {
-                                                    name.clone()
+                                                    sanitize(name)
                                                 };
                                             if options["header"]["show_status"] == true {
                                                 title.push_str(
@@ -2173,8 +2412,9 @@ impl Component for Chat {
                                 if total > TOOL_CARD_MAX_LINES {
                                     lines.push(Line::styled(
                                         format!(
-                                            "  │ … {} more lines ({name})",
-                                            total - TOOL_CARD_MAX_LINES
+                                            "  │ … {} more lines ({})",
+                                            total - TOOL_CARD_MAX_LINES,
+                                            sanitize(name)
                                         ),
                                         theme.dim,
                                     ));
@@ -2217,35 +2457,39 @@ impl Component for Chat {
                 self.retained_bytes += bytes;
                 durable_rows += self.entry_cache[entry_index].2.len();
                 if in_place {
-                    let delta =
-                        self.entry_cache[entry_index].2.len() as isize - old_height as isize;
+                    let delta = scroll_delta(self.entry_cache[entry_index].2.len(), old_height);
                     if delta != 0 {
-                        for end in &mut self.row_ends[entry_index..] {
-                            *end = end.saturating_add_signed(delta);
-                        }
-                        for (call, index) in &self.cached_calls {
-                            if *index > entry_index {
-                                if let Some(row) = self.card_rows.get_mut(call) {
-                                    *row = row.saturating_add_signed(delta);
-                                }
-                            }
-                        }
+                        pending.push((entry_index, delta));
+                        pending_sum = pending_sum.saturating_add(delta);
                     }
                 } else {
                     self.row_ends.push(durable_rows);
                 }
             }
+            if !pending.is_empty() {
+                shift_rows(
+                    &mut self.row_ends,
+                    &mut self.card_rows,
+                    &self.cached_calls,
+                    &pending,
+                    &laid,
+                );
+                #[cfg(test)]
+                {
+                    self.row_shift_passes += 1;
+                }
+            }
             durable_rows = self.row_ends.last().copied().unwrap_or(0);
             if !progressive.is_empty() {
-                // Keep progressive layout inside a small per-frame budget.
-                let elapsed = refill_started.elapsed();
-                self.refill_batch = if elapsed < std::time::Duration::from_millis(4) {
-                    (progressive.len() * 2).min(512)
-                } else if elapsed > std::time::Duration::from_millis(12) {
-                    (progressive.len() / 2).max(1)
+                // Offer next frame what fits the budget at this frame's rate.
+                let elapsed = refill_started.elapsed().as_nanos().max(1);
+                self.refill_batch = if background_skipped > 0 {
+                    background_laid
                 } else {
-                    progressive.len()
-                };
+                    (background_laid as u128 * budget.as_nanos() / elapsed).min(MAX_REFILL as u128)
+                        as usize
+                }
+                .clamp(MIN_REFILL, MAX_REFILL);
             }
             self.cache_card_revision = card_revision;
             self.cache_history_revision = ctx.model.history_revision;
@@ -2308,7 +2552,7 @@ impl Component for Chat {
                         .collect();
                     lines.extend(panel(rows, &options, width, theme, background));
                 } else if let Some(l) = live.thinking.lines().last() {
-                    lines.push(Line::styled(format!("· {l}"), theme.thinking));
+                    lines.push(Line::styled(format!("· {}", sanitize(l)), theme.thinking));
                 }
             }
             if !live.text.is_empty() {
@@ -2369,7 +2613,7 @@ impl Component for Chat {
                         let mut title = if options["header"]["show_name"] == false {
                             String::new()
                         } else {
-                            name.clone()
+                            sanitize(name)
                         };
                         if options["header"]["show_status"] == true {
                             title.push_str(" · running");
@@ -2386,7 +2630,10 @@ impl Component for Chat {
                         ));
                     }
                 } else {
-                    lines.push(Line::styled(format!("{name}…"), theme.tool_name));
+                    lines.push(Line::styled(
+                        format!("{}…", sanitize(name)),
+                        theme.tool_name,
+                    ));
                 }
             }
         }
@@ -2394,8 +2641,13 @@ impl Component for Chat {
         self.total_rows = durable_rows + lines.len();
         self.viewport_height = usize::from(area.height);
         let height = self.viewport_height;
-        let offset =
-            usize::from(ctx.model.scroll_from_bottom).min(self.total_rows.saturating_sub(height));
+        let offset = ctx
+            .model
+            .scroll_from_bottom
+            .min(self.total_rows.saturating_sub(height));
+        // Without an anchor the effective offset is `offset`; an anchor
+        // moves `start` by the scroll delta instead (see below).
+        let mut effective_scroll = offset;
         let mut end = self.total_rows - offset;
         let mut start = end.saturating_sub(height);
         if ctx.model.scroll_from_bottom != 0 && self.last_scroll != 0 {
@@ -2407,7 +2659,8 @@ impl Component for Chat {
                         self.row_ends[index - 1]
                     };
                     let anchored = base + row.min(&(self.row_ends[index] - base).saturating_sub(1));
-                    let delta = self.last_scroll as isize - ctx.model.scroll_from_bottom as isize;
+                    let delta = scroll_delta(self.last_scroll, ctx.model.scroll_from_bottom);
+                    effective_scroll = ctx.model.scroll_from_bottom;
                     start = anchored
                         .saturating_add_signed(delta)
                         .min(self.total_rows.saturating_sub(height));
@@ -2434,7 +2687,8 @@ impl Component for Chat {
                         })
                 };
                 if let Some(base) = base {
-                    let delta = self.last_scroll as isize - ctx.model.scroll_from_bottom as isize;
+                    let delta = scroll_delta(self.last_scroll, ctx.model.scroll_from_bottom);
+                    effective_scroll = ctx.model.scroll_from_bottom;
                     start = (base + row)
                         .saturating_add_signed(delta)
                         .min(self.total_rows.saturating_sub(height));
@@ -2442,6 +2696,15 @@ impl Component for Chat {
                 }
             }
         }
+        // Scrolling up can move the view by at most `start` more rows. While
+        // rows above are estimates (`stale`), progressive refill can grow
+        // them before the next frame, so a clamp from this frame could stop
+        // short of the real top: leave scroll-up unclamped until exact.
+        ctx.model.scroll_extent.set(if self.stale.is_empty() {
+            effective_scroll.saturating_add(start)
+        } else {
+            usize::MAX
+        });
         let selected_index = self
             .selected_message
             .as_ref()
@@ -2449,7 +2712,8 @@ impl Component for Chat {
         if let Some(index) = selected_index.filter(|index| *index < self.row_ends.len()) {
             let base = index.checked_sub(1).map_or(0, |i| self.row_ends[i]);
             let selected_end = self.row_ends[index];
-            let scroll = usize::from(self.message_scroll)
+            let scroll = self
+                .message_scroll
                 .min(selected_end.saturating_sub(base).saturating_sub(1));
             start = if selected_end.saturating_sub(base) > height || scroll > 0 {
                 base + scroll
@@ -3929,6 +4193,117 @@ mod tests {
         assert_eq!(chat.cached_ids, vec!["event-b"]);
     }
 
+    /// B4-2: offsets beyond 65 535 rows. A tool card at the top, then
+    /// ~80k rows of 40-line notices.
+    fn tall_transcript() -> crate::app::Model {
+        use crate::app::Entry;
+        let mut model = crate::app::Model::new("tall".into(), "fake".into());
+        model.entries.push(Entry::ToolResult {
+            call: "top-call".into(),
+            name: "TopTool".into(),
+            output: "top output\n".into(),
+            is_error: false,
+        });
+        model.entry_ids.push("e-top".into());
+        for i in 0..2000 {
+            let body: String = (0..40).map(|l| format!("n{i} l{l}\n")).collect();
+            model.entries.push(Entry::Notice(body));
+            model.entry_ids.push(format!("e-{i}"));
+        }
+        model
+    }
+
+    fn render_rows(
+        chat: &mut super::Chat,
+        model: &crate::app::Model,
+        area: ratatui::layout::Rect,
+    ) -> Vec<String> {
+        use super::*;
+        let theme = crate::theme::Theme::default();
+        let mut buf = Buffer::empty(area);
+        chat.render(
+            &Ctx {
+                model,
+                theme: &theme,
+            },
+            area,
+            &mut buf,
+        );
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scroll_beyond_u16_rows_reaches_the_top_and_back() {
+        use super::*;
+        let mut model = tall_transcript();
+        let area = Rect::new(0, 0, 60, 20);
+        let mut chat = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        let bottom = render_rows(&mut chat, &model, area);
+        assert!(chat.total_rows > 80_000, "{}", chat.total_rows);
+        let extent = chat.total_rows - 20;
+        assert_eq!(model.scroll_extent.get(), extent);
+
+        // One jump far past u16::MAX lands exactly where asked.
+        model.scroll_up(70_000);
+        assert_eq!(model.scroll_from_bottom, 70_000);
+        let mid = render_rows(&mut chat, &model, area);
+        assert_ne!(mid, bottom);
+        model.scroll_down(70_000);
+        assert_eq!(render_rows(&mut chat, &model, area), bottom);
+
+        // Saturating scroll clamps to the extent; the top is shown and a
+        // single step down moves the view (no dead offset to unwind).
+        model.scroll_up(usize::MAX);
+        let top = render_rows(&mut chat, &model, area);
+        assert!(top[0].contains("top output"), "{top:#?}");
+        model.scroll_up(usize::MAX);
+        assert_eq!(model.scroll_from_bottom, extent);
+        model.scroll_down(1);
+        assert_eq!(model.scroll_from_bottom, extent - 1);
+        let below = render_rows(&mut chat, &model, area);
+        assert_ne!(below, top);
+        assert_eq!(below[..19], top[1..]);
+    }
+
+    #[test]
+    fn card_jump_beyond_u16_rows_targets_the_card() {
+        use super::*;
+        let mut model = tall_transcript();
+        let area = Rect::new(0, 0, 60, 20);
+        let theme = crate::theme::Theme::default();
+        let mut chat = Chat {
+            config: serde_json::json!({}),
+            exact_layout: true,
+            ..Default::default()
+        };
+        render_rows(&mut chat, &model, area);
+        let actions = chat
+            .on_binding(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                "previous_tool",
+            )
+            .actions;
+        let [crate::app::Action::ScrollUp(n)] = actions[..] else {
+            panic!("{actions:?}");
+        };
+        assert!(n > usize::from(u16::MAX), "{n}");
+        model.scroll_up(n);
+        let rows = render_rows(&mut chat, &model, area);
+        assert!(rows[0].contains("top output"), "{rows:#?}");
+    }
+
     #[test]
     fn virtual_viewport_reuses_entries_and_matches_flat_render() {
         use super::*;
@@ -4002,6 +4377,361 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_row_shift_matches_per_entry_shifts() {
+        use super::*;
+        // Pseudo-random heights/deltas; compare against shifting per entry.
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..50 {
+            let n = 1 + next(200) as usize;
+            let mut end = 0;
+            let row_ends: Vec<usize> = (0..n)
+                .map(|_| {
+                    end += 1 + next(9) as usize;
+                    end
+                })
+                .collect();
+            let calls: std::collections::HashMap<String, usize> = (0..n)
+                .filter(|_| next(3) == 0)
+                .map(|i| (format!("c{i}"), i))
+                .collect();
+            let card_rows: std::collections::HashMap<String, usize> = calls
+                .iter()
+                .map(|(call, &i)| (call.clone(), i.checked_sub(1).map_or(0, |p| row_ends[p])))
+                .collect();
+            let mut changed: Vec<usize> = (0..n).filter(|_| next(4) == 0).collect();
+            changed.dedup();
+            let pending: Vec<(usize, isize)> = changed
+                .iter()
+                .map(|&i| (i, next(7) as isize - 3))
+                .filter(|(_, d)| *d != 0)
+                .collect();
+            let (mut naive_ends, mut naive_cards) = (row_ends.clone(), card_rows.clone());
+            for &(entry, delta) in &pending {
+                for end in &mut naive_ends[entry..] {
+                    *end = end.saturating_add_signed(delta);
+                }
+                for (call, &index) in &calls {
+                    if index > entry {
+                        let row = naive_cards.get_mut(call).unwrap();
+                        *row = row.saturating_add_signed(delta);
+                    }
+                }
+            }
+            let (mut ends, mut cards) = (row_ends, card_rows);
+            shift_rows(&mut ends, &mut cards, &calls, &pending, &[]);
+            assert_eq!(ends, naive_ends);
+            assert_eq!(cards, naive_cards);
+        }
+    }
+
+    #[test]
+    fn background_refill_shifts_rows_once_per_frame_and_converges() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("refill".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 3 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: "line\n".repeat(1 + i % 5),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let render = |chat: &mut Chat, model: &Model, area: Rect| {
+            let mut buf = Buffer::empty(area);
+            chat.render(
+                &Ctx {
+                    model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            buf
+        };
+        let wide = Rect::new(0, 0, 100, 12);
+        let narrow = Rect::new(0, 0, 33, 12);
+        // A zero budget lays out exactly MIN_REFILL of the offered batch
+        // and skips the rest, so skipped entries sit below laid-out ones.
+        let mut chat = Chat {
+            refill_budget: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        render(&mut chat, &model, wide);
+        render(&mut chat, &model, narrow);
+        assert!(!chat.stale.is_empty());
+        let mut frames = 0;
+        while !chat.stale.is_empty() {
+            frames += 1;
+            assert!(frames < 1000, "refill did not converge");
+            let (passes, stale) = (chat.row_shift_passes, chat.stale.len());
+            chat.refill_batch = 4 * MIN_REFILL;
+            render(&mut chat, &model, narrow);
+            assert!(chat.row_shift_passes - passes <= 1);
+            assert!(stale - chat.stale.len() <= MIN_REFILL);
+            // Card jumps read `card_rows` mid-refill: it must track the
+            // (partly estimated) row index every frame.
+            for (call, &index) in &chat.cached_calls {
+                let start = index.checked_sub(1).map_or(0, |i| chat.row_ends[i]);
+                assert_eq!(chat.card_rows.get(call), Some(&start), "{call}");
+            }
+        }
+        let mut reference = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        let expected = render(&mut reference, &model, narrow);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
+        assert_eq!(render(&mut chat, &model, narrow), expected);
+    }
+
+    /// A Lua card that changes every frame (spinner, live progress) makes
+    /// every frame a dirty-card frame. Background refill must still run
+    /// after the dirty cards, or `stale` never empties: `scroll_extent`
+    /// stays unclamped and estimated `card_rows` stay forever.
+    #[test]
+    fn background_refill_finishes_while_a_card_changes_every_frame() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("spinner".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 3 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: "line\n".repeat(1 + i % 5),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 40, 12);
+        // Zero budget: exactly MIN_REFILL background entries per frame.
+        let mut chat = Chat {
+            refill_budget: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        let publish = |chat: &Chat, frame: usize| {
+            chat.cards.insert(
+                "call-2997".into(),
+                vec![rness_kernel::presentation::StyledLine {
+                    text: format!("spinner {}", ["|", "/", "-", "\\"][frame % 4]),
+                    ..Default::default()
+                }],
+            );
+        };
+        let render = |chat: &mut Chat| {
+            chat.render(
+                &Ctx {
+                    model: &model,
+                    theme: &theme,
+                },
+                area,
+                &mut Buffer::empty(area),
+            );
+        };
+        publish(&chat, 0);
+        render(&mut chat);
+        let stale = chat.stale.len();
+        assert!(stale > 100, "{stale}");
+        // N = what the refill needs at MIN_REFILL per frame, plus slack.
+        let limit = stale / MIN_REFILL + 10;
+        let mut frames = 0;
+        while !chat.stale.is_empty() {
+            frames += 1;
+            assert!(
+                frames <= limit,
+                "refill stalled: {} stale after {frames} frames",
+                chat.stale.len()
+            );
+            let before = chat.cards.revision();
+            publish(&chat, frames);
+            assert_ne!(chat.cards.revision(), before);
+            render(&mut chat);
+            assert_eq!(chat.cache_card_revision, chat.cards.revision());
+        }
+        assert_ne!(model.scroll_extent.get(), usize::MAX);
+        assert_eq!(model.scroll_extent.get(), chat.total_rows - 12);
+        let mut reference = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        reference.cards.insert(
+            "call-2997".into(),
+            chat.cards.get(&"call-2997".into()).unwrap().to_vec(),
+        );
+        render(&mut reference);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
+    }
+
+    #[test]
+    fn width_only_resize_lays_out_the_window_and_converges() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("resize".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 4 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: format!("output {i} ").repeat(1 + i % 13),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let render = |chat: &mut Chat, model: &Model, area: Rect| {
+            let mut buf = Buffer::empty(area);
+            chat.render(
+                &Ctx {
+                    model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            buf
+        };
+        let exact = |model: &Model, area: Rect| {
+            let mut chat = Chat {
+                exact_layout: true,
+                ..Default::default()
+            };
+            let buf = render(&mut chat, model, area);
+            (chat, buf)
+        };
+        let drain = |chat: &mut Chat, model: &Model, area: Rect| {
+            for _ in 0..1000 {
+                if chat.stale.is_empty() {
+                    return;
+                }
+                render(chat, model, area);
+            }
+            panic!("refill did not converge");
+        };
+        let mut chat = Chat::default();
+        let wide = Rect::new(0, 0, 100, 12);
+        render(&mut chat, &model, wide);
+        drain(&mut chat, &model, wide);
+        for area in [
+            Rect::new(0, 0, 37, 12),
+            wide,
+            Rect::new(0, 0, 61, 20),
+            Rect::new(0, 0, 37, 12),
+        ] {
+            let before = chat.entry_visits;
+            let frame = render(&mut chat, &model, area);
+            assert!(chat.entry_visits - before < 100, "{area:?}");
+            assert_eq!(frame, exact(&model, area).1, "{area:?}");
+            // Card rows follow the rescaled (estimated) row index.
+            for (call, &index) in &chat.cached_calls {
+                let start = index.checked_sub(1).map_or(0, |i| chat.row_ends[i]);
+                assert_eq!(chat.card_rows.get(call), Some(&start), "{call}");
+            }
+            drain(&mut chat, &model, area);
+            let (reference, _) = exact(&model, area);
+            assert_eq!(chat.row_ends, reference.row_ends, "{area:?}");
+            assert_eq!(chat.card_rows, reference.card_rows, "{area:?}");
+        }
+        // Resized while scrolled: the jump to the top still shows exact rows.
+        model.scroll_from_bottom = 500;
+        render(&mut chat, &model, wide);
+        render(&mut chat, &model, Rect::new(0, 0, 45, 12));
+        model.scroll_from_bottom = usize::MAX;
+        let top = render(&mut chat, &model, Rect::new(0, 0, 45, 12));
+        assert_eq!(top, exact(&model, Rect::new(0, 0, 45, 12)).1);
+        // Resized while scrolled far up: only the window around the scroll
+        // anchor is laid out (not everything between it and the bottom), the
+        // frame is exact, and refill converging around it does not move it.
+        let narrow = Rect::new(0, 0, 45, 12);
+        drain(&mut chat, &model, narrow);
+        model.scroll_from_bottom = chat.total_rows - 300;
+        render(&mut chat, &model, narrow);
+        render(&mut chat, &model, narrow);
+        let before = chat.entry_visits;
+        let resized = render(&mut chat, &model, wide);
+        assert!(
+            chat.entry_visits - before < 100,
+            "{}",
+            chat.entry_visits - before
+        );
+        assert!(
+            chat.stale.iter().any(|&index| index > 2000),
+            "below-window rows left as estimates"
+        );
+        drain(&mut chat, &model, wide);
+        assert_eq!(render(&mut chat, &model, wide), resized);
+        let (reference, _) = exact(&model, wide);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
+    }
+
+    #[test]
+    fn scroll_up_is_not_clamped_by_estimated_rows() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("estimates".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        // Long single lines: estimates (len / width + 1) undercount the
+        // word-wrapped layout, so an estimated extent is too small.
+        for i in 0..2000 {
+            model
+                .entries
+                .push(Entry::Notice(format!("word{i} ").repeat(40)));
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 30, 10);
+        let mut chat = Chat::default();
+        let mut buf = Buffer::empty(area);
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        chat.render(&ctx, Rect::new(0, 0, 100, 10), &mut buf);
+        chat.render(&ctx, area, &mut buf);
+        assert!(!chat.stale.is_empty());
+        assert_eq!(model.scroll_extent.get(), usize::MAX);
+        while !chat.stale.is_empty() {
+            chat.render(&ctx, area, &mut buf);
+        }
+        assert_eq!(model.scroll_extent.get(), chat.total_rows - 10);
+    }
+
+    #[test]
     fn lazy_layout_converges_to_exact_layout() {
         use super::*;
         use crate::{app::Model, theme::Theme};
@@ -4061,7 +4791,7 @@ mod tests {
 
         // Jumping to the top of a freshly resized transcript shows exact rows.
         render(&mut chat, &model, wide);
-        model.scroll_from_bottom = u16::MAX;
+        model.scroll_from_bottom = usize::MAX;
         let top = render(&mut chat, &model, wide);
         let (_, expected) = exact(&model, wide);
         assert_eq!(top, expected);

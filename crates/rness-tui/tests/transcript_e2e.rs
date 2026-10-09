@@ -44,9 +44,15 @@ fn settle(app: &mut App, w: u16, h: u16) -> Vec<String> {
     last
 }
 
-fn scroll_to(app: &mut App, from_bottom: u16, w: u16, h: u16) -> Vec<String> {
+fn scroll_to(app: &mut App, from_bottom: usize, w: u16, h: u16) -> Vec<String> {
     app.model.scroll_from_bottom = 0;
-    render(app, w, h);
+    // Finish progressive layout first: scrolling over estimated rows lands
+    // wherever refill (time-budgeted, so CPU-load dependent) has got to,
+    // which is not what this test compares. Every idle frame lays out at
+    // least 16 stale entries, so this many frames always drain it.
+    for _ in 0..app.model.entries.len() / 16 + 2 {
+        render(app, w, h);
+    }
     app.apply(Action::ScrollUp(from_bottom));
     settle(app, w, h)
 }
@@ -59,7 +65,7 @@ fn turns() -> usize {
 fn eviction_budget_is_invisible() {
     let b = long_session("s-evict", turns(), 2, 7);
     let (w, h) = (120u16, 40u16);
-    let positions = [0u16, 37, 500, 2000, 9000];
+    let positions = [0usize, 37, 500, 2000, 9000];
     let mut frames: Vec<(String, Vec<Vec<String>>)> = Vec::new();
     for budget in [None, Some(1024u64), Some(0)] {
         let (mut app, _be) = new_app("s-evict", b.history(), config_with_cache(budget));
@@ -99,10 +105,9 @@ fn top_of_long_transcript_is_reachable() {
     let n = env_usize("RNESS_BENCH_TOP_TURNS", 3000);
     let mut b = LogBuilder::new("s-top");
     b.user("FIRST-MESSAGE-SENTINEL");
-    let rest = long_session("s-top", n, 2, 7);
-    for env in rest.envelopes.into_iter().skip(1) {
-        b.envelopes.push(env);
-    }
+    // Same builder: splicing a second builder's envelopes would duplicate
+    // event ids (entry ids key the chat's scroll anchor).
+    extend_long_session(&mut b, n, 2, 7);
     let (mut app, _be) = new_app("s-top", b.history(), flavor_config());
     let (w, h) = (120u16, 40u16);
     settle(&mut app, w, h);
@@ -120,7 +125,7 @@ fn top_of_long_transcript_is_reachable() {
     }
     let mut top = settle(&mut app, w, h);
     // Also the extreme: offset saturated.
-    app.model.scroll_from_bottom = u16::MAX;
+    app.model.scroll_from_bottom = usize::MAX;
     let top2 = settle(&mut app, w, h);
     eprintln!(
         "presses={presses} scroll_from_bottom={} top-row={:?}",
@@ -130,7 +135,7 @@ fn top_of_long_transcript_is_reachable() {
     top.extend(top2);
     assert!(
         top.iter().any(|r| r.contains("FIRST-MESSAGE-SENTINEL")),
-        "first message unreachable after {presses} PageUps (scroll_from_bottom is u16, saturates at 65535 rows)"
+        "first message unreachable after {presses} PageUps"
     );
 }
 
@@ -181,7 +186,7 @@ fn resize_round_trip_matches_fresh_open() {
         (1, 1),
         (120, 40),
     ];
-    for scroll in [0u16, 300] {
+    for scroll in [0usize, 300] {
         let (mut app, _be) = new_app("s-resize", b.history(), flavor_config());
         app.model.scroll_from_bottom = scroll;
         for &(w, h) in &sizes {

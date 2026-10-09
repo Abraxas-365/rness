@@ -194,10 +194,9 @@ impl Component for ExtStatusline {
                             base,
                         ));
                     }
-                    let text: String = text
-                        .chars()
-                        .map(|c| if c.is_control() { ' ' } else { c })
-                        .collect();
+                    // Drop escapes whole (payload included), not just
+                    // the control bytes; newlines become spaces.
+                    let text = crate::core::terminal_text::sanitize_text(text).replace('\n', " ");
                     spans.push(Span::styled(
                         text,
                         theme.resolve_style(&value["style"], base).unwrap_or(base),
@@ -224,9 +223,18 @@ impl Component for ExtStatusline {
         }
         let phase = if model.busy { "streaming" } else { "idle" };
         Line::from(vec![
-            Span::styled(format!(" {} ", model.model_name), theme.statusline_accent),
+            Span::styled(
+                format!(
+                    " {} ",
+                    crate::core::terminal_text::sanitize(&model.model_name)
+                ),
+                theme.statusline_accent,
+            ),
             Span::styled(format!("· {phase}  "), theme.statusline),
-            Span::styled(text, theme.statusline_accent),
+            Span::styled(
+                crate::core::terminal_text::sanitize_text(&text).replace('\n', " "),
+                theme.statusline_accent,
+            ),
         ])
         .render(area, buf);
     }
@@ -237,6 +245,34 @@ mod tests {
     use super::*;
     use crate::app::Model;
     use crate::theme::Theme;
+
+    #[test]
+    fn lua_text_escapes_are_dropped_with_their_payload() {
+        let cell = StatusText::default();
+        let mut component = ExtStatusline { text: cell.clone() };
+        let model = Model::new("s".into(), "m\u{1b}[31m".into());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        let row = |component: &mut ExtStatusline| {
+            let area = Rect::new(0, 0, 60, 1);
+            let mut buf = Buffer::empty(area);
+            component.render(&ctx, area, &mut buf);
+            (0..60).map(|x| buf[(x, 0)].symbol()).collect::<String>()
+        };
+        cell.set(Some("ok\u{1b}]0;EVIL\u{7} \u{1b}[2Jdone\nnext".into()));
+        let text = row(&mut component);
+        assert!(text.starts_with(" m · idle  ok done next"), "{text:?}");
+        cell.0.write().unwrap().view = Some(serde_json::json!({
+            "left":[{"text":"a\u{1b}[31mred\u{1b}[0m\u{9b}b"}], "right":"r"
+        }));
+        let text = row(&mut component);
+        // `\u{9b}b` is a whole C1 CSI (final byte `b`), dropped like `ESC [ b`.
+        assert!(text.starts_with("ared "), "{text:?}");
+        assert!(!text.contains("[31m"), "{text:?}");
+    }
 
     #[test]
     fn structured_sections_align_and_clip_at_every_width() {

@@ -92,6 +92,16 @@ pub fn render(app: &mut App, w: u16, h: u16) -> Buffer {
     buf
 }
 
+/// Like [`render`] but without the final control-character scrub, so
+/// content checks see what the text sources produced.
+#[allow(dead_code)]
+pub fn render_unscrubbed(app: &mut App, w: u16, h: u16) -> Buffer {
+    let area = Rect::new(0, 0, w, h);
+    let mut buf = Buffer::empty(area);
+    app.render_unscrubbed(area, &mut buf);
+    buf
+}
+
 /// Rows as text, skipping cells hidden behind wide glyphs.
 pub fn rows(buf: &Buffer) -> Vec<String> {
     let a = buf.area;
@@ -278,6 +288,18 @@ pub fn long_session(
     compact_every: usize,
 ) -> LogBuilder {
     let mut b = LogBuilder::new(session);
+    extend_long_session(&mut b, turns, tools_per_turn, compact_every);
+    b
+}
+
+/// Append [`long_session`] turns to `b` (event ids continue `b`'s sequence,
+/// so they stay unique when the builder already has events).
+pub fn extend_long_session(
+    b: &mut LogBuilder,
+    turns: usize,
+    tools_per_turn: usize,
+    compact_every: usize,
+) {
     for t in 0..turns {
         if compact_every > 0 && t > 0 && t % compact_every == 0 {
             b.compact(&format!("## Summary {t}\n\n{}", prose(t * 7 + 1, 600)));
@@ -305,7 +327,6 @@ pub fn long_session(
             prose(t * 7 + 3, 300)
         ));
     }
-    b
 }
 
 // ---------------------------------------------------------------------------
