@@ -37,7 +37,9 @@ pub struct Chat {
     /// Evicted entries whose `row_ends` height is an estimate, not a
     /// layout. Refilled when visible, otherwise a batch per frame.
     stale: std::collections::BTreeSet<usize>,
-    /// Adaptive number of stale entries laid out per idle frame.
+    /// Stale entries offered to the next idle frame: the number that fit
+    /// `REFILL_BUDGET` at the last measured rate (an upper bound; the
+    /// budget is enforced per entry).
     refill_batch: usize,
     refill: Vec<usize>,
     resident_bytes: std::collections::HashMap<usize, usize>,
@@ -62,6 +64,12 @@ pub struct Chat {
     cache_args: std::collections::HashMap<String, serde_json::Value>,
     #[cfg(test)]
     entry_visits: usize,
+    /// Passes over `row_ends` shifting refilled heights (one per frame).
+    #[cfg(test)]
+    row_shift_passes: usize,
+    /// Replaces `REFILL_BUDGET` so tests can force budget skips.
+    #[cfg(test)]
+    refill_budget: Option<std::time::Duration>,
     row_ends: Vec<usize>,
     cache_theme: Option<crate::theme::Theme>,
     cache_width: u16,
@@ -545,6 +553,59 @@ fn panel(
         border,
     ));
     out
+}
+
+/// Per-frame time spent laying out estimated (stale) entries in the
+/// background; visible refills and changed cards are not limited.
+const REFILL_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
+/// Background refills per idle frame regardless of budget (progress floor).
+const MIN_REFILL: usize = 16;
+/// Upper bound on stale entries offered to one frame.
+const MAX_REFILL: usize = 4096;
+
+/// Apply the height changes of one refill pass. `pending` holds
+/// `(entry index, delta)` ascending; `laid_out` (ascending) are the entries
+/// laid out this pass, whose `card_rows` were written from already-shifted
+/// bases. One pass over `row_ends[first..]` and one over `cached_calls`,
+/// however many entries changed height.
+fn shift_rows(
+    row_ends: &mut [usize],
+    card_rows: &mut std::collections::HashMap<String, usize>,
+    cached_calls: &std::collections::HashMap<String, usize>,
+    pending: &[(usize, isize)],
+    laid_out: &[usize],
+) {
+    let Some(&(first, _)) = pending.first() else {
+        return;
+    };
+    let mut next = 0;
+    let mut sum: isize = 0;
+    for (index, end) in row_ends.iter_mut().enumerate().skip(first) {
+        while next < pending.len() && pending[next].0 <= index {
+            sum = sum.saturating_add(pending[next].1);
+            next += 1;
+        }
+        *end = end.saturating_add_signed(sum);
+    }
+    let prefix: Vec<isize> = pending
+        .iter()
+        .scan(0isize, |sum, (_, delta)| {
+            *sum = sum.saturating_add(*delta);
+            Some(*sum)
+        })
+        .collect();
+    for (call, &index) in cached_calls {
+        if index <= first || laid_out.binary_search(&index).is_ok() {
+            continue;
+        }
+        let above = pending.partition_point(|(i, _)| *i < index);
+        if let (Some(shift), Some(row)) = (
+            above.checked_sub(1).map(|n| prefix[n]),
+            card_rows.get_mut(call),
+        ) {
+            *row = row.saturating_add_signed(shift);
+        }
+    }
 }
 
 /// Signed `last - current` scroll movement (rows the view start moves down).
@@ -1452,7 +1513,7 @@ impl Component for Chat {
                 self.stale
                     .iter()
                     .rev()
-                    .take(self.refill_batch.max(16))
+                    .take(self.refill_batch.max(MIN_REFILL))
                     .copied()
                     .collect()
             } else {
@@ -1623,6 +1684,13 @@ impl Component for Chat {
                 (start_entry..ctx.model.entries.len()).collect()
             };
             indices.extend(self.refill.iter().copied());
+            // Everything but background (progressive) refills must be laid
+            // out this frame; those stop once the frame budget is spent.
+            let required: std::collections::HashSet<usize> = if progressive.is_empty() {
+                Default::default()
+            } else {
+                indices.iter().copied().collect()
+            };
             indices.extend(progressive.iter().copied());
             let forced: std::collections::HashSet<usize> = std::mem::take(&mut self.refill)
                 .into_iter()
@@ -1632,18 +1700,58 @@ impl Component for Chat {
             indices.sort_unstable();
             indices.dedup();
             let refill_started = std::time::Instant::now();
-            for entry_index in indices {
+            #[cfg(test)]
+            let budget = self.refill_budget.unwrap_or(REFILL_BUDGET);
+            #[cfg(not(test))]
+            let budget = REFILL_BUDGET;
+            // Height changes of in-place entries, applied to `row_ends` and
+            // `card_rows` once per frame (`flush_row_shifts`) instead of per
+            // entry. `indices` is ascending, so every pending delta lies
+            // above the current entry and shifts its base by `pending_sum`.
+            let mut pending: Vec<(usize, isize)> = Vec::new();
+            let mut pending_sum: isize = 0;
+            let (mut background_laid, mut background_skipped) = (0usize, 0usize);
+            // Entries laid out this frame (ascending); their `card_rows`
+            // already include the pending shifts.
+            let mut laid: Vec<usize> = Vec::new();
+            for &entry_index in &indices {
+                if !progressive.is_empty() && !required.contains(&entry_index) {
+                    // Stale entries stay valid estimates; leaving one keeps
+                    // its row slot (shifted by `pending`) untouched.
+                    if background_laid >= MIN_REFILL && refill_started.elapsed() >= budget {
+                        background_skipped += 1;
+                        continue;
+                    }
+                    background_laid += 1;
+                }
+                laid.push(entry_index);
                 let entry = &ctx.model.entries[entry_index];
                 // Refills (visible or background) and dirty cards replace an
                 // existing row slot; everything else appends a new one.
                 let in_place = entry_index < self.row_ends.len();
+                if !in_place && !pending.is_empty() {
+                    shift_rows(
+                        &mut self.row_ends,
+                        &mut self.card_rows,
+                        &self.cached_calls,
+                        &std::mem::take(&mut pending),
+                        &laid,
+                    );
+                    #[cfg(test)]
+                    {
+                        self.row_shift_passes += 1;
+                    }
+                    pending_sum = 0;
+                }
                 let base = if in_place {
-                    entry_index.checked_sub(1).map_or(0, |i| self.row_ends[i])
+                    entry_index
+                        .checked_sub(1)
+                        .map_or(0, |i| self.row_ends[i].saturating_add_signed(pending_sum))
                 } else {
                     self.row_ends.last().copied().unwrap_or(0)
                 };
                 let old_height = if in_place {
-                    self.row_ends[entry_index] - base
+                    self.row_ends[entry_index].saturating_add_signed(pending_sum) - base
                 } else {
                     0
                 };
@@ -2228,35 +2336,39 @@ impl Component for Chat {
                 self.retained_bytes += bytes;
                 durable_rows += self.entry_cache[entry_index].2.len();
                 if in_place {
-                    let delta =
-                        self.entry_cache[entry_index].2.len() as isize - old_height as isize;
+                    let delta = scroll_delta(self.entry_cache[entry_index].2.len(), old_height);
                     if delta != 0 {
-                        for end in &mut self.row_ends[entry_index..] {
-                            *end = end.saturating_add_signed(delta);
-                        }
-                        for (call, index) in &self.cached_calls {
-                            if *index > entry_index {
-                                if let Some(row) = self.card_rows.get_mut(call) {
-                                    *row = row.saturating_add_signed(delta);
-                                }
-                            }
-                        }
+                        pending.push((entry_index, delta));
+                        pending_sum = pending_sum.saturating_add(delta);
                     }
                 } else {
                     self.row_ends.push(durable_rows);
                 }
             }
+            if !pending.is_empty() {
+                shift_rows(
+                    &mut self.row_ends,
+                    &mut self.card_rows,
+                    &self.cached_calls,
+                    &pending,
+                    &laid,
+                );
+                #[cfg(test)]
+                {
+                    self.row_shift_passes += 1;
+                }
+            }
             durable_rows = self.row_ends.last().copied().unwrap_or(0);
             if !progressive.is_empty() {
-                // Keep progressive layout inside a small per-frame budget.
-                let elapsed = refill_started.elapsed();
-                self.refill_batch = if elapsed < std::time::Duration::from_millis(4) {
-                    (progressive.len() * 2).min(512)
-                } else if elapsed > std::time::Duration::from_millis(12) {
-                    (progressive.len() / 2).max(1)
+                // Offer next frame what fits the budget at this frame's rate.
+                let elapsed = refill_started.elapsed().as_nanos().max(1);
+                self.refill_batch = if background_skipped > 0 {
+                    background_laid
                 } else {
-                    progressive.len()
-                };
+                    (background_laid as u128 * budget.as_nanos() / elapsed).min(MAX_REFILL as u128)
+                        as usize
+                }
+                .clamp(MIN_REFILL, MAX_REFILL);
             }
             self.cache_card_revision = card_revision;
             self.cache_history_revision = ctx.model.history_revision;
@@ -4136,6 +4248,132 @@ mod tests {
         );
         assert_eq!(chat.entry_cache.len(), 3);
         assert_eq!(chat.total_rows, 3);
+    }
+
+    #[test]
+    fn coalesced_row_shift_matches_per_entry_shifts() {
+        use super::*;
+        // Pseudo-random heights/deltas; compare against shifting per entry.
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..50 {
+            let n = 1 + next(200) as usize;
+            let mut end = 0;
+            let row_ends: Vec<usize> = (0..n)
+                .map(|_| {
+                    end += 1 + next(9) as usize;
+                    end
+                })
+                .collect();
+            let calls: std::collections::HashMap<String, usize> = (0..n)
+                .filter(|_| next(3) == 0)
+                .map(|i| (format!("c{i}"), i))
+                .collect();
+            let card_rows: std::collections::HashMap<String, usize> = calls
+                .iter()
+                .map(|(call, &i)| (call.clone(), i.checked_sub(1).map_or(0, |p| row_ends[p])))
+                .collect();
+            let mut changed: Vec<usize> = (0..n).filter(|_| next(4) == 0).collect();
+            changed.dedup();
+            let pending: Vec<(usize, isize)> = changed
+                .iter()
+                .map(|&i| (i, next(7) as isize - 3))
+                .filter(|(_, d)| *d != 0)
+                .collect();
+            let (mut naive_ends, mut naive_cards) = (row_ends.clone(), card_rows.clone());
+            for &(entry, delta) in &pending {
+                for end in &mut naive_ends[entry..] {
+                    *end = end.saturating_add_signed(delta);
+                }
+                for (call, &index) in &calls {
+                    if index > entry {
+                        let row = naive_cards.get_mut(call).unwrap();
+                        *row = row.saturating_add_signed(delta);
+                    }
+                }
+            }
+            let (mut ends, mut cards) = (row_ends, card_rows);
+            shift_rows(&mut ends, &mut cards, &calls, &pending, &[]);
+            assert_eq!(ends, naive_ends);
+            assert_eq!(cards, naive_cards);
+        }
+    }
+
+    #[test]
+    fn background_refill_shifts_rows_once_per_frame_and_converges() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("refill".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 3 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: "line\n".repeat(1 + i % 5),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let render = |chat: &mut Chat, model: &Model, area: Rect| {
+            let mut buf = Buffer::empty(area);
+            chat.render(
+                &Ctx {
+                    model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            buf
+        };
+        let wide = Rect::new(0, 0, 100, 12);
+        let narrow = Rect::new(0, 0, 33, 12);
+        // A zero budget lays out exactly MIN_REFILL of the offered batch
+        // and skips the rest, so skipped entries sit below laid-out ones.
+        let mut chat = Chat {
+            refill_budget: Some(std::time::Duration::ZERO),
+            ..Default::default()
+        };
+        render(&mut chat, &model, wide);
+        render(&mut chat, &model, narrow);
+        assert!(!chat.stale.is_empty());
+        let mut frames = 0;
+        while !chat.stale.is_empty() {
+            frames += 1;
+            assert!(frames < 1000, "refill did not converge");
+            let (passes, stale) = (chat.row_shift_passes, chat.stale.len());
+            chat.refill_batch = 4 * MIN_REFILL;
+            render(&mut chat, &model, narrow);
+            assert!(chat.row_shift_passes - passes <= 1);
+            assert!(stale - chat.stale.len() <= MIN_REFILL);
+            // Card jumps read `card_rows` mid-refill: it must track the
+            // (partly estimated) row index every frame.
+            for (call, &index) in &chat.cached_calls {
+                let start = index.checked_sub(1).map_or(0, |i| chat.row_ends[i]);
+                assert_eq!(chat.card_rows.get(call), Some(&start), "{call}");
+            }
+        }
+        let mut reference = Chat {
+            exact_layout: true,
+            ..Default::default()
+        };
+        let expected = render(&mut reference, &model, narrow);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
+        assert_eq!(render(&mut chat, &model, narrow), expected);
     }
 
     #[test]
