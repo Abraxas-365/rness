@@ -1127,7 +1127,9 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         jobs.attach_sessions(&sessions);
-        subagents.spawn_reconcile_children();
+        // Serve opens no session up front: a tree is reconciled when this
+        // host first runs a turn in it (never the whole store).
+        subagents.reconcile_on_resume();
         eprintln!(
             "rness serving on http://{addr} (model: {})",
             selection.model
@@ -1156,8 +1158,12 @@ async fn main() -> anyhow::Result<()> {
             format!("apply startup model/reasoning configuration to session {session}")
         })?;
     jobs.attach_sessions(&sessions);
+    // Close child turns a dead host left open, only in the tree of the
+    // session this host opens or resumes (and trees it later runs there).
+    // Headless `-p` runs skip it.
     if cli.prompt.is_none() {
-        subagents.spawn_reconcile_children();
+        subagents.reconcile_on_resume();
+        subagents.spawn_reconcile_tree(session.clone());
     }
 
     let Some(prompt) = cli.prompt else {

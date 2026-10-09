@@ -1695,6 +1695,29 @@ impl SessionService {
         id: &str,
         text: String,
     ) -> Result<bool, ServiceError> {
+        self.notice_once(session, id, text, UserIntent::Steer).await
+    }
+
+    /// [`Self::notify_job_once`] as a log-only Inject: it never starts a
+    /// turn. An idle session gets the notice appended; a turn running here
+    /// sees it at its next step boundary. Deduplicated by the same durable
+    /// source id.
+    pub async fn inject_job_once(
+        &self,
+        session: &SessionId,
+        id: &str,
+        text: String,
+    ) -> Result<bool, ServiceError> {
+        self.notice_once(session, id, text, UserIntent::Inject).await
+    }
+
+    async fn notice_once(
+        &self,
+        session: &SessionId,
+        id: &str,
+        text: String,
+        intent: UserIntent,
+    ) -> Result<bool, ServiceError> {
         let activity = self.lifecycle.clone().read_owned().await;
         let live = self.live(session);
         let operation = live.operation.clone().lock_owned().await;
@@ -1708,7 +1731,7 @@ impl SessionService {
         }
         self.send_or_retry_sourced(
             session,
-            UserIntent::Steer,
+            intent,
             vec![ContentPart::Text { text }],
             false,
             Notice::Job,

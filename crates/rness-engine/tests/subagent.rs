@@ -1439,93 +1439,313 @@ async fn failed_child_run_carries_the_provider_error() {
     assert!(error.contains("prompt is too long"), "{error}");
 }
 
+/// Write a delegated child the way a crashed host left it: the log ends
+/// in `turn/started` (plus whatever the turn committed).
+fn crashed_child(
+    store: &SessionStore,
+    parent: &SessionId,
+    depth: u32,
+    mode: rness_protocol::branch::DelegationMode,
+) -> rness_engine::session::log::SessionLog {
+    let mut log = store
+        .create_delegated(
+            None,
+            rness_protocol::branch::Delegation {
+                parent: parent.clone(),
+                call: None,
+                depth,
+                mode,
+            },
+        )
+        .unwrap();
+    log.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
+    log
+}
+
+fn turn_ends(sessions: &SessionService, s: &SessionId) -> Vec<TurnOutcome> {
+    sessions
+        .store()
+        .history(s)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::TurnEnded { outcome, .. } => Some(*outcome),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `[subagent ...]` notices in `s`, with their intent.
+fn subagent_notices(sessions: &SessionService, s: &SessionId) -> Vec<(UserIntent, String)> {
+    sessions
+        .store()
+        .history(s)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(m) => m.content.iter().find_map(|p| match p {
+                ContentPart::Text { text } if text.starts_with("[subagent ") => {
+                    Some((m.intent, text.clone()))
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn turns_started(sessions: &SessionService, s: &SessionId) -> usize {
+    sessions
+        .store()
+        .history(s)
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+        .count()
+}
+
 /// B6-3: a host killed mid-turn leaves children whose log ends in an open
-/// `turn/started`. The next host closes each turn `cancelled` and tells a
-/// continuable child's parent exactly once; a second reconcile is a no-op.
+/// `turn/started`. Reconciling the root's tree closes each turn
+/// `cancelled` (grandchildren too) and tells a continuable child's parent
+/// exactly once, as a log-only Inject that starts no turn; a second
+/// reconcile is a no-op.
 #[tokio::test(flavor = "multi_thread")]
 async fn reconcile_closes_turns_left_open_by_a_dead_host() {
-    use rness_protocol::branch::{Delegation, DelegationMode};
+    use rness_protocol::branch::DelegationMode;
     let dir = tempfile::tempdir().unwrap();
     // "Crashed host": write the logs directly, as a dead process left them.
-    let (root, cont, oneshot, done) = {
+    let (root, cont, oneshot, done, grandchild) = {
         let store = SessionStore::new(dir.path());
         let root = store.create(None).unwrap().session().clone();
-        let child = |mode| {
-            let mut log = store
-                .create_delegated(
-                    None,
-                    Delegation {
-                        parent: root.clone(),
-                        call: None,
-                        depth: 1,
-                        mode,
-                    },
-                )
-                .unwrap();
-            log.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
-            log
-        };
-        let cont = child(DelegationMode::Continuable).session().clone();
-        let oneshot = child(DelegationMode::OneShot).session().clone();
-        let mut done = child(DelegationMode::Continuable);
+        let cont = crashed_child(&store, &root, 1, DelegationMode::Continuable)
+            .session()
+            .clone();
+        let oneshot = crashed_child(&store, &root, 1, DelegationMode::OneShot)
+            .session()
+            .clone();
+        let mut done = crashed_child(&store, &root, 1, DelegationMode::Continuable);
         done.append(&SessionEvent::TurnEnded {
             turn: 1,
             outcome: TurnOutcome::Completed,
         })
         .unwrap();
-        (root, cont, oneshot, done.session().clone())
+        let grandchild = crashed_child(&store, &cont, 2, DelegationMode::Continuable)
+            .session()
+            .clone();
+        (root, cont, oneshot, done.session().clone(), grandchild)
     };
     let sessions = service(dir.path());
     let rt = runtime(&sessions, 3);
     let within = std::time::Duration::from_secs(10);
-    let reconciled = tokio::time::timeout(within, rt.reconcile_children())
+    let reconciled = tokio::time::timeout(within, rt.reconcile_tree(&root))
         .await
         .expect("reconcile finishes")
         .unwrap();
-    assert_eq!(reconciled, 2);
-    let ends = |s: &SessionId| -> Vec<TurnOutcome> {
-        sessions
-            .store()
-            .history(s)
-            .unwrap()
-            .iter()
-            .filter_map(|e| match &e.event {
-                SessionEvent::TurnEnded { outcome, .. } => Some(*outcome),
-                _ => None,
-            })
-            .collect()
-    };
-    assert_eq!(ends(&cont), vec![TurnOutcome::Cancelled]);
-    assert_eq!(ends(&oneshot), vec![TurnOutcome::Cancelled]);
-    assert_eq!(ends(&done), vec![TurnOutcome::Completed]);
-    let notices = |sessions: &SessionService| -> Vec<String> {
-        sessions
-            .store()
-            .history(&root)
-            .unwrap()
-            .iter()
-            .filter_map(|e| match &e.event {
-                SessionEvent::UserMessage(m) => m.content.iter().find_map(|p| match p {
-                    ContentPart::Text { text } if text.starts_with("[subagent ") => {
-                        Some(text.clone())
-                    }
-                    _ => None,
-                }),
-                _ => None,
-            })
-            .collect()
-    };
-    let got = notices(&sessions);
+    assert_eq!(reconciled, 3);
+    assert_eq!(turn_ends(&sessions, &cont), vec![TurnOutcome::Cancelled]);
+    assert_eq!(turn_ends(&sessions, &oneshot), vec![TurnOutcome::Cancelled]);
+    assert_eq!(
+        turn_ends(&sessions, &grandchild),
+        vec![TurnOutcome::Cancelled]
+    );
+    assert_eq!(turn_ends(&sessions, &done), vec![TurnOutcome::Completed]);
+    let got = subagent_notices(&sessions, &root);
     assert_eq!(got.len(), 1, "one notice, continuable child only: {got:?}");
-    assert!(got[0].starts_with(&format!("[subagent {cont} settled: interrupted]")));
+    assert_eq!(got[0].0, UserIntent::Inject, "log-only notice: {got:?}");
+    assert!(got[0]
+        .1
+        .starts_with(&format!("[subagent {cont} settled: interrupted]")));
+    // The grandchild's notice lands in its (now idle) parent, also log-only.
+    let got = subagent_notices(&sessions, &cont);
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert_eq!(got[0].0, UserIntent::Inject);
+    // No model turn was started anywhere by the reconcile.
+    assert_eq!(turns_started(&sessions, &root), 0);
+    assert_eq!(turns_started(&sessions, &cont), 1);
+    assert_eq!(sessions.phase(&root), rness_engine::inbox::Phase::Idle);
     // Idempotent: the turns are closed now, and the source id dedupes.
-    tokio::time::timeout(within, sessions.join(&root))
-        .await
-        .expect("parent notice turn finishes");
-    let again = tokio::time::timeout(within, rt.reconcile_children())
+    let again = tokio::time::timeout(within, rt.reconcile_tree(&root))
         .await
         .expect("second reconcile finishes")
         .unwrap();
     assert_eq!(again, 0);
-    assert_eq!(notices(&sessions).len(), 1);
+    assert_eq!(subagent_notices(&sessions, &root).len(), 1);
+}
+
+/// B6-3 must not touch sessions outside the tree this host opened: a
+/// month-old parent, or one another rness process hosts, keeps its open
+/// child turn, gets no notice and never starts a model turn.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_leaves_other_trees_alone() {
+    use rness_protocol::branch::DelegationMode;
+    let dir = tempfile::tempdir().unwrap();
+    let (mine, my_child, foreign, foreign_child) = {
+        let store = SessionStore::new(dir.path());
+        let mine = store.create(None).unwrap().session().clone();
+        let foreign = store.create(None).unwrap().session().clone();
+        let my_child = crashed_child(&store, &mine, 1, DelegationMode::Continuable)
+            .session()
+            .clone();
+        let foreign_child = crashed_child(&store, &foreign, 1, DelegationMode::Continuable)
+            .session()
+            .clone();
+        (mine, my_child, foreign, foreign_child)
+    };
+    let sessions = service(dir.path());
+    let rt = Arc::new(runtime(&sessions, 3));
+    let within = std::time::Duration::from_secs(10);
+    assert_eq!(
+        tokio::time::timeout(within, rt.reconcile_tree(&mine))
+            .await
+            .unwrap()
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        turn_ends(&sessions, &my_child),
+        vec![TurnOutcome::Cancelled]
+    );
+    assert!(turn_ends(&sessions, &foreign_child).is_empty());
+    assert!(subagent_notices(&sessions, &foreign).is_empty());
+    assert_eq!(turns_started(&sessions, &foreign), 0);
+
+    // Resume hook: running a turn in `mine` again (already reconciled) or
+    // in a fresh root never reaches the foreign tree.
+    rt.reconcile_on_resume();
+    let fresh = sessions.create(None).unwrap();
+    sessions
+        .send(
+            &fresh,
+            UserIntent::Followup,
+            vec![ContentPart::Text { text: "hi".into() }],
+        )
+        .unwrap();
+    tokio::time::timeout(within, sessions.join(&fresh))
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(turn_ends(&sessions, &foreign_child).is_empty());
+    assert!(subagent_notices(&sessions, &foreign).is_empty());
+
+    // A child whose writer lock another process holds is live there: skip.
+    let held = sessions.store().open(&foreign_child).unwrap();
+    assert_eq!(rt.reconcile_tree(&foreign).await.unwrap(), 0);
+    drop(held);
+    assert!(subagent_notices(&sessions, &foreign).is_empty());
+
+    // Resuming the foreign root here makes it this host's tree.
+    sessions
+        .send(
+            &foreign,
+            UserIntent::Followup,
+            vec![ContentPart::Text {
+                text: "resume".into(),
+            }],
+        )
+        .unwrap();
+    tokio::time::timeout(within, sessions.join(&foreign))
+        .await
+        .unwrap();
+    let closed = async {
+        while turn_ends(&sessions, &foreign_child).is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(within, closed)
+        .await
+        .expect("resume reconciles the resumed tree");
+    assert_eq!(
+        turn_ends(&sessions, &foreign_child),
+        vec![TurnOutcome::Cancelled]
+    );
+}
+
+/// Open turns are found from the log tail: a child whose long history
+/// ends in an open turn is reconciled, and the turn's own output is used.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_reads_only_the_tail_of_long_child_logs() {
+    use rness_protocol::branch::DelegationMode;
+    let dir = tempfile::tempdir().unwrap();
+    let (root, child) = {
+        let store = SessionStore::new(dir.path());
+        let root = store.create(None).unwrap().session().clone();
+        let mut log = store
+            .create_delegated(
+                None,
+                rness_protocol::branch::Delegation {
+                    parent: root.clone(),
+                    call: None,
+                    depth: 1,
+                    mode: DelegationMode::Continuable,
+                },
+            )
+            .unwrap();
+        // ~400 KB of closed turns before the open one.
+        let filler = "x".repeat(4000);
+        for turn in 1..=100 {
+            log.append(&SessionEvent::TurnStarted { turn }).unwrap();
+            log.append(&SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Followup,
+                content: vec![ContentPart::Text {
+                    text: filler.clone(),
+                }],
+                source: None,
+            }))
+            .unwrap();
+            log.append(&SessionEvent::TurnEnded {
+                turn,
+                outcome: TurnOutcome::Completed,
+            })
+            .unwrap();
+        }
+        log.append(&SessionEvent::TurnStarted { turn: 101 })
+            .unwrap();
+        (root, log.session().clone())
+    };
+    match rness_engine::session::log::read_tail_turn(dir.path(), &child, 1 << 20).unwrap() {
+        rness_engine::session::log::TailTurn::Open { turn, events } => {
+            assert_eq!(turn, 101);
+            assert_eq!(events.len(), 1);
+        }
+        other => panic!("expected an open turn, got {other:?}"),
+    }
+    // A bound smaller than the distance to the last marker gives up.
+    let closed_far = {
+        let store = SessionStore::new(dir.path());
+        let mut log = store.open(&child).unwrap();
+        log.append(&SessionEvent::TurnEnded {
+            turn: 101,
+            outcome: TurnOutcome::Completed,
+        })
+        .unwrap();
+        log.append(&SessionEvent::TurnStarted { turn: 102 })
+            .unwrap();
+        for _ in 0..40 {
+            log.append(&SessionEvent::UserMessage(UserMessage {
+                intent: UserIntent::Inject,
+                content: vec![ContentPart::Text {
+                    text: filler_text(),
+                }],
+                source: None,
+            }))
+            .unwrap();
+        }
+        rness_engine::session::log::read_tail_turn(dir.path(), &child, 64 * 1024).unwrap()
+    };
+    assert!(matches!(
+        closed_far,
+        rness_engine::session::log::TailTurn::Unknown
+    ));
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    assert_eq!(rt.reconcile_tree(&root).await.unwrap(), 1);
+    assert_eq!(
+        turn_ends(&sessions, &child).last(),
+        Some(&TurnOutcome::Cancelled)
+    );
+    assert_eq!(subagent_notices(&sessions, &root).len(), 1);
+}
+
+fn filler_text() -> String {
+    "y".repeat(4000)
 }

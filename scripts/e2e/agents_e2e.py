@@ -382,18 +382,30 @@ def group_crash(t, fp, rep):
         t.check("crash: restart delivers one 'interrupted' notice per bg job", len(jn) == n and
                 all(v == 1 for v in jn.values()) and len(interrupted) >= 1, jn)
         cont = [k for k, d in kids if d.get("mode") == "continuable"]
-        sc = settle_counts(log)
-        print(f"  restart1: job notices {jn}, continuable settle notices {len(sc)}/{len(cont)}", flush=True)
-        t.check("crash: continuable children with open turns get a settle notice after restart (observation)",
-                len(sc) == len(cont), f"{len(sc)} of {len(cont)} — interrupted continuable children never settle")
-        t.check("crash: open child turns closed after restart (observation)",
-                all("turn/ended" in [e["type"] for e in r.log(k)] for k, _ in kids),
-                f"{sum('turn/ended' not in [e['type'] for e in r.log(k)] for k, _ in kids)} children keep an "
-                f"unterminated turn")
+        # Serve opens no session up front: the crashed tree is reconciled
+        # once this host runs a turn in it (here the recovered job notices
+        # already wake the parent), never the whole store.
         st = r.api("POST", "/api/request", {"type": "send", "session": sid, "intent": "followup",
                                             "content": [{"kind": "text", "text": "after crash"}]})
         wait_until(lambda: phase(r, sid) == "idle", 20, 0.2)
         t.check("crash: parent usable after restart", outcomes(r.log(sid))[-1] == "completed", st)
+        wait_until(lambda: len(settle_counts(r.log(sid))) >= len(cont), 10, 0.2)
+        log = r.log(sid)
+        sc = settle_counts(log)
+        print(f"  restart1: job notices {jn}, continuable settle notices {len(sc)}/{len(cont)}", flush=True)
+        t.check("crash: continuable children with open turns get a settle notice after resume",
+                len(sc) == len(cont), f"{len(sc)} of {len(cont)} — interrupted continuable children never settle")
+        settle_intents = {e.get("intent") for e in log if e["type"] == "user/message"
+                          and "".join(p.get("text", "") for p in e.get("content", [])
+                                      if isinstance(p, dict)).startswith("[subagent ")
+                          and "settled: interrupted" in "".join(
+                              p.get("text", "") for p in e.get("content", []) if isinstance(p, dict))}
+        t.check("crash: interrupted settle notices are log-only injects", settle_intents == {"inject"},
+                settle_intents)
+        t.check("crash: open child turns closed after resume",
+                all("turn/ended" in [e["type"] for e in r.log(k)] for k, _ in kids),
+                f"{sum('turn/ended' not in [e['type'] for e in r.log(k)] for k, _ in kids)} children keep an "
+                f"unterminated turn")
         # A continuable child of the crashed host is still messageable by the parent? (via serve: user send)
         if cont:
             res = r.api("POST", "/api/request", {"type": "send", "session": cont[0], "intent": "followup",

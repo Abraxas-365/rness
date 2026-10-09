@@ -56,6 +56,10 @@ Returns a durable child session ID. Use `send_message`, `interrupt_agent`, and `
 
 When the TUI exits, it tears down its session. The cancel reaches every delegated descendant: running child turns end `cancelled`, background subagent jobs of the session settle `killed`, and all jobs owned by descendants (Bash, terminal and subagent) are stopped. Continuable children remain resumable sessions. Settle and job notices that arrive during teardown are logged without waking the parent.
 
+## Host crash
+
+If the rness process dies while children are running, their turns are left open in the logs. The next rness that opens or resumes the session (TUI start or `-s`, or the first turn a `--serve` host runs in that tree) closes those turns as `cancelled`. Each continuable child's parent gets one `[subagent <id> settled: interrupted]` notice. The notice is logged without starting a turn; a turn running there sees it at its next step. Only the tree of the session being opened is reconciled. Other sessions in the store are left alone, since another rness process may be hosting them. Children whose open turn started more than 16 MiB before the end of their log are not detected. Headless `-p` runs skip this step.
+
 Current parsing treats `background_mode = "continuable"` as sufficient to select this path even if `run_in_background` is omitted. Supply both fields to make intent explicit. Do not infer strict schema validation for every optional field from the advertised JSON Schema.
 
 ## Context and permissions

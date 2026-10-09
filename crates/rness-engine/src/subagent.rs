@@ -211,6 +211,8 @@ pub struct SubagentRuntime {
     /// Live settle-watch subscriptions for continuable children;
     /// dropped with the runtime.
     watchers: std::sync::Mutex<Vec<Disposer>>,
+    /// Roots whose tree [`Self::spawn_reconcile_tree`] already visited.
+    reconciled: std::sync::Mutex<std::collections::HashSet<SessionId>>,
 }
 
 impl SubagentRuntime {
@@ -223,6 +225,7 @@ impl SubagentRuntime {
             user_aliases: Default::default(),
             activity: SubagentActivity::default(),
             watchers: std::sync::Mutex::new(Vec::new()),
+            reconciled: Default::default(),
         };
         // Settle watch (dsh: "when a resident Activation settles, the
         // manager tells the child's direct parent in the parent's own
@@ -703,55 +706,66 @@ impl SubagentRuntime {
         self.sessions.close_tree(child)
     }
 
-    /// Startup reconcile for children whose host died mid-turn (their log
-    /// ends in `turn/started` with no `turn/ended`, and no live burst will
-    /// ever emit the idle that drives the settle watch). Shallowest first,
-    /// each gets `turn/ended{cancelled}`. A CONTINUABLE child's direct
-    /// parent is told first, once (`[subagent <id> settled: interrupted]`,
-    /// deduplicated by the durable source id `settle:<child>:<turn>`), so a
-    /// crash between the two stays idempotent. One-shot children get no
-    /// notice here: job recovery reports their background job as
+    /// Startup/resume reconcile for children whose host died mid-turn
+    /// (their own log ends in `turn/started` with no `turn/ended`, and no
+    /// live burst will ever emit the idle that drives the settle watch).
+    /// Only the delegation tree of `root` is visited: the session this host
+    /// opened or resumed. Other roots in the store may belong to another
+    /// live rness process, or be long finished, and are never touched.
+    /// Shallowest first, each open child turn gets `turn/ended{cancelled}`.
+    /// A CONTINUABLE child's direct parent is told first, once
+    /// (`[subagent <id> settled: interrupted]`, deduplicated by the durable
+    /// source id `settle:<child>:<turn>`), so a crash between the two stays
+    /// idempotent. The notice is a log-only Inject: it never starts a turn
+    /// (a parent running here sees it at its next step). One-shot children
+    /// get no notice here: job recovery reports their background job as
     /// `interrupted`. Sessions that are live here or whose log another
-    /// process holds are skipped. Returns how many turns were closed.
-    /// [`Self::reconcile_children`] on a background task, so host startup
-    /// never waits on the store scan. Idempotent; failures are logged.
-    pub fn spawn_reconcile_children(self: &Arc<Self>) {
-        let rt = Arc::clone(self);
-        tokio::spawn(async move {
-            match rt.reconcile_children().await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(closed = n, "closed interrupted child turns"),
-                Err(error) => tracing::warn!(%error, "interrupted child reconcile failed"),
-            }
-        });
-    }
-
-    pub async fn reconcile_children(&self) -> Result<usize, SubagentError> {
+    /// process holds are skipped. Open turns are found from the log tail
+    /// only. Returns how many turns were closed.
+    pub async fn reconcile_tree(&self, root: &SessionId) -> Result<usize, SubagentError> {
+        /// Look this far back from the end of a child's log for its last
+        /// turn marker; a child whose open turn started earlier is skipped.
+        const TAIL_BYTES: u64 = 16 * 1024 * 1024;
         let sessions = Arc::clone(&self.sessions);
+        let root = root.clone();
         let mut open: Vec<(SessionId, Delegation, u32, String)> =
             tokio::task::spawn_blocking(move || -> Result<_, SubagentError> {
-                let mut open = Vec::new();
+                let mut by_parent: HashMap<SessionId, Vec<(SessionId, Delegation)>> =
+                    HashMap::new();
                 for (child, d) in sessions.store().delegations()? {
+                    by_parent
+                        .entry(d.parent.clone())
+                        .or_default()
+                        .push((child, d));
+                }
+                let mut tree = Vec::new();
+                let mut queue = std::collections::VecDeque::from([root]);
+                while let Some(node) = queue.pop_front() {
+                    for (child, d) in by_parent.remove(&node).unwrap_or_default() {
+                        queue.push_back(child.clone());
+                        tree.push((child, d));
+                    }
+                }
+                let mut open = Vec::new();
+                for (child, d) in tree {
                     if sessions.phase(&child) != crate::inbox::Phase::Idle {
                         continue;
                     }
-                    let history = sessions.store().history(&child)?;
-                    let Some(start) = history
-                        .iter()
-                        .rposition(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
-                    else {
-                        continue;
+                    let tail = crate::session::log::read_tail_turn(
+                        sessions.store().root(),
+                        &child,
+                        TAIL_BYTES,
+                    );
+                    let (turn, events) = match tail {
+                        Ok(crate::session::log::TailTurn::Open { turn, events }) => (turn, events),
+                        Ok(_) => continue,
+                        Err(error) => {
+                            tracing::warn!(child = %child, %error, "child log tail unreadable");
+                            continue;
+                        }
                     };
-                    let SessionEvent::TurnStarted { turn } = history[start].event else {
-                        continue;
-                    };
-                    if history[start..]
-                        .iter()
-                        .any(|e| matches!(e.event, SessionEvent::TurnEnded { .. }))
-                    {
-                        continue;
-                    }
-                    let run = settle_events(&history, start, &child)?;
+                    let events: Vec<_> = events.into_iter().map(Arc::new).collect();
+                    let run = settle_events(&events, 0, &child)?;
                     open.push((child, d, turn, run.output));
                 }
                 Ok(open)
@@ -765,15 +779,12 @@ impl SubagentRuntime {
             if self.sessions.phase(&child) != crate::inbox::Phase::Idle {
                 continue;
             }
-            // Holding the writer keeps this host's turns out until closed;
-            // a lock held by another process means the child is live there.
-            let mut log = match self.sessions.store().open(&child) {
-                Ok(log) => log,
-                Err(error) => {
-                    tracing::warn!(child = %child, %error, "interrupted child not reconciled");
-                    continue;
-                }
-            };
+            // A writer lock held by another process means the child is live
+            // there. Probe it, but never hold it across the parent notice.
+            if let Err(error) = self.sessions.store().open(&child) {
+                tracing::debug!(child = %child, %error, "interrupted child not reconciled");
+                continue;
+            }
             let text = format!(
                 "[subagent {child} settled: interrupted]\nThe host stopped while this child's \
                  turn was running; the turn was closed as cancelled.\n{}",
@@ -786,19 +797,39 @@ impl SubagentRuntime {
             if d.mode == DelegationMode::Continuable {
                 if let Err(error) = self
                     .sessions
-                    .notify_job_once(&d.parent, &format!("settle:{child}:{turn}"), text)
+                    .inject_job_once(&d.parent, &format!("settle:{child}:{turn}"), text)
                     .await
                 {
                     tracing::warn!(parent = %d.parent, %error, "interrupted child notice failed");
                     continue;
                 }
             }
-            log.append(&SessionEvent::TurnEnded {
-                turn,
-                outcome: TurnOutcome::Cancelled,
-            })
-            .map_err(ServiceError::from)?;
-            drop(log);
+            if self.sessions.phase(&child) != crate::inbox::Phase::Idle {
+                continue;
+            }
+            let closed = (|| -> Result<bool, ServiceError> {
+                let mut log = match self.sessions.store().open(&child) {
+                    Ok(log) => log,
+                    Err(_) => return Ok(false),
+                };
+                // Still the same open turn now that we hold the writer?
+                match crate::session::log::read_tail_turn(
+                    self.sessions.store().root(),
+                    &child,
+                    TAIL_BYTES,
+                )? {
+                    crate::session::log::TailTurn::Open { turn: t, .. } if t == turn => {}
+                    _ => return Ok(false),
+                }
+                log.append(&SessionEvent::TurnEnded {
+                    turn,
+                    outcome: TurnOutcome::Cancelled,
+                })?;
+                Ok(true)
+            })()?;
+            if !closed {
+                continue;
+            }
             self.sessions.bus().emit::<crate::service::SubagentStopEv>(
                 &crate::service::SubagentStopNotice {
                     parent: d.parent.clone(),
@@ -810,6 +841,63 @@ impl SubagentRuntime {
             reconciled += 1;
         }
         Ok(reconciled)
+    }
+
+    /// [`Self::reconcile_tree`] for the delegation root of `session` on a
+    /// background task, at most once per root per process, so host startup
+    /// never waits on it. Idempotent; failures are logged.
+    pub fn spawn_reconcile_tree(self: &Arc<Self>, session: SessionId) {
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            let sessions = Arc::clone(&rt.sessions);
+            let start = session.clone();
+            let root = tokio::task::spawn_blocking(move || {
+                let mut node = start;
+                for _ in 0..1024 {
+                    match sessions.store().delegation(&node) {
+                        Ok(Some(d)) => node = d.parent,
+                        _ => break,
+                    }
+                }
+                node
+            })
+            .await;
+            let Ok(root) = root else { return };
+            let first = {
+                let mut seen = rt.reconciled.lock().unwrap();
+                let first = seen.insert(root.clone());
+                seen.insert(session);
+                first
+            };
+            if !first {
+                return;
+            }
+            match rt.reconcile_tree(&root).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(%root, closed = n, "closed interrupted child turns"),
+                Err(error) => tracing::warn!(%root, %error, "interrupted child reconcile failed"),
+            }
+        });
+    }
+
+    /// Reconcile a tree ([`Self::spawn_reconcile_tree`]) the first time this
+    /// process starts a turn anywhere in it, i.e. when this host opens or
+    /// resumes it. Trees nobody runs here are never touched.
+    pub fn reconcile_on_resume(self: &Arc<Self>) {
+        let rt = Arc::downgrade(self);
+        let disposer = self
+            .sessions
+            .bus()
+            .on::<crate::service::SessionStartEv>(move |n| {
+                let Some(rt) = rt.upgrade() else { return };
+                if rt.reconciled.lock().unwrap().contains(&n.session) {
+                    return;
+                }
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    rt.spawn_reconcile_tree(n.session.clone());
+                }
+            });
+        self.watchers.lock().expect("watchers lock").push(disposer);
     }
 
     /// Stop only the target's current turn (dsh interrupt_agent): queued
