@@ -96,11 +96,11 @@ impl ResponsesProvider {
             .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
         let projected = images
             .as_ref()
-            .map(|(store, policy)| store.project_request(request.context, policy))
+            .map(|(store, policy)| store.project_request_cow(request.context, policy))
             .transpose()
             .map_err(crate::image_error)?;
         let request = StepRequest {
-            context: projected.as_ref().unwrap_or(request.context),
+            context: projected.as_deref().unwrap_or(request.context),
             system: request.system,
             tools: request.tools,
             on_delta: request.on_delta,
@@ -158,14 +158,14 @@ impl ResponsesProvider {
     }
 
     fn request_for(&self, credential: &CodexCredential, body: &Value) -> reqwest::RequestBuilder {
-        let mut req = self
+        let req = self
             .client
             .post(format!("{}/codex/responses", self.base_url))
             .bearer_auth(&credential.access_token)
             .header("openai-beta", "responses=experimental")
             .header("originator", ORIGINATOR)
-            .header("accept", "text/event-stream")
-            .json(body);
+            .header("accept", "text/event-stream");
+        let mut req = crate::json_body(req, body);
         if let Some(account) = &credential.account_id {
             req = req.header("chatgpt-account-id", account);
         }
@@ -401,6 +401,9 @@ impl Accumulator<'_> {
     }
 
     fn finish(self, model: &str) -> AssistantMessage {
+        // First: a huge tool call's timed record (dropped from committed
+        // messages) must not be alive while its arguments are parsed.
+        let chunks = self.chunks.into_committed();
         let mut content = Vec::new();
         let mut saw_tool_use = false;
         for mut item in self.items {
@@ -467,7 +470,7 @@ impl Accumulator<'_> {
             stop,
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks.into_committed(),
+            chunks,
         }
     }
 }

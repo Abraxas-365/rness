@@ -279,50 +279,50 @@ pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelCo
 /// without mutating the append-only session log: retain ordinary assistant
 /// content, only paired calls/results, and discard orphan result turns.
 fn repair_tool_pairs(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
+    // Consumes the turns and moves their content: a tool call's arguments
+    // can be tens of MiB, so nothing here may copy them.
     let mut repaired = Vec::with_capacity(turns.len());
-    let mut index = 0;
-    while index < turns.len() {
-        let ModelTurn::Assistant { content } = &turns[index] else {
-            if !matches!(turns[index], ModelTurn::ToolResults { .. }) {
-                repaired.push(turns[index].clone());
+    let mut turns = turns.into_iter().peekable();
+    while let Some(turn) = turns.next() {
+        let content = match turn {
+            ModelTurn::ToolResults { .. } => continue, // orphan: no call before it
+            ModelTurn::Assistant { content } => content,
+            other => {
+                repaired.push(other);
+                continue;
             }
-            index += 1;
-            continue;
         };
-        let calls: HashSet<_> = content
+        let calls: HashSet<String> = content
             .iter()
             .filter_map(|part| match part {
-                ContentPart::ToolUse { call, .. } => Some(call.as_str()),
+                ContentPart::ToolUse { call, .. } => Some(call.clone()),
                 _ => None,
             })
             .collect();
         if calls.is_empty() {
-            repaired.push(turns[index].clone());
-            index += 1;
+            repaired.push(ModelTurn::Assistant { content });
             continue;
         }
-        let Some(ModelTurn::ToolResults { results }) = turns.get(index + 1) else {
+        let Some(ModelTurn::ToolResults { results }) =
+            turns.next_if(|next| matches!(next, ModelTurn::ToolResults { .. }))
+        else {
             let content = content
-                .iter()
+                .into_iter()
                 .filter(|part| !matches!(part, ContentPart::ToolUse { .. }))
-                .cloned()
                 .collect::<Vec<_>>();
             if !content.is_empty() {
                 repaired.push(ModelTurn::Assistant { content });
             }
-            index += 1;
             continue;
         };
-        let returned: HashSet<_> = results.iter().map(|result| result.call.as_str()).collect();
+        let returned: HashSet<&str> = results.iter().map(|result| result.call.as_str()).collect();
         let content = content
-            .iter()
+            .into_iter()
             .filter(|part| !matches!(part, ContentPart::ToolUse { call, .. } if !returned.contains(call.as_str())))
-            .cloned()
             .collect::<Vec<_>>();
         let results = results
-            .iter()
+            .into_iter()
             .filter(|result| calls.contains(result.call.as_str()))
-            .cloned()
             .collect::<Vec<_>>();
         if !content.is_empty() {
             repaired.push(ModelTurn::Assistant { content });
@@ -330,7 +330,6 @@ fn repair_tool_pairs(turns: Vec<ModelTurn>) -> Vec<ModelTurn> {
         if !results.is_empty() {
             repaired.push(ModelTurn::ToolResults { results });
         }
-        index += 2;
     }
     repaired
 }

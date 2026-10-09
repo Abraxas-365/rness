@@ -672,26 +672,24 @@ async fn drive(
         };
 
         let stop = message.stop;
+        // The message moves into the log and back out: a tool call's
+        // arguments can be tens of MiB, so they are never copied.
+        let committed = log.append_owned(SessionEvent::AssistantMessage(message))?;
+        frames(Frame::StepCommitted {
+            session: session.clone(),
+            event: committed.id,
+        });
+        let SessionEvent::AssistantMessage(message) = committed.event else {
+            unreachable!("appended an assistant message")
+        };
         let calls: Vec<ToolCall> = message
             .content
-            .iter()
+            .into_iter()
             .filter_map(|part| match part {
-                ContentPart::ToolUse { call, name, args } => Some(ToolCall {
-                    call: call.clone(),
-                    name: name.clone(),
-                    args: args.clone(),
-                }),
+                ContentPart::ToolUse { call, name, args } => Some(ToolCall { call, name, args }),
                 _ => None,
             })
             .collect();
-
-        log.append(&SessionEvent::AssistantMessage(message))
-            .map(|env| {
-                frames(Frame::StepCommitted {
-                    session: session.clone(),
-                    event: env.id,
-                });
-            })?;
 
         // Is this a terminal stop (EndTurn, or max_tokens with no tool calls)?
         let is_stopping =

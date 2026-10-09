@@ -142,7 +142,7 @@ mod tests {
             session: "s1".into(),
             call: "c1".into(),
             tool: "Bash".into(),
-            args: serde_json::json!({"command": "echo \u{1b}]0;x\u{7}"}),
+            args: serde_json::json!({"command": "echo \u{1b}]0;x\u{7}"}).into(),
             reason: Some("hook \u{1b}]0;EVIL\u{7}says\u{1b}[2J ok\tnow".into()),
         };
         let lines = render_args(&request);

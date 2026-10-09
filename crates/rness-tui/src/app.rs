@@ -3855,7 +3855,7 @@ mod tests {
                 session: "s1".into(),
                 call: "c1".into(),
                 tool: "Bash".into(),
-                args: serde_json::json!({"command": "rm -rf /tmp/x"}),
+                args: serde_json::json!({"command": "rm -rf /tmp/x"}).into(),
                 reason: None,
             },
             respond,

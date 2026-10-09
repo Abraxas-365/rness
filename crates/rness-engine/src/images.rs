@@ -815,6 +815,18 @@ impl ImageStore {
         context: &crate::session::projection::ModelContext,
         policy: &ImagePolicy,
     ) -> Result<crate::session::projection::ModelContext, String> {
+        self.project_request_cow(context, policy)
+            .map(|c| c.into_owned())
+    }
+
+    /// [`Self::project_request`], borrowing `context` when the projection
+    /// changes nothing (the usual case) so that a huge history, e.g. a tool
+    /// call with tens of MiB of arguments, is not copied for every request.
+    pub fn project_request_cow<'c>(
+        &self,
+        context: &'c crate::session::projection::ModelContext,
+        policy: &ImagePolicy,
+    ) -> Result<std::borrow::Cow<'c, crate::session::projection::ModelContext>, String> {
         use crate::session::projection::ModelTurn;
         use rness_protocol::events::{ContentPart, ToolResultContentPart};
         policy.validate()?;
@@ -862,6 +874,20 @@ impl ImageStore {
             total = total.saturating_sub(lengths[remove]);
             remove += 1;
         }
+        // The rewrite below changes a request only when it drops images or
+        // re-derives a tool output that disagrees with its content.
+        let unchanged = remove == 0
+            && context.turns.iter().all(|turn| match turn {
+                ModelTurn::ToolResults { results } => results.iter().all(|result| {
+                    result.content.is_empty()
+                        || result.output
+                            == rness_protocol::events::ToolResult::text_output(&result.content)
+                }),
+                _ => true,
+            });
+        if unchanged {
+            return Ok(std::borrow::Cow::Borrowed(context));
+        }
         let mut projected = context.clone();
         let placeholder = |attachment: &ImageRef| {
             format!("[Image {} omitted from this request by image budget; {} × {}. Original attachment remains in session history. Ask the user to reattach it if needed.]", attachment.id, attachment.width, attachment.height)
@@ -900,7 +926,7 @@ impl ImageStore {
                 }
             }
         }
-        Ok(projected)
+        Ok(std::borrow::Cow::Owned(projected))
     }
 
     pub fn request_image(

@@ -227,11 +227,11 @@ impl AnthropicProvider {
             .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
         let projected = images
             .as_ref()
-            .map(|(store, policy)| store.project_request(request.context, policy))
+            .map(|(store, policy)| store.project_request_cow(request.context, policy))
             .transpose()
             .map_err(crate::image_error)?;
         let request = StepRequest {
-            context: projected.as_ref().unwrap_or(request.context),
+            context: projected.as_deref().unwrap_or(request.context),
             system: request.system,
             tools: request.tools,
             on_delta: request.on_delta,
@@ -263,8 +263,10 @@ impl AnthropicProvider {
             "model": self.model,
             "max_tokens": max_tokens,
             "stream": true,
-            "messages": messages_from_context(request.context),
         });
+        // Moved in, not through `json!`, which would serialize (copy) the
+        // whole history a second time.
+        body["messages"] = Value::Array(messages_from_context(request.context));
 
         // Use explicit breakpoints below rather than top-level automatic
         // caching: Anthropic permits at most four cache_control blocks per
@@ -579,8 +581,8 @@ impl AnthropicProvider {
         let base = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", API_VERSION)
-            .json(body);
+            .header("anthropic-version", API_VERSION);
+        let base = crate::json_body(base, body);
 
         // Build caching beta headers when prompt caching is active.
         let cache_betas = if self.prompt_caching {
@@ -634,7 +636,9 @@ fn is_serialized_part(part: &ContentPart) -> bool {
 fn has_serialized_message(turn: &ModelTurn) -> bool {
     match turn {
         ModelTurn::User { content } | ModelTurn::Assistant { content } => {
-            !parts_to_json(content).is_empty()
+            // Same answer as `!parts_to_json(content).is_empty()`, without
+            // building (copying) the blocks just to count them.
+            content.iter().any(is_serialized_part)
         }
         ModelTurn::ToolResults { .. } => true,
     }
@@ -648,30 +652,41 @@ fn messages_from_context(context: &rness_engine::session::projection::ModelConte
             ModelTurn::User { content } => {
                 let content = parts_to_json(content);
                 if !content.is_empty() {
-                    messages.push(json!({ "role": "user", "content": content }));
+                    messages.push(message("user", content));
                 }
             }
             ModelTurn::Assistant { content } => {
                 let content = parts_to_json(content);
                 if !content.is_empty() {
-                    messages.push(json!({ "role": "assistant", "content": content }));
+                    messages.push(message("assistant", content));
                 }
             }
-            ModelTurn::ToolResults { results } => messages.push(json!({
-                "role": "user",
-                "content": results
+            ModelTurn::ToolResults { results } => messages.push(message(
+                "user",
+                results
                     .iter()
-                    .map(|r| json!({
-                        "type": "tool_result",
-                        "tool_use_id": r.call,
-                        "content": r.output,
-                        "is_error": r.is_error,
-                    }))
-                    .collect::<Vec<_>>(),
-            })),
+                    .map(|r| {
+                        json!({
+                            "type": "tool_result",
+                            "tool_use_id": r.call,
+                            "content": r.output,
+                            "is_error": r.is_error,
+                        })
+                    })
+                    .collect(),
+            )),
         }
     }
     messages
+}
+
+/// One `messages` entry. Takes the content by value: `json!` would copy it,
+/// and a tool call's arguments can be tens of MiB.
+fn message(role: &str, content: Vec<Value>) -> Value {
+    let mut message = serde_json::Map::new();
+    message.insert("role".into(), role.into());
+    message.insert("content".into(), Value::Array(content));
+    Value::Object(message)
 }
 
 /// Place `cache_control` on the last cacheable content block of a message.
@@ -703,12 +718,15 @@ fn parts_to_json(parts: &[ContentPart]) -> Vec<Value> {
                 Some(json!({ "type": "text", "text": text }))
             }
             ContentPart::Thinking { .. } => None,
-            ContentPart::ToolUse { call, name, args } => Some(json!({
-                "type": "tool_use",
-                "id": call,
-                "name": name,
-                "input": args,
-            })),
+            ContentPart::ToolUse { call, name, args } => {
+                let mut block = serde_json::Map::new();
+                block.insert("type".into(), "tool_use".into());
+                block.insert("id".into(), call.as_str().into());
+                block.insert("name".into(), name.as_str().into());
+                // One copy of the arguments (the context is borrowed).
+                block.insert("input".into(), args.clone());
+                Some(Value::Object(block))
+            }
             ContentPart::Text { .. } => None,
         })
         .collect()
@@ -740,6 +758,9 @@ struct Accumulator<'a> {
 
 impl Accumulator<'_> {
     fn finish(self, model: &str) -> AssistantMessage {
+        // First: a huge tool call's timed record (dropped from committed
+        // messages) must not be alive while its arguments are parsed.
+        let chunks = self.chunks.into_committed();
         let content = self
             .blocks
             .into_iter()
@@ -772,20 +793,14 @@ impl Accumulator<'_> {
                 // into `{}`: that can execute a different, unsafe command.
                 // Dropping it also keeps the next replay valid (there is no
                 // unmatched tool_use requiring a tool_result).
-                Block::ToolUse { args_json, .. }
-                    if serde_json::from_str::<Value>(&args_json).is_err() =>
-                {
-                    None
-                }
+                // Parsed once: the arguments can be tens of MiB.
                 Block::ToolUse {
                     call,
                     name,
                     args_json,
-                } => Some(ContentPart::ToolUse {
-                    call,
-                    name,
-                    args: serde_json::from_str(&args_json).expect("validated above"),
-                }),
+                } => serde_json::from_str::<Value>(&args_json)
+                    .ok()
+                    .map(|args| ContentPart::ToolUse { call, name, args }),
             })
             .collect();
         AssistantMessage {
@@ -794,7 +809,7 @@ impl Accumulator<'_> {
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks.into_committed(),
+            chunks,
         }
     }
 

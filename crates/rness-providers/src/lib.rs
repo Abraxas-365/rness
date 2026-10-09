@@ -401,6 +401,22 @@ async fn upload_with_quota_recovery(
     unreachable!("bounded upload attempts return")
 }
 
+/// `request.json(body)` with the body serialized into one exactly-sized
+/// buffer. `reqwest`'s `json` serializes through a `Vec` that doubles as it
+/// grows, which for a request carrying a tens-of-MiB tool call briefly holds
+/// the payload three times over. Same bytes, same `content-type`.
+pub(crate) fn json_body(
+    request: reqwest::RequestBuilder,
+    body: &serde_json::Value,
+) -> reqwest::RequestBuilder {
+    match rness_protocol::events::to_vec_exact(body) {
+        Ok(bytes) => request
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(bytes),
+        Err(_) => request.json(body),
+    }
+}
+
 #[cfg(test)]
 mod error_message_tests {
     use super::error_message;

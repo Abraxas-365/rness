@@ -282,11 +282,11 @@ impl OpenAiProvider {
             .map(|(store, policy)| (store.clone(), store.effective_request_policy(policy)));
         let projected = images
             .as_ref()
-            .map(|(store, policy)| store.project_request(request.context, policy))
+            .map(|(store, policy)| store.project_request_cow(request.context, policy))
             .transpose()
             .map_err(crate::image_error)?;
         let request = StepRequest {
-            context: projected.as_ref().unwrap_or(request.context),
+            context: projected.as_deref().unwrap_or(request.context),
             system: request.system,
             tools: request.tools,
             on_delta: request.on_delta,
@@ -499,6 +499,9 @@ struct Accumulator<'a> {
 
 impl Accumulator<'_> {
     fn finish(self, model: &str) -> AssistantMessage {
+        // First: a huge tool call's timed record (dropped from committed
+        // messages) must not be alive while its arguments are parsed.
+        let chunks = self.chunks.into_committed();
         let mut content = Vec::new();
         if !self.thinking.is_empty() {
             content.push(ContentPart::Thinking {
@@ -524,7 +527,7 @@ impl Accumulator<'_> {
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks.into_committed(),
+            chunks,
         }
     }
 
@@ -652,8 +655,8 @@ impl Provider for OpenAiProvider {
             }
             let mut http_request = self
                 .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .json(&body);
+                .post(format!("{}/chat/completions", self.base_url));
+            http_request = crate::json_body(http_request, &body);
             if let Some(key) = &self.api_key {
                 http_request = http_request.bearer_auth(key);
             }

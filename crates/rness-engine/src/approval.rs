@@ -171,7 +171,7 @@ mod tests {
             session: "s1".into(),
             call: "c1".into(),
             tool: "Bash".into(),
-            args: serde_json::json!({}),
+            args: serde_json::json!({}).into(),
             reason: None,
         }
     }

@@ -90,7 +90,7 @@ impl Answerer for RemoteApprovals {
             session: request.session.clone(),
             call: request.call.clone(),
             tool: request.tool.clone(),
-            args: request.args.clone(),
+            args: (*request.args).clone(),
         });
 
         // If this future is dropped mid-await (turn cancelled), the guard

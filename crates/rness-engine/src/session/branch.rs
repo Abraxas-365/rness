@@ -547,13 +547,18 @@ impl SessionStore {
                 LogError::Io(error)
             }
         })?;
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(offset))?;
         let mut reader = std::io::BufReader::new(file.by_ref());
         let mut fold = UsageFold::default();
         let mut bytes = Vec::new();
         loop {
             bytes.clear();
-            let n = reader.read_until(b'\n', &mut bytes)?;
+            let n = super::log::read_line_sized(
+                &mut reader,
+                &mut bytes,
+                file_len.saturating_sub(offset),
+            )?;
             if n == 0 || !bytes.ends_with(b"\n") {
                 break;
             }

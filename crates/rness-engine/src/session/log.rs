@@ -245,7 +245,16 @@ impl SessionLog {
 
     /// Append one event and fsync. Returns the committed envelope.
     pub fn append(&mut self, event: &SessionEvent) -> Result<Envelope, LogError> {
-        let mut committed = self.append_batch(std::slice::from_ref(event))?;
+        self.append_owned(event.clone())
+    }
+
+    /// [`Self::append`] taking the event by value: it moves into the
+    /// returned envelope instead of being copied first. For events with a
+    /// huge payload (a tool call with tens of MiB of arguments) that is one
+    /// whole-payload copy less; the caller can move the event back out of
+    /// the envelope.
+    pub fn append_owned(&mut self, event: SessionEvent) -> Result<Envelope, LogError> {
+        let mut committed = self.commit(vec![event])?;
         Ok(committed.pop().expect("one event in, one envelope out"))
     }
 
@@ -260,14 +269,17 @@ impl SessionLog {
     /// On error the file is rolled back to its previous length (best effort;
     /// if that fails the handle is poisoned).
     pub fn append_batch(&mut self, events: &[SessionEvent]) -> Result<Vec<Envelope>, LogError> {
+        self.commit(events.to_vec())
+    }
+
+    fn commit(&mut self, events: Vec<SessionEvent>) -> Result<Vec<Envelope>, LogError> {
         if events.is_empty() {
             return Ok(Vec::new());
         }
         let at = now_rfc3339();
         let mut envelopes = Vec::with_capacity(events.len());
         let mut bytes = Vec::new();
-        for event in events {
-            let mut event = event.clone();
+        for mut event in events {
             if !self.record_stream {
                 drop_committed_stream(&mut event);
             }
@@ -278,6 +290,11 @@ impl SessionLog {
                 event,
             };
             let start = bytes.len();
+            // A tool call's arguments can be tens of MiB: size the buffer
+            // once instead of letting it double.
+            if has_tool_use(&envelope.event) {
+                bytes.reserve_exact(rness_protocol::events::json_len(&envelope)? + 1);
+            }
             serde_json::to_writer(&mut bytes, &envelope)?;
             // Refuse what `Envelope::parse_line` could not read back: a
             // committed event must stay readable.
@@ -710,6 +727,31 @@ pub fn drop_committed_stream(event: &mut SessionEvent) {
 /// (`chunks`). They stay on disk, untouched; `SessionLog::read_all` and
 /// `session_event_read` (which read the file directly) still return them.
 /// On a 58k-event session this halves the parsed log (~1.08 GB -> ~0.5 GB).
+/// `read_until(b'\n')` for a log line that may be tens of MiB. Past 1 MiB
+/// without a newline the buffer is grown once to the most the line can
+/// still be (the rest of the file, at most 1 GiB) instead of by doubling, which for a
+/// 64 MiB line holds 64 + 128 MiB at the peak. Untouched capacity costs no
+/// resident memory.
+pub(super) fn read_line_sized<R: BufRead>(
+    reader: &mut R,
+    bytes: &mut Vec<u8>,
+    remaining: u64,
+) -> std::io::Result<usize> {
+    const FIRST: u64 = 1 << 20;
+    let mut total = (&mut *reader).take(FIRST).read_until(b'\n', bytes)?;
+    if total as u64 == FIRST && !bytes.ends_with(b"\n") {
+        let rest = remaining.saturating_sub(total as u64);
+        bytes.reserve_exact(usize::try_from(rest.min(1 << 30)).unwrap_or(0));
+        total += reader.read_until(b'\n', bytes)?;
+    }
+    Ok(total)
+}
+
+fn has_tool_use(event: &SessionEvent) -> bool {
+    matches!(event, SessionEvent::AssistantMessage(m)
+        if m.content.iter().any(|p| matches!(p, rness_protocol::events::ContentPart::ToolUse { .. })))
+}
+
 pub fn elide_payloads(event: &mut SessionEvent) {
     match event {
         SessionEvent::AssistantMessage(message) => message.chunks = Vec::new(),
@@ -927,12 +969,17 @@ impl SessionReader {
             self.events.clear();
             self.positions.clear();
         }
+        let file_len = file.metadata()?.len();
         file.seek(SeekFrom::Start(self.offset))?;
         let mut reader = BufReader::new(&mut *file);
         let mut bytes = Vec::new();
         loop {
             bytes.clear();
-            let n = reader.read_until(b'\n', &mut bytes)?;
+            let n = read_line_sized(
+                &mut reader,
+                &mut bytes,
+                file_len.saturating_sub(self.offset),
+            )?;
             if n == 0 || !bytes.ends_with(b"\n") {
                 break;
             }
@@ -981,6 +1028,29 @@ pub fn tip(root: &Path, session: &SessionId) -> Result<EventId, LogError> {
 mod tests {
     use super::*;
     use rness_protocol::events::{AssistantMessage, ContentPart, UserIntent, UserMessage};
+
+    #[test]
+    fn read_line_sized_reads_long_and_short_lines_like_read_until() {
+        let long = "x".repeat(3 << 20);
+        let data = format!("short\n{long}\nlast\nunterminated");
+        let mut reader = std::io::BufReader::new(data.as_bytes());
+        let mut buf = Vec::new();
+        let mut got = Vec::new();
+        loop {
+            buf.clear();
+            let n = read_line_sized(&mut reader, &mut buf, data.len() as u64).unwrap();
+            if n == 0 {
+                break;
+            }
+            assert_eq!(n, buf.len());
+            got.push(buf.clone());
+        }
+        let want: Vec<Vec<u8>> = data
+            .split_inclusive('\n')
+            .map(|l| l.as_bytes().to_vec())
+            .collect();
+        assert_eq!(got, want);
+    }
 
     fn user_msg(text: &str) -> SessionEvent {
         SessionEvent::UserMessage(UserMessage {

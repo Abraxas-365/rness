@@ -33,7 +33,9 @@ pub struct ApprovalRequest {
     pub session: SessionId,
     pub call: ToolCallId,
     pub tool: String,
-    pub args: serde_json::Value,
+    /// Shared with the tool event and its execution: arguments can be tens
+    /// of MiB, so one copy serves every holder.
+    pub args: std::sync::Arc<serde_json::Value>,
     /// Why approval is requested, when a `pre_tool` hook asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
