@@ -222,6 +222,7 @@ def section_headless(t, fp):
             ("context overflow (nothing to compact)", "context-overflow/h"),
             ("connection refused", None),
         ]
+        failed_sid = None  # first session whose only turn failed (auth 401)
         for name, scen in classes:
             if scen is None:
                 argv = [str(BIN), "-m", "anthropic/fake", "--base-url", "http://127.0.0.1:8707/x", "--instructions",
@@ -241,6 +242,20 @@ def section_headless(t, fp):
                     and any(l.startswith("rness: turn failed") for l in lines[-3:-1]), short(err))
             t.check(f"headless: {name}: stdout has no error text", out.strip() == "you: hi", repr(out))
             t.check(f"headless: {name}: error explained on stderr", "attempt: Error" in err, short(err))
+            failed_sid = failed_sid or sid
+        # Slash commands run no turn: exit 0, and an earlier failed turn must not leak into the status.
+        res = r.headless("/help", scenario="ok/help-new")
+        t.check("headless: -p /help on a new session -> exit 0", res.rc == 0 and res.session, f"rc={res.rc} {short(res.stderr)}")
+        t.check("headless: -p /help prints the command list", "/help" in res.stdout, repr(res.stdout[-200:]))
+        t.check("headless: -p /help runs no turn",
+                not [e for e in r.log(res.session) if e["type"] == "turn/started"] if res.session else False, res.session)
+        before = [e["outcome"] for e in r.log(failed_sid) if e["type"] == "turn/ended"]
+        res = r.headless("/help", session=failed_sid, scenario="ok/help-old")
+        after = [e["outcome"] for e in r.log(failed_sid) if e["type"] == "turn/ended"]
+        t.check("headless: -p /help on a session whose last turn failed -> exit 0",
+                res.rc == 0 and before == ["failed"] and after == before, f"rc={res.rc} {before} {after} {short(res.stderr)}")
+        t.check("headless: -p /help on a failed session: no stale 'turn failed' line",
+                "turn failed" not in res.stderr, short(res.stderr))
         # SIGINT mid-turn
         fp.set_stall_seconds(20)
         p = r.spawn_headless("hi", scenario="stall/sigint")

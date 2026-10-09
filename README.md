@@ -201,7 +201,7 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 | Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
 | One-off OpenAI-compatible connection | `rness --route local=http://localhost:8000/v1,none -m local/YOUR_MODEL` |
 
-Headless `-p` exit codes: `0` turn completed, `1` turn failed or startup/configuration error, `2` usage error, `130` turn cancelled or interrupted (Ctrl-C). Codes 3–5 are reserved; scripts should test for non-zero. `--list` needs no model.
+Headless `-p` exit codes: `0` turn completed or slash command (e.g. `-p /help`) succeeded, `1` turn failed, no turn ended for the prompt, or startup/configuration error, `2` usage error, `130` turn cancelled or interrupted (Ctrl-C). Codes 3–5 are reserved; scripts should test for non-zero. `--list` needs no model.
 
 Profiles and agents must exist in your Lua configuration. Resume restores the session's saved request configuration; its connection and credentials must still be available. Bind the server to loopback unless you have reviewed its security and deployment requirements. Use unauthenticated routes only for endpoints intended to accept them.
 

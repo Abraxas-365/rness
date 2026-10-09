@@ -1241,7 +1241,10 @@ async fn run() -> anyhow::Result<u8> {
     };
 
     questions.set_available(false);
-    sessions.send(
+    // Only a turn that ends after this point decides the exit status; an
+    // earlier turn of a resumed session must never leak into it.
+    let before = sessions.store().history(&session)?.len();
+    let disposition = sessions.send(
         &session,
         UserIntent::Followup,
         vec![ContentPart::Text { text: prompt }],
@@ -1268,8 +1271,20 @@ async fn run() -> anyhow::Result<u8> {
             }
         }
     }
-    let history = sessions.store().history(&session)?;
-    let (code, failure) = headless_exit(last_turn_outcome(&history));
+    let (code, failure) = match disposition {
+        // A slash command ran instead of a turn: its errors already surfaced
+        // through `send`'s `Err`, so reaching here means it succeeded.
+        rness_engine::inbox::Disposition::Command(result) => {
+            if !result.message.is_empty() {
+                println!("{}", result.message);
+            }
+            (0, None)
+        }
+        _ => {
+            let history = sessions.store().history(&session)?;
+            headless_exit(turn_outcome_since(&history, before))
+        }
+    };
     if let Some(line) = failure {
         eprintln!("{line}");
     }
@@ -1283,6 +1298,15 @@ type LastTurn = Option<(
     rness_protocol::events::TurnOutcome,
     Option<(Option<String>, String)>,
 )>;
+
+/// [`last_turn_outcome`] restricted to events appended at or after index
+/// `before` (the history length when the prompt was sent).
+fn turn_outcome_since(
+    history: &[Arc<rness_protocol::events::Envelope>],
+    before: usize,
+) -> LastTurn {
+    last_turn_outcome(history.get(before..).unwrap_or_default())
+}
 
 fn last_turn_outcome(history: &[Arc<rness_protocol::events::Envelope>]) -> LastTurn {
     use rness_protocol::events::{AttemptOutcome, SessionEvent};
@@ -1326,7 +1350,7 @@ fn headless_exit(last: LastTurn) -> (u8, Option<String>) {
             };
             (1, Some(format!("rness: turn failed{detail}")))
         }
-        None => (1, Some("rness: no turn completed".into())),
+        None => (1, Some("rness: no turn ended for this prompt".into())),
     }
 }
 
@@ -3194,8 +3218,37 @@ mod headless_exit_tests {
         assert_eq!(last_turn_outcome(&history), None);
         assert_eq!(
             headless_exit(None),
-            (1, Some("rness: no turn completed".to_string()))
+            (1, Some("rness: no turn ended for this prompt".to_string()))
         );
+    }
+
+    #[test]
+    fn earlier_turns_never_decide_the_exit_status() {
+        // Resumed session: turn 1 failed before this invocation, then the
+        // new prompt ended before any turn started.
+        let mut history = vec![
+            env(SessionEvent::TurnStarted { turn: 1 }),
+            attempt("HTTP", "old"),
+            ended(1, TurnOutcome::Failed),
+        ];
+        let before = history.len();
+        assert_eq!(
+            headless_exit(turn_outcome_since(&history, before)),
+            (1, Some("rness: no turn ended for this prompt".to_string()))
+        );
+        // A completed earlier turn must not turn a missing one into success.
+        history.push(env(SessionEvent::TurnStarted { turn: 2 }));
+        history.push(ended(2, TurnOutcome::Completed));
+        assert_eq!(turn_outcome_since(&history, history.len()), None);
+        // The new turn is seen, and the old turn's error does not leak.
+        history.push(env(SessionEvent::TurnStarted { turn: 3 }));
+        let before = history.len() - 1;
+        history.push(ended(3, TurnOutcome::Failed));
+        assert_eq!(
+            headless_exit(turn_outcome_since(&history, before)),
+            (1, Some("rness: turn failed".to_string()))
+        );
+        assert_eq!(turn_outcome_since(&history, history.len() + 5), None);
     }
 }
 
