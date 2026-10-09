@@ -133,14 +133,16 @@ Use the returned next byte offset to page; explicit offset reads do not move the
 ordinary incremental cursor. Text decoding is lossy for non-UTF-8 bytes and pages
 may split multi-byte characters. The disk file retains the original bytes.
 Job ownership checks apply to both reading modes. In-memory output is bounded to
-64 KiB per job; recovery reads only the tail. Custom nonpersistent hosts use
-anonymous temporary files, removed when their registry/jobs are dropped.
+64 KiB per job; recovery reads only the tail. Once a job is settled and its
+completion delivered (always true for foreground captures), its tail leaves RAM
+and readers fetch it from storage. Custom nonpersistent hosts keep output of up
+to 64 KiB in memory and spill larger output to anonymous temporary files,
+removed when their registry/jobs are dropped.
 
 The CLI retains artifacts under `<session-root>/jobs` across restarts, including
-foreground captures. Output quotas and age-based cleanup are **off by default**
-in the core (`max_job_bytes`, `max_total_bytes`, and `max_age_secs` are all zero).
-The shipped default flavor explicitly enables the following policy in
-`flavors/default/init.lua`; custom configurations can opt in the same way:
+foreground captures. Retention is **bounded by default** in the core; these are
+the defaults (the shipped flavor states the byte/age values explicitly in
+`flavors/default/init.lua`):
 
 ```lua
 rness.jobs.setup {
@@ -148,19 +150,22 @@ rness.jobs.setup {
     max_job_bytes = 256 * 1024 * 1024,
     max_total_bytes = 2 * 1024 * 1024 * 1024,
     max_age_secs = 7 * 24 * 60 * 60,
+    max_bash_captures = 200,
     cleanup_interval_secs = 60,
   },
 }
 ```
 
-Zero disables the corresponding byte limit or age-based deletion. Cleanup interval
+`max_bash_captures` keeps the newest settled foreground captures (`bash-output`)
+and evicts older ones, both on the cleanup tick and as new captures arrive.
+Zero disables the corresponding byte limit, age-based deletion or capture cap. Cleanup interval
 must be 1–86400 seconds. Quotas count output bytes owned/recovered by this host,
 not metadata or other live instances. Running jobs, outstanding readers and
 undelivered owned completions are protected. Expired settled artifacts are
 removed; interrupted deletions are reconciled on recovery. A full quota cancels
 the producer and exposes an explicit incomplete-output error; it does not evict
 recent output merely to admit a write. Disk failures also cancel producers.
-Metadata/job count is not capped; treat artifacts as sensitive.
+Background job count is not capped; treat artifacts as sensitive.
 
 ## Process backend configuration
 

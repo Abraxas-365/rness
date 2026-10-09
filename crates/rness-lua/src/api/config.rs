@@ -100,17 +100,34 @@ pub struct StartupConfig {
 #[cfg(test)]
 mod permission_tests {
     #[test]
-    fn job_retention_is_opt_in_and_default_flavor_enables_it() {
+    fn job_retention_is_bounded_by_default_and_matches_the_flavor() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
         for script in ["", "rness.jobs.setup {}", "rness.jobs.setup {retention={}}"] {
             std::fs::write(&path, script).unwrap();
             let policy = super::load(&path).unwrap().job_retention;
-            assert_eq!(policy.max_job_bytes, 0);
-            assert_eq!(policy.max_total_bytes, 0);
-            assert_eq!(policy.max_age_secs, 0);
+            assert_eq!(policy.max_job_bytes, 256 * 1024 * 1024);
+            assert_eq!(policy.max_total_bytes, 2 * 1024 * 1024 * 1024);
+            assert_eq!(policy.max_age_secs, 7 * 24 * 60 * 60);
+            assert_eq!(policy.max_bash_captures, 200);
             assert_eq!(policy.cleanup_interval_secs, 60);
         }
+        // Zero still opts out of each limit.
+        std::fs::write(
+            &path,
+            "rness.jobs.setup{retention={max_job_bytes=0, max_total_bytes=0, max_age_secs=0, max_bash_captures=0}}",
+        )
+        .unwrap();
+        let policy = super::load(&path).unwrap().job_retention;
+        assert_eq!(
+            (
+                policy.max_job_bytes,
+                policy.max_total_bytes,
+                policy.max_age_secs,
+                policy.max_bash_captures
+            ),
+            (0, 0, 0, 0)
+        );
         let flavor =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
         let policy = super::load(&flavor).unwrap().job_retention;

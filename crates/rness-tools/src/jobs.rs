@@ -53,6 +53,59 @@ struct OutputFile {
     synced: std::time::Instant,
 }
 
+/// Ephemeral (non-persistent) job output. Small outputs stay in memory;
+/// past [`MAX_READ_BYTES`] they spill to an anonymous temp file, so the
+/// common foreground call costs no fd at all.
+enum Spool {
+    Memory(Vec<u8>),
+    File(std::fs::File),
+}
+
+impl Spool {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        if let Spool::Memory(buffer) = self {
+            if buffer.len() + bytes.len() <= MAX_READ_BYTES {
+                buffer.extend_from_slice(bytes);
+                return Ok(());
+            }
+            let mut file = tempfile::tempfile()?;
+            file.write_all(buffer)?;
+            *self = Spool::File(file);
+        }
+        let Spool::File(file) = self else {
+            unreachable!()
+        };
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(bytes)
+    }
+
+    /// Up to `limit` bytes from `offset`.
+    fn read_at(&mut self, offset: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        match self {
+            Spool::Memory(buffer) => {
+                let start = (offset as usize).min(buffer.len());
+                let end = start.saturating_add(limit as usize).min(buffer.len());
+                Ok(buffer[start..end].to_vec())
+            }
+            Spool::File(file) => {
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(limit).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn len(&mut self) -> std::io::Result<u64> {
+        match self {
+            Spool::Memory(buffer) => Ok(buffer.len() as u64),
+            Spool::File(file) => Ok(file.metadata()?.len()),
+        }
+    }
+}
+
 pub(crate) fn retain_tail(output: &mut Vec<u8>, bytes: &[u8], limit: usize) {
     if bytes.len() >= limit {
         output.clear();
@@ -166,8 +219,8 @@ struct Job {
     budget: Arc<Mutex<retention::Budget>>,
     path: Option<std::path::PathBuf>,
     state: Mutex<JobState>,
-    /// Ephemeral compositions still spool full output to disk without JSON metadata.
-    spool: Mutex<Option<std::fs::File>>,
+    /// Ephemeral compositions keep full output without JSON metadata.
+    spool: Mutex<Option<Spool>>,
     /// Persistent jobs: the `.output` file, open while running.
     out: Mutex<Option<OutputFile>>,
     /// Whether settle fsyncs output and record (see module docs). False
@@ -196,6 +249,8 @@ struct Registry {
     directory: Mutex<Option<std::path::PathBuf>>,
     locks: Mutex<Vec<std::fs::File>>,
     next_id: AtomicU64,
+    /// Foreground captures started (drives opportunistic eviction).
+    captures: AtomicU64,
     jobs: Mutex<HashMap<String, Arc<Job>>>,
     sessions: Mutex<std::sync::Weak<rness_engine::service::SessionService>>,
     /// Background job recovery thread handle; joined on demand.
@@ -276,29 +331,70 @@ impl Job {
         Ok(())
     }
     fn reconcile_output(&self, state: &mut JobState) {
-        use std::io::{Read, Seek, SeekFrom};
-        let recover = |file: &mut std::fs::File| -> std::io::Result<(usize, Vec<u8>)> {
-            let len = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
-            file.seek(SeekFrom::Start(len.saturating_sub(MAX_READ_BYTES) as u64))?;
-            let mut tail = Vec::new();
-            file.take(MAX_READ_BYTES as u64).read_to_end(&mut tail)?;
-            Ok((len, tail))
-        };
-        let result = if let Some(path) = &self.path {
-            std::fs::File::open(path.with_extension("output"))
-                .and_then(|mut file| recover(&mut file))
-        } else {
-            self.spool
-                .lock()
-                .unwrap()
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("output spool unavailable"))
-                .and_then(recover)
-        };
-        if let Ok((len, tail)) = result {
+        if let Ok((len, tail)) = self.stored_tail() {
             state.output_bytes = len;
             state.output = tail;
             state.read_from = state.read_from.min(len);
+        }
+    }
+
+    /// Stored output length and its last [`MAX_READ_BYTES`].
+    fn stored_tail(&self) -> std::io::Result<(usize, Vec<u8>)> {
+        let len = usize::try_from(self.stored_len()?).map_err(std::io::Error::other)?;
+        let start = len.saturating_sub(MAX_READ_BYTES) as u64;
+        Ok((len, self.read_stored(start, MAX_READ_BYTES as u64)?))
+    }
+
+    fn stored_len(&self) -> std::io::Result<u64> {
+        match &self.path {
+            Some(path) => Ok(std::fs::metadata(path.with_extension("output"))?.len()),
+            None => self
+                .spool
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                .len(),
+        }
+    }
+
+    /// Up to `limit` stored output bytes from `offset`.
+    fn read_stored(&self, offset: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        match &self.path {
+            Some(path) => {
+                let mut file = std::fs::File::open(path.with_extension("output"))?;
+                file.seek(SeekFrom::Start(offset))?;
+                let mut bytes = Vec::new();
+                file.take(limit).read_to_end(&mut bytes)?;
+                Ok(bytes)
+            }
+            None => self
+                .spool
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                .read_at(offset, limit),
+        }
+    }
+
+    /// The RAM tail, re-read from storage when it was released (settled,
+    /// delivered jobs keep none). Empty if storage is unreadable.
+    fn tail<'a>(&self, state: &'a JobState) -> std::borrow::Cow<'a, [u8]> {
+        if state.output.len() >= state.output_bytes.min(MAX_READ_BYTES) {
+            return std::borrow::Cow::Borrowed(&state.output);
+        }
+        let start = state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64;
+        let limit = (state.output_bytes as u64).saturating_sub(start);
+        std::borrow::Cow::Owned(self.read_stored(start, limit).unwrap_or_default())
+    }
+
+    /// Settled and delivered: nobody waits on the tail any more, so it
+    /// leaves RAM; readers fetch it from storage.
+    fn release_tail(state: &mut JobState) {
+        if state.settled && state.delivered {
+            state.output = Vec::new();
         }
     }
 
@@ -390,14 +486,14 @@ impl JobWriter {
                 return;
             }
         } else {
-            use std::io::{Seek, SeekFrom, Write};
             let append = (|| -> std::io::Result<()> {
-                let mut spool = self.job.spool.lock().unwrap();
-                let file = spool
+                self.job
+                    .spool
+                    .lock()
+                    .unwrap()
                     .as_mut()
-                    .ok_or_else(|| std::io::Error::other("output spool unavailable"))?;
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(bytes)
+                    .ok_or_else(|| std::io::Error::other("output spool unavailable"))?
+                    .write_all(bytes)
             })();
             if let Err(error) = append {
                 state.output_error = Some(format!(
@@ -438,6 +534,7 @@ impl JobWriter {
             }
         }
         self.job.checkpoint(&state);
+        Job::release_tail(&mut state);
         let notice = format!(
             "Background {} job finished {}. Read its output with job_output.",
             state.kind,
@@ -459,7 +556,11 @@ impl JobWriter {
                         let job = self.job.clone();
                         tokio::spawn(async move {
                             match sessions.notify_job_wait(&owner, text).await {
-                                Ok(_) => job.state.lock().unwrap().delivered = true,
+                                Ok(_) => {
+                                    let mut state = job.state.lock().unwrap();
+                                    state.delivered = true;
+                                    Job::release_tail(&mut state);
+                                }
                                 Err(error) => {
                                     tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed")
                                 }
@@ -469,7 +570,11 @@ impl JobWriter {
                     Err(error) => {
                         tracing::warn!(job = %id, session = %owner, %error, "job completion delivery failed")
                     }
-                    Ok(_) => self.job.state.lock().unwrap().delivered = true,
+                    Ok(_) => {
+                        let mut state = self.job.state.lock().unwrap();
+                        state.delivered = true;
+                        Job::release_tail(&mut state);
+                    }
                 }
             }
         }
@@ -496,14 +601,45 @@ impl JobRegistry {
         Ok(())
     }
 
-    /// Expire only settled, delivered artifacts, never active or pending output.
+    /// Expire only settled, delivered artifacts, never active or pending
+    /// output: those older than `max_age_secs`, and the oldest foreground
+    /// captures beyond `max_bash_captures`.
     pub fn cleanup(&self) -> Result<usize, String> {
         let policy = self.inner.budget.lock().unwrap().policy.clone();
-        if policy.max_age_secs == 0 {
+        if policy.max_age_secs == 0 && policy.max_bash_captures == 0 {
             return Ok(0);
         }
         let now = retention::now_ms();
         let mut jobs = self.inner.jobs.lock().unwrap();
+        let expired = |state: &JobState| {
+            policy.max_age_secs != 0
+                && state.settled_at_ms.is_some_and(|at| {
+                    now.saturating_sub(at) >= policy.max_age_secs.saturating_mul(1000)
+                })
+        };
+        // Captures over the cap, oldest first (ULID/counter ids sort by
+        // creation within one id scheme; settle time decides).
+        let mut captures: Vec<(u64, &String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                (state.kind == "bash-output" && state.settled)
+                    .then(|| (state.settled_at_ms.unwrap_or(0), id))
+            })
+            .collect();
+        let excess = if policy.max_bash_captures == 0 {
+            0
+        } else {
+            captures
+                .len()
+                .saturating_sub(policy.max_bash_captures as usize)
+        };
+        captures.sort();
+        let over_cap: std::collections::HashSet<String> = captures
+            .into_iter()
+            .take(excess)
+            .map(|(_, id)| id.clone())
+            .collect();
         let mut removed = Vec::new();
         let mut errors = Vec::new();
         for (id, job) in jobs.iter() {
@@ -515,13 +651,21 @@ impl JobRegistry {
             let state = job.state.lock().unwrap();
             if !state.settled
                 || (!state.delivered && state.owner.is_some())
-                || !state.settled_at_ms.is_some_and(|at| {
-                    now.saturating_sub(at) >= policy.max_age_secs.saturating_mul(1000)
-                })
+                || !(expired(&state) || over_cap.contains(id))
             {
                 continue;
             }
-            if let Some(path) = &job.path {
+            if let (Some(path), false) = (&job.path, job.durable) {
+                // Captures were never synced: unlink the record, then its
+                // output (recovery removes an output left without record).
+                for path in [path.clone(), path.with_extension("output")] {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            errors.push(e.to_string());
+                        }
+                    }
+                }
+            } else if let Some(path) = &job.path {
                 // Rename to a tombstone first. Recovery resumes interrupted GC.
                 if let Err(error) = job.persist(&state) {
                     tracing::warn!(%error, "artifact cleanup metadata restore failed");
@@ -708,6 +852,7 @@ impl JobRegistry {
                     state.settled_at_ms.get_or_insert_with(retention::now_ms);
                     state.charged_bytes = state.output_bytes as u64;
                     self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                    Job::release_tail(&mut state);
                     let durable = state.kind != "bash-output";
                     let job = Arc::new(Job {
                         budget: self.inner.budget.clone(),
@@ -749,6 +894,7 @@ impl JobRegistry {
                 directory: Mutex::new(None),
                 locks: Mutex::new(Vec::new()),
                 next_id: AtomicU64::new(1),
+                captures: AtomicU64::new(0),
                 jobs: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(std::sync::Weak::new()),
                 recovery_handle: Mutex::new(None),
@@ -802,6 +948,7 @@ impl JobRegistry {
                                 let mut state = job.state.lock().unwrap();
                                 state.delivered = true;
                                 job.checkpoint(&state);
+                                Job::release_tail(&mut state);
                             }
                             Ok(false) => {}
                             Err(error) => {
@@ -860,6 +1007,18 @@ impl JobRegistry {
     /// fsynced: a crash mid-command leaves an orphan `.output` that
     /// recovery removes.
     pub(crate) fn capture(&self, label: String, owner: Option<&String>) -> (String, JobWriter) {
+        // Enforce the capture cap as captures arrive, not only on the
+        // cleanup tick: one cheap pass per `cap / 4` new captures.
+        let cap = self.inner.budget.lock().unwrap().policy.max_bash_captures;
+        if cap != 0 {
+            let every = (cap / 4).max(1);
+            let n = self.inner.captures.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_multiple_of(every) {
+                if let Err(error) = self.cleanup() {
+                    tracing::warn!(%error, "capture eviction failed");
+                }
+            }
+        }
         self.start_job("bash-output", label, owner, true)
     }
 
@@ -890,12 +1049,7 @@ impl JobRegistry {
             format!("j{}", self.inner.next_id.fetch_add(1, Ordering::Relaxed))
         };
         let ephemeral = self.inner.directory.lock().unwrap().is_none();
-        let spool = if ephemeral {
-            tempfile::tempfile().ok()
-        } else {
-            None
-        };
-        let spool_failed = ephemeral && spool.is_none();
+        let spool = ephemeral.then(|| Spool::Memory(Vec::new()));
         let job = Arc::new(Job {
             budget: self.inner.budget.clone(),
             spool: Mutex::new(spool),
@@ -951,9 +1105,6 @@ impl JobRegistry {
                 }
             }
         }
-        if spool_failed {
-            job.cancel.cancel();
-        }
         // Background jobs get a start record so a crash recovers them as
         // `interrupted` (and their notice is delivered); captures do not.
         if !capture {
@@ -965,6 +1116,25 @@ impl JobRegistry {
             .expect("jobs lock")
             .insert(id.clone(), job.clone());
         (id, JobWriter { job })
+    }
+
+    /// Output bytes this registry holds in RAM (job tails and in-memory
+    /// spools); a diagnostic for retention, independent of allocator noise.
+    #[doc(hidden)]
+    pub fn resident_output_bytes(&self) -> usize {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap()
+            .values()
+            .map(|job| {
+                let spool = match job.spool.lock().unwrap().as_ref() {
+                    Some(Spool::Memory(buffer)) => buffer.len(),
+                    _ => 0,
+                };
+                job.state.lock().unwrap().output.len() + spool
+            })
+            .sum()
     }
 
     /// Count visible unsettled jobs without reading or copying their output.
@@ -1009,7 +1179,8 @@ impl JobRegistry {
         let job = self.get_for_session(id, Some(session))?;
         let state = job.state.lock().expect("job lock");
         let output_bytes = state.output_bytes;
-        let tail = &state.output[state.output.len().saturating_sub(MAX_INSPECT_BYTES)..];
+        let tail = job.tail(&state);
+        let tail = &tail[tail.len().saturating_sub(MAX_INSPECT_BYTES)..];
         let mut output = String::from_utf8_lossy(tail).into_owned();
         // Lossy decoding can expand invalid bytes; retain a UTF-8-safe bounded tail.
         if output.len() > MAX_INSPECT_BYTES {
@@ -1318,6 +1489,91 @@ mod inspection_tests {
 mod durability_tests {
     use super::*;
 
+    fn capture(registry: &JobRegistry, bytes: &[u8]) -> String {
+        let (id, writer) = registry.capture("cmd".into(), None);
+        writer.append(bytes);
+        writer.settle(JobStatus::Exited(Some(0)));
+        id
+    }
+
+    #[test]
+    fn default_retention_evicts_oldest_captures_beyond_200() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let (bg, writer) = registry.start("bash", "bg".into());
+        let dir = writer.job.path.clone().unwrap();
+        let dir = dir.parent().unwrap().to_path_buf();
+        writer.append(b"kept");
+        writer.settle(JobStatus::Exited(Some(0)));
+        let first = capture(&registry, b"first");
+        let ids: Vec<String> = (0..299).map(|_| capture(&registry, b"x")).collect();
+        let records = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+                .count()
+        };
+        // Opportunistic eviction (every cap/4 captures) keeps the count
+        // near the cap between cleanup ticks.
+        assert!(records() <= 1 + 200 + 50, "{}", records());
+        registry.cleanup().unwrap();
+        assert!(registry.get(&first).is_err(), "oldest capture evicted");
+        assert!(registry.get(ids.last().unwrap()).is_ok());
+        assert!(
+            registry.get(&bg).is_ok(),
+            "background jobs are not captures"
+        );
+        assert_eq!(records(), 1 + 200);
+        let outputs = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "output"))
+            .count();
+        assert_eq!(outputs, 1 + 200);
+    }
+
+    #[test]
+    fn ephemeral_small_output_needs_no_spool_file_and_large_output_spills() {
+        let registry = JobRegistry::new();
+        let (_, writer) = registry.capture("cmd".into(), None);
+        writer.append(b"small");
+        assert!(matches!(
+            writer.job.spool.lock().unwrap().as_ref(),
+            Some(Spool::Memory(_))
+        ));
+        writer.append(&vec![b'a'; MAX_READ_BYTES]);
+        assert!(matches!(
+            writer.job.spool.lock().unwrap().as_ref(),
+            Some(Spool::File(_))
+        ));
+        assert_eq!(
+            writer.job.read_stored(0, 5).unwrap(),
+            b"small",
+            "spilled bytes keep their offsets"
+        );
+        assert_eq!(writer.job.stored_len().unwrap(), 5 + MAX_READ_BYTES as u64);
+    }
+
+    #[test]
+    fn settled_delivered_jobs_drop_ram_tail_but_stay_readable() {
+        for persistent in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let registry = JobRegistry::new();
+            if persistent {
+                registry.enable_persistence(directory.path()).unwrap();
+            }
+            let id = capture(&registry, b"captured tail");
+            let job = registry.get(&id).unwrap();
+            assert!(job.state.lock().unwrap().output.is_empty());
+            let inspection = registry.inspect("any", &id).unwrap();
+            assert_eq!(inspection.output, "captured tail");
+            let (text, _, _) = drain_output(&job);
+            assert_eq!(text, "captured tail");
+        }
+    }
+
     #[test]
     fn output_append_does_not_rewrite_metadata_and_recovers_before_settlement() {
         let directory = tempfile::tempdir().unwrap();
@@ -1344,7 +1600,6 @@ mod durability_tests {
     }
     #[tokio::test]
     async fn partial_output_failure_reconciles_pagination() {
-        use std::io::Write;
         let registry = JobRegistry::new();
         let (id, writer) = registry.start("bash", "partial".into());
         writer.append(b"first");
@@ -1670,12 +1925,14 @@ impl Default for JobRegistry {
 /// Consume the unread output window (bounded), advancing the read cursor.
 fn drain_output(job: &Job) -> (String, JobStatus, Value) {
     let mut state = job.state.lock().expect("job lock");
+    let tail = job.tail(&state);
     let start = state
         .read_from
-        .max(state.output_bytes.saturating_sub(state.output.len()));
+        .max(state.output_bytes.saturating_sub(tail.len()));
     let skipped = start - state.read_from;
-    let window = &state.output[start - (state.output_bytes - state.output.len())..];
+    let window = &tail[start - (state.output_bytes - tail.len())..];
     let mut text = String::from_utf8_lossy(window).into_owned();
+    drop(tail);
     if skipped > 0 {
         text = format!("… {skipped} bytes skipped …\n{text}");
     }
@@ -1784,7 +2041,6 @@ impl JobOutputTool {
         let id = crate::required_str(&args, "job_id")?;
         let job = self.jobs.get_for_session(id, session)?;
         if let Some(offset) = args.get("offset") {
-            use std::io::{Read, Seek, SeekFrom};
             let offset = offset
                 .as_u64()
                 .ok_or("offset must be a nonnegative byte offset")?;
@@ -1792,29 +2048,9 @@ impl JobOutputTool {
             if offset > state.output_bytes as u64 {
                 return Err("offset exceeds retained output".into());
             }
-            let read = |file: &mut std::fs::File| -> Result<String, String> {
-                file.seek(SeekFrom::Start(offset))
-                    .map_err(|e| e.to_string())?;
-                let mut bytes = Vec::new();
-                file.take((state.output_bytes as u64 - offset).min(MAX_READ_BYTES as u64))
-                    .read_to_end(&mut bytes)
-                    .map_err(|e| e.to_string())?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            };
-            let text = if let Some(path) = &job.path {
-                read(
-                    &mut std::fs::File::open(path.with_extension("output"))
-                        .map_err(|e| e.to_string())?,
-                )?
-            } else {
-                read(
-                    job.spool
-                        .lock()
-                        .unwrap()
-                        .as_mut()
-                        .ok_or("output spool unavailable")?,
-                )?
-            };
+            let limit = (state.output_bytes as u64 - offset).min(MAX_READ_BYTES as u64);
+            let bytes = job.read_stored(offset, limit).map_err(|e| e.to_string())?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
             let end = (offset + MAX_READ_BYTES as u64).min(state.output_bytes as u64);
             let metadata = json!({"version":1,"kind":"job_output","job_id":id,"start_byte":offset,"end_byte":end,"total_bytes":state.output_bytes,"truncated":end < state.output_bytes as u64});
             return Ok((
