@@ -20,7 +20,8 @@
 //!   but writers only emit what is defined here.
 //! - Forward compatibility: a line whose `type` this build does not know
 //!   (written by a newer rness) reads as [`SessionEvent::Unknown`] with its
-//!   JSON kept verbatim, instead of failing the whole log. A line with a
+//!   JSON kept semantically verbatim (same value; object key order and
+//!   whitespace may change), instead of failing the whole log. A line with a
 //!   KNOWN `type` but malformed fields is still an error (real corruption).
 //!   Projections ignore unknown events; the turn loop refuses to run a model
 //!   turn on a session that contains any (it could be model-visible).
@@ -223,13 +224,15 @@ impl<'de> Deserialize<'de> for Envelope {
 }
 
 /// An event of a type this build does not know (written by a newer rness).
-/// Kept verbatim; never rewritten, never model-visible here.
+/// Kept semantically verbatim (same JSON value; key order may change);
+/// never rewritten, never model-visible here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnknownEvent {
     /// The event's `type` tag.
     pub kind: String,
     /// The event's JSON object, `type` included (without the envelope's
-    /// `id`/`at` when read from a log line). Serialized back verbatim.
+    /// `id`/`at` when read from a log line). Serialized back as the same JSON
+    /// value (key order and whitespace are not preserved).
     pub raw: serde_json::Value,
 }
 
@@ -438,7 +441,8 @@ pub enum SessionEvent {
     Repair(LogRepair),
 
     /// Read-side only: an event whose `type` this build does not know.
-    /// Never constructed by writers; serialized back verbatim.
+    /// Never constructed by writers; serialized back semantically verbatim
+    /// (key order may change).
     #[serde(skip)]
     Unknown(UnknownEvent),
 }

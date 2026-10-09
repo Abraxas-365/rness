@@ -101,8 +101,14 @@ Old fixtures are kept forever and migrations are tested against them.
 
 ### Durability and damaged logs
 
-Every append is one `write` + `fdatasync`; a failed write is rolled back
-(`set_len`) so the next append never glues onto half a line. Readers stop
+Every append (or batch append, e.g. the prune pass: one `fdatasync` per
+batch of up to 512 events) is a `write` followed by one `fdatasync`; the
+caller is told "committed" only after the sync returns. A crash mid-batch
+can leave a whole-line prefix of the batch, never a reordered one. A failed
+write is rolled back (`set_len`) so the next append never glues onto half a
+line. Events nested deeper than 512 JSON levels are refused at append (the
+reader lifts serde_json's 128-level limit up to that bound), so a committed
+line is always readable. Readers stop
 at an unterminated last line (a crash mid-append) and never consume it.
 Opening a log for writing checks the header (present, `version ==
 FORMAT_VERSION`, session id matches) and then heals the tail:
@@ -119,7 +125,8 @@ FORMAT_VERSION`, session id matches) and then heals the tail:
 
 **Forward compatibility:** an event whose `type` this build does not know
 (written by a newer rness) is data, not corruption: it is read as
-`SessionEvent::Unknown`, re-serialized verbatim, ignored by projections,
+`SessionEvent::Unknown`, re-serialized semantically verbatim (same JSON value; object key order and
+whitespace may differ), ignored by projections,
 and the turn loop refuses to build a model request for that session
 ("session contains events from a newer rness (…); upgrade") — it could be
 model-visible. A header with a different `version` fails with
