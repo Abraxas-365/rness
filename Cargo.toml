@@ -42,7 +42,7 @@ mlua = { version = "0.10", features = ["lua54", "vendored", "async", "serialize"
 
 # -- llm providers
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-eventsource-stream = "0.2"
+memchr = "2"
 futures-core = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
