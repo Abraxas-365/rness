@@ -511,3 +511,59 @@ fn rewrites_rebuild_and_corrupt_sessions_are_skipped() {
     let found = workspace_search(&mut provider, "other");
     assert_eq!(found["items"].as_array().unwrap().len(), 1);
 }
+
+/// The standard index file is new per schema: an existing v2/v3 file (which
+/// older rness processes may still be using) is neither opened nor changed.
+#[test]
+fn v4_index_gets_a_new_file_and_leaves_older_indexes_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    log.append(&message("needle original")).unwrap();
+
+    let v2 = dir.path().join("session-search-v2.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&v2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE VIRTUAL TABLE events USING fts5(workspace UNINDEXED, session UNINDEXED,
+                   event UNINDEXED, kind UNINDEXED, surface UNINDEXED, time UNINDEXED, body);
+                 INSERT INTO events VALUES('/w','old','e','user/message','current',0,'needle stale');
+                 PRAGMA application_id = 1380864849; PRAGMA user_version=2;",
+            )
+            .unwrap();
+    }
+    let proto = dir.path().join("session-search.sqlite3");
+    std::fs::write(&proto, b"prototype bytes").unwrap();
+    let (v2_before, proto_before) = (std::fs::read(&v2).unwrap(), std::fs::read(&proto).unwrap());
+
+    let path = dir
+        .path()
+        .join(rness_engine::session_search::INDEX_FILE_NAME);
+    assert_eq!(path.file_name().unwrap(), "session-search-v4.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let found = provider
+        .execute(
+            &store,
+            log.session(),
+            "session_event_search",
+            request(json!({"query":"needle"})),
+        )
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    drop(connection);
+    drop(provider);
+    assert_eq!(std::fs::read(&v2).unwrap(), v2_before, "v2 index rewritten");
+    assert_eq!(std::fs::read(&proto).unwrap(), proto_before);
+    let v2_version: i64 = rusqlite::Connection::open(&v2)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(v2_version, 2);
+}

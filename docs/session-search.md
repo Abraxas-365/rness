@@ -12,9 +12,17 @@ Add these entries to your **existing** `rness.plugins.setup` list:
 
 Neither is enabled by default. Provider-only activation exposes a plugin API,
 not model tools. Loading the provider does not create/open SQLite or scan logs.
-The first valid search creates `session-search-v2.sqlite3` in the session store.
+The first valid search creates `session-search-v4.sqlite3` in the session store.
 Event reads and traces read JSONL without opening SQLite. JSONL remains the
-source of truth. The prototype `session-search.sqlite3` is left untouched.
+source of truth. The index is a derived cache: it is rebuilt from the logs on
+demand, so deleting it loses nothing.
+
+The index file name carries the schema version, so rness builds with different
+schemas never share (or rewrite) a file. Files from earlier builds —
+`session-search.sqlite3` and `session-search-v2.sqlite3` — are left untouched
+and are no longer used; they can be large (gigabytes), and you can delete them
+once no older rness is running. rness logs a note the first time it creates the
+v4 index next to one.
 SQLite is included in the binary; no Cargo feature/rebuild is needed to opt in.
 
 ## Tools

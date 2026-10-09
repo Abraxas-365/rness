@@ -8,6 +8,15 @@ use std::path::PathBuf;
 use rusqlite::{params, Connection};
 
 mod query;
+
+/// File name of the session search index inside the session store.
+/// Bumped together with the index schema (v4 = schema version 4): a new
+/// name means older and newer rness builds never share a schema and no
+/// large file is dropped in place.
+pub const INDEX_FILE_NAME: &str = "session-search-v4.sqlite3";
+/// Index files of earlier builds. Left alone; safe to delete by hand.
+pub const LEGACY_INDEX_FILE_NAMES: &[&str] =
+    &["session-search.sqlite3", "session-search-v2.sqlite3"];
 pub use query::QueryRequest;
 
 /// One searchable message, with a stable reference into its source session.

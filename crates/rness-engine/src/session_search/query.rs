@@ -17,8 +17,30 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 /// Derived index layout. v4: `surface` moved from the FTS row to
 /// `event_scope`, per-session `session_cursor` for append-only refresh.
-/// Older (v2/v3) indexes are dropped and rebuilt once on open.
+///
+/// The standard index lives in a NEW file ([`super::INDEX_FILE_NAME`]), so
+/// processes running an older build keep using their own v2/v3 file and this
+/// build never rewrites it. Only a custom path holding a v2/v3 index is
+/// migrated in place (drop + rebuild, under the write lock).
 const SCHEMA_VERSION: i64 = 4;
+const APPLICATION_ID: i64 = 0x524e5351;
+
+/// First build of a v4 index: say so if an earlier build's (possibly huge)
+/// index file sits next to it. It is never deleted automatically.
+fn note_legacy_indexes(path: &std::path::Path) {
+    let Some(dir) = path.parent() else { return };
+    for name in super::LEGACY_INDEX_FILE_NAMES {
+        let legacy = dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&legacy) {
+            tracing::info!(
+                path = %legacy.display(),
+                bytes = meta.len(),
+                "created a new session search index; this older index is no longer used \
+                 and can be deleted once no older rness is running"
+            );
+        }
+    }
+}
 fn invalid(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
 }
@@ -161,22 +183,42 @@ impl SqliteSessionSearch {
                 10_000,
                 Some(move || cancel.lock().is_ok_and(|token| token.is_cancelled())),
             );
-            let app: i64 = connection.query_row("PRAGMA application_id", [], |r| r.get(0))?;
-            let version: i64 = connection.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            let tables: i64 = connection.query_row(
-                "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
-                [],
-                |r| r.get(0),
-            )?;
-            if (app != 0x524e5351 || !matches!(version, 2..=SCHEMA_VERSION))
+            let header = |connection: &Connection| -> Result<(i64, i64, i64)> {
+                Ok((
+                    connection.query_row("PRAGMA application_id", [], |r| r.get(0))?,
+                    connection.query_row("PRAGMA user_version", [], |r| r.get(0))?,
+                    connection.query_row(
+                        "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+                        [],
+                        |r| r.get(0),
+                    )?,
+                ))
+            };
+            let (app, version, _) = header(&connection)?;
+            if app == APPLICATION_ID && version == SCHEMA_VERSION {
+                // Current layout (the normal case): no write lock taken.
+                self.connection = Some(connection);
+                return Ok(self.connection.as_mut().unwrap());
+            }
+            // Anything else is decided under the write lock: another process
+            // may be migrating or creating the same file right now, so the
+            // header is read again inside the transaction.
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (app, version, tables) = header(&tx)?;
+            if (app != APPLICATION_ID || !matches!(version, 2..=SCHEMA_VERSION))
                 && !(app == 0 && version == 0 && tables == 0)
             {
                 return Err(invalid(
                     "unrecognized search database; choose a new derived index path",
                 ));
             }
-            let tx = connection.transaction()?;
+            if app == 0 {
+                note_legacy_indexes(&self.path);
+            }
             if (2..SCHEMA_VERSION).contains(&version) {
+                // Only reachable for a custom index path: the standard path
+                // ([`INDEX_FILE_NAME`]) is a new file, so shipped v2/v3
+                // indexes are never opened, let alone dropped, by this build.
                 // v2/v3 kept `surface` inside the FTS row, so re-labelling an
                 // event rewrote its body. The index is derived: drop it and
                 // let the next refresh rebuild every session once.
