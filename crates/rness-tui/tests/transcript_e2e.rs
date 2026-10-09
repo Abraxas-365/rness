@@ -46,7 +46,13 @@ fn settle(app: &mut App, w: u16, h: u16) -> Vec<String> {
 
 fn scroll_to(app: &mut App, from_bottom: usize, w: u16, h: u16) -> Vec<String> {
     app.model.scroll_from_bottom = 0;
-    render(app, w, h);
+    // Finish progressive layout first: scrolling over estimated rows lands
+    // wherever refill (time-budgeted, so CPU-load dependent) has got to,
+    // which is not what this test compares. Every idle frame lays out at
+    // least 16 stale entries, so this many frames always drain it.
+    for _ in 0..app.model.entries.len() / 16 + 2 {
+        render(app, w, h);
+    }
     app.apply(Action::ScrollUp(from_bottom));
     settle(app, w, h)
 }
