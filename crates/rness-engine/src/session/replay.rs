@@ -43,6 +43,32 @@ pub fn unknown_kinds(history: &[impl std::borrow::Borrow<Envelope>]) -> Vec<Stri
     kinds
 }
 
+/// A session holds events this build does not understand (written by a
+/// newer rness). Any of them could be model-visible or change what a
+/// compaction folds, so every path that builds a model request or commits a
+/// compaction/prune must refuse (invariant #1). One check, many callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewerEvents(pub Vec<String>);
+
+/// `Err` iff `history` contains an unknown event type.
+pub fn require_known(history: &[impl std::borrow::Borrow<Envelope>]) -> Result<(), NewerEvents> {
+    match unknown_kinds(history) {
+        kinds if kinds.is_empty() => Ok(()),
+        kinds => Err(NewerEvents(kinds)),
+    }
+}
+
+impl Replayed {
+    /// See [`NewerEvents`].
+    pub fn require_known(&self) -> Result<(), NewerEvents> {
+        if self.unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(NewerEvents(self.unknown.clone()))
+        }
+    }
+}
+
 pub fn replay(store: &SessionStore, session: &SessionId) -> Result<Replayed, ReplayError> {
     store.count_replay();
     let history = store.history(session)?;

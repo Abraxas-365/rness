@@ -902,6 +902,62 @@ async fn send_refuses_sessions_with_newer_events_without_logging() {
     assert!(provider.seen().is_empty());
 }
 
+/// Every path that builds a model request or commits a compaction/prune
+/// refuses a session holding events from a newer rness, before the
+/// summarizer is called or anything is logged.
+#[tokio::test]
+async fn compaction_and_prune_refuse_sessions_with_newer_events() {
+    use rness_engine::service::ServiceError;
+    let dir = tempfile::tempdir().unwrap();
+    let mut steps = scripted_answers(3);
+    steps.push(StepOutcome::Committed(assistant(
+        "SUMMARY",
+        StopReason::EndTurn,
+        vec![],
+    )));
+    let provider = Scripted::new(steps);
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+    run_turns(&svc, &sid, 3).await;
+    let context = svc.replay(&sid).unwrap().context;
+    let path = dir.path().join(&sid).join("session.v1.jsonl");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    std::io::Write::write_all(
+        &mut f,
+        b"{\"id\":\"01FUTURE\",\"at\":\"2026-01-01T00:00:00.000Z\",\"type\":\"x/new\"}\n",
+    )
+    .unwrap();
+    drop(f);
+    let before = std::fs::read(&path).unwrap();
+    let requests = provider.seen().len();
+    let svc = service(dir.path(), provider.clone());
+    let newer = |err: &ServiceError| matches!(err, ServiceError::NewerEvents { types } if types == &["x/new".to_string()]);
+
+    let err = svc.compact(&sid, 1).await.unwrap_err();
+    assert!(newer(&err), "{err}");
+    let policy: rness_engine::turn::compaction::Policy =
+        serde_json::from_value(serde_json::json!({
+            "system_prompt": "Summarize", "prompt": "Preserve context",
+            "threshold_tokens": 5000, "retain_tokens": 1, "summary_tokens": 2048,
+            "max_overflow_retries": 1, "max_compactions": 1,
+            "prune_threshold": 8192, "prune_head": 4096, "prune_tail": 1024
+        }))
+        .unwrap();
+    let err = svc
+        .compact_region(&sid, 0, context.turns.len(), context.sources, policy)
+        .await
+        .unwrap_err();
+    assert!(newer(&err), "{err}");
+    let err = svc.prune_tool_results(&sid, prune_opts(1)).unwrap_err();
+    assert!(newer(&err), "{err}");
+
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing logged");
+    assert_eq!(provider.seen().len(), requests, "no summarizer request");
+}
+
 #[tokio::test]
 async fn followup_while_running_queues_and_runs_after() {
     let dir = tempfile::tempdir().unwrap();

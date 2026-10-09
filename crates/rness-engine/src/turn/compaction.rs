@@ -458,6 +458,7 @@ pub(crate) async fn reduce_cached(
             return Ok(changed);
         }
         let mut replayed = cache.get(store, log)?;
+        replayed.require_known()?;
         if let Some(r) = &region {
             if r.start >= r.end
                 || r.end > replayed.context.turns.len()

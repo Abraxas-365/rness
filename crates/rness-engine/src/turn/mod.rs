@@ -55,6 +55,12 @@ pub enum TurnError {
     NewerEvents { types: Vec<String> },
 }
 
+impl From<crate::session::replay::NewerEvents> for TurnError {
+    fn from(newer: crate::session::replay::NewerEvents) -> Self {
+        TurnError::NewerEvents { types: newer.0 }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TurnConfig {
     pub max_retries: u32,
@@ -203,11 +209,8 @@ pub async fn run_turn(
     // Refuse before anything is logged: events from a newer rness may be
     // model-visible, and dropping them would break invariant #1.
     let history = store.history(log.session()).map_err(ReplayError::from)?;
-    let unknown = crate::session::replay::unknown_kinds(&history);
+    crate::session::replay::require_known(&history)?;
     drop(history);
-    if !unknown.is_empty() {
-        return Err(TurnError::NewerEvents { types: unknown });
-    }
     log.append(&SessionEvent::TurnStarted { turn: turn_no })?;
     let outcome = drive(
         store, log, provider, tools, config, cancel, steers, turn_no, frames, loop_hooks,
