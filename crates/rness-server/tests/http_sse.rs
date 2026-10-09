@@ -954,3 +954,45 @@ async fn concurrent_remote_sends_all_accepted() {
     }
     assert_eq!(started, 1);
 }
+
+/// B5-9: a client that falls behind the broadcast buffer is told with an
+/// `event: lagged` / `{"missed": n}` event rather than silently losing frames.
+#[tokio::test(flavor = "current_thread")]
+async fn lagged_sse_client_is_told_to_resync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    for path in ["api/events", &format!("api/events/{id}")] {
+        let mut response = reqwest::get(format!("{base}/{path}")).await.unwrap();
+        // Current-thread runtime: the server cannot poll the stream while
+        // this synchronous burst (4x the 1024-frame buffer) runs.
+        for i in 0..4096 {
+            kernel
+                .bus()
+                .emit::<FrameEv>(&rness_protocol::frames::Frame::Notice {
+                    session: id.clone(),
+                    text: format!("n{i}"),
+                });
+        }
+        let mut body = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !body.contains("event: lagged") {
+            let Ok(Ok(Some(chunk))) = tokio::time::timeout_at(deadline, response.chunk()).await
+            else {
+                break;
+            };
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let at = body
+            .find("event: lagged")
+            .unwrap_or_else(|| panic!("{path}: no lagged event in {body}"));
+        let data = body[at..]
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap();
+        let missed = serde_json::from_str::<serde_json::Value>(data.trim()).unwrap()["missed"]
+            .as_u64()
+            .unwrap();
+        assert!(missed > 0, "{path}: {data}");
+    }
+}
