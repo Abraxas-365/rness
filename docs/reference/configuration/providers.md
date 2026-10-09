@@ -82,7 +82,7 @@ Custom OAuth store references select an entry; they do not define an arbitrary O
 
 Stored keys and OAuth tokens live in `~/.rness/credentials.json` (`$RNESS_HOME/credentials.json` when set), mode 0600. Several rness processes can share it safely: every save is a locked read-modify-write (lock file `credentials.json.lock` next to it, which you can ignore in backups) and replaces the file atomically, so concurrent logins and token refreshes neither lose each other's updates nor leave a half-written file. A symlinked `credentials.json` keeps its link.
 
-If the file is ever corrupt (for example hand-edited JSON), commands that only read it fail with `credentials file … is corrupt`; the next save (`rness auth login`, `set-key`, a token refresh) copies it to `credentials.json.corrupt-<timestamp>` and starts a fresh file.
+If the file is ever corrupt (for example hand-edited JSON), commands that only read it fail with `credentials file … is corrupt`. When it is not valid JSON at all (truncated, empty, a syntax error), the next save (`rness auth login`, `set-key`, a token refresh) copies it to `credentials.json.corrupt-<timestamp>` and starts a fresh file. Valid JSON with an unexpected shape (for example written by a newer rness) is never moved or overwritten: saves keep failing with the same error until you fix or delete the file.
 
 ## Multiple accounts per provider
 

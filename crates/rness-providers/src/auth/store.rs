@@ -256,9 +256,10 @@ impl CredentialStore {
         }
     }
 
-    /// Read-modify-write under the store lock. A corrupt file is backed up
-    /// (`<file>.corrupt-<unix-ts>`) and replaced, so saving self-heals;
-    /// read-only paths keep returning [`TokensError::Corrupt`].
+    /// Read-modify-write under the store lock. A torn or empty file is
+    /// backed up (`<file>.corrupt-<unix-ts>`) and replaced, so saving
+    /// self-heals; a well-formed file of an unexpected shape is left alone.
+    /// Read-only paths keep returning [`TokensError::Corrupt`].
     fn update<R>(&self, f: impl FnOnce(&mut FileData) -> R) -> Result<R, TokensError> {
         let lock = self.lock_exclusive()?;
         self.update_locked(&lock, f)
@@ -272,7 +273,15 @@ impl CredentialStore {
     ) -> Result<R, TokensError> {
         let mut data = match self.read() {
             Ok(data) => data,
-            Err(TokensError::Corrupt { source, .. }) => {
+            // Only a torn or empty file (invalid JSON) is safe to replace.
+            // Valid JSON of an unexpected shape (`Data`, e.g. written by a
+            // newer rness) keeps failing and is never moved or overwritten.
+            Err(TokensError::Corrupt { source, .. })
+                if matches!(
+                    source.classify(),
+                    serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+                ) =>
+            {
                 let backup = self.quarantine_corrupt()?;
                 tracing::warn!(
                     path = %self.path.display(),
@@ -684,6 +693,41 @@ mod tests {
                 let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode();
                 assert_eq!(mode & 0o777, 0o600);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn well_formed_unexpected_shape_is_never_quarantined_or_overwritten() {
+        // Valid JSON that does not match FileData (e.g. a newer format).
+        for shape in [
+            &br#"{"providers": {"anthropic": {"apiKey": 7}}}"#[..],
+            &br#"{"providers": []}"#[..],
+            &br#"{"providers": "x"}"#[..],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials.json");
+            std::fs::write(&path, shape).unwrap();
+            let store = CredentialStore::new(&path);
+            let err = store.tokens("anthropic").unwrap_err();
+            assert!(matches!(&err, TokensError::Corrupt { .. }), "{err}");
+            let err = store.save_api_key("anthropic", "k").unwrap_err();
+            assert!(matches!(&err, TokensError::Corrupt { .. }), "{err}");
+            assert!(err.to_string().contains(&path.display().to_string()));
+            let lease = store
+                .lock_for_refresh(std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
+            assert!(store
+                .save_tokens_locked(&lease, "anthropic", &Tokens::default())
+                .is_err());
+            drop(lease);
+            assert_eq!(std::fs::read(&path).unwrap(), shape);
+            let others: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "credentials.json" && n != "credentials.json.lock")
+                .collect();
+            assert!(others.is_empty(), "{others:?}");
         }
     }
 
