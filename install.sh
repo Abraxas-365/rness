@@ -12,7 +12,7 @@ usage() {
   printf '%s\n' 'Usage: ./install.sh [--bin-dir DIR] [--config-dir DIR] [--binary FILE] [--replace-binary] [--experimental-control]' \
     'Builds the release binary with Cargo unless --binary is supplied.' \
     'Copies the default flavor only when the configuration directory does not exist.' \
-    'Existing configuration is never merged, replaced, or deleted.' \
+    'Existing configuration is never merged, replaced, or deleted; files that differ from the default flavor are listed.' \
     '--replace-binary explicitly permits replacing an existing rness executable.' \
     '--experimental-control builds the experimental local submission API (off by default).'
 }
@@ -78,6 +78,25 @@ else
 fi
 if [[ -e "$config_dir" || -L "$config_dir" ]]; then
   printf 'Preserved existing configuration: %s\n' "$config_dir"
+  # Report, never touch: installed flavor files (plugins, lua/, init.lua)
+  # are user copies and do not follow upgrades.
+  flavor="$repo/flavors/default"
+  changed=0 missing=0 listed=()
+  while IFS= read -r -d '' file; do
+    rel=${file#"$flavor/"}
+    if [[ ! -e "$config_dir/$rel" ]]; then
+      missing=$((missing + 1)); listed+=("missing: $rel")
+    elif ! cmp -s "$file" "$config_dir/$rel"; then
+      changed=$((changed + 1)); listed+=("changed: $rel")
+    fi
+  done < <(find "$flavor" -type f -print0 | sort -z)
+  if ((changed + missing > 0)); then
+    printf 'Default flavor files in your configuration differ from this checkout (%d changed, %d missing); nothing was changed.\n' \
+      "$changed" "$missing"
+    for ((i = 0; i < ${#listed[@]} && i < 10; i++)); do printf '  %s\n' "${listed[i]}"; done
+    if ((${#listed[@]} > 10)); then printf '  ... and %d more\n' $((${#listed[@]} - 10)); fi
+    printf 'Review with: diff -ru %q %q\n' "$config_dir" "$flavor"
+  fi
 else
   mkdir -p "$(dirname "$config_dir")"
   # mkdir claims a new directory without ever writing into an existing one.

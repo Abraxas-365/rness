@@ -442,7 +442,9 @@ Build order follows the dependency graph:
 - **Workspace instructions SHIPPED** (dsh agent-instructions model):
   `engine/instructions.rs` discovers instruction files (AGENTS.md
   chain) from the project root (nearest `.git`) down to the cwd,
-  broad→specific, first candidate per directory wins, byte budget
+  broad→specific, first candidate per directory wins (a file that is
+  not valid UTF-8 still wins: it is injected with U+FFFD replacements
+  and a warning is logged), byte budget
   drops broad files whole before truncating the most-specific. The
   baseline is injected as a DURABLE user-role message (`UserMessage`
   gains `source: Option<MessageSource>`, `kind: instructions` with a

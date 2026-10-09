@@ -332,6 +332,8 @@ Upgrade the binary from your updated checkout without changing your configuratio
 ./install.sh --replace-binary
 ```
 
+Your `~/.rness` is your own copy and is never updated. The upgrade lists default flavor files (plugins, `lua/`, `init.lua`) that differ from the checkout, so you can review new plugin versions with the `diff -ru` command it prints and copy what you want.
+
 Install an executable you have already built:
 
 ```sh

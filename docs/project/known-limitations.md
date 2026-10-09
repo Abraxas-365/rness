@@ -7,7 +7,7 @@ This page explains where you may run into problems, what to expect, and what you
 - **Most configuration changes need a restart.** This includes providers, profiles, agents, and other declarations in `init.lua`. Plugins loaded later cannot add these startup settings.
 - **Not every plugin can reload automatically.** Watched files and linked packages support reload; managed packages and inline plugin code do not support watching. See [plugin loading and lifecycle](../guides/plugins/loading-and-lifecycle.md).
 - **Reload is not a full reset.** It replaces plugin registrations, but it does not undo files written, network requests, or other side effects. Lua modules loaded with `require` remain cached. If a plugin behaves unexpectedly after reload, restart rness.
-- **Updating the binary does not update your copied plugins.** If you keep local copies of the default plugins, check whether a feature also requires changes to those files. For example, older compaction commands may still block the Lua statusline while they run.
+- **Updating the binary does not update your copied plugins.** `./install.sh --replace-binary` lists the default flavor files that differ from the checkout but never changes them. Check whether a feature also requires changes to those files. For example, older compaction commands may still block the Lua statusline while they run.
 
 ## Terminal display and performance
 

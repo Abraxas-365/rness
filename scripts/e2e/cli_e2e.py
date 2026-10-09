@@ -423,9 +423,18 @@ def section_install(t):
         out = p2.stdout + p2.stderr
         t.check("install: upgrade preserves user config", p2.returncode == 0 and "Preserved existing configuration" in out
                 and plugin and plugin.read_text().startswith("-- locally modified"), short(out))
-        warned = any(w in out.lower() for w in ("differ", "stale", "outdated", "newer", "plugins"))
-        t.xcheck("install: upgrade warns that installed flavor plugins differ from the repo", warned,
-                 "install.sh never compares ~/.rness/plugins with flavors/default/plugins", short(out))
+        rel = f"plugins/{plugin.name}" if plugin else None
+        warned = "differ from this checkout" in out and rel is not None and f"changed: {rel}" in out
+        t.check("install: upgrade warns that installed flavor plugins differ from the repo (B0-10)", warned,
+                short(out))
+        clean = base / "clean"
+        clean.mkdir()
+        clean_env = {**env, "HOME": str(clean)}
+        p3 = subprocess.run(cmd + ["--replace-binary"], env=clean_env, capture_output=True, text=True, timeout=60)
+        p4 = subprocess.run(cmd + ["--replace-binary"], env=clean_env, capture_output=True, text=True, timeout=60)
+        t.check("install: unchanged config upgrade prints no difference notice",
+                p3.returncode == 0 and p4.returncode == 0 and "differ" not in p4.stdout + p4.stderr,
+                short(p4.stdout + p4.stderr))
     finally:
         import shutil
         shutil.rmtree(base, ignore_errors=True)
