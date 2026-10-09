@@ -7,6 +7,9 @@
 //! install time is entered around it.
 //!
 //!   rness.session.list()            -> { id, ... }
+//!   rness.session.recent([{workspace=}]) -> { {id=, workspace=, parent=,
+//!     updated_ms=}, ... } (top-level, most recently active first)
+//!   rness.session.workspace(id)     -> string|nil
 //!   rness.session.phase(id)         -> "idle" | "running"
 //!   rness.session.title(id)         -> string|nil (get current title)
 //!   rness.session.title(id, text[, source]) -> string (set; "user" pins,
@@ -394,6 +397,43 @@ pub fn install(
     session.set(
         "list_roots",
         lua.create_function(move |_, ()| s.list_roots().map_err(err))?,
+    )?;
+
+    // `rness.session.recent([{ workspace = path }])` → user-created
+    // sessions, most recently active first: `{ id, workspace, parent,
+    // updated_ms }`. `workspace` limits it to one project; `workspace(id)`
+    // gives a session's own.
+    let s = Arc::clone(&sessions);
+    session.set(
+        "recent",
+        lua.create_function(move |lua, opts: Option<Table>| {
+            let workspace = match &opts {
+                Some(opts) => opts.get::<Option<String>>("workspace")?,
+                None => None,
+            };
+            let out = lua.create_table()?;
+            for (i, entry) in s
+                .recent_roots(workspace.as_deref())
+                .map_err(err)?
+                .into_iter()
+                .enumerate()
+            {
+                let row = lua.create_table()?;
+                row.set("id", entry.id)?;
+                row.set("workspace", entry.workspace)?;
+                row.set("parent", entry.parent)?;
+                row.set("updated_ms", entry.updated_ms)?;
+                out.set(i + 1, row)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    // `rness.session.workspace(id)` → the session's workspace root or nil.
+    let s = Arc::clone(&sessions);
+    session.set(
+        "workspace",
+        lua.create_function(move |_, id: String| s.store().workspace(&id).map_err(err))?,
     )?;
 
     let s = Arc::clone(&sessions);

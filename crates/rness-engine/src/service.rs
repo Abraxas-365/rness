@@ -323,8 +323,9 @@ fn effective_title(
     if let Some(t) = live.titles.lock().unwrap().last() {
         return Ok(Some((t.title.clone(), t.source)));
     }
-    let events = store.read_session(session)?;
-    Ok(crate::titles::current(events.iter().map(|e| &e.event)))
+    // Own log only, via an incremental byte cursor: never parse (or pin in
+    // the reader cache) a whole history just to show its title.
+    Ok(store.latest_title(session)?)
 }
 
 fn announce_title(
@@ -1197,6 +1198,26 @@ impl SessionService {
     /// List only user-created sessions (excludes subagent children).
     pub fn list_roots(&self) -> Result<Vec<SessionId>, ServiceError> {
         Ok(self.store.list_roots()?)
+    }
+
+    /// User-created sessions, most recently active first, optionally only
+    /// those whose workspace is `workspace` (compared after canonicalizing,
+    /// as recorded workspaces are canonical).
+    pub fn recent_roots(
+        &self,
+        workspace: Option<&str>,
+    ) -> Result<Vec<crate::session::branch::SessionSummary>, ServiceError> {
+        let wanted = workspace.map(|path| {
+            std::fs::canonicalize(path)
+                .ok()
+                .and_then(|p| p.to_str().map(str::to_owned))
+                .unwrap_or_else(|| path.to_owned())
+        });
+        let mut all = self.store.recent_roots()?;
+        if let Some(wanted) = wanted {
+            all.retain(|s| s.workspace.as_deref() == Some(wanted.as_str()));
+        }
+        Ok(all)
     }
 
     pub fn phase(&self, session: &SessionId) -> Phase {

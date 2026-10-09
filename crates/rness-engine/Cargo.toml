@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 ulid.workspace = true
 jiff.workspace = true
+memchr.workspace = true
 ignore = "0.4"
 image.workspace = true
 moxcms = "0.8.1"

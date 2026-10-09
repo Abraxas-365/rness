@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rness_protocol::branch::{AncestryHop, ChildRef, Delegation, ForkRef};
-use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId};
+use rness_protocol::events::{Envelope, EventId, Header, SessionEvent, SessionId, TitleSource};
 
 use super::log::{LogError, SessionLog};
 
@@ -109,6 +109,69 @@ pub struct SessionStore {
     /// Parent -> delegated children, so teardown and kills don't scan
     /// every header. See [`Self::delegated_descendants`].
     children: std::sync::Mutex<Option<ChildIndex>>,
+    /// Per-session title cursors for [`Self::latest_title`].
+    titles: std::sync::Mutex<std::collections::HashMap<SessionId, TitleCursor>>,
+}
+
+/// A top-level session as listed by pickers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub id: SessionId,
+    pub workspace: Option<String>,
+    /// The session it was forked from, if any.
+    pub parent: Option<SessionId>,
+    /// Last commit (log modification time), ms since the Unix epoch.
+    pub updated_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TitleCursor {
+    /// Bytes scanned: always the end of a complete line.
+    offset: u64,
+    title: Option<(String, TitleSource)>,
+}
+
+/// Fold complete lines from `cursor.offset` to EOF into `cursor`. The tag
+/// cannot occur unescaped inside a JSON string, so a match marks a real
+/// event key; the line is parsed to confirm. A torn tail is left unread.
+fn scan_titles(file: &mut std::fs::File, cursor: &mut TitleCursor) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAG: &[u8] = br#""type":"session/title""#;
+    let finder = memchr::memmem::Finder::new(TAG);
+    file.seek(SeekFrom::Start(cursor.offset))?;
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut pending: Vec<u8> = Vec::new();
+    loop {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        pending.extend_from_slice(&chunk[..n]);
+        let Some(end) = memchr::memrchr(b'\n', &pending) else {
+            continue;
+        };
+        let complete = &pending[..=end];
+        let mut at = 0;
+        while let Some(found) = finder.find(&complete[at..]) {
+            let hit = at + found;
+            let start = memchr::memrchr(b'\n', &complete[..hit]).map_or(0, |i| i + 1);
+            let stop =
+                hit + memchr::memchr(b'\n', &complete[hit..]).unwrap_or(complete.len() - hit);
+            if let Ok(Envelope {
+                event: SessionEvent::Title(title),
+                ..
+            }) = Envelope::parse_line(&complete[start..stop])
+            {
+                cursor.title = Some((title.title, title.source));
+            }
+            at = stop + 1;
+            if at >= complete.len() {
+                break;
+            }
+        }
+        cursor.offset += (end + 1) as u64;
+        pending.drain(..=end);
+    }
 }
 
 /// In-memory delegation tree from one header scan, valid while the store
@@ -139,6 +202,7 @@ impl SessionStore {
             usage: Default::default(),
             record_stream: Default::default(),
             children: Default::default(),
+            titles: Default::default(),
         }
     }
 
@@ -291,6 +355,84 @@ impl SessionStore {
 
     pub fn workspace(&self, session: &SessionId) -> Result<Option<String>, BranchError> {
         Ok(self.read_header(session)?.workspace)
+    }
+
+    /// Latest `session/title` in a session's own log, without parsing (or
+    /// caching) the history: a per-session byte cursor scans only appended
+    /// bytes, and only lines carrying the title tag are parsed. Pickers ask
+    /// for the titles of many idle, possibly huge sessions.
+    pub fn latest_title(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<(String, TitleSource)>, BranchError> {
+        let cached = self.titles.lock().unwrap().get(session).cloned();
+        let mut cursor = cached.unwrap_or_default();
+        let path = super::log::log_file(&self.root.join(session));
+        let mut file = std::fs::File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                LogError::NotFound(session.clone())
+            } else {
+                LogError::Io(error)
+            }
+        })?;
+        let len = file.metadata().map_err(LogError::from)?.len();
+        if len < cursor.offset {
+            // Torn-tail heal shrank the log: rescan from the start.
+            cursor = TitleCursor::default();
+        }
+        if len > cursor.offset {
+            scan_titles(&mut file, &mut cursor).map_err(LogError::from)?;
+            self.titles
+                .lock()
+                .unwrap()
+                .insert(session.clone(), cursor.clone());
+        }
+        Ok(cursor.title)
+    }
+
+    /// Top-level sessions (no delegated children), most recently active
+    /// first. Activity is the log's modification time, i.e. its last commit.
+    /// Reads only cached headers and file metadata.
+    pub fn recent_roots(&self) -> Result<Vec<SessionSummary>, BranchError> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&self.root).map_err(LogError::from)? {
+            let entry = entry.map_err(LogError::from)?;
+            if !entry.file_type().map_err(LogError::from)?.is_dir() {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(super::log::log_file(&entry.path())) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            // Auxiliary directories and torn or foreign headers are not
+            // sessions (same rule as `list`).
+            let Ok(header) = self.read_header(&id) else {
+                continue;
+            };
+            if header.delegation.is_some() {
+                continue;
+            }
+            let updated_ms = meta
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
+            out.push(SessionSummary {
+                id,
+                workspace: header.workspace,
+                parent: header.parent.map(|fork| fork.session),
+                updated_ms,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.updated_ms
+                .cmp(&a.updated_ms)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        Ok(out)
     }
 
     pub fn open(&self, session: &SessionId) -> Result<SessionLog, BranchError> {
@@ -1636,5 +1778,80 @@ mod tests {
             vec![child.clone(), grandchild.clone(), late]
         );
         assert_eq!(scans(&store), after_rebuild + 1);
+    }
+
+    fn title(text: &str, source: TitleSource) -> SessionEvent {
+        SessionEvent::Title(rness_protocol::events::SessionTitle {
+            title: text.into(),
+            source,
+        })
+    }
+
+    #[test]
+    fn latest_title_scans_only_appended_complete_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        let id = log.session().clone();
+        assert_eq!(store.latest_title(&id).unwrap(), None);
+        // A message quoting the tag must not be mistaken for a title.
+        log.append(&msg(r#"x "type":"session/title" y"#)).unwrap();
+        log.append(&title("first", TitleSource::Fallback)).unwrap();
+        log.append(&msg("between")).unwrap();
+        assert_eq!(
+            store.latest_title(&id).unwrap(),
+            Some(("first".into(), TitleSource::Fallback))
+        );
+        log.append(&title("second", TitleSource::Model)).unwrap();
+        // A torn tail is not read until it is committed.
+        let path = super::super::log::log_file(&dir.path().join(&id));
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, br#"{"type":"session/title","title":"torn"#).unwrap();
+        assert_eq!(
+            store.latest_title(&id).unwrap(),
+            Some(("second".into(), TitleSource::Model))
+        );
+        // Never touches the history reader cache.
+        assert!(store.readers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_roots_orders_by_activity_and_skips_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let old = store.create(Some("/a".into())).unwrap().session().clone();
+        let new = store.create(Some("/b".into())).unwrap().session().clone();
+        store
+            .create_delegated(
+                Some("/a".into()),
+                Delegation {
+                    parent: old.clone(),
+                    call: None,
+                    depth: 1,
+                    mode: Default::default(),
+                },
+            )
+            .unwrap();
+        std::fs::create_dir(dir.path().join("jobs")).unwrap();
+        let touch = |id: &SessionId, secs: u64| {
+            let path = super::super::log::log_file(&dir.path().join(id));
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .unwrap();
+        };
+        // The older-created session was active most recently.
+        touch(&old, 2_000);
+        touch(&new, 1_000);
+        let recent = store.recent_roots().unwrap();
+        let ids: Vec<_> = recent.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, vec![old.clone(), new.clone()]);
+        assert_eq!(recent[0].workspace.as_deref(), Some("/a"));
+        assert_eq!(recent[0].updated_ms, 2_000_000);
     }
 }
