@@ -89,6 +89,8 @@ pub struct SessionStore {
     /// recovery) scan every session header several times a second; without
     /// this each scan re-opens and re-parses hundreds of files.
     headers: std::sync::Mutex<std::collections::HashMap<SessionId, Header>>,
+    /// `replay()` calls against this store (tests assert per-step budgets).
+    replays: std::sync::atomic::AtomicU64,
     /// Per-session usage cursors. Kept apart from the reader LRU so the
     /// statusline's per-step usage query never copies or re-parses a whole
     /// history, even after the reader was evicted.
@@ -104,9 +106,21 @@ impl SessionStore {
             reader_order: Default::default(),
             readers: Default::default(),
             headers: Default::default(),
+            replays: Default::default(),
             usage: Default::default(),
             record_stream: Default::default(),
         }
+    }
+
+    /// Number of [`crate::session::replay::replay`] calls on this store.
+    #[doc(hidden)]
+    pub fn replay_count(&self) -> u64 {
+        self.replays.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_replay(&self) {
+        self.replays
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Keep the exact timed stream of committed outputs (default off).

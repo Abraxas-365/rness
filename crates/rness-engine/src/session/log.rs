@@ -152,6 +152,8 @@ pub struct SessionLog {
     ids: ulid::Generator,
     /// Durability syncs issued by appends (observability for batching).
     syncs: u64,
+    /// Successful writes through this handle; see [`SessionLog::generation`].
+    generation: u64,
     /// A failed write could not be rolled back: the tail may hold a partial
     /// line, so nothing more is appended through this handle.
     poisoned: bool,
@@ -220,6 +222,7 @@ impl SessionLog {
                 record_stream: false,
                 ids: ulid::Generator::new(),
                 syncs: 0,
+                generation: 0,
                 poisoned: false,
             }),
             Err(_) => Err(LogError::Locked(session.clone())),
@@ -283,6 +286,13 @@ impl SessionLog {
         self.syncs
     }
 
+    /// Bumped by every successful write through this handle. The handle
+    /// holds the writer lock, so an unchanged generation means the log has
+    /// not changed — what [`crate::session::replay::ReplayCache`] relies on.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Write `bytes` (whole lines) at the end and fsync once. On any failure
     /// the file is rolled back to its previous length, so a partial write
     /// never glues onto the next append; if even that fails the handle is
@@ -323,6 +333,7 @@ impl SessionLog {
             );
             return Err(error.into());
         }
+        self.generation += 1;
         Ok(())
     }
 

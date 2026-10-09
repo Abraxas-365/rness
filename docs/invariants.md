@@ -8,7 +8,10 @@ invariant without an ADR in `docs/decisions/`.
 
 1. **Model-visible means logged.** Anything included in a model request is
    reconstructable from the session's event log. No hidden context.
-   Asserted at request-build time.
+   Asserted at request-build time (release builds included). The turn
+   loop re-derives the request context only after its writer handle
+   appended; every append through the handle invalidates the derivation
+   (`ReplayCache`), so a request never omits a committed event.
 2. **Append-only.** Committed events are never mutated or deleted. New
    truth = new events. Bytes that never formed an event (a torn tail, or a
    trailing run of non-envelope lines such as a zero-filled extent) are not

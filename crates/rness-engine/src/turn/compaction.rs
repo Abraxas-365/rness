@@ -3,7 +3,7 @@ use crate::session::{
     branch::SessionStore,
     log::SessionLog,
     projection::{ModelContext, ModelTurn},
-    replay::replay,
+    replay::ReplayCache,
 };
 use crate::tools::ToolSpec;
 use crate::turn::{
@@ -416,6 +416,39 @@ pub async fn reduce_region_with_progress(
     cancel: &CancellationToken,
     progress: &(dyn Fn(CompactionProgress) + Send + Sync),
 ) -> Result<bool, TurnError> {
+    reduce_cached(
+        store,
+        log,
+        &mut ReplayCache::default(),
+        provider,
+        system,
+        tools,
+        policy,
+        overflow,
+        region,
+        cancel,
+        progress,
+    )
+    .await
+}
+
+/// [`reduce_region_with_progress`] replaying through the caller's `cache`:
+/// a no-op pass costs no replay when the caller already derived this step's
+/// context, and the post-prune replay only happens when a prune landed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reduce_cached(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    cache: &mut ReplayCache,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    region: Option<std::ops::Range<usize>>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(CompactionProgress) + Send + Sync),
+) -> Result<bool, TurnError> {
     policy
         .validate()
         .map_err(|last| TurnError::ModelExhausted { attempts: 0, last })?;
@@ -424,7 +457,7 @@ pub async fn reduce_region_with_progress(
         if cancel.is_cancelled() {
             return Ok(changed);
         }
-        let mut replayed = replay(store, log.session())?;
+        let mut replayed = cache.get(store, log)?;
         if let Some(r) = &region {
             if r.start >= r.end
                 || r.end > replayed.context.turns.len()
@@ -495,7 +528,7 @@ pub async fn reduce_region_with_progress(
             )?;
         }
         changed |= batch.flush(log)?;
-        replayed = replay(store, log.session())?;
+        replayed = cache.get(store, log)?;
         // Calibrated: scale the heuristic by the observed real/estimated
         // ratio of the latest committed step, so the threshold compares
         // against something close to what the provider will actually count.

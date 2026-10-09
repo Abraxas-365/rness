@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use crate::inbox::Pending;
 use crate::session::branch::SessionStore;
 use crate::session::log::SessionLog;
-use crate::session::replay::{replay, ReplayError};
+use crate::session::replay::{ReplayCache, ReplayError};
 use crate::tools::{ToolCall, ToolRegistry};
 use hooks::{LoopEvent, LoopHooks, PreStepDecision, RequestErrorAction, TurnStoppingAction};
 use provider::{Provider, StepOutcome, StepRequest};
@@ -128,6 +128,7 @@ fn cap_block(mut text: String, name: &str) -> String {
 async fn restore_context(
     store: &SessionStore,
     log: &mut SessionLog,
+    cache: &mut ReplayCache,
     config: &TurnConfig,
     loop_hooks: Option<&dyn LoopHooks>,
     event: &LoopEvent,
@@ -136,7 +137,7 @@ async fn restore_context(
 ) -> Result<bool, TurnError> {
     let mut appended = false;
     if let Some(instructions) = &config.instructions {
-        appended |= crate::instructions::ensure(store, log, instructions)?;
+        appended |= crate::instructions::ensure_with(store, log, instructions, cache)?;
     }
     if let Some(hooks) = loop_hooks {
         let blocks = tokio::select! {
@@ -148,15 +149,18 @@ async fn restore_context(
             Err(_) if cancel.is_cancelled() => {}
             Err(e) => tracing::warn!(session = %event.session, "context hook failed: {e}"),
             Ok(blocks) => {
+                // One snapshot for all blocks: each checks its own source,
+                // which earlier appends here cannot hide.
+                let replayed = cache.get(store, log)?;
                 let mut seen = std::collections::HashSet::new();
                 for block in blocks {
                     if block.text.trim().is_empty() || !seen.insert(block.name.clone()) {
                         continue;
                     }
                     let text = cap_block(block.text, &block.name);
-                    appended |= crate::instructions::ensure_source(
-                        store,
+                    appended |= crate::instructions::ensure_source_in(
                         log,
+                        &replayed,
                         rness_protocol::events::MessageSource::Context {
                             name: block.name,
                             identity: block.identity,
@@ -236,7 +240,10 @@ async fn drive(
     let session = log.session().clone();
     tools.set_current_turn(turn_no);
     let workspace = store.workspace(&session).map_err(ReplayError::from)?;
-    let call_config = replay(store, log.session())?.context.config;
+    // One derivation per step, shared by every reader below; any append
+    // through `log` invalidates it (see `ReplayCache`).
+    let mut cache = ReplayCache::default();
+    let call_config = cache.get(store, log)?.context.config.clone();
     let sandbox = call_config
         .sandbox
         .unwrap_or(rness_protocol::sandbox::SandboxMode::DangerFullAccess);
@@ -270,7 +277,7 @@ async fn drive(
         None => config.system.clone(),
     };
     let mut activated =
-        crate::tools::exposure::Exposure::activated(&replay(store, &session)?.history);
+        crate::tools::exposure::Exposure::activated(&cache.get(store, log)?.history);
     let mut step_no = 0u32;
     loop {
         step_no += 1;
@@ -302,9 +309,8 @@ async fn drive(
                 log.append(&SessionEvent::PlanMode { active })?;
                 Ok(())
             })?;
-            let state = rness_protocol::events::PlanState::from_history(
-                &replay(store, log.session())?.history,
-            );
+            let state =
+                rness_protocol::events::PlanState::from_history(&cache.get(store, log)?.history);
             if let Some(active) = state.pending {
                 log.append(&SessionEvent::PlanMode { active })?;
             }
@@ -327,7 +333,10 @@ async fn drive(
                 turn: turn_no,
                 step: step_no,
             };
-            restore_context(store, log, config, loop_hooks, &event, cancel, frames).await?;
+            restore_context(
+                store, log, &mut cache, config, loop_hooks, &event, cancel, frames,
+            )
+            .await?;
         }
 
         // Loop hook: pre_step — may inject messages or reject the step.
@@ -372,7 +381,7 @@ async fn drive(
         }
 
         // Derive the request input from the log — never from memory.
-        let mut replayed = replay(store, log.session())?;
+        let mut replayed = cache.get(store, log)?;
         let task_snapshot = rness_protocol::events::TaskSnapshot::from_history(&replayed.history);
         // Sections follow tool usability on THIS step: advertised directly,
         // or callable from run_code in ptc/both (programs cannot host workflow).
@@ -431,14 +440,16 @@ async fn drive(
             let on_compaction = |progress: compaction::CompactionProgress| {
                 frames(progress.frame(session.clone()));
             };
-            let compacted = compaction::reduce_with_progress(
+            let compacted = compaction::reduce_cached(
                 store,
                 log,
+                &mut cache,
                 provider,
                 &step_system,
                 &tool_specs,
                 policy,
                 false,
+                None,
                 cancel,
                 &on_compaction,
             )
@@ -454,6 +465,7 @@ async fn drive(
                 restore_context(
                     store,
                     log,
+                    &mut cache,
                     config,
                     loop_hooks,
                     &LoopEvent {
@@ -465,7 +477,7 @@ async fn drive(
                     frames,
                 )
                 .await?;
-                replayed = replay(store, log.session())?;
+                replayed = cache.get(store, log)?;
             }
         }
         if cancel.is_cancelled() {
@@ -590,14 +602,16 @@ async fn drive(
                             let on_compaction = |progress: compaction::CompactionProgress| {
                                 frames(progress.frame(session.clone()));
                             };
-                            let compacted = compaction::reduce_with_progress(
+                            let compacted = compaction::reduce_cached(
                                 store,
                                 log,
+                                &mut cache,
                                 provider,
                                 &step_system,
                                 &tool_specs,
                                 policy,
                                 true,
+                                None,
                                 cancel,
                                 &on_compaction,
                             )
@@ -615,6 +629,7 @@ async fn drive(
                                 restore_context(
                                     store,
                                     log,
+                                    &mut cache,
                                     config,
                                     loop_hooks,
                                     &LoopEvent {
@@ -626,7 +641,7 @@ async fn drive(
                                     frames,
                                 )
                                 .await?;
-                                replayed = replay(store, log.session())?;
+                                replayed = cache.get(store, log)?;
                                 frames(Frame::HistoryChanged {
                                     session: session.clone(),
                                 });
