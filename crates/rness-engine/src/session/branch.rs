@@ -612,9 +612,7 @@ impl SessionStore {
                     return Err(LogError::Corrupt {
                         line: 0,
                         offset: 0,
-                        reason: format!(
-                            "session '{target}' not found in this workspace"
-                        ),
+                        reason: format!("session '{target}' not found in this workspace"),
                     }
                     .into());
                 }
