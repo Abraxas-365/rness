@@ -60,6 +60,19 @@ pub enum ServiceError {
     },
     #[error("invalid request config: {0}")]
     InvalidConfig(String),
+    /// See [`crate::turn::TurnError::NewerEvents`]: refused before the
+    /// prompt is accepted, so nothing is logged.
+    #[error(
+        "session contains events from a newer rness ({}); upgrade rness to continue it",
+        .types.join(", ")
+    )]
+    NewerEvents { types: Vec<String> },
+}
+
+impl From<crate::session::replay::NewerEvents> for ServiceError {
+    fn from(newer: crate::session::replay::NewerEvents) -> Self {
+        ServiceError::NewerEvents { types: newer.0 }
+    }
 }
 
 // -- bus events (live notifications, invariant #9: never persisted) --------
@@ -1713,6 +1726,7 @@ impl SessionService {
         if command.is_some() {
             return Err(ServiceError::Busy);
         }
+        crate::session::replay::require_known(&self.store.history(session)?)?;
         let request_config = self.config(session)?;
         let images_forbidden = request_config
             .selection
@@ -1986,6 +2000,7 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
+        replayed.require_known()?;
         // Idle-only, so the burst token is free: installing a fresh one makes
         // `cancel(session)` (Ctrl-C) stop the summarizer request.
         let cancel = CancellationToken::new();
@@ -2161,6 +2176,7 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
+        replayed.require_known()?;
         if replayed.context.sources != expected_sources {
             return Err(ServiceError::InvalidConfig(
                 "stale compaction region".into(),
@@ -2230,6 +2246,7 @@ impl SessionService {
             return Err(ServiceError::Busy);
         }
         let replayed = replay(&self.store, session)?;
+        replayed.require_known()?;
         let history = &replayed.history;
 
         // Protected tail: events at/after the TurnStarted of the

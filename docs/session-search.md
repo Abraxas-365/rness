@@ -12,9 +12,17 @@ Add these entries to your **existing** `rness.plugins.setup` list:
 
 Neither is enabled by default. Provider-only activation exposes a plugin API,
 not model tools. Loading the provider does not create/open SQLite or scan logs.
-The first valid search creates `session-search-v2.sqlite3` in the session store.
+The first valid search creates `session-search-v4.sqlite3` in the session store.
 Event reads and traces read JSONL without opening SQLite. JSONL remains the
-source of truth. The prototype `session-search.sqlite3` is left untouched.
+source of truth. The index is a derived cache: it is rebuilt from the logs on
+demand, so deleting it loses nothing.
+
+The index file name carries the schema version, so rness builds with different
+schemas never share (or rewrite) a file. Files from earlier builds —
+`session-search.sqlite3` and `session-search-v2.sqlite3` — are left untouched
+and are no longer used; they can be large (gigabytes), and you can delete them
+once no older rness is running. rness logs a note the first time it creates the
+v4 index next to one.
 SQLite is included in the binary; no Cargo feature/rebuild is needed to opt in.
 
 ## Tools
@@ -101,12 +109,22 @@ card callbacks. Rendering should remain cheap while scrolling.
 
 ## Indexing and execution
 
-Each search enumerates session headers and stats log files, but only **changed
-sessions** have their bodies read and SQLite rows replaced. Deleted/moved sessions
-are removed on refresh. A changed session is reindexed as a unit so compaction
-can update earlier events' visibility. This is per-session incremental indexing,
-not incremental FTS insertion for every appended line. Unchanged bodies are not
-read. Revision tracking uses file size/mtime, plus device/inode/ctime on Unix.
+Each search enumerates session headers and stats log files; unchanged sessions
+(same size/mtime, plus device/inode/ctime on Unix) are not read. Deleted/moved
+sessions are removed on refresh. For a changed session the index keeps a cursor
+(byte offset, hash of the last indexed line, hash of the header line, file
+identity): if the same file only grew, just the new complete lines are read and
+inserted; an unterminated last line (a write in progress) waits for the next
+search. Everything else — a rewritten or replaced file, or new events that
+include a compaction checkpoint or prune (they change earlier events' surface) —
+reindexes that session as a unit. An in-place edit in the middle of an already
+indexed prefix that keeps the first and last indexed lines intact is not
+detected; logs are append-only (`docs/invariants.md` #2/#3).
+
+A session log that cannot be read (corrupt, written by a newer rness, or no
+longer the same session) is skipped with a warning: its rows are dropped, so
+nothing stale is served from it, and it is retried when the file changes. Other
+sessions still search normally.
 
 The Lua tool yields while a Tokio blocking worker performs authorization,
 filesystem reads, indexing and querying. The VM can service status/UI and other
@@ -160,7 +178,15 @@ increased from 143.5 to 153 MiB. These are synthetic warm-filesystem observation
 not latency guarantees or cold-disk measurements; no million-event run yet.
 
 Search ranks/selects before generating bounded snippets, batches snippet lookup,
-and uses indexed scope metadata for filtering and session deletion. Schema v2
-indexes are transactionally upgraded to v3 in the same file on first search;
-existing FTS rows and JSONL remain intact. Changed sessions still rebuild as a
-unit; append-only row indexing and event-offset reads are future optimizations.
+and uses indexed scope metadata (workspace, session, surface) for filtering and
+session deletion. Schema v4 keeps `surface` outside the FTS rows and adds
+per-session cursors. An existing v2/v3 index is dropped in place on first search
+(transactionally) and rebuilt once, session by session — a one-time cost of
+about one initial index; JSONL is never touched. An older rness refuses a v4
+index file ("unrecognized search database").
+
+The engine probe `perf_search_append_reindex` (100k events, 185 MB log)
+measured, on a loaded Apple-silicon machine: one append then search 5.2 s →
+8–12 ms, warm no-op refresh 0.4 ms, initial index 2.4–2.7 s, index 259 MB
+(1.4× the log); an append that includes a prune or checkpoint still rebuilds
+the session (5.1 s).

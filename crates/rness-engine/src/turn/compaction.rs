@@ -3,7 +3,7 @@ use crate::session::{
     branch::SessionStore,
     log::SessionLog,
     projection::{ModelContext, ModelTurn},
-    replay::replay,
+    replay::ReplayCache,
 };
 use crate::tools::ToolSpec;
 use crate::turn::{
@@ -367,10 +367,79 @@ pub async fn reduce_region(
     .await
 }
 
+/// Bounds of one prune batch: what a crash or cancel can lose, and the
+/// latency of one commit.
+const PRUNE_BATCH_EVENTS: usize = 512;
+const PRUNE_BATCH_BYTES: usize = 8 << 20;
+
+#[derive(Default)]
+struct PruneBatch {
+    events: Vec<SessionEvent>,
+    bytes: usize,
+    committed: bool,
+}
+
+impl PruneBatch {
+    fn push(&mut self, log: &mut SessionLog, event: SessionEvent) -> Result<(), TurnError> {
+        if let SessionEvent::Prune(prune) = &event {
+            self.bytes += prune.result.output.len() + prune.replaces.len() + 256;
+        }
+        self.events.push(event);
+        if self.events.len() >= PRUNE_BATCH_EVENTS || self.bytes >= PRUNE_BATCH_BYTES {
+            self.flush(log)?;
+        }
+        Ok(())
+    }
+
+    /// Commit pending events; returns whether anything was ever committed.
+    fn flush(&mut self, log: &mut SessionLog) -> Result<bool, TurnError> {
+        if !self.events.is_empty() {
+            log.append_batch(&self.events)?;
+            self.events.clear();
+            self.bytes = 0;
+            self.committed = true;
+        }
+        Ok(self.committed)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn reduce_region_with_progress(
     store: &SessionStore,
     log: &mut SessionLog,
+    provider: &dyn Provider,
+    system: &str,
+    tools: &[ToolSpec],
+    policy: &Policy,
+    overflow: bool,
+    region: Option<std::ops::Range<usize>>,
+    cancel: &CancellationToken,
+    progress: &(dyn Fn(CompactionProgress) + Send + Sync),
+) -> Result<bool, TurnError> {
+    reduce_cached(
+        store,
+        log,
+        &mut ReplayCache::default(),
+        provider,
+        system,
+        tools,
+        policy,
+        overflow,
+        region,
+        cancel,
+        progress,
+    )
+    .await
+}
+
+/// [`reduce_region_with_progress`] replaying through the caller's `cache`:
+/// a no-op pass costs no replay when the caller already derived this step's
+/// context, and the post-prune replay only happens when a prune landed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reduce_cached(
+    store: &SessionStore,
+    log: &mut SessionLog,
+    cache: &mut ReplayCache,
     provider: &dyn Provider,
     system: &str,
     tools: &[ToolSpec],
@@ -388,7 +457,8 @@ pub async fn reduce_region_with_progress(
         if cancel.is_cancelled() {
             return Ok(changed);
         }
-        let mut replayed = replay(store, log.session())?;
+        let mut replayed = cache.get(store, log)?;
+        replayed.require_known()?;
         if let Some(r) = &region {
             if r.start >= r.end
                 || r.end > replayed.context.turns.len()
@@ -411,11 +481,16 @@ pub async fn reduce_region_with_progress(
         let n: usize = replayed.context.turns[..cut].iter().map(source_count).sum();
         let eligible: std::collections::HashSet<_> =
             replayed.context.sources[..n].iter().cloned().collect();
+        // Prunes are independent events: collect and commit them in batches
+        // (one durability sync per batch, plan P6). Cancellation flushes what
+        // was collected, like the former per-event path kept its progress.
+        let mut batch = PruneBatch::default();
         for event in &replayed.history {
             if region.is_some() {
                 break;
             }
             if cancel.is_cancelled() {
+                changed |= batch.flush(log)?;
                 return Ok(changed);
             }
             if !eligible.contains(&event.id) {
@@ -445,13 +520,16 @@ pub async fn reduce_region_with_progress(
             let mut replacement = result.clone();
             replacement.content.clear();
             replacement.output = format!("{head}\n[tool result middle pruned]\n{tail}");
-            log.append(&SessionEvent::Prune(Prune {
-                replaces: event.id.clone(),
-                result: replacement,
-            }))?;
-            changed = true;
+            batch.push(
+                log,
+                SessionEvent::Prune(Prune {
+                    replaces: event.id.clone(),
+                    result: replacement,
+                }),
+            )?;
         }
-        replayed = replay(store, log.session())?;
+        changed |= batch.flush(log)?;
+        replayed = cache.get(store, log)?;
         // Calibrated: scale the heuristic by the observed real/estimated
         // ratio of the latest committed step, so the threshold compares
         // against something close to what the provider will actually count.

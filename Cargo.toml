@@ -53,7 +53,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rand = "0.8"
 open = "5"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }
 tiktoken-rs = "0.6"
 
 # -- session log

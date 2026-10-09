@@ -190,10 +190,22 @@ fn scope_metadata_migrates_and_tracks_refreshes() {
         )
         .unwrap();
     drop(provider);
+    // Reproduce a shipped v3 index (surface inside the FTS row, no cursors)
+    // holding a stale row; the v4 upgrade discards it and rebuilds.
+    std::fs::remove_file(&path).unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();
-    // Reproduce the shipped v2 schema, then upgrade without rereading bodies.
     connection
-        .execute_batch("DROP TABLE event_scope; PRAGMA user_version=2;")
+        .execute_batch(
+            "CREATE TABLE revisions (workspace TEXT NOT NULL, session TEXT NOT NULL,
+               revision TEXT NOT NULL, PRIMARY KEY(workspace, session));
+             CREATE VIRTUAL TABLE events USING fts5(workspace UNINDEXED, session UNINDEXED,
+               event UNINDEXED, kind UNINDEXED, surface UNINDEXED, time UNINDEXED, body);
+             CREATE TABLE event_scope (rowid INTEGER PRIMARY KEY, workspace TEXT NOT NULL,
+               session TEXT NOT NULL);
+             INSERT INTO events VALUES('/w','gone','e','user/message','current',0,'needle stale');
+             INSERT INTO event_scope SELECT rowid,workspace,session FROM events;
+             PRAGMA application_id = 1380864849; PRAGMA user_version=3;",
+        )
         .unwrap();
     let mut provider = SqliteSessionSearch::new(path.clone());
     let migrated = provider
@@ -209,7 +221,7 @@ fn scope_metadata_migrates_and_tracks_refreshes() {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
             .unwrap(),
-        3
+        4
     );
     log.append(&message("needle appended")).unwrap();
     let refreshed = provider
@@ -301,4 +313,320 @@ fn cancelled_search_stops_refresh_and_keeps_committed_sessions() {
         )
         .unwrap();
     assert_eq!(found["items"].as_array().unwrap().len(), 1);
+}
+
+/// Every indexed row as (session, event, kind, surface, body), sorted.
+fn index_rows(path: &std::path::Path) -> Vec<(String, String, String, String, String)> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let mut rows: Vec<_> = connection
+        .prepare(
+            "SELECT events.session,events.event,events.kind,s.surface,events.body
+             FROM events JOIN event_scope s ON s.rowid=events.rowid",
+        )
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    rows.sort();
+    rows
+}
+
+fn search(
+    provider: &mut SqliteSessionSearch,
+    store: &SessionStore,
+    caller: &String,
+    query: &str,
+) -> Value {
+    provider
+        .execute(
+            store,
+            caller,
+            "session_event_search",
+            request(json!({"query": query, "limit": 100})),
+        )
+        .unwrap()
+}
+
+/// Plan P4: appends index only the delta (no row of the session is
+/// deleted or rewritten), a delta with a Prune/Compaction rebuilds the
+/// session with re-labelled surfaces, and in every state the index equals
+/// a from-scratch index of the same logs.
+#[test]
+fn appends_index_incrementally_and_match_a_fresh_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    let caller = log.session().clone();
+    let first = log.append(&message("needle one")).unwrap();
+    let path = dir.path().join("index.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    search(&mut provider, &store, &caller, "needle");
+    let fresh_matches = |provider_path: &std::path::Path| {
+        let fresh = dir.path().join("fresh.sqlite3");
+        let _ = std::fs::remove_file(&fresh);
+        search(
+            &mut SqliteSessionSearch::new(fresh.clone()),
+            &store,
+            &caller,
+            "needle",
+        );
+        assert_eq!(index_rows(provider_path), index_rows(&fresh));
+    };
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER no_delete BEFORE DELETE ON event_scope
+             BEGIN SELECT RAISE(FAIL,'append rewrote indexed rows'); END;",
+        )
+        .unwrap();
+    for i in 0..3 {
+        log.append(&message(&format!("needle appended {i}")))
+            .unwrap();
+        log.append(&SessionEvent::TurnEnded {
+            turn: i,
+            outcome: TurnOutcome::Completed,
+        })
+        .unwrap();
+        let found = search(&mut provider, &store, &caller, "needle");
+        assert_eq!(found["items"].as_array().unwrap().len(), 2 + i as usize);
+    }
+    fresh_matches(&path);
+    // A torn (unterminated) tail is not indexed, and is picked up once the
+    // line completes.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(log.path())
+        .unwrap();
+    let torn = serde_json::to_string(&Envelope {
+        id: "01ZZZZZZZZZZZZZZZZZZZZZZZZ".into(),
+        at: "2026-01-01T00:00:00Z".into(),
+        event: message("needle torn"),
+    })
+    .unwrap();
+    use std::io::Write;
+    file.write_all(&torn.as_bytes()[..20]).unwrap();
+    assert_eq!(
+        search(&mut provider, &store, &caller, "torn")["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    file.write_all(&torn.as_bytes()[20..]).unwrap();
+    file.write_all(b"\n").unwrap();
+    assert_eq!(
+        search(&mut provider, &store, &caller, "torn")["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    fresh_matches(&path);
+    // Fold events re-label earlier rows: rebuild of this session.
+    connection.execute_batch("DROP TRIGGER no_delete;").unwrap();
+    log.append(&SessionEvent::Compaction(Compaction {
+        replaces: vec![first.id.clone()],
+        summary: "summary".into(),
+        model: "m".into(),
+    }))
+    .unwrap();
+    let shadowed = provider
+        .execute(
+            &store,
+            &caller,
+            "session_event_search",
+            request(json!({"query":"needle","surfaces":["shadowed"]})),
+        )
+        .unwrap();
+    assert_eq!(shadowed["items"][0]["event_ref"], first.id);
+    fresh_matches(&path);
+}
+
+/// Plan P4: a rewritten or replaced log (not an append) is re-indexed from
+/// scratch, and an unreadable session is skipped with its rows dropped
+/// instead of failing the whole workspace search.
+#[test]
+fn rewrites_rebuild_and_corrupt_sessions_are_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    let mut other = store.create(Some("/w".into())).unwrap();
+    let caller = log.session().clone();
+    log.append(&message("needle original text")).unwrap();
+    other.append(&message("needle in other")).unwrap();
+    let path = dir.path().join("index.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let workspace_search = |provider: &mut SqliteSessionSearch, query: &str| {
+        provider
+            .execute(
+                &store,
+                &caller,
+                "session_search",
+                request(json!({"query": query, "limit": 100})),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        workspace_search(&mut provider, "needle")["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    // Same-length in-place rewrite of the last indexed line plus growth:
+    // the last-line check catches it.
+    let original = std::fs::read_to_string(log.path()).unwrap();
+    let rewritten = original.replace("needle original text", "needle replaced text");
+    std::fs::write(log.path(), &rewritten).unwrap();
+    log.append(&message("needle later")).unwrap();
+    let found = search(&mut provider, &store, &caller, "original");
+    assert_eq!(found["items"].as_array().unwrap().len(), 0, "{found}");
+    assert_eq!(
+        search(&mut provider, &store, &caller, "replaced")["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Garbage in another session's committed prefix: skipped, not fatal.
+    let bytes = std::fs::read(other.path()).unwrap();
+    let mut broken = bytes.clone();
+    let second_line = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
+    broken[second_line] = b'#';
+    std::fs::write(other.path(), &broken).unwrap();
+    let found = workspace_search(&mut provider, "needle");
+    let sessions: Vec<_> = found["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["session_id"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!sessions.is_empty());
+    assert!(sessions.iter().all(|s| s == &caller), "{sessions:?}");
+    // Repaired: indexed again.
+    std::fs::write(other.path(), &bytes).unwrap();
+    let found = workspace_search(&mut provider, "other");
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+}
+
+/// The standard index file is new per schema: an existing v2/v3 file (which
+/// older rness processes may still be using) is neither opened nor changed.
+#[test]
+fn v4_index_gets_a_new_file_and_leaves_older_indexes_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    log.append(&message("needle original")).unwrap();
+
+    let v2 = dir.path().join("session-search-v2.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&v2).unwrap();
+        connection
+            .execute_batch(
+                "CREATE VIRTUAL TABLE events USING fts5(workspace UNINDEXED, session UNINDEXED,
+                   event UNINDEXED, kind UNINDEXED, surface UNINDEXED, time UNINDEXED, body);
+                 INSERT INTO events VALUES('/w','old','e','user/message','current',0,'needle stale');
+                 PRAGMA application_id = 1380864849; PRAGMA user_version=2;",
+            )
+            .unwrap();
+    }
+    let proto = dir.path().join("session-search.sqlite3");
+    std::fs::write(&proto, b"prototype bytes").unwrap();
+    let (v2_before, proto_before) = (std::fs::read(&v2).unwrap(), std::fs::read(&proto).unwrap());
+
+    let path = dir
+        .path()
+        .join(rness_engine::session_search::INDEX_FILE_NAME);
+    assert_eq!(path.file_name().unwrap(), "session-search-v4.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let found = provider
+        .execute(
+            &store,
+            log.session(),
+            "session_event_search",
+            request(json!({"query":"needle"})),
+        )
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1);
+
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    drop(connection);
+    drop(provider);
+    assert_eq!(std::fs::read(&v2).unwrap(), v2_before, "v2 index rewritten");
+    assert_eq!(std::fs::read(&proto).unwrap(), proto_before);
+    let v2_version: i64 = rusqlite::Connection::open(&v2)
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(v2_version, 2);
+}
+
+/// A session whose header cannot be read is recorded with its log revision,
+/// so it is skipped (and warned about) once per change, not on every search.
+#[test]
+fn unreadable_header_records_a_revision() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(Some("/w".into())).unwrap();
+    let mut broken = store.create(Some("/w".into())).unwrap();
+    let caller = log.session().clone();
+    log.append(&message("needle ok")).unwrap();
+    broken.append(&message("needle broken")).unwrap();
+    let broken_id = broken.session().clone();
+    let path = dir.path().join("index.sqlite3");
+    let mut provider = SqliteSessionSearch::new(path.clone());
+    let run = |provider: &mut SqliteSessionSearch| {
+        provider
+            .execute(
+                &store,
+                &caller,
+                "session_search",
+                request(json!({"query":"needle","limit":100})),
+            )
+            .unwrap()
+    };
+    assert_eq!(run(&mut provider)["items"].as_array().unwrap().len(), 2);
+    // Fresh store handle: the first store cached the readable header.
+    // A newer-format header still lists, but its header cannot be read.
+    let text = std::fs::read_to_string(broken.path()).unwrap();
+    assert!(text.contains("\"version\":1"));
+    std::fs::write(
+        broken.path(),
+        text.replacen("\"version\":1", "\"version\":99", 1),
+    )
+    .unwrap();
+    let store2 = SessionStore::new(dir.path());
+    let found = provider
+        .execute(
+            &store2,
+            &caller,
+            "session_search",
+            request(json!({"query":"needle","limit":100})),
+        )
+        .unwrap();
+    assert_eq!(found["items"].as_array().unwrap().len(), 1, "{found}");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let recorded: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM revisions WHERE session=?1",
+            [&broken_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 1);
+    let rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM event_scope WHERE session=?1",
+            [&broken_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0, "nothing stale served from it");
 }

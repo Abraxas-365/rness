@@ -148,6 +148,38 @@ pub fn search_surfaces<E: std::borrow::Borrow<Envelope>>(
         .collect()
 }
 
+/// [`search_surfaces`] label of an event appended after `history`, valid
+/// only while no `Compaction`/`Prune` is appended (only those re-label
+/// earlier events or fold anything). Mirrors [`model_context`]: messages and
+/// tool results are cited as sources (`current`), everything else never
+/// reaches the model (`log-only`). Returns `None` for the fold events, whose
+/// arrival requires the full derivation.
+pub fn fast_surface(event: &SessionEvent) -> Option<&'static str> {
+    Some(match event {
+        SessionEvent::UserMessage(_)
+        | SessionEvent::AssistantMessage(_)
+        | SessionEvent::ToolResult(_) => "current",
+        SessionEvent::Compaction(_) | SessionEvent::Prune(_) => return None,
+        SessionEvent::RequestConfig(_)
+        | SessionEvent::Header(_)
+        | SessionEvent::ToolsActivated { .. }
+        | SessionEvent::ProgramToolStarted { .. }
+        | SessionEvent::ProgramToolResult { .. }
+        | SessionEvent::CompactionRequest { .. }
+        | SessionEvent::CompactionStarted { .. }
+        | SessionEvent::CompactionFinished { .. }
+        | SessionEvent::PlanMode { .. }
+        | SessionEvent::AssistantAttempt(_)
+        | SessionEvent::TurnStarted { .. }
+        | SessionEvent::TurnEnded { .. }
+        | SessionEvent::HookInvoked(_)
+        | SessionEvent::HookResult(_)
+        | SessionEvent::Title(_)
+        | SessionEvent::Repair(_)
+        | SessionEvent::Unknown(_) => "log-only",
+    })
+}
+
 pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelContext {
     let mut ctx = ModelContext::default();
     let mut pending_tools: Vec<(EventId, ToolResult)> = Vec::new();
@@ -228,7 +260,11 @@ pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelCo
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
             | SessionEvent::HookResult(_)
-            | SessionEvent::Title(_) => {}
+            | SessionEvent::Title(_)
+            | SessionEvent::Repair(_) => {}
+            // Written by a newer rness: never projected here. The turn loop
+            // refuses to build a request for a session holding one.
+            SessionEvent::Unknown(_) => {}
         }
     }
     flush_tools(&mut ctx, &mut pending_tools);
@@ -353,7 +389,11 @@ pub fn transcript<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Transcript
             | SessionEvent::TurnEnded { .. }
             | SessionEvent::HookInvoked(_)
             | SessionEvent::HookResult(_)
-            | SessionEvent::Title(_) => {}
+            | SessionEvent::Title(_)
+            | SessionEvent::Repair(_) => {}
+            // Written by a newer rness: never projected here. The turn loop
+            // refuses to build a request for a session holding one.
+            SessionEvent::Unknown(_) => {}
         }
     }
     t

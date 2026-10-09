@@ -313,12 +313,32 @@ fn corruption_matrix_reports_current_behaviour() {
     assert_eq!(get("CRLF line endings").replay, "ok");
     assert_eq!(get("blank lines between events").replay, "ok");
     assert_eq!(get("event ids out of ULID order").replay, "ok");
-    assert!(get("header version FORMAT_VERSION+1")
-        .replay
-        .contains("version 2"));
-    assert!(get("trailing complete invalid JSON line")
-        .replay
-        .contains("corrupt"));
+    let newer = get("header version FORMAT_VERSION+1");
+    assert!(newer.replay.contains("format v2") && newer.replay.contains("upgrade"));
+    assert!(
+        newer.open.contains("format v2"),
+        "open refuses a newer format"
+    );
+    // A complete invalid trailing line: lockless readers report it, the
+    // writer quarantines it on open and later appends are reachable (B1-1).
+    let tail = get("trailing complete invalid JSON line");
+    assert!(tail.replay.contains("corrupt"));
+    assert_eq!(tail.append_then_replay, "append ok / replay ok");
+    let nul = get("NUL bytes then newline (zero-filled + later line)");
+    assert_eq!(nul.append_then_replay, "append ok / replay ok");
+    // Unknown (newer) event type: readable data (B1-2).
+    let unknown = get("trailing valid JSON, unknown event type");
+    assert_eq!(unknown.replay, "ok");
+    assert_eq!(unknown.read_session, "ok");
+    // Headerless / empty files: the writer refuses instead of appending
+    // headerless events (B1-5).
+    for case in [
+        "0-byte file",
+        "torn header (crash during create)",
+        "header missing (first line removed)",
+    ] {
+        assert!(get(case).open.starts_with("err: corrupt"), "{case}");
+    }
 }
 
 /// The open/heal path must never touch committed bytes (only the torn tail).
@@ -332,8 +352,26 @@ fn heal_only_removes_unterminated_tail() {
     let log = store.open(&sid).unwrap();
     assert_eq!(fs::read(&path).unwrap(), committed);
     drop(log);
-    // Corrupt-but-terminated tail: open must NOT truncate it (it is not ours to drop).
+    // Corrupt-but-terminated tail: open moves it to a sidecar (never drops
+    // it) and records a repair event; the committed prefix is untouched.
     append_raw(&path, b"garbage\n");
+    let log = store.open(&sid).unwrap();
+    drop(log);
+    let after = fs::read(&path).unwrap();
+    assert!(after.starts_with(&committed));
+    let events = read_session(dir.path(), &sid).unwrap();
+    let SessionEvent::Repair(repair) = &events.last().unwrap().event else {
+        panic!("expected session/repair, got {:?}", events.last());
+    };
+    assert_eq!((repair.bytes, repair.lines), (8, 1));
+    let sidecar = path.parent().unwrap().join(&repair.sidecar);
+    assert_eq!(fs::read(sidecar).unwrap(), b"garbage\n");
+    // A terminated line that LOOKS like an event (string id + type) but does
+    // not parse may be a real event with a schema problem: never moved.
+    append_raw(
+        &path,
+        b"{\"id\":\"x\",\"at\":\"t\",\"type\":\"user/message\"}\n",
+    );
     let before = fs::read(&path).unwrap();
     let _ = store.open(&sid);
     assert_eq!(fs::read(&path).unwrap(), before);
@@ -344,7 +382,6 @@ fn heal_only_removes_unterminated_tail() {
 /// write) bricks the session forever: every replay fails, the writer still
 /// opens and appends AFTER the bad line, so nothing ever recovers.
 #[test]
-#[ignore = "bug B1-1: complete invalid trailing line bricks the session"]
 fn bug_invalid_trailing_line_is_recoverable() {
     let dir = tempfile::tempdir().unwrap();
     let (store, sid) = seeded(dir.path());
@@ -359,23 +396,70 @@ fn bug_invalid_trailing_line_is_recoverable() {
     assert!(replay(&store, &sid).is_ok(), "session must stay usable");
 }
 
-/// The writer happily appends after a corrupt line; the new events are
-/// then unreachable. Pins current behaviour (part of B1-1).
+/// A corrupt trailing line is quarantined on open (sidecar bytes == the bad
+/// line), so events appended afterwards stay reachable (B1-1).
 #[test]
 fn open_succeeds_and_appends_after_corrupt_line() {
     let dir = tempfile::tempdir().unwrap();
     let (store, sid) = seeded(dir.path());
     append_raw(&log_path(dir.path(), &sid), b"not json\n");
     let mut log = store.open(&sid).unwrap();
-    assert!(log.append(&user("lost")).is_ok());
+    assert!(log.append(&user("kept")).is_ok());
     drop(log);
     let fresh = SessionStore::new(dir.path());
-    assert!(is_corrupt_replay(&replay(&fresh, &sid)));
+    let replayed = replay(&fresh, &sid).unwrap();
+    let rendered = serde_json::to_string(&replayed.context.turns).unwrap();
+    assert!(rendered.contains("kept"));
+    let repair = replayed
+        .history
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::Repair(r) => Some(r.clone()),
+            _ => None,
+        })
+        .expect("repair audit event");
+    let sidecar = log_path(dir.path(), &sid)
+        .parent()
+        .unwrap()
+        .join(&repair.sidecar);
+    assert_eq!(fs::read(sidecar).unwrap(), b"not json\n");
+    // The sidecar is not a session.
+    assert_eq!(fresh.list().unwrap(), vec![sid]);
 }
 
-/// Invalid UTF-8 inside a committed line: the cached reader reports
-/// `Corrupt{line}`, but `read_all`/`read_session`/`recover()` (which use
-/// `read_line` into a String) fail with a bare io error and no line number.
+/// Mid-file corruption (valid lines after the bad one, e.g. a session
+/// bricked by an older rness that appended past a bad line) is never
+/// repaired automatically: open leaves the file alone, replay says where.
+#[test]
+fn mid_file_corruption_is_reported_with_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, sid) = seeded(dir.path());
+    drop(store);
+    let path = log_path(dir.path(), &sid);
+    let text = fs::read_to_string(&path).unwrap();
+    let last = text.lines().last().unwrap().to_string();
+    let bad_at = fs::metadata(&path).unwrap().len();
+    append_raw(&path, b"\x00\x00garbage\n");
+    append_raw(&path, format!("{last}\n").as_bytes());
+    let before = fs::read(&path).unwrap();
+    let store = SessionStore::new(dir.path());
+    let log = store.open(&sid).unwrap();
+    drop(log);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "open never touches mid-file damage"
+    );
+    let message = replay(&store, &sid).err().unwrap().to_string();
+    assert!(message.contains("corrupt log at line 8"), "{message}");
+    assert!(
+        message.contains(&format!("byte offset {bad_at}")),
+        "{message}"
+    );
+}
+
+/// Invalid UTF-8 inside a committed line: every reader reports the same
+/// `Corrupt{line}` (B1-3; they used to differ: io error without a line).
 #[test]
 fn invalid_utf8_error_shape_differs_between_readers() {
     let dir = tempfile::tempdir().unwrap();
@@ -395,12 +479,12 @@ fn invalid_utf8_error_shape_differs_between_readers() {
     println!("raw read_session: {}", describe(&raw));
     println!("recover(): {}", describe(&recovered));
     assert!(is_corrupt_replay(&cached));
-    assert!(matches!(raw, Err(LogError::Io(_))));
-    assert!(matches!(recovered, Err(LogError::Io(_))));
+    assert!(matches!(raw, Err(LogError::Corrupt { line: 3, .. })));
+    assert!(matches!(recovered, Err(LogError::Corrupt { line: 3, .. })));
 }
 
-/// Version mismatch: message is reported as "corrupt log", which reads
-/// like data loss rather than "written by a newer rness, upgrade".
+/// Version mismatch: reported as "written by a newer rness, upgrade" (not as
+/// a corrupt log), and the writer refuses to append v1 events into it (B1-6).
 #[test]
 fn newer_format_version_message() {
     let dir = tempfile::tempdir().unwrap();
@@ -415,11 +499,133 @@ fn newer_format_version_message() {
     // list() does not validate the version: the session shows up in the
     // picker and only fails on resume.
     assert!(store.list().unwrap().contains(&sid));
-    assert!(msg.contains("unsupported session header version 2"));
-    // The writer opens a future-format file and appends v1 events into it.
+    assert!(
+        msg.contains("format v2") && msg.contains("upgrade rness"),
+        "{msg}"
+    );
+    assert!(!msg.contains("corrupt"), "{msg}");
+    let before = fs::read(&p).unwrap();
     let opened = store.open(&sid);
     println!("v2 open for append: {}", describe(&opened));
-    assert!(opened.is_ok());
+    assert!(matches!(
+        opened,
+        Err(BranchError::Log(LogError::UnsupportedVersion {
+            found: 2,
+            supported: 1
+        }))
+    ));
+    assert_eq!(fs::read(&p).unwrap(), before);
+}
+
+/// An event of a type this build does not know (newer rness) is data:
+/// read/list/transcript work, its bytes survive untouched (also through a
+/// fork), and a model turn is refused before anything is logged (B1-2).
+#[tokio::test]
+async fn unknown_event_type_is_readable_and_refuses_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, sid) = seeded(dir.path());
+    drop(store);
+    let path = log_path(dir.path(), &sid);
+    let future = b"{\"id\":\"01FUTURE000000000000000000\",\"at\":\"2026-01-01T00:00:00.000Z\",\"type\":\"future/event\",\"payload\":{\"x\":[1,2]}}\n";
+    // In the middle: one more valid line after it.
+    append_raw(&path, future);
+    let store = SessionStore::new(dir.path());
+    let mut log = store.open(&sid).unwrap();
+    log.append(&user("after future")).unwrap();
+    let on_disk = fs::read(&path).unwrap();
+    assert!(on_disk.windows(future.len()).any(|w| w == future));
+
+    let replayed = replay(&store, &sid).unwrap();
+    assert_eq!(replayed.unknown, vec!["future/event".to_string()]);
+    let unknown = replayed
+        .history
+        .iter()
+        .find_map(|e| match &e.event {
+            SessionEvent::Unknown(u) => Some(u.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(unknown.raw["payload"]["x"][1], 2);
+    assert!(store.list().unwrap().contains(&sid));
+    let _ = rness_engine::session::projection::transcript(&replayed.history);
+    // Serializing the envelope reproduces the line (fields reordered at most).
+    let env = replayed
+        .history
+        .iter()
+        .find(|e| e.id == "01FUTURE000000000000000000")
+        .unwrap();
+    let back: serde_json::Value = serde_json::to_value(&**env).unwrap();
+    let orig: serde_json::Value = serde_json::from_slice(&future[..future.len() - 1]).unwrap();
+    assert_eq!(back, orig);
+
+    // A fork reads the parent's bytes through, never rewrites them.
+    let tip = replayed.history.last().unwrap().id.clone();
+    let child = store.fork(&sid, Some(tip)).unwrap();
+    let child_id = child.session().clone();
+    drop(child);
+    assert_eq!(
+        replay(&store, &child_id).unwrap().unknown,
+        vec!["future/event".to_string()]
+    );
+    assert_eq!(fs::read(&path).unwrap(), on_disk);
+
+    // The turn path refuses: no turn/started, no request.
+    let tools = ToolRegistry::default();
+    let before = fs::read(&path).unwrap();
+    let err = run_turn(
+        &store,
+        &mut log,
+        &Refuser,
+        &tools,
+        &TurnConfig::default(),
+        &CancellationToken::new(),
+        &mut Vec::new,
+        2,
+        &|_| {},
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("newer rness (future/event)"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+struct Refuser;
+#[async_trait]
+impl Provider for Refuser {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+        panic!("no model request may be built for a session with unknown events");
+    }
+}
+
+/// 0-byte, torn-header and headerless files: open refuses and leaves the
+/// file byte-for-byte unchanged (no headerless appends, B1-5).
+#[test]
+fn headerless_open_refuses_and_leaves_file_unchanged() {
+    for contents in [
+        &b""[..],
+        b"{\"id\":\"01A\",\"at\":\"t\",\"type\":\"session/hea",
+        b"{\"id\":\"01A\",\"at\":\"t\",\"type\":\"turn/started\",\"turn\":1}\n",
+        b"\x00\x00\x00\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, sid) = seeded(dir.path());
+        let path = log_path(dir.path(), &sid);
+        fs::write(&path, contents).unwrap();
+        let opened = store.open(&sid);
+        assert!(
+            matches!(opened, Err(BranchError::Log(LogError::Corrupt { .. }))),
+            "{contents:?}: {}",
+            describe(&opened)
+        );
+        assert_eq!(fs::read(&path).unwrap(), contents);
+    }
 }
 
 /// Duplicate event ids: a checkpoint replacing a duplicated id anchors
@@ -986,6 +1192,82 @@ async fn prune_pass_skips_image_results() {
     .await
     .unwrap();
     assert!(!again, "second prune pass re-pruned already-pruned results");
+}
+
+/// The prune pass commits its prunes in batches (plan P6): 1100 oversized
+/// results -> 1100 Prune events in history order, 3 syncs (512 cap), and
+/// the projection replaces every pruned result.
+#[tokio::test]
+async fn prune_pass_is_batched_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    let mut batch = Vec::new();
+    for i in 0..1100 {
+        batch.push(user(&format!("u{i}")));
+        batch.push(SessionEvent::AssistantMessage(assistant(
+            "c",
+            &[(&format!("c{i}"), "Big")],
+        )));
+        batch.push(SessionEvent::ToolResult(ToolResult {
+            call: format!("c{i}"),
+            name: "Big".into(),
+            content: vec![],
+            output: format!("{i:05}").repeat(2000),
+            is_error: false,
+            duration_ms: 1,
+            tasks: None,
+            plan_review: None,
+            presentation: None,
+        }));
+        batch.push(SessionEvent::AssistantMessage(assistant("ok", &[])));
+    }
+    log.append_batch(&batch).unwrap();
+    let mut policy = stack_policy();
+    policy.prune_threshold = 8192;
+    policy.prune_head = 100;
+    policy.prune_tail = 100;
+    policy.threshold_tokens = 100_000_000; // only the prune pass
+    policy.retain_tokens = 100;
+    let provider = Refuser;
+    let syncs = log.sync_count();
+    let changed = compaction::reduce(
+        &store,
+        &mut log,
+        &provider,
+        "",
+        &[],
+        &policy,
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert_eq!(
+        log.sync_count() - syncs,
+        3,
+        "1100 prunes in 512-event batches"
+    );
+    let history = read_session(dir.path(), &sid).unwrap();
+    let calls: Vec<String> = history
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::Prune(p) => Some(p.result.call.clone()),
+            _ => None,
+        })
+        .collect();
+    let pruned = calls.len();
+    assert!(pruned >= 1090, "{pruned}");
+    let expected: Vec<String> = (0..pruned).map(|i| format!("c{i}")).collect();
+    assert_eq!(calls, expected, "prunes follow history order");
+    let replayed = replay(&store, &sid).unwrap();
+    let rendered = serde_json::to_string(&replayed.context.turns).unwrap();
+    assert_eq!(
+        rendered.matches("[tool result middle pruned]").count(),
+        pruned
+    );
 }
 
 /// recover(): a compaction/started with a later checkpoint but no finished

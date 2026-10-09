@@ -650,6 +650,7 @@ async fn perf_reduce_prune_pass() {
     let extra = json!({"events": line_count(dir.path(), &sid), "big_results": 2000, "mb": file_mb(dir.path(), &sid)});
     let mut log = store.open(&sid).unwrap();
     let policy = default_policy();
+    let syncs0 = log.sync_count();
     let t = Instant::now();
     let changed = compaction::reduce(
         &store,
@@ -677,6 +678,7 @@ async fn perf_reduce_prune_pass() {
     e["prunes"] = json!(prunes);
     e["checkpoints"] = json!(ckpts);
     e["changed"] = json!(changed);
+    e["syncs"] = json!(log.sync_count() - syncs0);
     rep.sample("reduce_first_ms", ms, "ms", e);
     // Steady state: nothing to do, but reduce still runs every step.
     rep.time("reduce_noop_ms", 5, extra.clone(), || {
@@ -798,6 +800,32 @@ fn perf_search_append_reindex() {
         .unwrap();
         q(&mut search, "freshappend")
     });
+    // Rare path: a fold event in the delta re-labels earlier rows, so the
+    // session is rebuilt.
+    let target = read_session(&root, &sid).unwrap()[1].id.clone();
+    let t = Instant::now();
+    log.append(&SessionEvent::Prune(rness_protocol::events::Prune {
+        replaces: target,
+        result: rness_protocol::events::ToolResult {
+            call: "c".into(),
+            name: "Read".into(),
+            content: vec![],
+            output: "pruned".into(),
+            is_error: false,
+            duration_ms: 0,
+            tasks: None,
+            plan_review: None,
+            presentation: None,
+        },
+    }))
+    .unwrap();
+    q(&mut search, "freshappend");
+    rep.sample(
+        "append_fold_then_search_ms",
+        t.elapsed().as_secs_f64() * 1000.0,
+        "ms",
+        extra.clone(),
+    );
     drop(log);
     let _ = Arc::new(()); // keep import used
 }

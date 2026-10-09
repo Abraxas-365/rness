@@ -6,7 +6,7 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 
-use rness_protocol::events::{ContentPart, Envelope, SessionEvent, SessionId};
+use rness_protocol::events::{ContentPart, SessionEvent, SessionId};
 
 use super::branch::{BranchError, SessionStore};
 use super::log::{log_file, LogError};
@@ -60,11 +60,7 @@ impl AgentHintReader {
                 break;
             }
             if !bytes.iter().all(u8::is_ascii_whitespace) {
-                let envelope: Envelope =
-                    serde_json::from_slice(&bytes).map_err(|error| LogError::Corrupt {
-                        line: self.line + 1,
-                        reason: error.to_string(),
-                    })?;
+                let envelope = super::log::parse_line(&bytes, self.line + 1, self.offset)?;
                 match envelope.event {
                     SessionEvent::RequestConfig(config) => {
                         // None is an explicit clearing of an inherited role.
@@ -277,7 +273,7 @@ mod tests {
         );
         assert_eq!((hints.offset, hints.line), (offset, line));
 
-        let envelope = Envelope {
+        let envelope = rness_protocol::events::Envelope {
             id: "new-config".into(),
             at: "now".into(),
             event: config(Some("reviewer")),

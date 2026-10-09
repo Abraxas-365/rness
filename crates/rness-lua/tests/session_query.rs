@@ -62,7 +62,9 @@ async fn opt_in_query_yields_while_sqlite_is_locked() {
     )
     .await
     .unwrap();
-    let path = dir.path().join("session-search-v2.sqlite3");
+    let path = dir
+        .path()
+        .join(rness_engine::session_search::INDEX_FILE_NAME);
     assert!(!path.exists());
     assert!(host.tool_specs().await.is_empty());
     assert!(host

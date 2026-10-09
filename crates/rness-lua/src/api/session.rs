@@ -160,8 +160,11 @@ pub fn install(
         "sqlite_search_provider",
         lua.create_function(move |lua, ()| {
             let sessions = Arc::clone(&search_service);
-            // Separate versioned filename: leave the earlier prototype index alone.
-            let path = sessions.store().root().join("session-search-v2.sqlite3");
+            // Separate versioned filename: earlier indexes are left alone.
+            let path = sessions
+                .store()
+                .root()
+                .join(rness_engine::session_search::INDEX_FILE_NAME);
             let provider = Arc::new(std::sync::Mutex::new(
                 rness_engine::session_search::SqliteSessionSearch::new(path),
             ));

@@ -214,6 +214,21 @@ pub fn ensure(
     log: &mut crate::session::log::SessionLog,
     config: &InstructionsConfig,
 ) -> Result<bool, EnsureError> {
+    ensure_with(
+        store,
+        log,
+        config,
+        &mut crate::session::replay::ReplayCache::default(),
+    )
+}
+
+/// [`ensure`], replaying through `cache` (the turn loop's per-step replay).
+pub fn ensure_with(
+    store: &crate::session::branch::SessionStore,
+    log: &mut crate::session::log::SessionLog,
+    config: &InstructionsConfig,
+    cache: &mut crate::session::replay::ReplayCache,
+) -> Result<bool, EnsureError> {
     let mut config = config.clone();
     if let Some(workspace) = store
         .workspace(log.session())
@@ -224,9 +239,10 @@ pub fn ensure(
     let Some(baseline) = render(&config) else {
         return Ok(false);
     };
-    ensure_source(
-        store,
+    let replayed = cache.get(store, log)?;
+    ensure_source_in(
         log,
+        &replayed,
         rness_protocol::events::MessageSource::Instructions {
             identity: baseline.identity,
         },
@@ -244,9 +260,21 @@ pub fn ensure_source(
     source: rness_protocol::events::MessageSource,
     text: String,
 ) -> Result<bool, EnsureError> {
-    use rness_protocol::events::{ContentPart, SessionEvent, UserIntent, UserMessage};
     let replayed = crate::session::replay::replay(store, log.session())?;
-    if visible(&replayed, &source) {
+    ensure_source_in(log, &replayed, source, text)
+}
+
+/// [`ensure_source`] against an already derived `replayed` of `log`'s
+/// session. A snapshot taken before other `ensure*` appends stays valid for
+/// a *different* source: appending a message never hides another one.
+pub fn ensure_source_in(
+    log: &mut crate::session::log::SessionLog,
+    replayed: &crate::session::replay::Replayed,
+    source: rness_protocol::events::MessageSource,
+    text: String,
+) -> Result<bool, EnsureError> {
+    use rness_protocol::events::{ContentPart, SessionEvent, UserIntent, UserMessage};
+    if visible(replayed, &source) {
         return Ok(false);
     }
     log.append(&SessionEvent::UserMessage(UserMessage {

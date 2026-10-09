@@ -1064,6 +1064,110 @@ async fn max_tokens_stop_with_tool_use_dispatches_and_continues() {
     }));
 }
 
+/// Plan P1-B: a step derives its request context once. A tool-less step
+/// replays once (with or without a no-op compaction policy); a step whose
+/// reduce appends a prune replays twice. The request still sees every
+/// event committed before it (the prune and the user message).
+#[tokio::test]
+async fn tool_less_step_replays_once_and_twice_with_a_prune() {
+    async fn turn(
+        store: &SessionStore,
+        log: &mut rness_engine::session::log::SessionLog,
+        config: &TurnConfig,
+        turn_no: u32,
+    ) -> u64 {
+        let provider = Scripted::new(vec![StepOutcome::Committed(assistant(
+            "done",
+            StopReason::EndTurn,
+            vec![],
+        ))]);
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text {
+                text: format!("ask {turn_no}"),
+            }],
+            source: None,
+        }))
+        .unwrap();
+        let before = store.replay_count();
+        let outcome = run_turn(
+            store,
+            log,
+            &provider,
+            &ToolRegistry::default(),
+            config,
+            &CancellationToken::new(),
+            &mut no_steers(),
+            turn_no,
+            &|_| {},
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let seen = provider.seen_texts.lock().unwrap();
+        assert!(
+            seen.last().unwrap().contains(&format!("ask {turn_no}")),
+            "stale request context: {seen:?}"
+        );
+        store.replay_count() - before
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    assert_eq!(turn(&store, &mut log, &TurnConfig::default(), 1).await, 1);
+
+    let mut policy = compact_policy(165000);
+    policy.retain_tokens = 1;
+    let with_policy = TurnConfig {
+        compaction: [("default".to_string(), policy)].into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        turn(&store, &mut log, &with_policy, 2).await,
+        1,
+        "no-op reduce"
+    );
+
+    // An oversized, closed tool round trip: the next step's reduce prunes it.
+    log.append(&SessionEvent::AssistantMessage(assistant(
+        "",
+        StopReason::ToolUse,
+        vec![("big", "Echo")],
+    )))
+    .unwrap();
+    let output = "x".repeat(16000);
+    log.append(&SessionEvent::ToolResult(ToolResult {
+        call: "big".into(),
+        name: "Echo".into(),
+        output: output.clone(),
+        content: vec![ToolResultContentPart::Text { text: output }],
+        is_error: false,
+        duration_ms: 0,
+        tasks: None,
+        plan_review: None,
+        presentation: None,
+    }))
+    .unwrap();
+    log.append(&SessionEvent::AssistantMessage(assistant(
+        "ok",
+        StopReason::EndTurn,
+        vec![],
+    )))
+    .unwrap();
+    assert_eq!(
+        turn(&store, &mut log, &with_policy, 3).await,
+        2,
+        "prune step"
+    );
+    let replayed = replay(&store, log.session()).unwrap();
+    assert!(replayed
+        .history
+        .iter()
+        .any(|e| matches!(e.event, SessionEvent::Prune(_))));
+}
+
 #[tokio::test]
 async fn max_tokens_stop_without_tool_use_completes_the_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -1669,6 +1773,8 @@ async fn tool_roundtrip_turn_commits_and_replays() {
             SessionEvent::HookInvoked(_) => "hook-invoked",
             SessionEvent::HookResult(_) => "hook-result",
             SessionEvent::Title(_) => "title",
+            SessionEvent::Repair(_) => "repair",
+            SessionEvent::Unknown(_) => "unknown",
         })
         .collect();
     assert_eq!(

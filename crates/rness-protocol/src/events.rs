@@ -18,6 +18,15 @@
 //!   the parent, never copied.
 //! - Everything is `deny_unknown_fields`-free on read (forward-tolerant),
 //!   but writers only emit what is defined here.
+//! - Forward compatibility: a line whose `type` this build does not know
+//!   (written by a newer rness) reads as [`SessionEvent::Unknown`] with its
+//!   JSON kept semantically verbatim (same value; object key order and
+//!   whitespace may change), instead of failing the whole log. A line with a
+//!   KNOWN `type` but malformed fields is still an error (real corruption).
+//!   Projections ignore unknown events; the turn loop refuses to run a model
+//!   turn on a session that contains any (it could be model-visible).
+//! - `session/repair` is a pure audit event: the writer quarantined an
+//!   invalid trailing region to a sidecar file on open.
 
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +43,11 @@ pub type SessionId = String;
 pub type Timestamp = String;
 
 /// One line of the log: identity + time + the event itself.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Deserialization never fails on an unknown `type`: see
+/// [`SessionEvent::Unknown`]. Log readers use [`Envelope::parse_line`]
+/// (fast path for known types).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Envelope {
     /// ULID — unique, monotonically sortable within the session.
     pub id: EventId,
@@ -44,9 +57,271 @@ pub struct Envelope {
     pub event: SessionEvent,
 }
 
+/// Every `type` tag this build understands (all [`SessionEvent`] variants
+/// except [`SessionEvent::Unknown`]). A line with any other tag parses as
+/// `Unknown`.
+pub const KNOWN_TYPES: &[&str] = &[
+    "session/header",
+    "user/message",
+    "assistant/message",
+    "assistant/attempt",
+    "tool/result",
+    "tools/activated",
+    "tools/program_started",
+    "tools/program_result",
+    "turn/started",
+    "turn/ended",
+    "compaction/prune",
+    "compaction/summary",
+    "compaction/started",
+    "compaction/request",
+    "compaction/finished",
+    "request/config",
+    "plan/mode",
+    "hook/invoked",
+    "hook/result",
+    "session/title",
+    "session/repair",
+];
+
+/// Deepest JSON nesting a log line may have. serde_json's own reader stops
+/// at 128 levels, which an event's envelope (+ content array + part) eats
+/// 3–4 of, so arguments nested ~125 deep used to commit fine and then fail
+/// to parse. The reader retries past that limit up to this depth (bounded,
+/// so the recursion cannot overflow the stack); the writer refuses lines
+/// deeper than this, so every committed line stays readable.
+pub const MAX_JSON_DEPTH: usize = 512;
+
+/// Maximum bracket nesting of the JSON text in `bytes` (string-aware; does
+/// not validate).
+pub fn json_depth(bytes: &[u8]) -> usize {
+    let (mut depth, mut max) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                max = max.max(depth);
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max
+}
+
+/// `serde_json::from_slice`, except that a line rejected only for exceeding
+/// serde_json's 128-level recursion limit is re-read without it when it is
+/// at most [`MAX_JSON_DEPTH`] deep.
+fn from_slice_deep<'a, T: Deserialize<'a>>(line: &'a [u8]) -> Result<T, serde_json::Error> {
+    match serde_json::from_slice(line) {
+        Err(error)
+            if error.to_string().starts_with("recursion limit exceeded")
+                && json_depth(line) <= MAX_JSON_DEPTH =>
+        {
+            let mut de = serde_json::Deserializer::from_slice(line);
+            de.disable_recursion_limit();
+            let value = T::deserialize(&mut de)?;
+            de.end()?;
+            Ok(value)
+        }
+        other => other,
+    }
+}
+
+/// Derived fast path for log lines of a known type.
+#[derive(Deserialize)]
+struct KnownEnvelope {
+    id: EventId,
+    at: Timestamp,
+    #[serde(flatten, deserialize_with = "SessionEvent::deserialize_known")]
+    event: SessionEvent,
+}
+
+impl Envelope {
+    /// Parse one log line (without or with its trailing newline). Known
+    /// types take the derived fast path; a JSON object whose `type` is not
+    /// in [`KNOWN_TYPES`] becomes [`SessionEvent::Unknown`]. Anything else
+    /// (invalid JSON, known type with bad fields, missing `id`/`at`) is the
+    /// original parse error.
+    pub fn parse_line(line: &[u8]) -> Result<Envelope, serde_json::Error> {
+        match from_slice_deep::<KnownEnvelope>(line) {
+            Ok(known) => Ok(Envelope {
+                id: known.id,
+                at: known.at,
+                event: known.event,
+            }),
+            Err(error) => match from_slice_deep::<serde_json::Value>(line) {
+                Ok(value) => match Self::unknown_from_value(value) {
+                    Some(envelope) => Ok(envelope),
+                    None => Err(error),
+                },
+                Err(_) => Err(error),
+            },
+        }
+    }
+
+    /// `Some` iff `value` is an envelope-shaped object (string `id`, `at`
+    /// and `type`) whose `type` this build does not know.
+    fn unknown_from_value(value: serde_json::Value) -> Option<Envelope> {
+        let serde_json::Value::Object(mut map) = value else {
+            return None;
+        };
+        let kind = map.get("type")?.as_str()?;
+        if KNOWN_TYPES.contains(&kind) {
+            return None;
+        }
+        let kind = kind.to_owned();
+        if !(map.get("id")?.is_string() && map.get("at")?.is_string()) {
+            return None;
+        }
+        let Some(serde_json::Value::String(id)) = map.remove("id") else {
+            return None;
+        };
+        let Some(serde_json::Value::String(at)) = map.remove("at") else {
+            return None;
+        };
+        Some(Envelope {
+            id,
+            at,
+            event: SessionEvent::Unknown(UnknownEvent {
+                kind,
+                raw: serde_json::Value::Object(map),
+            }),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Envelope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let known = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|kind| KNOWN_TYPES.contains(&kind));
+        if known {
+            let known = KnownEnvelope::deserialize(value).map_err(D::Error::custom)?;
+            return Ok(Envelope {
+                id: known.id,
+                at: known.at,
+                event: known.event,
+            });
+        }
+        Self::unknown_from_value(value)
+            .ok_or_else(|| D::Error::custom("envelope requires string `id` and `at` fields"))
+    }
+}
+
+/// An event of a type this build does not know (written by a newer rness).
+/// Kept semantically verbatim (same JSON value; key order may change);
+/// never rewritten, never model-visible here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnknownEvent {
+    /// The event's `type` tag.
+    pub kind: String,
+    /// The event's JSON object, `type` included (without the envelope's
+    /// `id`/`at` when read from a log line). Serialized back as the same JSON
+    /// value (key order and whitespace are not preserved).
+    pub raw: serde_json::Value,
+}
+
+/// Payload of `session/repair`: the writer quarantined an invalid trailing
+/// region of the log (never an acknowledged append) on open.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRepair {
+    /// Bytes moved out of the log.
+    pub bytes: u64,
+    /// Lines in the quarantined region.
+    pub lines: u64,
+    /// Sidecar file (relative to the session directory) holding the bytes.
+    pub sidecar: String,
+    pub reason: String,
+}
+
+impl Serialize for SessionEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SessionEvent::Unknown(unknown) => unknown.raw.serialize(serializer),
+            known => SessionEvent::serialize_known(known, serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some(kind) if !KNOWN_TYPES.contains(&kind) => Ok(SessionEvent::Unknown(UnknownEvent {
+                kind: kind.to_owned(),
+                raw: value,
+            })),
+            _ => SessionEvent::deserialize_known(value).map_err(D::Error::custom),
+        }
+    }
+}
+
+impl SessionEvent {
+    /// The derived (known-types-only) serializer.
+    fn serialize_known<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        SessionEvent::serialize(self, serializer)
+    }
+
+    /// The derived (known-types-only) deserializer.
+    fn deserialize_known<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        SessionEvent::deserialize(deserializer)
+    }
+
+    /// The `type` tag of this event (exhaustive: a new variant must add its
+    /// tag here and to [`KNOWN_TYPES`]).
+    pub fn kind(&self) -> &str {
+        match self {
+            SessionEvent::Header(_) => "session/header",
+            SessionEvent::UserMessage(_) => "user/message",
+            SessionEvent::AssistantMessage(_) => "assistant/message",
+            SessionEvent::AssistantAttempt(_) => "assistant/attempt",
+            SessionEvent::ToolResult(_) => "tool/result",
+            SessionEvent::ToolsActivated { .. } => "tools/activated",
+            SessionEvent::ProgramToolStarted { .. } => "tools/program_started",
+            SessionEvent::ProgramToolResult { .. } => "tools/program_result",
+            SessionEvent::TurnStarted { .. } => "turn/started",
+            SessionEvent::TurnEnded { .. } => "turn/ended",
+            SessionEvent::Prune(_) => "compaction/prune",
+            SessionEvent::Compaction(_) => "compaction/summary",
+            SessionEvent::CompactionStarted { .. } => "compaction/started",
+            SessionEvent::CompactionRequest { .. } => "compaction/request",
+            SessionEvent::CompactionFinished { .. } => "compaction/finished",
+            SessionEvent::RequestConfig(_) => "request/config",
+            SessionEvent::PlanMode { .. } => "plan/mode",
+            SessionEvent::HookInvoked(_) => "hook/invoked",
+            SessionEvent::HookResult(_) => "hook/result",
+            SessionEvent::Title(_) => "session/title",
+            SessionEvent::Repair(_) => "session/repair",
+            SessionEvent::Unknown(unknown) => &unknown.kind,
+        }
+    }
+}
+
 /// The durable event vocabulary, tagged by `type`.
+///
+/// `remote = "Self"`: the derives generate inherent `serialize` /
+/// `deserialize` over the known variants; the trait impls above wrap them
+/// with the [`SessionEvent::Unknown`] fallback.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(remote = "Self", tag = "type")]
 pub enum SessionEvent {
     /// Always the first line of a log file.
     #[serde(rename = "session/header")]
@@ -159,6 +434,17 @@ pub enum SessionEvent {
     /// plugin (automatic: `fallback`/`model`) or by an explicit rename.
     #[serde(rename = "session/title")]
     Title(SessionTitle),
+
+    /// Audit only: an invalid trailing region (never an acknowledged
+    /// append) was moved to a sidecar file when the writer opened the log.
+    #[serde(rename = "session/repair")]
+    Repair(LogRepair),
+
+    /// Read-side only: an event whose `type` this build does not know.
+    /// Never constructed by writers; serialized back semantically verbatim
+    /// (key order may change).
+    #[serde(skip)]
+    Unknown(UnknownEvent),
 }
 
 /// Payload for the `session/title` event.

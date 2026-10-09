@@ -78,6 +78,54 @@ proptest! {
         prop_assert_eq!(read_session(root.path(), &sid).unwrap().len(), expect_lines + 1);
     }
 
+    /// A garbage tail (complete lines that are not envelopes, optionally a
+    /// torn remainder) never bricks the log: open keeps every committed
+    /// event, quarantines the garbage byte-exactly, and stays appendable.
+    #[test]
+    fn garbage_tail_is_quarantined_and_prefix_survives(
+        events in prop::collection::vec(arb_event(), 1..6),
+        garbage in prop::collection::vec("[^\n{]{0,40}|\u{0}{1,64}", 1..4),
+        torn in "[^\n]{0,20}",
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "01GARB".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        for ev in &events {
+            log.append(ev).unwrap();
+        }
+        let committed = log.read_all().unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let mut region = Vec::new();
+        for line in &garbage {
+            region.extend_from_slice(line.as_bytes());
+            region.push(b'\n');
+        }
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(&region).unwrap();
+        f.write_all(torn.as_bytes()).unwrap();
+        drop(f);
+
+        let mut log = SessionLog::open(root.path(), &sid).unwrap();
+        log.append(&events[0]).unwrap();
+        let read = log.read_all().unwrap();
+        prop_assert_eq!(&read[..committed.len()], &committed[..]);
+        let only_blank = region.iter().all(u8::is_ascii_whitespace);
+        if only_blank {
+            prop_assert_eq!(read.len(), committed.len() + 1);
+        } else {
+            prop_assert_eq!(read.len(), committed.len() + 2);
+            let SessionEvent::Repair(repair) = &read[committed.len()].event else {
+                panic!("expected repair");
+            };
+            let sidecar = fs::read(path.parent().unwrap().join(&repair.sidecar)).unwrap();
+            // Leading blank lines before the first garbage line stay in the
+            // log (harmless); the sidecar holds the rest byte-for-byte.
+            prop_assert!(region.ends_with(&sidecar));
+            prop_assert!(region[..region.len() - sidecar.len()].iter().all(u8::is_ascii_whitespace));
+        }
+    }
+
     /// Appending never rewrites earlier bytes (append-only, byte-level).
     #[test]
     fn append_never_mutates_existing_bytes(events in prop::collection::vec(arb_event(), 1..10)) {
