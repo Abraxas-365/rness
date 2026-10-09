@@ -381,8 +381,8 @@ def section_control(t, fp):
         time.sleep(3)
         pane = r.tmux.capture(history=200)
         bound = alive(r.pid) and not r.tmux.pane_dead() and "RNESS-EXITED" not in pane
-        t.xcheck("control: restart on stale socket path recovers (stale-socket detection)", bound,
-                 "kill -9 leaves the socket file and the next start refuses to bind", pane.strip()[-200:])
+        t.check("control: restart on stale socket path recovers (stale-socket detection)", bound,
+                pane.strip()[-200:])
         if not bound:
             r.tmux.kill()
             path.unlink()

@@ -37,6 +37,35 @@ impl Drop for ControlSocket {
         }
     }
 }
+/// A previous process killed with SIGKILL leaves its socket file behind. If
+/// `path` is a socket owned by us that refuses connections nobody is
+/// listening: remove it so the bind can succeed. A live listener, a path we
+/// cannot prove stale (timeout, permission, other errors), or anything that is
+/// not a socket is left untouched and the bind then fails as before.
+#[cfg(unix)]
+fn remove_stale_socket(path: &Path) {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    // SAFETY: geteuid has no preconditions.
+    if !meta.file_type().is_socket() || meta.uid() != unsafe { libc::geteuid() } {
+        return;
+    }
+    let probe = path.to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // A live listener with a full backlog would block connect(); bound it.
+    std::thread::spawn(move || {
+        let _ = tx.send(std::os::unix::net::UnixStream::connect(probe));
+    });
+    let refused = matches!(
+        rx.recv_timeout(Duration::from_secs(2)),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused
+    );
+    if refused {
+        let _ = std::fs::remove_file(path);
+    }
+}
 #[cfg(unix)]
 fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     let parent = path
@@ -46,8 +75,9 @@ fn bind(path: &Path) -> anyhow::Result<UnixListener> {
     if !directory.is_dir() || directory.permissions().mode() & 0o077 != 0 {
         bail!("socket directory must be private (0700)");
     }
-    let listener =
-        UnixListener::bind(path).context("bind socket; existing paths are never overwritten")?;
+    remove_stale_socket(path);
+    let listener = UnixListener::bind(path)
+        .context("bind socket; live sockets and other existing paths are never overwritten")?;
     let meta = std::fs::symlink_metadata(path)?;
     if directory.uid() != meta.uid() {
         std::fs::remove_file(path)?;
@@ -249,6 +279,27 @@ async fn response<S: AsyncRead + Unpin>(stream: &mut BufReader<S>) -> anyhow::Re
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_socket_is_replaced_but_live_sockets_and_other_files_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("control.sock");
+        // kill -9 leaves the file behind: std listeners never unlink on drop.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let live = bind(&path).expect("stale socket is replaced");
+        // Now live: a second bind must refuse and keep the first working.
+        assert!(bind(&path).is_err());
+        let client = UnixStream::connect(&path).await;
+        assert!(client.is_ok());
+        drop(live);
+        // Non-socket paths are never removed.
+        let file = dir.path().join("regular");
+        std::fs::write(&file, b"data").unwrap();
+        assert!(bind(&file).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"data");
+    }
     #[test]
     fn cli_modes() {
         crate::Cli::command().debug_assert();
