@@ -92,8 +92,9 @@ pub struct StartupConfig {
     pub sections: Vec<rness_engine::prompt::PromptSection>,
     /// `rness.terminal_title` — set the terminal window title (None = on).
     pub terminal_title: Option<bool>,
-    /// `rness.record_stream` — also store the exact timed stream of
-    /// committed model outputs in the session log (default false).
+    /// `rness.record_stream` — also store the timed stream of committed
+    /// model outputs in the session log (default false). The recording is
+    /// coalesced into chunks of at most 50 ms / 16 KiB (text byte-identical).
     pub record_stream: bool,
 }
 

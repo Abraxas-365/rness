@@ -91,7 +91,7 @@ hidden context, ever.
 **Attempt preservation:** failed / cancelled / retried attempts are kept as
 events (deepseek's `assistant/attempt`) without polluting model history,
 together with whatever streamed before they died. Committed messages store
-their result; the exact timed chunk stream behind it is recorded only with
+their result; the timed chunk stream behind it is recorded only with
 `rness.record_stream = true` (off by default: on a 12 h session it was 158 MB
 of a 722 MB log, and nothing reads it back). The recording coalesces deltas
 (50 ms / 16 KiB per chunk) and, for a committed reply, drops tool-argument

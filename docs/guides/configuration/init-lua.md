@@ -117,7 +117,7 @@ The CLI synchronizes loaded Lua tools into the engine registry before firing `re
 ## Session log size
 
 `rness.record_stream` (startup-only, default `false`) controls whether the
-exact timed stream of each committed reply is written to the session log.
+timed stream of each committed reply is written to the session log.
 Off, the reply's result is still stored in full (message content, compaction
 summary, usage, timing of the event); only the token-by-token recording is
 left out. Failed, cancelled and rejected requests always keep what streamed,

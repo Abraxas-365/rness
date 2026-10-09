@@ -109,7 +109,7 @@ impl SessionStore {
         }
     }
 
-    /// Keep the exact timed stream of committed outputs (default off).
+    /// Keep the (coalesced) timed stream of committed outputs (default off).
     pub fn set_record_stream(&self, on: bool) {
         self.record_stream
             .store(on, std::sync::atomic::Ordering::Relaxed);

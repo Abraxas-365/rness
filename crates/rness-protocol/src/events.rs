@@ -6,11 +6,11 @@
 //! generations (invariant #3).
 //!
 //! Design rules:
-//! - Committed assistant messages carry their result (`content`); the exact
-//!   timed chunk stream that produced it is kept only with
-//!   `rness.record_stream = true` (otherwise `chunks` is written as `[]`,
-//!   never omitted, so older readers still parse it). Failed/cancelled
-//!   attempts always keep what streamed.
+//! - Committed assistant messages carry their result (`content`); the timed
+//!   chunk stream that produced it (coalesced into chunks of at most
+//!   50 ms / 16 KiB) is kept only with `rness.record_stream = true`
+//!   (otherwise `chunks` is written as `[]`, never omitted, so older readers
+//!   still parse it). Failed/cancelled attempts always keep what streamed.
 //! - Failed/cancelled/retried model calls are `assistant/attempt` events —
 //!   preserved, but never part of derived model context (invariant #5).
 //! - The first line of every log is `session/header`. A forked session
@@ -568,7 +568,8 @@ pub struct AssistantMessage {
     /// calibrate the heuristic meter against `usage`'s real counts.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub estimated_input: u64,
-    /// The exact timed stream that produced `content`. Empty unless
+    /// The timed stream that produced `content`, coalesced into chunks of
+    /// at most 50 ms / 16 KiB (older logs: one per delta). Empty unless
     /// `rness.record_stream` is on (older logs always have it).
     pub chunks: Vec<TimedChunk>,
 }

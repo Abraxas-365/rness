@@ -43,8 +43,9 @@ pub struct SessionLog {
     session: SessionId,
     file: File,
     path: PathBuf,
-    /// `rness.record_stream`: keep the exact timed stream of committed
-    /// outputs. Off by default — see [`drop_committed_stream`].
+    /// `rness.record_stream`: keep the timed stream of committed outputs,
+    /// as the providers recorded it (coalesced into chunks of at most
+    /// 50 ms / 16 KiB). Off by default — see [`drop_committed_stream`].
     record_stream: bool,
 }
 
@@ -113,7 +114,7 @@ impl SessionLog {
         &self.path
     }
 
-    /// Record the exact timed stream of committed outputs too (default off).
+    /// Record the (coalesced) timed stream of committed outputs too (default off).
     pub fn set_record_stream(&mut self, on: bool) {
         self.record_stream = on;
     }
