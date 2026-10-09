@@ -14,11 +14,22 @@ use std::borrow::Cow;
 
 use ratatui::buffer::Buffer;
 
-/// Bidirectional override/embedding/isolate controls. They are not
-/// `is_control()` (category Cf) but reorder the visible text (spoofing),
-/// and terminals disagree on how to render them.
+/// Bidirectional override/embedding/isolate controls and the implicit
+/// marks (LRM, RLM, ALM). They are not `is_control()` (category Cf) but
+/// reorder the visible text (spoofing), and terminals disagree on how to
+/// render them. All are zero-width, so dropping them keeps caret math.
 fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    matches!(
+        c,
+        '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'
+    )
+}
+
+/// LINE / PARAGRAPH SEPARATOR: line breaks to Unicode, a 1-column glyph
+/// (or nothing) to a terminal. The sanitizers turn them into `\n`
+/// (multi-line) or a space (single line).
+fn is_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 /// A character that must never reach a terminal cell: controls (C0, DEL,
@@ -109,6 +120,10 @@ impl Sanitizer {
             '\u{1b}' => self.escape = 1,
             // C1 CSI: 8-bit `ESC [`; its parameters and final byte go too.
             '\u{9b}' => self.escape = 2,
+            c if is_line_separator(c) => {
+                out.push(' ');
+                self.col += 1;
+            }
             '\t' if self.keep_tabs => out.push('\t'),
             '\t' => {
                 let next = (self.col / 8 + 1) * 8;
@@ -141,7 +156,9 @@ pub fn sanitize(line: &str) -> String {
 
 /// Byte-level fast check: does `text` contain any character that
 /// [`sanitize_text`] would change? Controls other than `\n` (C0, DEL), C1
-/// (UTF-8 `C2 80..9F`) and bidi controls (`E2 80 AA..AE`, `E2 81 A6..A9`).
+/// (UTF-8 `C2 80..9F`), bidi controls (`E2 80 AA..AE`, `E2 81 A6..A9`,
+/// LRM/RLM `E2 80 8E..8F`, ALM `D8 9C`) and line/paragraph separators
+/// (`E2 80 A8..A9`).
 /// No char decoding, so clean text costs one pass over the bytes.
 fn needs_sanitizing(text: &str) -> bool {
     needs_sanitizing_except(text, b'\n')
@@ -159,16 +176,17 @@ fn needs_sanitizing_except(text: &str, allowed: u8) -> bool {
         b if b == allowed => false,
         0x00..=0x1f | 0x7f => true,
         0xc2 => matches!(bytes.get(i + 1), Some(0x80..=0x9f)),
+        0xd8 => bytes.get(i + 1) == Some(&0x9c),
         0xe2 => matches!(
             (bytes.get(i + 1), bytes.get(i + 2)),
-            (Some(0x80), Some(0xaa..=0xae)) | (Some(0x81), Some(0xa6..=0xa9))
+            (Some(0x80), Some(0x8e..=0x8f | 0xa8..=0xae)) | (Some(0x81), Some(0xa6..=0xa9))
         ),
         _ => false,
     })
 }
 
-/// Multi-line [`sanitize`]: keeps `\n`, turns `\r\n` and a lone `\r` into
-/// `\n` (CommonMark line endings), restarts tab columns per line and ends
+/// Multi-line [`sanitize`]: keeps `\n`, turns `\r\n`, a lone `\r` and
+/// U+2028/U+2029 into `\n` (CommonMark line endings), restarts tab columns per line and ends
 /// any unterminated escape at the line break. Borrows when the text is
 /// already clean (the common case; no allocation).
 pub fn sanitize_text(text: &str) -> Cow<'_, str> {
@@ -219,7 +237,7 @@ fn sanitize_lines(text: &str, mut state: Sanitizer) -> Cow<'_, str> {
                 state.newline();
                 out.push('\n');
             }
-            '\n' => {
+            '\n' | '\u{2028}' | '\u{2029}' => {
                 state.newline();
                 out.push('\n');
             }
@@ -237,8 +255,18 @@ fn sanitize_lines(text: &str, mut state: Sanitizer) -> Cow<'_, str> {
 /// terminal, at most its printable payload does.
 pub fn scrub_buffer(buf: &mut Buffer) {
     for cell in buf.content.iter_mut() {
-        if cell.symbol().chars().any(is_unsafe) {
-            let clean: String = cell.symbol().chars().filter(|c| !is_unsafe(*c)).collect();
+        if cell
+            .symbol()
+            .chars()
+            .any(|c| is_unsafe(c) || is_line_separator(c))
+        {
+            // A line separator is one cell wide: it becomes a space.
+            let clean: String = cell
+                .symbol()
+                .chars()
+                .filter(|c| !is_unsafe(*c))
+                .map(|c| if is_line_separator(c) { ' ' } else { c })
+                .collect();
             cell.set_symbol(if clean.is_empty() { " " } else { &clean });
         }
     }
@@ -317,6 +345,17 @@ mod tests {
     }
 
     #[test]
+    fn line_and_paragraph_separators_break_lines() {
+        assert_eq!(clean("a\u{2028}b\u{2029}c"), "a\nb\nc");
+        assert_eq!(sanitize_markdown("a\u{2028}\tb"), "a\n\tb");
+        // Tab columns restart and an open escape ends, as at `\n`.
+        assert_eq!(clean("1234\u{2028}\tx"), "1234\n        x");
+        assert_eq!(clean("a\x1b]0;t\u{2029}b"), "a\nb");
+        // A single line has nowhere to break: a space keeps words apart.
+        assert_eq!(sanitize("a\u{2028}b\u{2029}\tc"), "a b     c");
+    }
+
+    #[test]
     fn tabs_expand_per_line_with_wide_chars() {
         assert_eq!(clean("\tx"), "        x");
         assert_eq!(clean("1234567\tx"), "1234567 x");
@@ -329,6 +368,9 @@ mod tests {
     fn bidi_overrides_are_removed() {
         assert_eq!(clean("a\u{202e}desrever\u{202c}b"), "adesreverb");
         assert_eq!(clean("\u{2066}iso\u{2069}"), "iso");
+        // Implicit direction marks (LRM, RLM, ALM) are spoofing tools too.
+        assert_eq!(clean("a\u{200e}b\u{200f}c\u{61c}d"), "abcd");
+        assert_eq!(sanitize("\u{200f}x\u{61c}"), "x");
         // Joiners and combining marks are legitimate text.
         assert_eq!(clean("👨\u{200d}👩 e\u{301}"), "👨\u{200d}👩 e\u{301}");
     }
@@ -345,15 +387,16 @@ mod tests {
     fn byte_fast_path_matches_char_predicate() {
         for c in (0u32..0x3000).filter_map(char::from_u32) {
             let text = format!("x{c}y");
+            let changes = is_unsafe(c) || is_line_separator(c);
             assert_eq!(
                 needs_sanitizing(&text),
-                c != '\n' && is_unsafe(c),
+                c != '\n' && changes,
                 "U+{:04X}",
                 c as u32
             );
             assert_eq!(
                 needs_sanitizing_markdown(&text),
-                c != '\n' && c != '\t' && is_unsafe(c),
+                c != '\n' && c != '\t' && changes,
                 "U+{:04X}",
                 c as u32
             );
@@ -389,7 +432,7 @@ mod tests {
         // Deterministic pseudo-random strings (xorshift) over a hostile alphabet.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let alphabet: Vec<char> =
-            "\x1b[]0;?\x07\\\r\n\t\x08\x00ab漢 \u{9b}\u{9c}\u{85}\u{202e}mPX(#B"
+            "\x1b[]0;?\x07\\\r\n\t\x08\x00ab漢 \u{9b}\u{9c}\u{85}\u{202e}\u{200f}\u{2028}mPX(#B"
                 .chars()
                 .collect();
         for _ in 0..2000 {
@@ -406,12 +449,17 @@ mod tests {
             }
             let once = clean(&text);
             assert!(
-                once.chars().all(|c| c == '\n' || !is_unsafe(c)),
+                once.chars()
+                    .all(|c| c == '\n' || !(is_unsafe(c) || is_line_separator(c))),
                 "{text:?} -> {once:?}"
             );
             assert_eq!(clean(&once), once, "{text:?}");
             let line = sanitize(&text);
-            assert!(line.chars().all(|c| !is_unsafe(c)), "{text:?} -> {line:?}");
+            assert!(
+                line.chars()
+                    .all(|c| !(is_unsafe(c) || is_line_separator(c))),
+                "{text:?} -> {line:?}"
+            );
             let markdown = sanitize_markdown(&text);
             assert!(
                 markdown
@@ -431,9 +479,9 @@ mod tests {
         buf[(0, 0)].set_symbol("\x1b");
         buf[(1, 0)].set_symbol("a\u{202e}");
         buf[(2, 0)].set_symbol("\t");
-        buf[(3, 0)].set_symbol("b");
+        buf[(3, 0)].set_symbol("\u{2028}");
         scrub_buffer(&mut buf);
         let symbols: Vec<&str> = buf.content.iter().map(|c| c.symbol()).collect();
-        assert_eq!(symbols, vec![" ", "a", " ", "b"]);
+        assert_eq!(symbols, vec![" ", "a", " ", " "]);
     }
 }

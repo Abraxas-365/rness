@@ -47,7 +47,8 @@ invariant without an ADR in `docs/decisions/`.
     dependency direction.
 13. **No control character reaches the terminal from content.** Model,
     tool, sub-agent and plugin text is display-sanitized in `rness-tui`
-    (`core::terminal_text`): escape sequences (CSI/OSC/DCS…) are dropped
-    whole, other controls and bidi overrides are removed, tabs expand to
-    8-column stops, `\r` becomes a line break. `App::render` scrubs the final
+    (`core::terminal_text`): escape sequences (CSI incl. C1 `\x9b`,
+    OSC/DCS…, `ESC ( B`-style) are dropped whole, other controls, bidi
+    overrides and LRM/RLM/ALM are removed, tabs expand to 8-column stops
+    (in markdown after parsing), `\r` and U+2028/U+2029 become line breaks. `App::render` scrubs the final
     buffer as a guard. The session log keeps the raw text.
