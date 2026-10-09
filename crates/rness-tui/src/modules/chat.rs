@@ -1606,18 +1606,43 @@ impl Component for Chat {
                         self.row_ends.clone(),
                     )
                 });
-            let relayout_start = relayout.then(|| {
+            let relayout_window = relayout.then(|| {
+                let height = usize::from(area.height);
                 let start = rescale_rows(
                     &mut self.row_ends,
                     &mut self.card_rows,
                     &self.cached_calls,
                     self.cache_width,
                     width,
-                    ctx.model
-                        .scroll_from_bottom
-                        .saturating_add(2 * usize::from(area.height)),
+                    ctx.model.scroll_from_bottom.saturating_add(2 * height),
                 );
-                // Rows above the window are estimates until refilled; all
+                // A scrolled view is placed by its anchor (see the anchor
+                // block below), not by the offset from the bottom, so lay
+                // out ±2 screens around the anchor instead of everything
+                // between it and the bottom (O(scroll) at the top of a long
+                // session).
+                let anchored = (ctx.model.scroll_from_bottom != 0
+                    && self.last_scroll != 0
+                    && self.live_scroll_anchor.is_none())
+                .then_some(self.scroll_anchor.as_ref())
+                .flatten()
+                .and_then(|(id, row)| {
+                    let index = *self.cached_positions.get(id)?;
+                    Some(index.checked_sub(1).map_or(0, |i| self.row_ends[i]) + row)
+                });
+                let (start, end) = match anchored {
+                    Some(row) => (
+                        self.row_ends
+                            .partition_point(|end| *end <= row.saturating_sub(2 * height)),
+                        (self
+                            .row_ends
+                            .partition_point(|end| *end < row.saturating_add(3 * height))
+                            + 1)
+                        .min(self.row_ends.len()),
+                    ),
+                    None => (start, self.row_ends.len()),
+                };
+                // Rows outside the window are estimates until refilled; all
                 // cached rows are for the old width.
                 for cached in &mut self.entry_cache {
                     if !cached.1.is_empty() || !cached.2.is_empty() {
@@ -1627,11 +1652,13 @@ impl Component for Chat {
                 self.resident_bytes.clear();
                 self.retained_bytes = 0;
                 self.evicted.clear();
-                self.evicted.extend(0..start);
-                self.stale = (0..start).collect();
+                self.evicted
+                    .extend((0..start).chain(end..self.row_ends.len()));
+                self.stale = (0..start).chain(end..self.row_ends.len()).collect();
                 self.cache_width = width;
-                start
+                (start, end)
             });
+            let relayout_start = relayout_window.map(|(start, _)| start);
             if !relayout
                 && (self.cache_width != width
                     || self.cache_theme.as_ref() != Some(theme)
@@ -1770,8 +1797,10 @@ impl Component for Chat {
                     }
                 }
                 indices
+            } else if let Some((start, end)) = relayout_window {
+                (start..end).collect()
             } else {
-                (relayout_start.unwrap_or(start_entry)..ctx.model.entries.len()).collect()
+                (start_entry..ctx.model.entries.len()).collect()
             };
             indices.extend(self.refill.iter().copied());
             // Everything but background (progressive) refills must be laid
@@ -4554,6 +4583,30 @@ mod tests {
         model.scroll_from_bottom = usize::MAX;
         let top = render(&mut chat, &model, Rect::new(0, 0, 45, 12));
         assert_eq!(top, exact(&model, Rect::new(0, 0, 45, 12)).1);
+        // Resized while scrolled far up: only the window around the scroll
+        // anchor is laid out (not everything between it and the bottom), the
+        // frame is exact, and refill converging around it does not move it.
+        let narrow = Rect::new(0, 0, 45, 12);
+        drain(&mut chat, &model, narrow);
+        model.scroll_from_bottom = chat.total_rows - 300;
+        render(&mut chat, &model, narrow);
+        render(&mut chat, &model, narrow);
+        let before = chat.entry_visits;
+        let resized = render(&mut chat, &model, wide);
+        assert!(
+            chat.entry_visits - before < 100,
+            "{}",
+            chat.entry_visits - before
+        );
+        assert!(
+            chat.stale.iter().any(|&index| index > 2000),
+            "below-window rows left as estimates"
+        );
+        drain(&mut chat, &model, wide);
+        assert_eq!(render(&mut chat, &model, wide), resized);
+        let (reference, _) = exact(&model, wide);
+        assert_eq!(chat.row_ends, reference.row_ends);
+        assert_eq!(chat.card_rows, reference.card_rows);
     }
 
     #[test]
