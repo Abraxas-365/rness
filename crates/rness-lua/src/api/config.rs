@@ -1,5 +1,6 @@
 //! Startup-only declarations. Evaluated before any provider is constructed.
-use mlua::{Lua, LuaSerdeExt, Table};
+use crate::json_guard::LuaJsonExt;
+use mlua::{Lua, Table};
 use rness_engine::config::{ModelDeclaration, ModelRegistry, Profile};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -190,6 +191,22 @@ mod permission_tests {
         std::fs::write(&path, "rness.web = {search={provider='brave'}}").unwrap();
         let startup = super::load(&path).unwrap();
         assert!(serde_json::from_value::<rness_tools::web::Config>(startup.web.unwrap()).is_err());
+    }
+    #[test]
+    fn deep_or_cyclic_config_tables_error_without_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        for (src, needle) in [
+            (
+                "local t = {} local c = t for i = 1, 100000 do c.n = {} c = c.n end rness.web = t",
+                "nesting exceeds 128",
+            ),
+            ("local t = {} t.self = t rness.web = t", "recursive table"),
+        ] {
+            std::fs::write(&path, src).unwrap();
+            let error = super::load(&path).err().expect("must fail").to_string();
+            assert!(error.contains(needle), "{error}");
+        }
     }
     #[test]
     fn boundary_compaction_requires_explicit_valid_route_budgets() {
@@ -841,7 +858,7 @@ pub fn evaluate(
         "register",
         lua.create_function(move |lua, (name, spec): (String, Table)| {
             crate::loader::validate_name(&name).map_err(mlua::Error::runtime)?;
-            let value = lua.from_value(mlua::Value::Table(spec))?;
+            let value = lua.from_value_guarded(mlua::Value::Table(spec))?;
             let mut config = registered.lock().unwrap();
             if name == "default" || config.colorschemes.contains_key(&name) {
                 return Err(mlua::Error::runtime("duplicate colorscheme"));
@@ -871,7 +888,7 @@ pub fn evaluate(
         "enable",
         lua.create_function(move |lua, options: Option<Table>| {
             let mut config: QuestionOverlayConfig = match options {
-                Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                Some(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                 None => Default::default(),
             };
             config.validate().map_err(mlua::Error::runtime)?;
@@ -888,7 +905,7 @@ pub fn evaluate(
         "set",
         lua.create_function(move |lua, value: Table| {
             let rules: BTreeMap<String, rness_engine::approval::ToolPolicy> =
-                lua.from_value(mlua::Value::Table(value))?;
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             if rules
                 .keys()
                 .any(|name| name.is_empty() || name.trim() != name || name.contains('*'))
@@ -1003,13 +1020,13 @@ pub fn evaluate(
                 }
                 let opts = match spec.get::<mlua::Value>("opts")? {
                     mlua::Value::Nil => serde_json::json!({}),
-                    mlua::Value::Table(table) => lua.from_value(mlua::Value::Table(table))?,
+                    mlua::Value::Table(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                     _ => return Err(mlua::Error::runtime("plugin opts must be a table")),
                 };
                 let keys = match spec.get::<mlua::Value>("keys")? {
                     mlua::Value::Nil => serde_json::json!({}),
                     mlua::Value::Boolean(false) => serde_json::Value::Bool(false),
-                    mlua::Value::Table(table) => lua.from_value(mlua::Value::Table(table))?,
+                    mlua::Value::Table(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                     _ => return Err(mlua::Error::runtime("plugin keys must be a table or false")),
                 };
                 let source = if let Some(file) = file {
@@ -1076,7 +1093,8 @@ pub fn evaluate(
     models.set(
         "declare",
         lua.create_function(move |lua, value: Table| {
-            let declaration: ModelDeclaration = lua.from_value(mlua::Value::Table(value))?;
+            let declaration: ModelDeclaration =
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             s.lock()
                 .unwrap()
                 .models
@@ -1090,7 +1108,7 @@ pub fn evaluate(
     profiles.set(
         "declare",
         lua.create_function(move |lua, (name, value): (String, Table)| {
-            let profile: Profile = lua.from_value(mlua::Value::Table(value))?;
+            let profile: Profile = lua.from_value_guarded(mlua::Value::Table(value))?;
             s.lock()
                 .unwrap()
                 .models
@@ -1105,7 +1123,7 @@ pub fn evaluate(
         "setup",
         lua.create_function(move |lua, value: Table| {
             let config: rness_engine::sandbox::SandboxConfig =
-                lua.from_value(mlua::Value::Table(value))?;
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             config.process.validate().map_err(mlua::Error::runtime)?;
             let mut state = s.lock().unwrap();
             if state.sandbox_configured {
@@ -1178,7 +1196,8 @@ pub fn evaluate(
     providers.set(
         "register",
         lua.create_function(move |lua, (name, value): (String, Table)| {
-            let declaration: ProviderDeclaration = lua.from_value(mlua::Value::Table(value))?;
+            let declaration: ProviderDeclaration =
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             if name.is_empty() || name.contains('/') {
                 return Err(mlua::Error::runtime("invalid provider name"));
             }
@@ -1201,7 +1220,7 @@ pub fn evaluate(
         "declare",
         lua.create_function(move |lua, (name, value): (String, Table)| {
             let definition: rness_engine::config::AgentDefinition =
-                lua.from_value(mlua::Value::Table(value))?;
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             if name.trim().is_empty()
                 || definition.description.trim().is_empty()
                 || definition.instructions.trim().is_empty()
@@ -1229,7 +1248,8 @@ pub fn evaluate(
             }
             let mut mappings = Vec::new();
             for entry in entries.clone().sequence_values::<Table>() {
-                let mut mapping: UserMapping = lua.from_value(mlua::Value::Table(entry?))?;
+                let mut mapping: UserMapping =
+                    lua.from_value_guarded(mlua::Value::Table(entry?))?;
                 if !matches!(
                     mapping.scope.as_str(),
                     "global" | "promptbox" | "messagebox"
@@ -1264,7 +1284,7 @@ pub fn evaluate(
         "section",
         lua.create_function(move |lua, value: Table| {
             let section: rness_engine::prompt::PromptSection =
-                lua.from_value(mlua::Value::Table(value))?;
+                lua.from_value_guarded(mlua::Value::Table(value))?;
             let text = section.text.trim();
             if section.name.trim().is_empty() || text.is_empty() {
                 return Err(mlua::Error::runtime(
@@ -1323,7 +1343,7 @@ pub fn evaluate(
         })?,
     )?;
     if let Some(lsp) = rness.get::<Option<Table>>("lsp")? {
-        state.lock().unwrap().lsp = Some(lua.from_value(mlua::Value::Table(lsp))?);
+        state.lock().unwrap().lsp = Some(lua.from_value_guarded(mlua::Value::Table(lsp))?);
     }
     if let Some(web) = rness.get::<Option<Table>>("web")? {
         let data = lua.create_table()?;
@@ -1349,14 +1369,15 @@ pub fn evaluate(
                 data.set(key, value)?;
             }
         }
-        state.lock().unwrap().web = Some(lua.from_value(mlua::Value::Table(data))?);
+        state.lock().unwrap().web = Some(lua.from_value_guarded(mlua::Value::Table(data))?);
     }
     if let Some(exposure) = rness.get::<Option<Table>>("tool_exposure")? {
-        state.lock().unwrap().tool_exposure = lua.from_value(mlua::Value::Table(exposure))?;
+        state.lock().unwrap().tool_exposure =
+            lua.from_value_guarded(mlua::Value::Table(exposure))?;
     }
     if let Some(policies) = rness.get::<Option<Table>>("compaction")? {
         let policies: BTreeMap<String, rness_engine::turn::compaction::Policy> =
-            lua.from_value(mlua::Value::Table(policies))?;
+            lua.from_value_guarded(mlua::Value::Table(policies))?;
         for (route, policy) in &policies {
             if route != "default"
                 && !route
@@ -1371,7 +1392,7 @@ pub fn evaluate(
     }
     if let Some(images) = rness.get::<Option<Table>>("images")? {
         let policy: rness_engine::images::ImagePolicy =
-            lua.from_value(mlua::Value::Table(images))?;
+            lua.from_value_guarded(mlua::Value::Table(images))?;
         policy.validate().map_err(std::io::Error::other)?;
         state.lock().unwrap().images = policy;
     }
@@ -1388,7 +1409,7 @@ pub fn evaluate(
             cleaned.set(key, value)?;
         }
         let config: crate::runtime::ImageReaderConfig =
-            lua.from_value(mlua::Value::Table(cleaned))?;
+            lua.from_value_guarded(mlua::Value::Table(cleaned))?;
         config.validate().map_err(std::io::Error::other)?;
         state.lock().unwrap().image_reader = config;
     }
@@ -1435,7 +1456,7 @@ pub fn evaluate(
                 data.set(key, value)?;
             }
         }
-        let value: serde_json::Value = lua.from_value(mlua::Value::Table(data))?;
+        let value: serde_json::Value = lua.from_value_guarded(mlua::Value::Table(data))?;
         validate_messagebox(&value, "ui.messagebox", "root")?;
         state.lock().unwrap().messagebox = value;
     }
@@ -1443,7 +1464,7 @@ pub fn evaluate(
         .get::<Table>("ui")?
         .get::<Option<Table>>("promptbox")?
     {
-        let value: serde_json::Value = lua.from_value(mlua::Value::Table(promptbox))?;
+        let value: serde_json::Value = lua.from_value_guarded(mlua::Value::Table(promptbox))?;
         let valid_keys = |field: &serde_json::Value, names: &[&str]| {
             field.as_object().is_some_and(|keys| {
                 keys.iter().all(|(key, chord)| {
@@ -1528,7 +1549,7 @@ pub fn evaluate(
     let mut config = state.lock().unwrap().clone();
     if let Some(jobs) = rness.get::<Table>("jobs")?.get::<Option<Table>>("config")? {
         if let Some(retention) = jobs.get::<Option<Table>>("retention")? {
-            config.job_retention = lua.from_value(mlua::Value::Table(retention))?;
+            config.job_retention = lua.from_value_guarded(mlua::Value::Table(retention))?;
             config.job_retention.validate()?;
         }
     }
@@ -1601,7 +1622,7 @@ pub fn evaluate(
         mlua::Value::Nil => {}
         mlua::Value::Table(table) => {
             config.terminal = lua
-                .from_value(mlua::Value::Table(table))
+                .from_value_guarded(mlua::Value::Table(table))
                 .map_err(|e| format!("rness.terminal: {e}"))?;
             config.terminal.validate()?;
         }

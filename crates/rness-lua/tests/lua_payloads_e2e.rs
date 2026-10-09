@@ -52,6 +52,18 @@ async fn tool_return_values_are_survivable() {
         ("error_table", "error({code = 1})"),
         ("error_nil", "error(nil)"),
         ("huge_string_8mb", "return string.rep('x', 8 * 1024 * 1024)"),
+        (
+            "depth_129",
+            "local t = {} local c = t for i = 2, 129 do c.n = {} c = c.n end return t",
+        ),
+        (
+            "depth_128",
+            "local t = {} local c = t for i = 2, 128 do c.n = {} c = c.n end return t",
+        ),
+        (
+            "cyclic_deep",
+            "local a, b = {}, {} a.b = b b.a = a return {a}",
+        ),
     ];
     let mut out = Vec::new();
     for (label, body) in cases {
@@ -79,6 +91,19 @@ async fn tool_return_values_are_survivable() {
             serde_json::from_str::<serde_json::Value>(&s).is_ok(),
             "tool output is not JSON: {s}"
         );
+    }
+    // Nesting beyond the 128-level limit and cycles are tool errors that
+    // name the cause; 128 levels still encode.
+    match get("depth_129") {
+        Err(e) => assert!(e.contains("nesting exceeds 128"), "{e}"),
+        Ok(s) => panic!("depth 129 encoded: {}", s.len()),
+    }
+    assert!(get("depth_128").is_ok(), "{:?}", get("depth_128"));
+    for label in ["cyclic", "cyclic_deep"] {
+        match get(label) {
+            Err(e) => assert!(e.contains("recursive table"), "{label}: {e}"),
+            Ok(s) => panic!("{label} encoded: {s}"),
+        }
     }
     // An error table must give the model something readable.
     match get("error_table") {
@@ -121,6 +146,85 @@ async fn hook_payload_edge_cases() {
         7,
         "some hook payloads were dropped: {seen}"
     );
+
+    // Interception handlers returning too-deep or cyclic tables: the
+    // chain fails with the existing error path; the VM stays alive.
+    for (label, ret) in [
+        (
+            "depth_129",
+            "local t = {} local c = t for i = 2, 129 do c.n = {} c = c.n end return t",
+        ),
+        (
+            "depth_100000",
+            "local t = {} local c = t for i = 2, 100000 do c.n = {} c = c.n end return t",
+        ),
+        ("cyclic", "local t = {} t.self = t return t"),
+    ] {
+        host.reload(vec![rness_lua::loader::PluginSource {
+            name: "i".into(),
+            source: format!("rness.hook.on('pre_step', function(ev, next) {ret} end)"),
+            dependencies: vec![],
+        }])
+        .await
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let r = tokio::time::timeout(
+            T,
+            host.intercept("pre_step", json!({"session": "s"}), json!(null), &cancel),
+        )
+        .await
+        .expect("intercept bounded");
+        println!(
+            "{}",
+            json!({"case": "intercept_return", "label": label, "result": format!("{r:?}")})
+        );
+        let e = r.expect_err(label);
+        assert!(
+            e.contains("nesting exceeds 128") || e.contains("recursive table"),
+            "{label}: {e}"
+        );
+        assert!(alive(&host).await, "{label}: VM died");
+    }
+}
+
+/// Too-deep / cyclic tables returned from interception hooks and passed
+/// to `rness.json.encode` under `pcall` are ordinary Lua errors.
+#[tokio::test(flavor = "multi_thread")]
+async fn deep_and_cyclic_tables_are_catchable_errors() {
+    let host = LuaHost::spawn().unwrap();
+    host.load(
+        "j",
+        "local function deep(n) local t = {} local c = t for i = 2, n do c.n = {} c = c.n end return t end\n\
+         rness.tool.register{name='enc', run=function()\n\
+           local out = {}\n\
+           for _, n in ipairs({128, 129, 5000, 100000}) do\n\
+             local ok, r = pcall(rness.json.encode, deep(n))\n\
+             out[#out+1] = n .. '=' .. tostring(ok) .. ':' .. (ok and #r or tostring(r):match('nesting exceeds %d+') or tostring(r))\n\
+           end\n\
+           local cyc = {} cyc.self = cyc\n\
+           local ok, r = pcall(rness.json.encode, cyc)\n\
+           out[#out+1] = 'cyclic=' .. tostring(ok) .. ':' .. tostring(tostring(r):match('recursive table') )\n\
+           return table.concat(out, ',')\n\
+         end}",
+    )
+    .await
+    .unwrap();
+    let out = tokio::time::timeout(T, host.call_tool("enc", json!({})))
+        .await
+        .unwrap()
+        .unwrap();
+    println!("{}", json!({"case": "json_encode_depth", "out": out}));
+    let parts: Vec<&str> = out.split(',').collect();
+    assert!(parts[0].starts_with("128=true:"), "{out}");
+    for (i, n) in [129, 5000, 100000].iter().enumerate() {
+        assert_eq!(
+            parts[i + 1],
+            format!("{n}=false:nesting exceeds 128"),
+            "{out}"
+        );
+    }
+    assert_eq!(parts[4], "cyclic=false:recursive table", "{out}");
+    assert!(alive(&host).await);
 }
 
 /// Statusline / card return values of the wrong type.
@@ -350,13 +454,12 @@ async fn process_output_cap_and_timeout() {
     assert!(slow_ms < 3000, "timeout_ms ignored: {slow_ms} ms");
 }
 
-/// A deeply nested table returned from a tool overflows the lua-vm thread's
-/// stack inside serde conversion (`lua_display` -> `from_value`,
-/// runtime.rs:3699) and ABORTS THE PROCESS. `#[ignore]`: it kills the test
-/// binary; run alone:
-///   RNESS_BENCH_DEPTH=10000 cargo test -p rness-lua --test lua_payloads_e2e -- --ignored deep_nested_tool_result
+/// A deeply nested table returned from a tool used to overflow the lua-vm
+/// thread's stack inside serde conversion and abort the process (B3-8).
+/// The json_guard depth walk now turns it into a tool error. Depth via
+/// RNESS_BENCH_DEPTH (default 10000):
+///   RNESS_BENCH_DEPTH=100000 cargo test -p rness-lua --test lua_payloads_e2e deep_nested_tool_result
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
 async fn deep_nested_tool_result_does_not_abort() {
     let depth: usize = std::env::var("RNESS_BENCH_DEPTH")
         .ok()
@@ -372,5 +475,9 @@ async fn deep_nested_tool_result_does_not_abort() {
         "{}",
         json!({"case": "deep_nesting", "depth": depth, "ok": r.is_ok()})
     );
+    match &r {
+        Err(e) => assert!(e.contains("nesting exceeds 128"), "{e}"),
+        Ok(s) => assert!(depth <= 128, "depth {depth} encoded: {}", s.len()),
+    }
     assert!(alive(&host).await);
 }

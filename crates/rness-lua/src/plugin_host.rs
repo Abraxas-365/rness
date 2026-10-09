@@ -838,6 +838,7 @@ impl rness_engine::presentation::ToolCards for LuaHost {
 
 use std::sync::mpsc;
 
+use crate::json_guard::LuaJsonExt;
 use crate::runtime::{AppKeyOutcome, LuaAppSpec, LuaRuntime, LuaToolSpec};
 
 /// The engine services `rness.session` bridges to. Kept by the actor so
@@ -1324,6 +1325,9 @@ impl LuaHost {
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::Builder::new()
             .name("lua-vm".into())
+            // Defense in depth: deep recursion in native code (serde, Lua C
+            // API) must not abort the process; json_guard caps depth first.
+            .stack_size(16 << 20)
             .spawn(move || {
                 let mut rt = match LuaRuntime::new() {
                     Ok(mut rt) => {
@@ -1383,7 +1387,6 @@ impl LuaHost {
                             let _ = reply.send(result);
                         }
                         Cmd::Command { name, context, permit, cancel, reply } => {
-                            use mlua::LuaSerdeExt;
                             let thread = match rt.command_thread(&name) {
                                 Ok(thread) => thread,
                                 Err(error) => { let _ = reply.send(Err(error)); continue; }
@@ -1391,7 +1394,7 @@ impl LuaHost {
                             let id = next_command_id;
                             next_command_id = next_command_id.checked_add(1).expect("command ID exhausted");
                             let mut command = PendingCommand { thread, permit, cancel, reply };
-                            let step = rt.lua().to_value(&context).map_err(|e| e.to_string()).and_then(|args|
+                            let step = rt.lua().json_to_lua(&context).map_err(|e| e.to_string()).and_then(|args|
                                 rt.resume_command(&mut command.thread, args, command.permit.clone(), &command.cancel));
                             command_step(id, command, step, &mut pending_commands,
                                 session_binding.as_ref().map(|b| &b.rt), &command_tx);
@@ -1400,8 +1403,7 @@ impl LuaHost {
                             let Some(mut command) = pending_commands.remove(&id) else { continue; };
                             let step = match result {
                                 Ok(value) => {
-                                    use mlua::LuaSerdeExt;
-                                    let lua_val = rt.lua().to_value(&value);
+                                    let lua_val = rt.lua().json_to_lua(&value);
                                     match lua_val {
                                         Ok(v) => rt.resume_command(&mut command.thread, (true, v), command.permit.clone(), &command.cancel),
                                         Err(e) => rt.resume_command(&mut command.thread, (false, e.to_string()), command.permit.clone(), &command.cancel),
@@ -1541,7 +1543,6 @@ impl LuaHost {
                             pending_executes.remove(&id);
                         }
                         Cmd::WebTransform { operation, phase, value, context, cancel, reply } => {
-                            use mlua::LuaSerdeExt;
                             let token = cancel.clone();
                             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                             rt.lua().set_app_data(cancel.clone());
@@ -1551,34 +1552,32 @@ impl LuaHost {
                             let result = (|| -> mlua::Result<serde_json::Value> {
                                 if cancel.is_cancelled() || reply.is_closed() { return Err(mlua::Error::runtime("web hook cancelled")); }
                                 let Some(callback) = rt.web_hook(&operation, &phase)? else { return Ok(value); };
-                                let returned: mlua::Value = callback.call((rt.lua().to_value(&value)?, rt.lua().to_value(&context)?))?;
+                                let returned: mlua::Value = callback.call((rt.lua().json_to_lua(&value)?, rt.lua().json_to_lua(&context)?))?;
                                 if !matches!(returned, mlua::Value::Table(_)) { return Err(mlua::Error::runtime("web hook must return a table")); }
-                                rt.lua().from_value(returned)
+                                rt.lua().from_value_guarded(returned)
                             })().map_err(|e| format!("web.{operation}.{phase}: {e}"));
                             rt.lua().remove_hook();
                             rt.lua().remove_app_data::<tokio_util::sync::CancellationToken>();
                             let _ = reply.send(result);
                         }
                         Cmd::CallTool { name, args, context, cancel, reply } => {
-                            use mlua::LuaSerdeExt;
                             let mut thread = match rt.tool_thread(&name) {
                                 Ok(thread) => thread,
                                 Err(error) => { let _ = reply.send(Err(error)); continue; }
                             };
                             let id = next_tool_id;
                             next_tool_id = next_tool_id.checked_add(1).expect("tool ID exhausted");
-                            let step = rt.lua().to_value(&args).and_then(|args|
-                                Ok((args, rt.lua().to_value(&context)?))).map_err(|e| e.to_string())
+                            let step = rt.lua().json_to_lua(&args).and_then(|args|
+                                Ok((args, rt.lua().json_to_lua(&context)?))).map_err(|e| e.to_string())
                                 .and_then(|args| rt.resume_tool(&mut thread, args, &cancel));
                             tool_step(id, PendingTool { thread, cancel, reply }, step, &mut pending_tools,
                                 session_binding.as_ref().map(|b| &b.rt), &command_tx);
                         }
                         Cmd::ResumeTool { id, result } => {
-                            use mlua::LuaSerdeExt;
                             let Some(mut tool) = pending_tools.remove(&id) else { continue; };
                             if tool.reply.is_closed() { continue; }
                             let step = match result {
-                                Ok(value) => rt.lua().to_value(&value).map_err(|e| e.to_string())
+                                Ok(value) => rt.lua().json_to_lua(&value).map_err(|e| e.to_string())
                                     .and_then(|value| rt.resume_tool(&mut tool.thread, (true, value), &tool.cancel)),
                                 Err(error) => rt.resume_tool(&mut tool.thread, (false, error), &tool.cancel),
                             };

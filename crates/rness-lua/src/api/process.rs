@@ -1,4 +1,5 @@
 //! Explicit external programs, isolated in a Unix process group.
+use crate::json_guard::LuaJsonExt;
 use mlua::{Lua, LuaSerdeExt, Table};
 use serde::Deserialize;
 
@@ -17,7 +18,7 @@ pub fn install(lua: &Lua, rness: &Table) -> mlua::Result<()> {
     process.set(
         "run",
         lua.create_function(|lua, spec: Table| {
-            let spec: Spec = lua.from_value(mlua::Value::Table(spec))?;
+            let spec: Spec = lua.from_value_guarded(mlua::Value::Table(spec))?;
             if spec.program.is_empty() || spec.timeout_ms == Some(0) {
                 return Err(mlua::Error::runtime(
                     "program must be nonempty and timeout_ms must be positive",

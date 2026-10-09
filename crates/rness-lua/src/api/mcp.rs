@@ -32,7 +32,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mlua::{Lua, LuaSerdeExt, Table};
+use crate::json_guard::LuaJsonExt;
+use mlua::{Lua, Table};
 use rness_engine::tools::ToolRegistry;
 use rness_mcp::{McpConnection, StdioServer};
 
@@ -188,12 +189,12 @@ pub fn install(
         lua.create_function(move |lua, spec: Table| {
             let policy: rness_mcp::reconnect::ReconnectPolicy =
                 match spec.get::<Option<Table>>("reconnect")? {
-                    Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                    Some(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                     None => Default::default(),
                 };
             policy.validate().map_err(err)?;
             let sse: rness_mcp::http::SsePolicy = match spec.get::<Option<Table>>("sse")? {
-                Some(table) => lua.from_value(mlua::Value::Table(table))?,
+                Some(table) => lua.from_value_guarded(mlua::Value::Table(table))?,
                 None => Default::default(),
             };
             sse.validate().map_err(err)?;

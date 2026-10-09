@@ -226,8 +226,8 @@ pub fn wake(lua: &Lua, wake: TaskWake) -> Result<(), String> {
                     .collect::<mlua::Result<_>>()?
             }
             Some(Ok(value)) => {
-                use mlua::LuaSerdeExt;
-                (true, lua.to_value(&value)?).into_lua_multi(lua)?
+                use crate::json_guard::LuaJsonExt;
+                (true, lua.json_to_lua(&value)?).into_lua_multi(lua)?
             }
             Some(Err(error)) => (false, error).into_lua_multi(lua)?,
         };
