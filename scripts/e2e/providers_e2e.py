@@ -79,10 +79,9 @@ def blackhole(t, fp):
         t.check("blackhole connect: fails with TIMEOUT x3 (idle=2s)",
                 len(a) == 3 and all(x.get("code") == "TIMEOUT" for x in a), json.dumps(a)[:300])
         t.check("blackhole connect: total < 15s (3x2s + backoff)", res.elapsed < 15, f"{res.elapsed:.1f}s")
-        t.xcheck("blackhole connect: message names the connect phase",
-                 any("connect" in x.get("message", "").lower() for x in a),
-                 "B5-7 no connect_timeout; message 'waiting for provider response'", a[0].get("message") if a else "")
-        print(f"      blackhole elapsed={res.elapsed:.1f}s (default idle 300s => ~15 min before failing)")
+        t.check("blackhole connect: message names the connect phase",
+                any("connect timeout to" in x.get("message", "").lower() for x in a), a[0].get("message") if a else "")
+        print(f"      blackhole elapsed={res.elapsed:.1f}s (connect bound: min(10s, idle/2) per attempt)")
 
 
 def huge_tool_json_rss(t, fp, mb):

@@ -88,13 +88,17 @@ impl AnthropicProvider {
         mut self,
         headers: crate::headers::ProviderHeaders,
     ) -> Result<Self, reqwest::Error> {
-        self.client = headers.client()?;
+        self.client = headers.client(crate::connect_timeout(self.idle_timeout))?;
         self.headers = headers;
         Ok(self)
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.idle_timeout = timeout;
+        // The connect bound follows the idle timeout (see `connect_timeout`).
+        if let Ok(client) = self.headers.client(crate::connect_timeout(timeout)) {
+            self.client = client;
+        }
         self
     }
 
@@ -102,7 +106,7 @@ impl AnthropicProvider {
         Self {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-            client: reqwest::Client::new(),
+            client: crate::http_client(crate::connect_timeout(crate::sse::DEFAULT_IDLE_TIMEOUT)),
             headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::ApiKey(api_key.into()),
@@ -122,7 +126,7 @@ impl AnthropicProvider {
         Self {
             images: None,
             idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
-            client: reqwest::Client::new(),
+            client: crate::http_client(crate::connect_timeout(crate::sse::DEFAULT_IDLE_TIMEOUT)),
             headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
             auth: Auth::Source(source),
@@ -951,12 +955,7 @@ impl Provider for AnthropicProvider {
                 Ok(r) => r,
                 Err(e) => {
                     return StepOutcome::Failed {
-                        error: ProviderError {
-                            code: "PROVIDER",
-                            retry_after: None,
-                            message: format!("transport: {e}"),
-                            retryable: true,
-                        },
+                        error: crate::transport_error(&e),
                         partial: vec![],
                     };
                 }

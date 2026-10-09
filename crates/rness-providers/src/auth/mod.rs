@@ -216,7 +216,7 @@ impl OAuthClient {
     pub fn new(config: OAuthConfig) -> Self {
         Self {
             config,
-            http: reqwest::Client::new(),
+            http: crate::http_client(crate::CONNECT_TIMEOUT),
         }
     }
 

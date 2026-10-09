@@ -118,7 +118,7 @@ impl Default for CodexOAuthClient {
         Self {
             token_url: TOKEN_URL.into(),
             authorize_url: AUTHORIZE_URL.into(),
-            http: reqwest::Client::new(),
+            http: crate::http_client(crate::CONNECT_TIMEOUT),
         }
     }
 }
@@ -129,7 +129,7 @@ impl CodexOAuthClient {
         Self {
             token_url: format!("{base}/oauth/token"),
             authorize_url: format!("{base}/oauth/authorize"),
-            http: reqwest::Client::new(),
+            http: crate::http_client(crate::CONNECT_TIMEOUT),
         }
     }
 

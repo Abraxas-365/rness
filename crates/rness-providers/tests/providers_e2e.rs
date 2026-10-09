@@ -421,10 +421,21 @@ async fn blackholed_connect_time_to_failure() {
             return;
         }
         assert!(
-            matches!(&out, StepOutcome::Failed { error, .. } if error.code == "TIMEOUT" && error.retryable)
+            matches!(&out, StepOutcome::Failed { error, .. } if error.code == "TIMEOUT" && error.retryable),
+            "{shape:?}: {}",
+            describe(&out)
         );
-        // The message says "waiting for provider response" — it does not say
-        // the TCP connect never completed.
+        // B5-7: the connect phase has its own bound (half the idle timeout
+        // here, at most 10 s) and the message names it and the host.
+        let StepOutcome::Failed { error, .. } = &out else {
+            unreachable!()
+        };
+        assert!(
+            error.message.contains("connect timeout to "),
+            "{shape:?}: {}",
+            error.message
+        );
+        assert!(ms < 1500, "{shape:?}: connect bound not applied ({ms} ms)");
     }
 }
 

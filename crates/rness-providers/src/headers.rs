@@ -58,8 +58,13 @@ impl ProviderHeaders {
         Ok(Self(parsed))
     }
 
-    pub(crate) fn client(&self) -> Result<reqwest::Client, reqwest::Error> {
-        let mut builder = reqwest::Client::builder().default_headers(self.0.clone());
+    pub(crate) fn client(
+        &self,
+        connect_timeout: std::time::Duration,
+    ) -> Result<reqwest::Client, reqwest::Error> {
+        let mut builder = reqwest::Client::builder()
+            .default_headers(self.0.clone())
+            .connect_timeout(connect_timeout);
         if self.0.contains_key(reqwest::header::REFERER) {
             // Preserve an explicit Referer rather than replacing it on redirects.
             builder = builder.referer(false);

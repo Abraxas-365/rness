@@ -190,6 +190,11 @@ or generation duration limit: a healthy stream can run indefinitely. Keepalives
 can keep it alive even without tokens. Waiting for initial HTTP response headers
 also has the configured deadline.
 
+Establishing the connection (TCP and TLS) has its own bound: 10 seconds, or half
+the idle deadline when that is shorter. A host that never answers fails with a
+retryable `TIMEOUT: connect timeout to <host>` instead of waiting out the idle
+deadline. OAuth token requests use the 10-second connect bound too.
+
 Like DSH, this is not a timeout for AskUser, approval, or tool execution. OAuth
 credential acquisition uses its own transport and is not covered by this setting.
 Timeout failures are retryable; Ctrl+C remains cancellation. Partial failed output

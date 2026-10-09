@@ -57,6 +57,51 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
     }
 }
 
+/// Upper bound on establishing a provider connection (TCP + TLS).
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The connect timeout for a stream idle timeout: [`CONNECT_TIMEOUT`], or
+/// half the idle timeout when that is shorter, so a black-holed host is
+/// reported as a connect failure rather than as a silent provider.
+pub(crate) fn connect_timeout(idle: Option<std::time::Duration>) -> std::time::Duration {
+    idle.map_or(CONNECT_TIMEOUT, |idle| (idle / 2).min(CONNECT_TIMEOUT))
+        .max(std::time::Duration::from_millis(1))
+}
+
+/// An HTTP client whose connect phase is bounded by `connect`.
+pub(crate) fn http_client(connect: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .build()
+        // Same failure mode as `reqwest::Client::new()` (TLS backend init).
+        .expect("http client")
+}
+
+/// A failed `send()`: a connect timeout is a retryable `TIMEOUT` naming the
+/// host; anything else a retryable `PROVIDER` transport error.
+pub(crate) fn transport_error(e: &reqwest::Error) -> rness_engine::turn::provider::ProviderError {
+    use rness_engine::turn::provider::ProviderError;
+    if e.is_connect() && e.is_timeout() {
+        let host = e
+            .url()
+            .and_then(|u| u.host_str())
+            .unwrap_or("provider")
+            .to_string();
+        return ProviderError {
+            code: "TIMEOUT",
+            retry_after: None,
+            message: format!("TIMEOUT: connect timeout to {host}"),
+            retryable: true,
+        };
+    }
+    ProviderError {
+        code: "PROVIDER",
+        retry_after: None,
+        message: format!("transport: {e}"),
+        retryable: true,
+    }
+}
+
 /// Characters of a non-JSON error body quoted in an error message.
 const ERROR_TEXT_CHARS: usize = 200;
 
@@ -344,6 +389,26 @@ async fn upload_with_quota_recovery(
 #[cfg(test)]
 mod error_message_tests {
     use super::error_message;
+
+    #[test]
+    fn connect_timeout_is_ten_seconds_or_half_the_idle_timeout() {
+        use super::{connect_timeout, CONNECT_TIMEOUT};
+        use std::time::Duration;
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(connect_timeout(None), CONNECT_TIMEOUT);
+        assert_eq!(
+            connect_timeout(Some(Duration::from_secs(300))),
+            CONNECT_TIMEOUT
+        );
+        assert_eq!(
+            connect_timeout(Some(Duration::from_secs(4))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            connect_timeout(Some(Duration::ZERO)),
+            Duration::from_millis(1)
+        );
+    }
 
     #[test]
     fn fallback_chain_covers_gateway_shapes() {
