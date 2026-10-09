@@ -28,14 +28,17 @@ pub fn install(lua: &Lua, rness: &Table) -> mlua::Result<()> {
                 .app_data_ref::<tokio_util::sync::CancellationToken>()
                 .map(|token| token.clone())
                 .unwrap_or_default();
+            // Clamp to the calling scope (hook budget, turn cancel, ...).
+            let (deadline, tokens) = crate::budget::limits(lua);
             #[cfg(unix)]
             {
-                let result = run(spec, cancel).map_err(mlua::Error::external)?;
+                let result =
+                    run_bounded(spec, cancel, deadline, tokens).map_err(mlua::Error::external)?;
                 lua.to_value(&result)
             }
             #[cfg(not(unix))]
             {
-                let _ = (spec, cancel);
+                let _ = (spec, cancel, deadline, tokens);
                 Err::<mlua::Value, _>(mlua::Error::runtime(
                     "rness.process.run requires Unix process-group support on this platform",
                 ))
@@ -45,10 +48,20 @@ pub fn install(lua: &Lua, rness: &Table) -> mlua::Result<()> {
     rness.set("process", process)
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn run(
     spec: Spec,
     cancel: tokio_util::sync::CancellationToken,
+) -> std::io::Result<serde_json::Value> {
+    run_bounded(spec, cancel, None, Vec::new())
+}
+
+#[cfg(unix)]
+fn run_bounded(
+    spec: Spec,
+    cancel: tokio_util::sync::CancellationToken,
+    budget: Option<std::time::Instant>,
+    budget_tokens: Vec<tokio_util::sync::CancellationToken>,
 ) -> std::io::Result<serde_json::Value> {
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -81,15 +94,21 @@ fn run(
     let deadline = Instant::now()
         .checked_add(Duration::from_millis(spec.timeout_ms.unwrap_or(30_000)))
         .ok_or_else(|| std::io::Error::other("timeout_ms is too large"))?;
+    let deadline = budget.map_or(deadline, |b| b.min(deadline));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
     let (status, reason) = runtime.block_on(async {
         loop {
-            let reason = if cancel.is_cancelled() {
+            let reason = if cancel.is_cancelled() || budget_tokens.iter().any(|t| t.is_cancelled())
+            {
                 Some("command cancelled")
             } else if Instant::now() >= deadline {
-                Some("process timed out")
+                Some(if budget == Some(deadline) {
+                    "process exceeded the caller's time budget"
+                } else {
+                    "process timed out"
+                })
             } else if stdout.metadata()?.len() > LIMIT || stderr.metadata()?.len() > LIMIT {
                 Some("process output limit exceeded")
             } else {

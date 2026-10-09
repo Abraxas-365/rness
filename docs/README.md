@@ -32,6 +32,7 @@ These pages describe the current source checkout, not a versioned stable release
 | Inject time and tmux location into model context | [Context injection](guides/plugins/example-recipes.md#context-injection-time-and-tmux) |
 | Let the model set one-shot or recurring reminders | [Scheduled reminders](guides/scheduled-reminders.md) |
 | Run Lua code later or deliver text into a session | [Lua timers and session delivery](reference/lua/timer.md) |
+| Understand Lua callback time limits and why a handler was disabled | [Lua execution budgets](reference/lua/budgets.md) |
 | Customize messages and tool cards | [Messagebox presentation](guides/plugins/example-recipes.md#messagebox-presentation) |
 | Hide or relabel hook, AGENTS.md, and job messages | [Injected messages](guides/plugins/example-recipes.md#injected-messages-hooks-agentsmd-jobs) |
 | Register commands and use session context | [Lua commands](reference/lua/commands.md) |

@@ -289,7 +289,9 @@ async fn pcall_wrapped_runaway_tool_card_is_bounded() {
 }
 
 /// Native work is invisible to instruction-count hooks: one long C call
-/// (pathological Lua pattern) cannot be interrupted by the 100 ms deadline.
+/// (pathological Lua pattern) cannot be interrupted mid-call (B3-6,
+/// documented). The budget applies again as soon as the call returns, so
+/// the VM is never wedged; the overrun is the length of one C call.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn native_heavy_tool_card_overruns_deadline() {
@@ -318,10 +320,11 @@ async fn native_heavy_tool_card_overruns_deadline() {
         took.as_millis(),
         card.is_some()
     );
-    assert!(
-        took < Duration::from_millis(1000),
-        "native C call ignored the 100 ms card deadline: {took:?}"
-    );
+    // Known limitation: the C call itself runs to completion, and the few
+    // instructions after it may finish the render. The overrun still counts
+    // as a strike, and the VM is free right after.
+    assert!(took > Duration::from_millis(100), "{took:?}");
+    assert!(responsive(&host).await);
 }
 
 // ------------------------------------------------------------- (d) command
@@ -387,12 +390,11 @@ async fn pcall_wrapped_runaway_command_stops_on_cancel() {
 
 // ------------------------------------------------------------- (e) timer
 
-/// Timers: HOOK_TIMEOUT (30 s) deadline (plugin_host.rs:1601-1606). The VM
-/// is unavailable for the full 30 s, which in the TUI means a frozen
-/// statusline / app roster for 30 s.
+/// Timers: own 1 s budget (B3-7; was HOOK_TIMEOUT, 30 s, during which the
+/// TUI's statusline / app roster froze).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
-async fn runaway_timer_aborted_after_30s() {
+async fn runaway_timer_aborted_after_1s() {
     let host = LuaHost::spawn().unwrap();
     host.load(
         "spin",
@@ -409,7 +411,61 @@ async fn runaway_timer_aborted_after_30s() {
         stall.as_millis()
     );
     assert!(d.is_some(), "timer never aborted");
-    assert!(stall > Duration::from_secs(25), "{stall:?}");
+    assert!(stall < Duration::from_secs(2), "{stall:?}");
+}
+
+/// A repeating timer that overruns every time is cancelled after
+/// `budget::STRIKES` overruns; the VM stops paying for it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn repeating_runaway_timer_is_disabled_after_strikes() {
+    let host = LuaHost::spawn().unwrap();
+    host.load(
+        "spin",
+        "rness.timer.every(1, function() while true do end end)",
+    )
+    .await
+    .unwrap();
+    // Three 1 s overruns (one per second), then the timer is gone.
+    tokio::time::sleep(Duration::from_millis(7000)).await;
+    for _ in 0..8 {
+        let d = probe_within(&host, Duration::from_millis(500)).await;
+        assert!(
+            d.is_some(),
+            "VM still busy: repeating runaway timer not disabled"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A notification handler that overruns on every event is unsubscribed
+/// after `budget::STRIKES` overruns; other handlers keep running.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn runaway_notification_hook_is_disabled_after_strikes() {
+    let host = LuaHost::spawn().unwrap();
+    host.load(
+        "spin",
+        "rness.hook.on('frame', function() while true do end end)
+         ok_count = 0
+         rness.hook.on('frame', function() ok_count = ok_count + 1 end)
+         rness.tool.register{name='n', run=function() return tostring(ok_count) end}",
+    )
+    .await
+    .unwrap();
+    for _ in 0..3 {
+        host.fire_hook("frame", json!({}));
+    }
+    let _ = probe_within(&host, Duration::from_secs(10)).await;
+    let t = Instant::now();
+    host.fire_hook("frame", json!({}));
+    let d = probe_within(&host, PROBE).await.expect("VM answers");
+    assert!(
+        t.elapsed() < Duration::from_millis(300),
+        "{d:?}: handler still runs"
+    );
+    let n = host.call_tool("n", json!({})).await.unwrap();
+    assert_eq!(n, "4", "healthy handler kept running");
 }
 
 #[tokio::test(flavor = "multi_thread")]
