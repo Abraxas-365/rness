@@ -51,8 +51,7 @@ def gateway_shapes(t, fp):
                 msg = a[0].get("message", "") if a else ""
                 retry_ok = all(x.get("retryable") == (status >= 500) for x in a)
                 t.check(f"{shape} gateway {status}/{kind}: retryable={status >= 500}", a and retry_ok, json.dumps(a)[:200])
-                t.xcheck(f"{shape} gateway {status}/{kind}: message carries body", needle in msg.lower(),
-                         "B5-5 non-standard error bodies reduced to 'http NNN'", msg)
+                t.check(f"{shape} gateway {status}/{kind}: message carries body", needle in msg.lower(), msg)
 
 
 def heartbeat_forever(t, fp, seconds):

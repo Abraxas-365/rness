@@ -57,6 +57,56 @@ fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
     }
 }
 
+/// Characters of a non-JSON error body quoted in an error message.
+const ERROR_TEXT_CHARS: usize = 200;
+
+/// A useful one-line message from an HTTP error body, whatever its shape:
+/// `error.message` → `error` (string) → `message` → `detail` →
+/// `errors[0].message` → the body text (HTML tags stripped, whitespace
+/// collapsed, first 200 characters) → `http {status}`.
+pub(crate) fn error_message(body: &str, status: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        let found = [
+            &v["error"]["message"],
+            &v["error"],
+            &v["message"],
+            &v["detail"],
+            &v["errors"][0]["message"],
+        ]
+        .into_iter()
+        .filter_map(|m| m.as_str())
+        .find(|m| !m.trim().is_empty());
+        if let Some(message) = found {
+            return message.to_string();
+        }
+    }
+    let mut text = String::new();
+    let mut in_tag = false;
+    for c in body.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => {
+                in_tag = false;
+                text.push(' ');
+            }
+            _ if in_tag => {}
+            _ => text.push(c),
+        }
+    }
+    let text: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(ERROR_TEXT_CHARS)
+        .collect();
+    if text.is_empty() {
+        format!("http {status}")
+    } else {
+        text
+    }
+}
+
 /// How much of a non-stream 2xx body is read to explain the failure.
 const NON_SSE_BODY_LIMIT: usize = 64 * 1024;
 
@@ -102,17 +152,7 @@ async fn reject_non_sse(
     let overflow = value
         .as_ref()
         .is_some_and(|v| is_context_overflow(&v["error"]));
-    let detail = value
-        .as_ref()
-        .and_then(|v| {
-            v["error"]["message"]
-                .as_str()
-                .or(v["error"].as_str())
-                .or(v["message"].as_str())
-                .or(v["detail"].as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| body.trim().chars().take(200).collect());
+    let detail = error_message(&body, &status.to_string());
     Err(StepOutcome::Failed {
         error: ProviderError {
             code: if overflow { "CONTEXT_OVERFLOW" } else { "HTTP" },
@@ -299,6 +339,40 @@ async fn upload_with_quota_recovery(
         }
     }
     unreachable!("bounded upload attempts return")
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::error_message;
+
+    #[test]
+    fn fallback_chain_covers_gateway_shapes() {
+        let cases = [
+            (r#"{"error":{"message":"invalid key"}}"#, "invalid key"),
+            (r#"{"error":"model 'm' not found"}"#, "model 'm' not found"),
+            (r#"{"message":"overloaded"}"#, "overloaded"),
+            (r#"{"detail":"region blocked"}"#, "region blocked"),
+            (r#"{"errors":[{"message":"quota"}]}"#, "quota"),
+            (r#"{"error":{"message":""},"detail":"why"}"#, "why"),
+            (
+                "<html><body><h1>502 Bad Gateway</h1>upstream\n  connect error</body></html>",
+                "502 Bad Gateway upstream connect error",
+            ),
+            ("upstream request timeout", "upstream request timeout"),
+            (r#"{"unrelated":1}"#, r#"{"unrelated":1}"#),
+            ("   ", "http 503 Service Unavailable"),
+            ("<html></html>", "http 503 Service Unavailable"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(
+                error_message(body, "503 Service Unavailable"),
+                want,
+                "{body}"
+            );
+        }
+        let long = "x".repeat(1000);
+        assert_eq!(error_message(&long, "500").len(), 200);
+    }
 }
 
 #[cfg(test)]

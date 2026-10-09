@@ -690,10 +690,7 @@ impl Provider for OpenAiProvider {
                         continue;
                     }
                 }
-                let message = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["error"]["message"].as_str().map(String::from))
-                    .unwrap_or_else(|| format!("http {status}"));
+                let message = crate::error_message(&body, &status.to_string());
                 return StepOutcome::Failed {
                     error: ProviderError {
                         code: crate::request_error_code(status.as_u16(), &body),

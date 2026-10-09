@@ -561,15 +561,7 @@ impl Provider for ResponsesProvider {
                 let retry_after = crate::sse::retry_after(response.headers());
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 let text = response.text().await.unwrap_or_default();
-                let message = serde_json::from_str::<Value>(&text)
-                    .ok()
-                    .and_then(|v| {
-                        v["error"]["message"]
-                            .as_str()
-                            .or(v["detail"].as_str())
-                            .map(String::from)
-                    })
-                    .unwrap_or_else(|| format!("http {status}"));
+                let message = crate::error_message(&text, &status.to_string());
                 return StepOutcome::Failed {
                     error: ProviderError {
                         code: crate::request_error_code(status.as_u16(), &text),

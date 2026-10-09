@@ -506,6 +506,10 @@ async fn gateway_error_shapes_produce_useful_messages() {
         useless.len(),
         useless
     );
+    assert!(
+        useless.is_empty(),
+        "messages without the cause: {useless:?}"
+    );
 }
 
 #[tokio::test]
