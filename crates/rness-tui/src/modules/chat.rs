@@ -2575,10 +2575,15 @@ impl Component for Chat {
                 }
             }
         }
-        // Scrolling up can move the view by at most `start` more rows.
-        ctx.model
-            .scroll_extent
-            .set(effective_scroll.saturating_add(start));
+        // Scrolling up can move the view by at most `start` more rows. While
+        // rows above are estimates (`stale`), progressive refill can grow
+        // them before the next frame, so a clamp from this frame could stop
+        // short of the real top: leave scroll-up unclamped until exact.
+        ctx.model.scroll_extent.set(if self.stale.is_empty() {
+            effective_scroll.saturating_add(start)
+        } else {
+            usize::MAX
+        });
         let selected_index = self
             .selected_message
             .as_ref()
@@ -4374,6 +4379,39 @@ mod tests {
         assert_eq!(chat.row_ends, reference.row_ends);
         assert_eq!(chat.card_rows, reference.card_rows);
         assert_eq!(render(&mut chat, &model, narrow), expected);
+    }
+
+    #[test]
+    fn scroll_up_is_not_clamped_by_estimated_rows() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("estimates".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        // Long single lines: estimates (len / width + 1) undercount the
+        // word-wrapped layout, so an estimated extent is too small.
+        for i in 0..2000 {
+            model
+                .entries
+                .push(Entry::Notice(format!("word{i} ").repeat(40)));
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 30, 10);
+        let mut chat = Chat::default();
+        let mut buf = Buffer::empty(area);
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        chat.render(&ctx, Rect::new(0, 0, 100, 10), &mut buf);
+        chat.render(&ctx, area, &mut buf);
+        assert!(!chat.stale.is_empty());
+        assert_eq!(model.scroll_extent.get(), usize::MAX);
+        while !chat.stale.is_empty() {
+            chat.render(&ctx, area, &mut buf);
+        }
+        assert_eq!(model.scroll_extent.get(), chat.total_rows - 10);
     }
 
     #[test]
