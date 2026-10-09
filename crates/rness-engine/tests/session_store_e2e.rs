@@ -768,25 +768,30 @@ fn deep_fork_chains_replay_in_order() {
     }
 }
 
-/// Fork a fork at an event it INHERITED from its parent (an id the user
-/// sees in the leaf's transcript). The store only searches the session's
-/// own file, so this fails with ForkPointNotFound.
+/// Fork a fork at an id that is NOT in its visible history (unknown, or an
+/// ancestor event past the point the fork branched off) stays
+/// ForkPointNotFound.
 #[test]
-fn fork_at_inherited_event_is_rejected_today() {
+fn fork_at_unknown_or_invisible_event_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut root = store.create(None).unwrap();
-    let inherited = root.append(&user("root message")).unwrap();
+    root.append(&user("root message")).unwrap();
     let root_id = root.session().clone();
-    drop(root);
     let child = store.fork(&root_id, None).unwrap().session().clone();
-    let r = store.fork(&child, Some(inherited.id.clone()));
-    println!("fork child at inherited event: {}", describe(&r));
-    assert!(matches!(r, Err(BranchError::ForkPointNotFound { .. })));
+    // Appended to the root AFTER the fork: not visible in the child.
+    let later = root.append(&user("after the fork")).unwrap();
+    drop(root);
+    for at in [later.id, "01NOPE".to_string()] {
+        let r = store.fork(&child, Some(at));
+        println!("fork child at invisible event: {}", describe(&r));
+        assert!(matches!(r, Err(BranchError::ForkPointNotFound { .. })));
+    }
 }
 
+/// B1-4: forking a fork at an event inherited from its parent (an id the
+/// user sees in the leaf's transcript) forks from the owning ancestor.
 #[test]
-#[ignore = "bug B1-4: cannot fork a fork at an inherited (transcript-visible) event"]
 fn bug_fork_at_inherited_event_works() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
@@ -798,6 +803,39 @@ fn bug_fork_at_inherited_event_works() {
     let grand = store.fork(&child, Some(inherited.id.clone())).unwrap();
     let ctx = replay(&store, grand.session()).unwrap().context;
     assert_eq!(ctx.turns.len(), 1);
+    // Same visible prefix as forking the owner directly: parent = ancestor.
+    assert_eq!(
+        store.parent(grand.session()).unwrap().unwrap().session,
+        root_id
+    );
+}
+
+/// B1-4, deeper chain: a grandchild forked at a mid-root event sees exactly
+/// the root prefix up to that event, not the child's or root's later events.
+#[test]
+fn fork_at_inherited_event_two_levels_keeps_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut root = store.create(None).unwrap();
+    let a = root.append(&user("a")).unwrap();
+    root.append(&user("b")).unwrap();
+    let root_id = root.session().clone();
+    drop(root);
+    let mut child = store.fork(&root_id, None).unwrap();
+    child.append(&user("c")).unwrap();
+    let child_id = child.session().clone();
+    drop(child);
+    let mid = store.fork(&child_id, None).unwrap().session().clone();
+    let leaf = store.fork(&mid, Some(a.id.clone())).unwrap();
+    let ctx = replay(&store, leaf.session()).unwrap().context;
+    assert_eq!(ctx.turns.len(), 1);
+    let ids: Vec<_> = store
+        .history(leaf.session())
+        .unwrap()
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(ids.last(), Some(&a.id));
 }
 
 /// Fork at an assistant tool_use whose result is not in the prefix: the

@@ -146,7 +146,10 @@ Branches preserve alternate conversation paths through log references:
 - Edit-and-resend, retry, and subagent trees are all this one mechanism.
 - Engine API: `fork(session, at_event)`, `ancestry(session)`,
   `children(session, at?)` — exposed through SessionService so ANY frontend
-  can branch.
+  can branch. `at_event` may be any event visible in the session's
+  transcript, including ones inherited from an ancestor: the child is then
+  forked from the ancestor that owns the event (same visible prefix), so its
+  `parent` is that ancestor. Ids outside the visible history are rejected.
 
 **Rule of thumb:** if it changes what's *true* about a session (lineage,
 events) → engine core. If it changes what you *see* (tree view, sibling
