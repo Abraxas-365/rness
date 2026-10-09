@@ -1749,3 +1749,195 @@ async fn reconcile_reads_only_the_tail_of_long_child_logs() {
 fn filler_text() -> String {
     "y".repeat(4000)
 }
+
+/// Pending-jobs probe for settle-gating tests: every session except
+/// `parent` reports `pending` outstanding background jobs.
+fn gate_jobs(sessions: &SessionService, parent: &SessionId) -> Arc<std::sync::atomic::AtomicUsize> {
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let (probe, parent) = (Arc::clone(&pending), parent.clone());
+    sessions.set_pending_jobs(Arc::new(move |session: &SessionId| {
+        if *session == parent {
+            0
+        } else {
+            probe.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }));
+    pending
+}
+
+async fn wait_idle_after_turns(sessions: &SessionService, s: &SessionId, turns: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if turn_ends(sessions, s).len() >= turns
+                && sessions.phase(s) == rness_engine::inbox::Phase::Idle
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("child turns ended");
+}
+
+/// A one-shot child that ends its turn while its own background job is
+/// still out has not answered: the job's completion wakes it, and its
+/// result is the turn after that.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_shot_child_waits_out_its_own_jobs() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = Arc::new(runtime(&sessions, 3));
+    let parent = sessions.create(None).unwrap();
+    let pending = gate_jobs(&sessions, &parent);
+    let started = Arc::new(std::sync::Mutex::new(None::<SessionId>));
+    let run = {
+        let (rt, parent, started) = (Arc::clone(&rt), parent.clone(), Arc::clone(&started));
+        tokio::spawn(async move {
+            rt.start_with(
+                "spawn",
+                SubagentRequest {
+                    agent: None,
+                    parent,
+                    prompt: "start a job, then wait".into(),
+                },
+                rness_engine::subagent::RunOptions {
+                    on_start: Some(Box::new(move |child: &SessionId| {
+                        *started.lock().unwrap() = Some(child.clone());
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+        })
+    };
+    let child = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(child) = started.lock().unwrap().clone() {
+                break child;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    wait_idle_after_turns(&sessions, &child, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !run.is_finished(),
+        "an idle child with a running job has not settled"
+    );
+
+    // The job completes: its notice wakes the child, then counts as delivered.
+    sessions.notify_job(&child, "job done".into()).unwrap();
+    pending.store(0, std::sync::atomic::Ordering::SeqCst);
+    let run = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+        .await
+        .expect("child settles after its job")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Completed);
+    assert_eq!(turns_started(&sessions, &child), 2);
+    // The answer is the second turn's, not the "waiting" turn's.
+    assert!(
+        !run.output.is_empty() && run.output != "saw 1 turns",
+        "{}",
+        run.output
+    );
+}
+
+/// A continuable child idle with its own jobs outstanding stays quiet; the
+/// parent hears once, after the job wakes it, as a job-sourced notice.
+#[tokio::test(flavor = "multi_thread")]
+async fn continuable_settle_waits_for_own_jobs_and_is_job_sourced() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    let pending = gate_jobs(&sessions, &parent);
+    let child = rt
+        .start_continuable(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "start a job, then wait".into(),
+            },
+        )
+        .unwrap();
+    wait_idle_after_turns(&sessions, &child, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(subagent_notices(&sessions, &parent).is_empty());
+    assert_eq!(turns_started(&sessions, &parent), 0, "parent not woken");
+
+    sessions.notify_job(&child, "job done".into()).unwrap();
+    pending.store(0, std::sync::atomic::Ordering::SeqCst);
+    wait_for_notices(&sessions, &parent, 1).await;
+    wait_for_parent_turns(&sessions, &parent, 1).await;
+    let history = sessions.store().history(&parent).unwrap();
+    let notices: Vec<_> = history
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(m)
+                if m.content.iter().any(
+                    |p| matches!(p, ContentPart::Text { text } if text.starts_with("[subagent ")),
+                ) =>
+            {
+                Some(m.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1, "exactly one settle notice");
+    assert_eq!(
+        notices[0].source,
+        Some(MessageSource::JobCompletion {
+            id: format!("settle:{child}:2")
+        })
+    );
+    let text = match &notices[0].content[0] {
+        ContentPart::Text { text } => text.clone(),
+        _ => panic!("text notice"),
+    };
+    assert!(
+        text.starts_with(&format!("[subagent {child} settled: completed]"))
+            && !text.contains("saw 1 turns"),
+        "{text}"
+    );
+}
+
+/// Interrupting a continuable child that is idle but waiting on its own
+/// work ends the wait: the parent hears now, as aborted.
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_reports_a_waiting_continuable_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let parent = sessions.create(None).unwrap();
+    let _pending = gate_jobs(&sessions, &parent);
+    let child = rt
+        .start_continuable(
+            "spawn",
+            SubagentRequest {
+                agent: None,
+                parent: parent.clone(),
+                prompt: "start a job, then wait".into(),
+            },
+        )
+        .unwrap();
+    wait_idle_after_turns(&sessions, &child, 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(subagent_notices(&sessions, &parent).is_empty());
+    rt.interrupt(&parent, &child).unwrap();
+    wait_for_notices(&sessions, &parent, 1).await;
+    let notices = subagent_notices(&sessions, &parent);
+    assert_eq!(notices.len(), 1);
+    assert!(
+        notices[0]
+            .1
+            .starts_with(&format!("[subagent {child} settled: aborted]"))
+            && notices[0].1.contains("saw 1 turns"),
+        "{}",
+        notices[0].1
+    );
+}

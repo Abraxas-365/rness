@@ -125,13 +125,15 @@ fn estimate_rows(entry: &Entry, id: &str, width: u16, old: Option<&OldLayout>) -
     }
 }
 
-/// Config key for an engine-injected message's provenance.
+/// Config key for an engine-injected message's provenance. A subagent
+/// settle notice is a `JobCompletion` with a `settle:<child>:<turn>` id.
 fn source_key(source: &rness_protocol::events::MessageSource) -> &'static str {
     use rness_protocol::events::MessageSource;
     match source {
         MessageSource::Hook { .. } => "hook",
         MessageSource::Instructions { .. } => "instructions",
         MessageSource::Context { .. } => "context",
+        MessageSource::JobCompletion { id } if id.starts_with("settle:") => "agent",
         MessageSource::JobCompletion { .. } => "job",
         MessageSource::ExternalPrompt { .. } => "external",
     }
@@ -139,7 +141,8 @@ fn source_key(source: &rness_protocol::events::MessageSource) -> &'static str {
 
 /// Layer per-source options over the resolved `user` options:
 /// `user` → `user.sources.<kind>` → `user.sources.hook.tags.<tag>` /
-/// `user.sources.context.names.<name>`.
+/// `user.sources.context.names.<name>`. Subagent notices (`agent`) layer
+/// over the `job` style, so a theme without `agent` still shows a job card.
 fn source_options(
     base: &serde_json::Value,
     source: Option<&rness_protocol::events::MessageSource>,
@@ -147,8 +150,13 @@ fn source_options(
     let Some(source) = source else {
         return base.clone();
     };
-    let specific = &base["sources"][source_key(source)];
-    let mut options = merge_options(base, specific);
+    let key = source_key(source);
+    let mut options = base.clone();
+    if key == "agent" {
+        options = merge_options(&options, &base["sources"]["job"]);
+    }
+    let specific = &base["sources"][key];
+    options = merge_options(&options, specific);
     match source {
         rness_protocol::events::MessageSource::Hook { tag: Some(tag), .. } => {
             options = merge_options(&options, &specific["tags"][tag.as_str()]);
@@ -3349,6 +3357,34 @@ mod tests {
                 chat.entry_visits
             );
         }
+    }
+
+    #[test]
+    fn subagent_settle_notices_use_agent_then_job_style() {
+        use super::*;
+        use rness_protocol::events::MessageSource;
+        let settle = MessageSource::JobCompletion {
+            id: "settle:01CHILD:2".into(),
+        };
+        let job = MessageSource::JobCompletion { id: "j1".into() };
+        assert_eq!(source_key(&settle), "agent");
+        assert_eq!(source_key(&job), "job");
+        let base = serde_json::json!({
+            "label": {"text": "You", "style": "user_prefix"},
+            "sources": {"job": {"display": "preview", "label": {"text": "Job", "style": "tool_name"}}}
+        });
+        // No `agent` options: a settle notice looks like a job card, not "You".
+        let options = source_options(&base, Some(&settle));
+        assert_eq!(options["label"]["text"], "Job");
+        assert_eq!(options["display"], "preview");
+        // `agent` layers over `job`.
+        let mut themed = base.clone();
+        themed["sources"]["agent"] = serde_json::json!({"label": {"text": "Agent"}});
+        let options = source_options(&themed, Some(&settle));
+        assert_eq!(options["label"]["text"], "Agent");
+        assert_eq!(options["label"]["style"], "tool_name");
+        assert_eq!(options["display"], "preview");
+        assert_eq!(source_options(&themed, Some(&job))["label"]["text"], "Job");
     }
 
     #[test]

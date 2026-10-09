@@ -91,7 +91,10 @@ impl Tool for SubagentTool {
          end your turn with a brief waiting update; a commentary update followed \
          by more dependent tool calls is not waiting. Resume dependent work only \
          after receiving and reading the child's result. A launch acknowledgement \
-         is not a result. Do not ask the user to prompt you again."
+         is not a result. Do not ask the user to prompt you again. If you are \
+         yourself a delegated child, ending a turn while your own background \
+         work is outstanding does not report back: you are woken when it \
+         completes, and your parent hears your final turn after the last of it."
     }
 
     fn input_schema(&self) -> Value {

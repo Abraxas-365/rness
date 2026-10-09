@@ -731,13 +731,16 @@ rness.ui.messagebox = {
         names = { memory = { visible = true, label = { text = 'Memory' } } },
       },
       job = { label = { text = 'Job', style = 'tool_name' } },
+      agent = { label = { text = 'Agent' } },         -- subagent settle notices
       external = { label = { text = 'External' } },   -- scheduled/external prompts
     },
   },
 }
 ```
 
-`kind` is one of `hook`, `instructions`, `context`, `job`, `external`. A hook's `tag` is set
+`kind` is one of `hook`, `instructions`, `context`, `job`, `agent`, `external`. `agent`
+(a continuable subagent's `[subagent <id> settled: ...]` notice) layers over `job`, so it
+looks like a job card unless you style it. A hook's `tag` is set
 by the plugin that injected it (see `pre_step` below); untagged hooks use the
 `hook` options. A context block's `name` selects `context.names.<name>`.
 `visible = false` removes the message from the transcript and from

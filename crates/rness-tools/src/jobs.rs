@@ -1096,6 +1096,12 @@ impl JobRegistry {
 
     pub fn attach_sessions(&self, sessions: &Arc<rness_engine::service::SessionService>) {
         *self.inner.sessions.lock().expect("sessions lock") = Arc::downgrade(sessions);
+        let probe = Arc::downgrade(&self.inner);
+        sessions.set_pending_jobs(Arc::new(move |session: &String| {
+            probe
+                .upgrade()
+                .map_or(0, |inner| JobRegistry { inner }.pending_for(session))
+        }));
         let registry = Arc::downgrade(&self.inner);
         let period = self
             .inner
@@ -1342,6 +1348,24 @@ impl JobRegistry {
             .filter(|job| {
                 let state = job.state.lock().expect("job lock");
                 state.listable(Some(session)) && !state.settled
+            })
+            .count()
+    }
+
+    /// Background jobs `session` owns that it still waits on: running, or
+    /// settled with the completion notice not yet delivered (its wake is on
+    /// the way). Drives subagent settle gating.
+    pub fn pending_for(&self, session: &str) -> usize {
+        self.inner
+            .jobs
+            .lock()
+            .expect("jobs lock")
+            .values()
+            .filter(|job| {
+                let state = job.state.lock().expect("job lock");
+                state.kind != "bash-output"
+                    && state.owner.as_deref() == Some(session)
+                    && (!state.settled || !state.delivered)
             })
             .count()
     }

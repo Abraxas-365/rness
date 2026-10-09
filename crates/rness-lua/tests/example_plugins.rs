@@ -1531,6 +1531,94 @@ async fn booted_host(dir: &std::path::Path) -> LuaHost {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn session_picker_lists_this_project_by_recent_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let ws_path = ws
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let other_path = other
+        .path()
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let store = SessionStore::new(dir.path());
+    let make = |workspace: &str, name: &str, secs: u64| {
+        let mut log = store.create(Some(workspace.into())).unwrap();
+        log.append(&SessionEvent::Title(SessionTitle {
+            title: name.into(),
+            source: TitleSource::User,
+        }))
+        .unwrap();
+        let id = log.session().clone();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.path().join(&id).join("session.v1.jsonl"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+            .unwrap();
+        id
+    };
+    let current = make(&ws_path, "Current work", 1_000);
+    let _older = make(&ws_path, "Older idea", 2_000);
+    let _newer = make(&ws_path, "Newer fix", 3_000);
+    let _foreign = make(&other_path, "Elsewhere", 4_000);
+    let untitled = store
+        .create(Some(ws_path.clone()))
+        .unwrap()
+        .session()
+        .clone();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.path().join(&untitled).join("session.v1.jsonl"))
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(500))
+        .unwrap();
+    let host = booted_host(dir.path()).await;
+    host.load(
+        "sessions",
+        include_str!("../../../flavors/default/plugins/sessions.lua"),
+    )
+    .await
+    .unwrap();
+    let ctx = serde_json::json!({"session": current, "rows": 12, "cols": 90});
+    let view = host.app_view("sessions", ctx.clone()).await.unwrap();
+    let position = |name: &str| view.iter().position(|l| l.contains(name));
+    // Current first, then most recently active; other projects hidden.
+    assert!(view[0].contains("4 sessions"), "{view:?}");
+    // An untitled session shows its full id instead.
+    assert!(position(&untitled) > position("Older idea"), "{view:?}");
+    assert!(position("Current work") < position("Newer fix"), "{view:?}");
+    assert!(position("Newer fix") < position("Older idea"), "{view:?}");
+    assert_eq!(position("Elsewhere"), None, "{view:?}");
+    assert!(
+        view[position("Current work").unwrap()].contains("current"),
+        "{view:?}"
+    );
+    // The cursor opens on the latest other session.
+    assert!(
+        view[position("Newer fix").unwrap()].starts_with('▸'),
+        "{view:?}"
+    );
+
+    // "a" toggles every project; search narrows it.
+    host.app_key("sessions", "a", ctx.clone()).await.unwrap();
+    let all = host.app_view("sessions", ctx.clone()).await.unwrap();
+    assert!(all.iter().any(|l| l.contains("Elsewhere")), "{all:?}");
+    for key in ["/", "e", "l", "s", "e"] {
+        host.app_key("sessions", key, ctx.clone()).await.unwrap();
+    }
+    let found = host.app_view("sessions", ctx.clone()).await.unwrap();
+    assert!(found.iter().any(|l| l.contains("Elsewhere")), "{found:?}");
+    assert!(!found.iter().any(|l| l.contains("Newer fix")), "{found:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn region_confirmation_reuses_only_its_own_command_reservation() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
