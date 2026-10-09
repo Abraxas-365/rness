@@ -37,8 +37,8 @@ fn sse_ok() -> ResponseTemplate {
     .map(|(e, d)| format!("event: {e}\ndata: {d}\n\n"))
     .collect::<String>();
     ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_string(body)
+        // set_body_string would force content-type text/plain.
+        .set_body_raw(body, "text/event-stream")
 }
 
 fn context() -> ModelContext {

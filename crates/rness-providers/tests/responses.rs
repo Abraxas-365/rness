@@ -21,8 +21,8 @@ fn sse(events: &[(&str, serde_json::Value)]) -> ResponseTemplate {
         .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
         .collect();
     ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_string(body)
+        // set_body_string would force content-type text/plain.
+        .set_body_raw(body, "text/event-stream")
 }
 
 /// A store holding valid (non-expired) ChatGPT tokens.

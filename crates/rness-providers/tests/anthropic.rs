@@ -21,8 +21,8 @@ fn sse(events: &[(&str, serde_json::Value)]) -> String {
 
 fn sse_response(events: &[(&str, serde_json::Value)]) -> ResponseTemplate {
     ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_string(sse(events))
+        // set_body_string would force content-type text/plain.
+        .set_body_raw(sse(events), "text/event-stream")
 }
 
 #[tokio::test]

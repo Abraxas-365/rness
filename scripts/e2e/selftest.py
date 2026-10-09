@@ -132,8 +132,7 @@ def scenario_expectations():
                 ("both blocks kept", "rness: AAA" in res.stdout and "rness: BBB" in res.stdout, res.stdout[-200:])]
         return completed("dup-index done")(res, log, fp, shape) + [
             # OpenAI: two calls with distinct ids but the same index. Merging them silently is data loss.
-            ("both same-index tool calls executed", tool_names(log).count("X") == 2, tool_names(log),
-             {"openai": "openai: same-index tool_calls with distinct ids are merged into one call"}.get(shape))]
+            ("both same-index tool calls executed", tool_names(log).count("X") == 2, tool_names(log))]
 
     def tool_loop(res, log, fp, shape):
         return completed("tool-loop done after 3 tool results")(res, log, fp, shape) + [
@@ -150,13 +149,11 @@ def scenario_expectations():
         return completed("script done 2")(res, log, fp, shape) + [("scripted Bash ran", tool_names(log) == ["Bash"], tool_names(log))]
 
     def truncated(res, log, fp, shape):
-        bug = {"openai": "openai: stream closed without finish_reason/[DONE] is committed as a complete message",
-               "responses": "responses: stream closed without response.completed is committed as a complete message"}.get(shape)
-        return failed_retried("PROVIDER", xfail={shape: bug} if bug else None)(res, log, fp, shape)
+        # Every shape: EOF before the terminal marker is a retryable failure (plan 09).
+        return failed_retried("PROVIDER")(res, log, fp, shape)
 
     def malformed(res, log, fp, shape):
-        bug = {"responses": "responses: invalid JSON events are silently skipped; empty message committed"}.get(shape)
-        return failed_retried("PROVIDER", xfail={shape: bug} if bug else None)(res, log, fp, shape)
+        return failed_retried("PROVIDER")(res, log, fp, shape)
 
     all_shapes = SHAPES
     return [
@@ -203,9 +200,15 @@ def run_scenarios(t, fp, quick):
                 key = f"{scenario}/{shape}"  # private counter per shape
                 res = r.headless("hello", scenario=key, timeout=120)
                 res.followup = r.headless("again", session=res.session, scenario=key) if scenario == "recover" else None
-                if not t.check(f"{name}: rness ran (rc=0, session)", res.rc == 0 and res.session, repr(res)):
+                # rc mirrors the turn outcome (plan 10): 0 completed, 1 failed.
+                if not t.check(f"{name}: rness ran (rc 0/1, session)", res.rc in (0, 1) and res.session, repr(res)):
                     continue
                 log = r.log(res.session)
+                outcome = turn_outcome(log)
+                if res.followup:  # the log also holds the follow-up turn; rc is the first turn's
+                    outcome = next((e["outcome"] for e in log if e["type"] == "turn/ended"), None)
+                t.check(f"{name}: exit code matches turn outcome", res.rc == (0 if outcome == "completed" else 1),
+                        f"rc={res.rc} outcome={outcome}")
                 for item in checker(res, log, fp, shape):
                     label, ok, detail = item[0], item[1], item[2]
                     bug = item[3] if len(item) > 3 else None

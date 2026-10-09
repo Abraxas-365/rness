@@ -304,11 +304,14 @@ struct Accumulator {
 }
 
 impl Accumulator {
-    fn apply(&mut self, event: &str, data: &str, at_ms: u64) {
-        let v: Value = match serde_json::from_str(data) {
-            Ok(v) => v,
-            Err(_) => return, // tolerate unknown/empty payloads
-        };
+    /// Unknown event types are ignored; an empty payload is skipped; a
+    /// non-JSON payload is an error (the stream is corrupt).
+    fn apply(&mut self, event: &str, data: &str, at_ms: u64) -> Result<(), String> {
+        if data.trim().is_empty() {
+            return Ok(());
+        }
+        let v: Value =
+            serde_json::from_str(data).map_err(|e| format!("responses: bad json: {e}"))?;
         match event {
             "response.output_text.delta" => {
                 if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
@@ -396,6 +399,7 @@ impl Accumulator {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn finish(self, model: &str) -> AssistantMessage {
@@ -581,6 +585,10 @@ impl Provider for ResponsesProvider {
             }
             break response;
         };
+        let response = match crate::reject_non_sse(response, self.idle_timeout, cancel).await {
+            Ok(response) => response,
+            Err(outcome) => return outcome,
+        };
 
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator::default();
@@ -595,7 +603,17 @@ impl Provider for ResponsesProvider {
                         };
                     }
                     let at_ms = started.elapsed().as_millis() as u64;
-                    acc.apply(&event, &data, at_ms);
+                    if let Err(message) = acc.apply(&event, &data, at_ms) {
+                        return StepOutcome::Failed {
+                            error: ProviderError {
+                                code: "PROVIDER",
+                                retry_after: None,
+                                message,
+                                retryable: true,
+                            },
+                            partial: acc.chunks,
+                        };
+                    }
                     if let Some(sink) = request.on_delta {
                         for chunk in &acc.chunks[emitted..] {
                             sink(&chunk.delta);
@@ -639,6 +657,9 @@ impl Provider for ResponsesProvider {
                             },
                             partial: acc.chunks,
                         };
+                    }
+                    if !acc.done {
+                        return crate::truncated("responses", "response.completed", acc.chunks);
                     }
                     return StepOutcome::Committed(acc.finish(&self.model));
                 }

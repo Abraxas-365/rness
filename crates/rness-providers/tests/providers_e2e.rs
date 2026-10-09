@@ -522,17 +522,240 @@ async fn sse_200_with_json_error_body_is_not_committed_as_empty() {
         let (base, _) = raw_server(script).await;
         let p = provider(shape, &base, Some(Duration::from_secs(5)), dir.path());
         let out = step(p.as_ref(), &CancellationToken::new()).await;
-        let committed_empty = matches!(&out, StepOutcome::Committed(m) if m.content.is_empty());
-        println!(
-            "WP5 json200 {shape:?}: committed_empty={committed_empty} {}",
-            describe(&out)
-        );
-        if committed_empty {
-            println!(
-                "WP5 BUG json200 {shape:?}: 200+JSON error committed as an empty assistant message"
-            );
+        println!("WP5 json200 {shape:?}: {}", describe(&out));
+        match &out {
+            StepOutcome::Failed { error, .. } => {
+                assert!(error.retryable, "{shape:?}: {}", describe(&out));
+                assert!(
+                    error.message.contains("gateway says no"),
+                    "{shape:?}: {}",
+                    describe(&out)
+                );
+            }
+            other => panic!("{shape:?}: expected Failed, got {}", describe(other)),
         }
     }
+}
+
+// -- stream completeness contract (EOF, bad JSON, content type, tool ids) ----
+
+/// Serve `body` as one SSE response with the given head, then close.
+async fn serve_once(head: Vec<u8>, body: String) -> String {
+    let script: Script =
+        Arc::new(move || vec![Piece(head.clone(), 0), Piece(body.clone().into_bytes(), 0)]);
+    raw_server(script).await.0
+}
+
+fn partial_len(o: &StepOutcome) -> usize {
+    match o {
+        StepOutcome::Failed { partial, .. } | StepOutcome::Cancelled { partial } => partial.len(),
+        StepOutcome::Committed(_) => 0,
+    }
+}
+
+#[tokio::test]
+async fn eof_without_terminal_marker_fails_retryably() {
+    let dir = tempfile::tempdir().unwrap();
+    for shape in SHAPES {
+        let mut events = text_stream(shape, &["par", "tial"]);
+        // Drop the terminal events: Anthropic message_delta+message_stop,
+        // OpenAI finish_reason chunk + [DONE], Responses item done + completed.
+        events.truncate(events.len() - 2);
+        let base = serve_once(sse_head(), events.concat()).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(5)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        match &out {
+            StepOutcome::Failed { error, partial } => {
+                assert_eq!(error.code, "PROVIDER", "{shape:?}");
+                assert!(error.retryable, "{shape:?}");
+                assert!(
+                    error.message.contains("stream ended before"),
+                    "{}",
+                    error.message
+                );
+                let text: String = partial
+                    .iter()
+                    .filter_map(|c| match &c.delta {
+                        ChunkDelta::Text { t } => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text, "partial", "{shape:?}");
+            }
+            other => panic!("{shape:?}: expected Failed, got {}", describe(other)),
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_finish_reason_without_done_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut events = text_stream(Shape::OpenAi, &["all ", "here"]);
+    assert_eq!(events.pop().as_deref(), Some("data: [DONE]\n\n"));
+    let base = serve_once(sse_head(), events.concat()).await;
+    let p = provider(
+        Shape::OpenAi,
+        &base,
+        Some(Duration::from_secs(5)),
+        dir.path(),
+    );
+    let out = step(p.as_ref(), &CancellationToken::new()).await;
+    assert_eq!(text_of(&out), "all here", "{}", describe(&out));
+}
+
+#[tokio::test]
+async fn responses_bad_json_event_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut events = text_stream(Shape::Responses, &["ok"]);
+    events.insert(
+        3,
+        "event: response.output_text.delta\ndata: {not json\n\n".into(),
+    );
+    let base = serve_once(sse_head(), events.concat()).await;
+    let p = provider(
+        Shape::Responses,
+        &base,
+        Some(Duration::from_secs(5)),
+        dir.path(),
+    );
+    let out = step(p.as_ref(), &CancellationToken::new()).await;
+    match &out {
+        StepOutcome::Failed { error, .. } => {
+            assert_eq!(error.code, "PROVIDER");
+            assert!(error.retryable);
+            assert!(error.message.contains("bad json"), "{}", error.message);
+        }
+        other => panic!("expected Failed, got {}", describe(other)),
+    }
+    assert_eq!(
+        partial_len(&out),
+        1,
+        "the delta before the bad event is kept"
+    );
+}
+
+#[tokio::test]
+async fn responses_empty_data_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut events = text_stream(Shape::Responses, &["ok"]);
+    events.insert(2, "event: keepalive\ndata: \n\n".into());
+    events.insert(2, "event: response.in_progress\ndata: {}\n\n".into());
+    let base = serve_once(sse_head(), events.concat()).await;
+    let p = provider(
+        Shape::Responses,
+        &base,
+        Some(Duration::from_secs(5)),
+        dir.path(),
+    );
+    let out = step(p.as_ref(), &CancellationToken::new()).await;
+    assert_eq!(text_of(&out), "ok", "{}", describe(&out));
+}
+
+#[tokio::test]
+async fn event_stream_content_type_variants_are_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    for head in [
+        "HTTP/1.1 200 OK\r\ncontent-type: Text/Event-Stream; charset=utf-8\r\nconnection: close\r\n\r\n",
+        // No Content-Type at all: parse it; the EOF contract still applies.
+        "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n",
+    ] {
+        for shape in SHAPES {
+            let body = text_stream(shape, &["fine"]).concat();
+            let base = serve_once(head.as_bytes().to_vec(), body).await;
+            let p = provider(shape, &base, Some(Duration::from_secs(5)), dir.path());
+            let out = step(p.as_ref(), &CancellationToken::new()).await;
+            assert_eq!(text_of(&out), "fine", "{shape:?} {head:?}: {}", describe(&out));
+        }
+    }
+}
+
+#[tokio::test]
+async fn json_200_context_overflow_is_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+    for shape in SHAPES {
+        let pieces = http_error("200 OK", "application/json", body);
+        let script: Script = Arc::new(move || pieces.clone());
+        let (base, _) = raw_server(script).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(5)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        match &out {
+            StepOutcome::Failed { error, .. } => {
+                assert_eq!(error.code, "CONTEXT_OVERFLOW", "{shape:?}");
+                assert!(!error.retryable, "{shape:?}");
+            }
+            other => panic!("{shape:?}: expected Failed, got {}", describe(other)),
+        }
+    }
+}
+
+fn openai_tool_chunk(index: u64, id: Option<&str>, name: Option<&str>, args: &str) -> String {
+    let mut call = json!({"index": index, "function": {"arguments": args}});
+    if let Some(id) = id {
+        call["id"] = json!(id);
+        call["type"] = json!("function");
+    }
+    if let Some(name) = name {
+        call["function"]["name"] = json!(name);
+    }
+    ev(
+        Shape::OpenAi,
+        "",
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[call]}}]}),
+    )
+}
+
+fn tool_calls(o: &StepOutcome) -> Vec<(String, String, serde_json::Value)> {
+    match o {
+        StepOutcome::Committed(m) => m
+            .content
+            .iter()
+            .filter_map(|p| match p {
+                ContentPart::ToolUse { call, name, args } => {
+                    Some((call.to_string(), name.clone(), args.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn openai_same_index_distinct_ids_make_two_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let finish = ev(
+        Shape::OpenAi,
+        "",
+        json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+    );
+    let body = [
+        openai_tool_chunk(0, Some("call_a"), Some("X"), "{\"n\":"),
+        openai_tool_chunk(0, None, None, "1}"),
+        openai_tool_chunk(0, Some("call_b"), Some("X"), "{\"n\":2}"),
+        // The same id again continues its call (no third call).
+        openai_tool_chunk(0, Some("call_b"), None, ""),
+        finish,
+        "data: [DONE]\n\n".into(),
+    ]
+    .concat();
+    let base = serve_once(sse_head(), body).await;
+    let p = provider(
+        Shape::OpenAi,
+        &base,
+        Some(Duration::from_secs(5)),
+        dir.path(),
+    );
+    let out = step(p.as_ref(), &CancellationToken::new()).await;
+    assert_eq!(
+        tool_calls(&out),
+        vec![
+            ("call_a".into(), "X".into(), json!({"n": 1})),
+            ("call_b".into(), "X".into(), json!({"n": 2})),
+        ],
+        "{}",
+        describe(&out)
+    );
 }
 
 // -- huge tool JSON ----------------------------------------------------------

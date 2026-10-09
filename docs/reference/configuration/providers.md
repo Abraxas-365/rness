@@ -211,6 +211,18 @@ Older logs without these fields remain readable. A failed turn displays an
 explicit recovery-stopped notice. `/help retry` and `/retry --help` describe
 manual recovery, and `/retry` is included in TUI completion.
 
+A model response is accepted only after the provider's end-of-response marker:
+Anthropic `message_stop`; OpenAI-compatible `data: [DONE]` or a chunk with a
+`finish_reason`; Responses `response.completed` or `response.incomplete`. If
+the connection closes before that marker, the attempt fails with a retryable
+`PROVIDER` error (`stream ended before …`) and its partial output is kept only
+in the failed attempt. The same applies to a stream event whose data is not
+valid JSON (`bad json: …`). A successful HTTP status whose `Content-Type` is not
+`text/event-stream` (for example a gateway answering `200 application/json` with
+an error body) fails with a retryable `HTTP` error that quotes the body's
+message, or a non-retryable `CONTEXT_OVERFLOW` when the body reports one. A
+response without a `Content-Type` header is parsed as a stream.
+
 Enter **`/retry`** in the TUI to start a new turn from the saved context. The command
 is local UI control, never a prompt sent to the model. It does not append another
 user message, and existing committed assistant/tool-result messages remain in

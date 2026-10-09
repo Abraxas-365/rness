@@ -21,8 +21,8 @@ fn sse(chunks: &[serde_json::Value]) -> String {
 
 fn sse_response(chunks: &[serde_json::Value]) -> ResponseTemplate {
     ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_string(sse(chunks))
+        // set_body_string would force content-type text/plain.
+        .set_body_raw(sse(chunks), "text/event-stream")
 }
 
 fn user_context(text: &str) -> ModelContext {

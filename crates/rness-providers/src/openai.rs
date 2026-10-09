@@ -12,6 +12,10 @@
 //!   else EndTurn
 //! - reasoning models' `delta.reasoning_content` (DeepSeek style) maps to
 //!   thinking chunks
+//! - the step commits on `[DONE]`, or at EOF after a `finish_reason`; EOF
+//!   with neither is a retryable failure (see the contract in `lib.rs`)
+//! - tool calls are keyed by `index` *and* `id`: a new id at a used index
+//!   starts a new call
 
 use std::time::Instant;
 
@@ -482,6 +486,10 @@ struct Accumulator {
     text: String,
     thinking: String,
     calls: Vec<PendingCall>,
+    /// Wire `index` → position in `calls`. A delta with a new id at an
+    /// index already holding another id opens a new call (some servers
+    /// reuse index 0 for every call).
+    slot_of_index: std::collections::HashMap<usize, usize>,
     chunks: Vec<TimedChunk>,
     stop: Option<StopReason>,
     usage: Usage,
@@ -572,11 +580,23 @@ impl Accumulator {
         if let Some(tool_calls) = delta["tool_calls"].as_array() {
             for tc in tool_calls {
                 let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                while self.calls.len() <= index {
-                    self.calls.push(PendingCall::default());
-                }
-                let call = &mut self.calls[index];
-                if let Some(id) = tc["id"].as_str() {
+                let id = tc["id"].as_str().filter(|id| !id.is_empty());
+                let slot = match self.slot_of_index.get(&index) {
+                    Some(&slot)
+                        if id.is_none_or(|id| {
+                            self.calls[slot].id.is_empty() || self.calls[slot].id == id
+                        }) =>
+                    {
+                        slot
+                    }
+                    _ => {
+                        self.calls.push(PendingCall::default());
+                        self.slot_of_index.insert(index, self.calls.len() - 1);
+                        self.calls.len() - 1
+                    }
+                };
+                let call = &mut self.calls[slot];
+                if let Some(id) = id {
                     call.id = id.to_string();
                 }
                 if let Some(name) = tc["function"]["name"].as_str() {
@@ -701,6 +721,10 @@ impl Provider for OpenAiProvider {
 
             break response;
         };
+        let response = match crate::reject_non_sse(response, self.idle_timeout, cancel).await {
+            Ok(response) => response,
+            Err(outcome) => return outcome,
+        };
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator::default();
         let mut emitted = 0usize;
@@ -746,7 +770,14 @@ impl Provider for OpenAiProvider {
                         partial: acc.chunks,
                     }
                 }
-                SsePull::Done => return StepOutcome::Committed(acc.finish(&self.model)),
+                // `[DONE]` returns above; a `finish_reason` without it is
+                // complete too (some compatible servers omit `[DONE]`).
+                SsePull::Done if acc.stop.is_some() => {
+                    return StepOutcome::Committed(acc.finish(&self.model))
+                }
+                SsePull::Done => {
+                    return crate::truncated("openai", "[DONE]/finish_reason", acc.chunks)
+                }
                 SsePull::Cancelled => {
                     return StepOutcome::Cancelled {
                         partial: acc.chunks,

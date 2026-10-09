@@ -11,6 +11,120 @@ pub mod responses;
 pub mod routes;
 pub mod sse;
 
+// -- stream completeness contract ---------------------------------------------
+//
+// An adapter's `step` returns `StepOutcome::Committed` only after it saw the
+// wire shape's terminal marker: Anthropic `message_stop`; OpenAI chat
+// `[DONE]` or a chunk with a non-null `finish_reason`; Responses
+// `response.completed` / `response.incomplete`. A stream that ends (EOF)
+// without it is a retryable `PROVIDER` failure carrying the partial chunks
+// (`truncated`), never a committed message. A non-empty data payload that is
+// not JSON is a retryable `PROVIDER` failure too; unknown event types are
+// ignored. A 2xx response that is not an event stream is rejected before
+// parsing (`reject_non_sse`).
+
+/// The stream ended before `marker`: retryable, partial chunks kept as the
+/// failed attempt's record.
+fn truncated(
+    shape: &str,
+    marker: &str,
+    partial: Vec<rness_protocol::events::TimedChunk>,
+) -> rness_engine::turn::provider::StepOutcome {
+    rness_engine::turn::provider::StepOutcome::Failed {
+        error: rness_engine::turn::provider::ProviderError {
+            code: "PROVIDER",
+            retry_after: None,
+            message: format!(
+                "{shape}: stream ended before {marker} (connection closed or incomplete response)"
+            ),
+            retryable: true,
+        },
+        partial,
+    }
+}
+
+/// `Content-Type` is `text/event-stream` (any parameters/case), or absent.
+fn is_event_stream(headers: &reqwest::header::HeaderMap) -> bool {
+    match headers.get(reqwest::header::CONTENT_TYPE) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .unwrap_or_default()
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("text/event-stream"),
+    }
+}
+
+/// How much of a non-stream 2xx body is read to explain the failure.
+const NON_SSE_BODY_LIMIT: usize = 64 * 1024;
+
+/// A 2xx response that is not an event stream (gateways answering
+/// `200 application/json {"error":…}`): read a bounded prefix of the body
+/// and fail the step instead of parsing zero events into an empty message.
+/// Retryable unless the body says context overflow. `Ok` = stream it.
+async fn reject_non_sse(
+    response: reqwest::Response,
+    idle_timeout: Option<std::time::Duration>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<reqwest::Response, rness_engine::turn::provider::StepOutcome> {
+    use rness_engine::turn::provider::{ProviderError, StepOutcome};
+    if is_event_stream(response.headers()) {
+        return Ok(response);
+    }
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let read = async {
+        let mut response = response;
+        let mut body = Vec::new();
+        while body.len() < NON_SSE_BODY_LIMIT {
+            match response.chunk().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                _ => break,
+            }
+        }
+        body.truncate(NON_SSE_BODY_LIMIT);
+        String::from_utf8_lossy(&body).into_owned()
+    };
+    let body = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(StepOutcome::Cancelled { partial: vec![] }),
+        _ = sse::idle_deadline(idle_timeout) => String::new(),
+        body = read => body,
+    };
+    let value = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let overflow = value
+        .as_ref()
+        .is_some_and(|v| is_context_overflow(&v["error"]));
+    let detail = value
+        .as_ref()
+        .and_then(|v| {
+            v["error"]["message"]
+                .as_str()
+                .or(v["error"].as_str())
+                .or(v["message"].as_str())
+                .or(v["detail"].as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| body.trim().chars().take(200).collect());
+    Err(StepOutcome::Failed {
+        error: ProviderError {
+            code: if overflow { "CONTEXT_OVERFLOW" } else { "HTTP" },
+            retry_after: None,
+            message: format!(
+                "provider returned {status} {content_type} instead of an event stream: {detail}"
+            ),
+            retryable: !overflow,
+        },
+        partial: vec![],
+    })
+}
+
 fn request_error_code(status: u16, body: &str) -> &'static str {
     if !matches!(status, 400 | 413 | 422) {
         return "HTTP";

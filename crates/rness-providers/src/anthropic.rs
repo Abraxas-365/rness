@@ -1022,6 +1022,10 @@ impl Provider for AnthropicProvider {
                     partial: vec![],
                 };
             }
+            let response = match crate::reject_non_sse(response, self.idle_timeout, cancel).await {
+                Ok(response) => response,
+                Err(outcome) => return outcome,
+            };
 
             let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
             let mut acc = Accumulator::default();
@@ -1030,12 +1034,20 @@ impl Provider for AnthropicProvider {
                 match reader.pull(cancel).await {
                     SsePull::Event { event, data } => {
                         if let Some(error) = crate::stream_overflow(&event, &data) {
-                            return StepOutcome::Failed { error, partial: acc.chunks };
+                            return StepOutcome::Failed {
+                                error,
+                                partial: acc.chunks,
+                            };
                         }
                         let at_ms = started.elapsed().as_millis() as u64;
                         if let Err(message) = acc.apply(&event, &data, at_ms) {
                             return StepOutcome::Failed {
-                                error: ProviderError { code: "PROVIDER", retry_after: None, message, retryable: true },
+                                error: ProviderError {
+                                    code: "PROVIDER",
+                                    retry_after: None,
+                                    message,
+                                    retryable: true,
+                                },
                                 partial: acc.chunks,
                             };
                         }
@@ -1045,19 +1057,34 @@ impl Provider for AnthropicProvider {
                             }
                             emitted = acc.chunks.len();
                         }
-                        if event == "message_stop" { return StepOutcome::Committed(acc.finish(&self.model)); }
+                        if event == "message_stop" {
+                            return StepOutcome::Committed(acc.finish(&self.model));
+                        }
                     }
-                    SsePull::Timeout => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: provider stream inactivity timeout".into(), retryable: true }, partial: acc.chunks },
-                SsePull::Done => return StepOutcome::Failed {
-                        error: ProviderError { code: "PROVIDER", retry_after: None, message: "anthropic: stream ended before message_stop (connection closed or incomplete response)".into(), retryable: true },
-                        partial: acc.chunks,
-                    },
+                    SsePull::Timeout => {
+                        return StepOutcome::Failed {
+                            error: ProviderError {
+                                code: "TIMEOUT",
+                                retry_after: None,
+                                message: "TIMEOUT: provider stream inactivity timeout".into(),
+                                retryable: true,
+                            },
+                            partial: acc.chunks,
+                        }
+                    }
+                    SsePull::Done => {
+                        return crate::truncated("anthropic", "message_stop", acc.chunks)
+                    }
                     SsePull::Cancelled => {
-                        return StepOutcome::Cancelled { partial: acc.chunks }
+                        return StepOutcome::Cancelled {
+                            partial: acc.chunks,
+                        }
                     }
                     SsePull::Error(e) => {
                         return StepOutcome::Failed {
-                            error: ProviderError { code: "PROVIDER", retry_after: None,
+                            error: ProviderError {
+                                code: "PROVIDER",
+                                retry_after: None,
                                 message: format!("stream: {e}"),
                                 retryable: true,
                             },
