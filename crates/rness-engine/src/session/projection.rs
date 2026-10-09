@@ -11,7 +11,8 @@
 use std::collections::HashSet;
 
 use rness_protocol::events::{
-    AssistantAttempt, CallConfig, ContentPart, Envelope, EventId, SessionEvent, ToolResult, Usage,
+    AssistantAttempt, CallConfig, ContentPart, Envelope, EventId, MessageSource, SessionEvent,
+    ToolResult, Usage, UserMessage,
 };
 
 /// One entry of the conversation as the model will see it.
@@ -90,6 +91,11 @@ struct CompactionPlan {
     /// original tool/result id -> (prune event id, pruned result).
     /// Replayed in the original's place; latest prune wins.
     pruned: std::collections::HashMap<EventId, (EventId, ToolResult)>,
+    /// Instruction baselines (`MessageSource::Instructions`) replaced by a
+    /// later one in the same history: only the newest baseline can reach the
+    /// model. "Newest" ignores compaction, so a baseline folded into a
+    /// summary never resurrects the older ones it superseded.
+    superseded: HashSet<EventId>,
 }
 
 fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> CompactionPlan {
@@ -117,10 +123,29 @@ fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Compactio
             pruned.insert(pr.replaces.clone(), (env.id.clone(), pr.result.clone()));
         }
     }
+    // Every instruction baseline but the newest is superseded.
+    let is_baseline = |env: &Envelope| {
+        matches!(
+            &env.event,
+            SessionEvent::UserMessage(UserMessage {
+                source: Some(MessageSource::Instructions { .. }),
+                ..
+            })
+        )
+    };
+    let newest = history.iter().rposition(|env| is_baseline(env.borrow()));
+    let superseded = history
+        .iter()
+        .take(newest.unwrap_or(0))
+        .map(|env| env.borrow())
+        .filter(|env| is_baseline(env))
+        .map(|env| env.id.clone())
+        .collect();
     CompactionPlan {
         shadowed,
         anchors,
         pruned,
+        superseded,
     }
 }
 
@@ -135,14 +160,16 @@ pub fn search_surfaces<E: std::borrow::Borrow<Envelope>>(
         .iter()
         .map(|event| {
             let event = event.borrow();
-            let surface =
-                if plan.shadowed.contains(&event.id) || plan.pruned.contains_key(&event.id) {
-                    "shadowed"
-                } else if current.contains(&event.id) {
-                    "current"
-                } else {
-                    "log-only"
-                };
+            let surface = if plan.shadowed.contains(&event.id)
+                || plan.pruned.contains_key(&event.id)
+                || plan.superseded.contains(&event.id)
+            {
+                "shadowed"
+            } else if current.contains(&event.id) {
+                "current"
+            } else {
+                "log-only"
+            };
             (event.id.clone(), surface)
         })
         .collect()
@@ -156,6 +183,11 @@ pub fn search_surfaces<E: std::borrow::Borrow<Envelope>>(
 /// arrival requires the full derivation.
 pub fn fast_surface(event: &SessionEvent) -> Option<&'static str> {
     Some(match event {
+        // A new instruction baseline supersedes (re-labels) the previous one.
+        SessionEvent::UserMessage(UserMessage {
+            source: Some(MessageSource::Instructions { .. }),
+            ..
+        }) => return None,
         SessionEvent::UserMessage(_)
         | SessionEvent::AssistantMessage(_)
         | SessionEvent::ToolResult(_) => "current",
@@ -209,6 +241,9 @@ pub fn model_context<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> ModelCo
                     }],
                 });
             }
+            continue;
+        }
+        if plan.superseded.contains(&env.id) {
             continue;
         }
         match &env.event {
@@ -351,6 +386,9 @@ pub fn transcript<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Transcript
                     shadowed: *span,
                 });
             }
+            continue;
+        }
+        if plan.superseded.contains(&env.id) {
             continue;
         }
         match &env.event {

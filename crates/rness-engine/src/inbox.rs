@@ -129,6 +129,17 @@ impl Inbox {
         self.followups.pop_front()
     }
 
+    /// The oldest parked/queued followup, without removing it.
+    pub fn peek_followup(&self) -> Option<&Pending> {
+        self.followups.front()
+    }
+
+    /// Queue `pending` behind the followups already waiting (a new input
+    /// that must not overtake parked ones).
+    pub fn push_followup(&mut self, pending: Pending) {
+        self.followups.push_back(pending);
+    }
+
     pub fn has_steers(&self) -> bool {
         !self.steers.is_empty()
     }
@@ -196,5 +207,21 @@ mod tests {
         inbox.set_phase(Phase::Idle);
         assert!(inbox.pop_followup().is_some());
         assert!(inbox.pop_followup().is_none());
+    }
+
+    #[test]
+    fn peek_and_push_keep_arrival_order() {
+        let mut inbox = Inbox::default();
+        inbox.set_phase(Phase::Running);
+        inbox.submit(UserIntent::Followup, text("parked"));
+        inbox.set_phase(Phase::Idle);
+        inbox.push_followup(Pending {
+            source: None,
+            intent: UserIntent::Followup,
+            content: text("newer"),
+        });
+        assert_eq!(inbox.peek_followup().unwrap().content, text("parked"));
+        assert_eq!(inbox.pop_followup().unwrap().content, text("parked"));
+        assert_eq!(inbox.pop_followup().unwrap().content, text("newer"));
     }
 }

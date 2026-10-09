@@ -116,9 +116,8 @@ def sec_lock(c):
         log = read_log(r.root, sid)
         started = [e["turn"] for e in log if e["type"] == "turn/started"]
         ended = [e["turn"] for e in log if e["type"] == "turn/ended"]
-        c.xcheck("lock: every turn/started has a turn/ended after resume",
-                 sorted(set(started)) == sorted(set(ended)), "B1-9 killed turn never closed",
-                 f"started={started} ended={ended}")
+        c.check("lock: every turn/started has a turn/ended after resume",
+                sorted(set(started)) == sorted(set(ended)), f"started={started} ended={ended}")
 
     # serve + headless on one session
     with with_rness(wp=WP, tag="lock-serve", mode="serve", scenario="ok") as r:
@@ -392,8 +391,7 @@ rness.compaction = { default = {
         print(f"INFO  instr: after AGENTS.md change: {len(rem)} baselines visible; v1={any('RULE-V1' in x for x in rem)} "
               f"v2={any('RULE-V2' in x for x in rem)}")
         c.check("instr: changed file -> new baseline present", any("RULE-V2" in x for x in rem))
-        c.xcheck("instr: changed file -> stale V1 baseline no longer visible", not any("RULE-V1" in x for x in rem),
-                 "B1-8 old baseline stays model-visible")
+        c.check("instr: changed file -> stale V1 baseline no longer visible", not any("RULE-V1" in x for x in rem), rem)
         # Force compaction folds with big turns; afterwards exactly one baseline.
         for i in range(4):
             run(f"big {i} " + "w" * 6000, sid)

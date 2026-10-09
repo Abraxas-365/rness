@@ -768,25 +768,30 @@ fn deep_fork_chains_replay_in_order() {
     }
 }
 
-/// Fork a fork at an event it INHERITED from its parent (an id the user
-/// sees in the leaf's transcript). The store only searches the session's
-/// own file, so this fails with ForkPointNotFound.
+/// Fork a fork at an id that is NOT in its visible history (unknown, or an
+/// ancestor event past the point the fork branched off) stays
+/// ForkPointNotFound.
 #[test]
-fn fork_at_inherited_event_is_rejected_today() {
+fn fork_at_unknown_or_invisible_event_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
     let mut root = store.create(None).unwrap();
-    let inherited = root.append(&user("root message")).unwrap();
+    root.append(&user("root message")).unwrap();
     let root_id = root.session().clone();
-    drop(root);
     let child = store.fork(&root_id, None).unwrap().session().clone();
-    let r = store.fork(&child, Some(inherited.id.clone()));
-    println!("fork child at inherited event: {}", describe(&r));
-    assert!(matches!(r, Err(BranchError::ForkPointNotFound { .. })));
+    // Appended to the root AFTER the fork: not visible in the child.
+    let later = root.append(&user("after the fork")).unwrap();
+    drop(root);
+    for at in [later.id, "01NOPE".to_string()] {
+        let r = store.fork(&child, Some(at));
+        println!("fork child at invisible event: {}", describe(&r));
+        assert!(matches!(r, Err(BranchError::ForkPointNotFound { .. })));
+    }
 }
 
+/// B1-4: forking a fork at an event inherited from its parent (an id the
+/// user sees in the leaf's transcript) forks from the owning ancestor.
 #[test]
-#[ignore = "bug B1-4: cannot fork a fork at an inherited (transcript-visible) event"]
 fn bug_fork_at_inherited_event_works() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new(dir.path());
@@ -798,6 +803,39 @@ fn bug_fork_at_inherited_event_works() {
     let grand = store.fork(&child, Some(inherited.id.clone())).unwrap();
     let ctx = replay(&store, grand.session()).unwrap().context;
     assert_eq!(ctx.turns.len(), 1);
+    // Same visible prefix as forking the owner directly: parent = ancestor.
+    assert_eq!(
+        store.parent(grand.session()).unwrap().unwrap().session,
+        root_id
+    );
+}
+
+/// B1-4, deeper chain: a grandchild forked at a mid-root event sees exactly
+/// the root prefix up to that event, not the child's or root's later events.
+#[test]
+fn fork_at_inherited_event_two_levels_keeps_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut root = store.create(None).unwrap();
+    let a = root.append(&user("a")).unwrap();
+    root.append(&user("b")).unwrap();
+    let root_id = root.session().clone();
+    drop(root);
+    let mut child = store.fork(&root_id, None).unwrap();
+    child.append(&user("c")).unwrap();
+    let child_id = child.session().clone();
+    drop(child);
+    let mid = store.fork(&child_id, None).unwrap().session().clone();
+    let leaf = store.fork(&mid, Some(a.id.clone())).unwrap();
+    let ctx = replay(&store, leaf.session()).unwrap().context;
+    assert_eq!(ctx.turns.len(), 1);
+    let ids: Vec<_> = store
+        .history(leaf.session())
+        .unwrap()
+        .iter()
+        .map(|e| e.id.clone())
+        .collect();
+    assert_eq!(ids.last(), Some(&a.id));
 }
 
 /// Fork at an assistant tool_use whose result is not in the prefix: the
@@ -1270,6 +1308,46 @@ async fn prune_pass_is_batched_in_order() {
     );
 }
 
+/// B1-9: a process killed mid-turn leaves `turn/started N` unclosed; recover()
+/// closes only that trailing turn, as `failed`, once (idempotent), and the
+/// context is unchanged.
+#[test]
+fn recover_closes_trailing_unclosed_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    for turn in 1..=2u32 {
+        log.append(&SessionEvent::TurnStarted { turn }).unwrap();
+        log.append(&user("q")).unwrap();
+        if turn == 1 {
+            log.append(&SessionEvent::TurnEnded {
+                turn,
+                outcome: TurnOutcome::Completed,
+            })
+            .unwrap();
+        }
+    }
+    let before = replay(&store, &sid).unwrap().context;
+    drop(log);
+    let mut log = store.open(&sid).unwrap();
+    compaction::recover(&mut log).unwrap();
+    compaction::recover(&mut log).unwrap(); // idempotent
+    let ended: Vec<(u32, TurnOutcome)> = read_session(dir.path(), &sid)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::TurnEnded { turn, outcome } => Some((*turn, *outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended,
+        vec![(1, TurnOutcome::Completed), (2, TurnOutcome::Failed)]
+    );
+    assert_eq!(replay(&store, &sid).unwrap().context, before);
+}
+
 /// recover(): a compaction/started with a later checkpoint but no finished
 /// is closed as committed_before_interruption; a bare one as interrupted.
 #[test]
@@ -1393,11 +1471,12 @@ mod instructions_e2e {
         assert!(!b.text.contains("claude rules"), "AGENTS.md must win");
     }
 
-    /// Changing AGENTS.md between turns appends a new baseline; the old one
-    /// stays model-visible (both identities in context), so the model sees
-    /// two instruction versions after every edit.
+    /// Changing AGENTS.md between turns appends a new baseline and the old
+    /// one is superseded (B1-8): both stay in the append-only log, but only
+    /// the current version is model-visible — across cold replay, forks and
+    /// compaction-style prune/fold of the log.
     #[test]
-    fn changed_file_appends_second_visible_baseline() {
+    fn changed_file_supersedes_previous_baseline() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
         let agents = dir.path().join("AGENTS.md");
@@ -1422,9 +1501,26 @@ mod instructions_e2e {
             rendered.contains("version one"),
             rendered.contains("version two")
         );
+        // Both baselines are durable history, one per identity...
         assert_eq!(ids.len(), 2);
-        // At most one baseline per identity.
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+        // ...but only the current one reaches the model.
+        assert!(rendered.contains("version two"));
+        assert!(!rendered.contains("version one"), "stale baseline visible");
+        // Same through a cold store and through a fork of the session.
+        let cold = SessionStore::new(dir.path().join("sessions"));
+        let fork = cold.fork(&sid, None).unwrap();
+        for session in [&sid, fork.session()] {
+            let rendered =
+                serde_json::to_string(&replay(&cold, session).unwrap().context.turns).unwrap();
+            assert!(rendered.contains("version two") && !rendered.contains("version one"));
+        }
+        // Reverting the file re-injects a fresh baseline for the old identity
+        // (it is superseded, hence not visible) and hides version two.
+        fs::write(&agents, "version one").unwrap();
+        assert!(ensure(&store, &mut log, &c).unwrap());
+        let rendered = serde_json::to_string(&replay(&store, &sid).unwrap().context.turns).unwrap();
+        assert!(rendered.contains("version one") && !rendered.contains("version two"));
     }
 
     /// After a checkpoint folds the baseline, ensure re-injects exactly once.

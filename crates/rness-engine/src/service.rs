@@ -1949,11 +1949,29 @@ impl SessionService {
                 // the turn (dsh baseline order).
                 self.ensure_instructions(&mut log)?;
                 if !retry {
-                    log.append(&SessionEvent::UserMessage(UserMessage {
+                    // Followups parked by a cancelled/failed burst were
+                    // submitted before this input: they open the turn and
+                    // this one queues behind them (user intent order). The
+                    // inbox changes only after the prompt is durable.
+                    let parked = inbox.peek_followup().cloned();
+                    let opening = parked.clone().unwrap_or_else(|| crate::inbox::Pending {
+                        source: source.clone(),
                         intent,
-                        content,
-                        source,
+                        content: content.clone(),
+                    });
+                    log.append(&SessionEvent::UserMessage(UserMessage {
+                        intent: opening.intent,
+                        content: opening.content,
+                        source: opening.source,
                     }))?;
+                    if parked.is_some() {
+                        inbox.pop_followup();
+                        inbox.push_followup(crate::inbox::Pending {
+                            source,
+                            intent,
+                            content,
+                        });
+                    }
                 }
                 let all_events = log.read_all_elided()?;
                 let turns_so_far = all_events

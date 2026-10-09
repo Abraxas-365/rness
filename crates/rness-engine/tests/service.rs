@@ -1098,6 +1098,49 @@ async fn cancel_ends_the_burst_and_returns_to_idle() {
     assert_eq!(replayed.context.turns.len(), 1); // just the user message
 }
 
+/// B1-10: followups parked by a cancelled burst are delivered before a
+/// newer message sent afterwards (submission order), none lost or duplicated.
+#[tokio::test]
+async fn parked_followups_precede_a_newer_message_after_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let provider = Scripted::gated(scripted_answers(3), Arc::clone(&gate));
+    let svc = service(dir.path(), provider.clone());
+    let sid = svc.create(None).unwrap();
+
+    svc.send(&sid, UserIntent::Followup, text("start")).unwrap();
+    while svc.phase(&sid) != Phase::Running {
+        tokio::task::yield_now().await;
+    }
+    for q in ["q1", "q2"] {
+        let d = svc.send(&sid, UserIntent::Followup, text(q)).unwrap();
+        assert_eq!(d, Disposition::Queued);
+    }
+    svc.cancel(&sid);
+    svc.join(&sid).await;
+    assert_eq!(svc.phase(&sid), Phase::Idle);
+
+    gate.add_permits(10);
+    svc.send(&sid, UserIntent::Followup, text("after")).unwrap();
+    svc.join(&sid).await;
+
+    let users: Vec<String> = svc
+        .store()
+        .history(&sid)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(UserMessage { content, .. }) => match &content[0] {
+                ContentPart::Text { text } => Some(text.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users, ["start", "q1", "q2", "after"]);
+    assert_eq!(svc.phase(&sid), Phase::Idle);
+}
+
 #[tokio::test]
 async fn sessions_run_independently() {
     let dir = tempfile::tempdir().unwrap();
@@ -1892,8 +1935,15 @@ async fn instructions_change_on_disk_reinjects_with_new_identity() {
         last_seen.contains("version-dos"),
         "fresh content missing: {last_seen}"
     );
-    // Old baseline is still durable history (append-only log).
-    assert!(last_seen.contains("version-uno"), "history is append-only");
+    // B1-8: the superseded baseline is no longer model-visible...
+    assert!(
+        !last_seen.contains("version-uno"),
+        "stale baseline still visible: {last_seen}"
+    );
+    // ...but stays durable history (append-only log).
+    let history = svc.store().history(&sid).unwrap();
+    let durable = serde_json::to_string(&history).unwrap();
+    assert!(durable.contains("version-uno"), "history is append-only");
 }
 
 /// Tool whose output alone crosses the mid-turn compaction threshold.
@@ -2255,11 +2305,13 @@ async fn queued_followup_rechecks_instructions() {
     assert!(order(&seen[0], &["version-uno", "|m1"]), "{}", seen[0]);
     assert!(!seen[0].contains("version-dos"), "{}", seen[0]);
     assert!(
-        order(&seen[1], &["version-uno", "|m1", "version-dos", "|m2"]),
+        order(&seen[1], &["m1", "version-dos", "|m2"]),
         "fresh baseline must sit between m1 and the followup: {}",
         seen[1]
     );
     assert_eq!(seen[1].matches("version-dos").count(), 1, "{}", seen[1]);
+    // B1-8: the superseded baseline is gone from the model's view.
+    assert!(!seen[1].contains("version-uno"), "{}", seen[1]);
 }
 
 #[tokio::test]

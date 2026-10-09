@@ -326,31 +326,31 @@ impl SessionStore {
         delegation: Option<Delegation>,
     ) -> Result<SessionLog, BranchError> {
         let events = self.read_session(session)?;
-        let at = match at {
-            Some(id) => {
-                let pos = events.iter().position(|e| e.id == id).ok_or_else(|| {
-                    BranchError::ForkPointNotFound {
-                        session: session.clone(),
-                        at: id.clone(),
-                    }
-                })?;
-                if pos == 0 {
-                    return Err(BranchError::ForkAtHeader(session.clone()));
+        // The session whose log owns the fork point: `session` itself, or —
+        // when `at` is an event inherited from an ancestor (visible in the
+        // transcript) — that ancestor, forked at the same event so the child
+        // sees the identical visible prefix.
+        let (owner, owner_events, at) = match at {
+            Some(id) => match events.iter().position(|e| e.id == id) {
+                Some(0) => return Err(BranchError::ForkAtHeader(session.clone())),
+                Some(_) => (session.clone(), events, id),
+                None => {
+                    let (owner, owner_events) = self.inherited_owner(session, &id)?;
+                    (owner, owner_events, id)
                 }
-                id
+            },
+            None => {
+                let at = events.last().expect("log has header").id.clone();
+                (session.clone(), events, at)
             }
-            None => events.last().expect("log has header").id.clone(),
         };
         // Workspace is inherited from the parent header.
-        let workspace = match &events[0].event {
+        let workspace = match &owner_events[0].event {
             SessionEvent::Header(h) => h.workspace.clone(),
             _ => unreachable!("read_session guarantees header first"),
         };
         let child = ulid::Ulid::new().to_string();
-        let fork = ForkRef {
-            session: session.clone(),
-            at,
-        };
+        let fork = ForkRef { session: owner, at };
         Ok(self.writer(SessionLog::create(
             &self.root,
             &child,
@@ -358,6 +358,37 @@ impl SessionStore {
             Some(fork),
             delegation,
         )?))
+    }
+
+    /// Find the ancestor of `session` whose visible prefix contains event
+    /// `at` (an event inherited into `session`'s transcript). Ancestors are
+    /// searched nearest first, each only up to the point the next hop forked
+    /// from it, so ids outside the visible history stay `ForkPointNotFound`.
+    fn inherited_owner(
+        &self,
+        session: &SessionId,
+        at: &EventId,
+    ) -> Result<(SessionId, Vec<Arc<Envelope>>), BranchError> {
+        let chain = self.ancestry(session)?;
+        for hop in chain[..chain.len() - 1].iter().rev() {
+            let events = self.read_session(&hop.session)?;
+            let visible = match &hop.forked_at {
+                Some(bound) => events
+                    .iter()
+                    .position(|e| &e.id == bound)
+                    .map_or(events.len(), |p| p + 1),
+                None => events.len(),
+            };
+            match events[..visible].iter().position(|e| &e.id == at) {
+                Some(0) => return Err(BranchError::ForkAtHeader(hop.session.clone())),
+                Some(_) => return Ok((hop.session.clone(), events)),
+                None => {}
+            }
+        }
+        Err(BranchError::ForkPointNotFound {
+            session: session.clone(),
+            at: at.clone(),
+        })
     }
 
     /// Delegation lineage of a session, if an agent created it.

@@ -125,6 +125,12 @@ FORMAT_VERSION`, session id matches) and then heals the tail:
 - **Mid-file damage** (valid events after a bad line): never repaired
   automatically. Reads fail with `corrupt log at line N (byte offset O)`.
 
+**Interrupted turns:** a process killed mid-turn leaves `turn/started N`
+without `turn/ended`. When the session is next opened for a turn (or a
+manual compaction), `recover()` appends `turn/ended {N, failed}` for that
+trailing turn (and closes dangling compaction audit spans), so every started
+turn is closed. No new event kind or format bump.
+
 **Forward compatibility:** an event whose `type` this build does not know
 (written by a newer rness) is data, not corruption: it is read as
 `SessionEvent::Unknown`, re-serialized semantically verbatim (same JSON value; object key order and
@@ -146,7 +152,10 @@ Branches preserve alternate conversation paths through log references:
 - Edit-and-resend, retry, and subagent trees are all this one mechanism.
 - Engine API: `fork(session, at_event)`, `ancestry(session)`,
   `children(session, at?)` — exposed through SessionService so ANY frontend
-  can branch.
+  can branch. `at_event` may be any event visible in the session's
+  transcript, including ones inherited from an ancestor: the child is then
+  forked from the ancestor that owns the event (same visible prefix), so its
+  `parent` is that ancestor. Ids outside the visible history are rejected.
 
 **Rule of thumb:** if it changes what's *true* about a session (lineage,
 events) → engine core. If it changes what you *see* (tree view, sibling
@@ -175,6 +184,9 @@ data, the design is wrong. rness initially ships with no SQLite at all.
 - **One inbox, three intents:** user input while the agent runs is
   classified `followup` / `steer` / `inject`, with explicit phases
   (idle / running / maintenance), rather than ad-hoc queued messages.
+  A cancelled or failed burst parks its queued followups; the next send
+  delivers them first, in submission order, and the new message queues
+  behind them.
 - **Parallel tools, model-order commits:** bounded concurrent execution,
   deterministic history order.
 - **Durable events vs live frames:** committed history and streaming
@@ -454,7 +466,10 @@ Build order follows the dependency graph:
   additive plugin label used only for TUI presentation; no format bump.) Before each turn `ensure_instructions`
   checks the PROJECTED surface for a visible baseline with the current
   identity; absent (first turn, compaction folded it, file changed on
-  disk) → re-read disk, append fresh. Config is explicit
+  disk) → re-read disk, append fresh. A newer baseline supersedes the
+  older ones in the projection (the log keeps them; the model, transcript
+  and search surfaces see only the newest), so an edited AGENTS.md never
+  leaves two versions model-visible. Config is explicit
   (`InstructionsConfig { cwd, candidates, max_bytes }`, zero engine
   defaults); the CLI seeds it visibly (`--instructions
   AGENTS.md,CLAUDE.md`, `--instructions-bytes 65536`, `none`
