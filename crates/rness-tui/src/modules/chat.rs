@@ -608,6 +608,42 @@ fn shift_rows(
     }
 }
 
+/// Width-only relayout: rescale every height from `old_width` to `width`
+/// in index order (the `estimate_rows` rule, without id lookups) and
+/// re-derive `card_rows`. Returns the first entry of the window
+/// (`target` rows from the bottom) that the caller lays out exactly.
+fn rescale_rows(
+    row_ends: &mut [usize],
+    card_rows: &mut std::collections::HashMap<String, usize>,
+    cached_calls: &std::collections::HashMap<String, usize>,
+    old_width: u16,
+    width: u16,
+    target: usize,
+) -> usize {
+    let (old, new) = (usize::from(old_width), usize::from(width.max(1)));
+    let (mut previous, mut total) = (0, 0);
+    for end in row_ends.iter_mut() {
+        let rows = *end - previous;
+        previous = *end;
+        total += if rows == 0 || old == new {
+            rows
+        } else {
+            (rows * old / new).max(1)
+        };
+        *end = total;
+    }
+    let mut start = row_ends.len();
+    while start > 0 && total - start.checked_sub(1).map_or(0, |i| row_ends[i]) < target {
+        start -= 1;
+    }
+    for (call, &index) in cached_calls {
+        if let Some(row) = card_rows.get_mut(call) {
+            *row = index.checked_sub(1).map_or(0, |i| row_ends[i]);
+        }
+    }
+    start
+}
+
 /// Signed `last - current` scroll movement (rows the view start moves down).
 fn scroll_delta(last: usize, current: usize) -> isize {
     if last >= current {
@@ -1524,15 +1560,35 @@ impl Component for Chat {
         let mut assistant_count = ctx.model.next_assistant_id;
         if !unchanged {
             let partial = dirty.is_some();
+            // Width-only change (same history, view state, theme and config):
+            // entry order, ids, calls and tool args are unchanged, so only
+            // heights are rescaled and the window near the viewport laid out.
+            let relayout = !append_only
+                && !partial
+                && !self.exact_layout
+                && ctx.model.history_revision != 0
+                && self.durable_stamp.as_ref() == Some(&stamp)
+                && self.cache_epoch == ctx.model.history_epoch
+                && self.entry_cache.len() == ctx.model.entries.len()
+                && self.row_ends.len() == ctx.model.entries.len()
+                && self.cached_ids.len() == ctx.model.entries.len()
+                && self.cache_width != width
+                && self.cache_theme.as_ref() == Some(theme)
+                && self.cache_config == self.config;
             let start_entry = if append_only || partial {
                 self.entry_cache.len()
             } else {
                 0
             };
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.cache_args.clear();
             }
-            for entry in &ctx.model.entries[start_entry..] {
+            let args_from = if relayout {
+                ctx.model.entries.len()
+            } else {
+                start_entry
+            };
+            for entry in &ctx.model.entries[args_from..] {
                 if let Entry::Assistant { content, .. } = entry {
                     for part in content {
                         if let ContentPart::ToolUse { call, args, .. } = part {
@@ -1542,17 +1598,44 @@ impl Component for Chat {
                 }
             }
             let tool_args = &self.cache_args;
-            let old_layout: Option<OldLayout> = (!append_only && !partial && !self.exact_layout)
-                .then(|| {
+            let old_layout: Option<OldLayout> =
+                (!append_only && !partial && !self.exact_layout && !relayout).then(|| {
                     (
                         self.cache_width,
                         std::mem::take(&mut self.cached_positions),
                         self.row_ends.clone(),
                     )
                 });
-            if self.cache_width != width
-                || self.cache_theme.as_ref() != Some(theme)
-                || self.cache_config != self.config
+            let relayout_start = relayout.then(|| {
+                let start = rescale_rows(
+                    &mut self.row_ends,
+                    &mut self.card_rows,
+                    &self.cached_calls,
+                    self.cache_width,
+                    width,
+                    ctx.model
+                        .scroll_from_bottom
+                        .saturating_add(2 * usize::from(area.height)),
+                );
+                // Rows above the window are estimates until refilled; all
+                // cached rows are for the old width.
+                for cached in &mut self.entry_cache {
+                    if !cached.1.is_empty() || !cached.2.is_empty() {
+                        *cached = (0, String::new(), Vec::new());
+                    }
+                }
+                self.resident_bytes.clear();
+                self.retained_bytes = 0;
+                self.evicted.clear();
+                self.evicted.extend(0..start);
+                self.stale = (0..start).collect();
+                self.cache_width = width;
+                start
+            });
+            if !relayout
+                && (self.cache_width != width
+                    || self.cache_theme.as_ref() != Some(theme)
+                    || self.cache_config != self.config)
             {
                 self.entry_cache.clear();
                 self.evicted.clear();
@@ -1568,7 +1651,9 @@ impl Component for Chat {
             // width/theme/config change) get estimated heights and are
             // refilled when they scroll into view or in later frames.
             let entry_id = |index: usize| ctx.model.entry_ids.get(index).map_or("", String::as_str);
-            let window_start = if old_layout.is_some() {
+            let window_start = if let Some(start) = relayout_start {
+                start
+            } else if old_layout.is_some() {
                 let target = ctx
                     .model
                     .scroll_from_bottom
@@ -1594,7 +1679,7 @@ impl Component for Chat {
                 }
                 self.cached_ids
                     .extend_from_slice(&ctx.model.entry_ids[start_entry..]);
-            } else if self.cached_ids != ctx.model.entry_ids {
+            } else if !relayout && self.cached_ids != ctx.model.entry_ids {
                 // Reordered slots cannot retain eviction indexes from the old order.
                 if !self.evicted.is_empty() {
                     self.entry_cache.clear();
@@ -1618,7 +1703,7 @@ impl Component for Chat {
                     .collect();
                 self.cached_ids = ctx.model.entry_ids.clone();
             }
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.cached_positions = self
                     .cached_ids
                     .iter()
@@ -1629,14 +1714,19 @@ impl Component for Chat {
                 self.cached_assistants.clear();
             }
             self.entry_cache.truncate(ctx.model.entries.len());
-            if !append_only && !partial {
+            if !append_only && !partial && !relayout {
                 self.resident_bytes.clear();
                 self.retained_bytes = 0;
                 self.row_ends.clear();
                 self.card_rows.clear();
                 self.stale.clear();
             }
-            assistant_count = 0;
+            // Fallback ids for assistants missing from `assistant_ids`
+            // count from the first laid-out entry.
+            assistant_count = ctx.model.entries[..relayout_start.unwrap_or(0)]
+                .iter()
+                .filter(|entry| matches!(entry, Entry::Assistant { .. }))
+                .count();
             let mut indices: Vec<usize> = if let Some(calls) = dirty {
                 let mut indices: Vec<_> = calls
                     .iter()
@@ -1681,7 +1771,7 @@ impl Component for Chat {
                 }
                 indices
             } else {
-                (start_entry..ctx.model.entries.len()).collect()
+                (relayout_start.unwrap_or(start_entry)..ctx.model.entries.len()).collect()
             };
             indices.extend(self.refill.iter().copied());
             // Everything but background (progressive) refills must be laid
@@ -4379,6 +4469,91 @@ mod tests {
         assert_eq!(chat.row_ends, reference.row_ends);
         assert_eq!(chat.card_rows, reference.card_rows);
         assert_eq!(render(&mut chat, &model, narrow), expected);
+    }
+
+    #[test]
+    fn width_only_resize_lays_out_the_window_and_converges() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("resize".into(), "fake".into());
+        model.history_epoch = 1;
+        model.history_revision = 1;
+        for i in 0..3000 {
+            if i % 4 == 0 {
+                model.entries.push(Entry::ToolResult {
+                    call: format!("call-{i}"),
+                    name: "Read".into(),
+                    output: format!("output {i} ").repeat(1 + i % 13),
+                    is_error: false,
+                });
+            } else {
+                model
+                    .entries
+                    .push(Entry::Notice(format!("entry {i} ").repeat(1 + i % 11)));
+            }
+            model.entry_ids.push(format!("id-{i}"));
+        }
+        let theme = Theme::default();
+        let render = |chat: &mut Chat, model: &Model, area: Rect| {
+            let mut buf = Buffer::empty(area);
+            chat.render(
+                &Ctx {
+                    model,
+                    theme: &theme,
+                },
+                area,
+                &mut buf,
+            );
+            buf
+        };
+        let exact = |model: &Model, area: Rect| {
+            let mut chat = Chat {
+                exact_layout: true,
+                ..Default::default()
+            };
+            let buf = render(&mut chat, model, area);
+            (chat, buf)
+        };
+        let drain = |chat: &mut Chat, model: &Model, area: Rect| {
+            for _ in 0..1000 {
+                if chat.stale.is_empty() {
+                    return;
+                }
+                render(chat, model, area);
+            }
+            panic!("refill did not converge");
+        };
+        let mut chat = Chat::default();
+        let wide = Rect::new(0, 0, 100, 12);
+        render(&mut chat, &model, wide);
+        drain(&mut chat, &model, wide);
+        for area in [
+            Rect::new(0, 0, 37, 12),
+            wide,
+            Rect::new(0, 0, 61, 20),
+            Rect::new(0, 0, 37, 12),
+        ] {
+            let before = chat.entry_visits;
+            let frame = render(&mut chat, &model, area);
+            assert!(chat.entry_visits - before < 100, "{area:?}");
+            assert_eq!(frame, exact(&model, area).1, "{area:?}");
+            // Card rows follow the rescaled (estimated) row index.
+            for (call, &index) in &chat.cached_calls {
+                let start = index.checked_sub(1).map_or(0, |i| chat.row_ends[i]);
+                assert_eq!(chat.card_rows.get(call), Some(&start), "{call}");
+            }
+            drain(&mut chat, &model, area);
+            let (reference, _) = exact(&model, area);
+            assert_eq!(chat.row_ends, reference.row_ends, "{area:?}");
+            assert_eq!(chat.card_rows, reference.card_rows, "{area:?}");
+        }
+        // Resized while scrolled: the jump to the top still shows exact rows.
+        model.scroll_from_bottom = 500;
+        render(&mut chat, &model, wide);
+        render(&mut chat, &model, Rect::new(0, 0, 45, 12));
+        model.scroll_from_bottom = usize::MAX;
+        let top = render(&mut chat, &model, Rect::new(0, 0, 45, 12));
+        assert_eq!(top, exact(&model, Rect::new(0, 0, 45, 12)).1);
     }
 
     #[test]
