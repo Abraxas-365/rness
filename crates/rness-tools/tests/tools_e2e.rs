@@ -105,6 +105,24 @@ impl RssPeak {
     }
 }
 
+/// Wait until no process holds a stale owner lock under `root`. A child
+/// that another test forks concurrently holds a duplicate of every fd,
+/// owner locks included, until it execs; recovery would then (correctly)
+/// treat that directory as live and keep it.
+fn wait_owner_locks_released(root: &std::path::Path) {
+    use fs2::FileExt;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for dir in std::fs::read_dir(root).unwrap() {
+        let Ok(file) = std::fs::File::open(dir.unwrap().path().join("owner.lock")) else {
+            continue;
+        };
+        while file.try_lock_exclusive().is_err() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = FileExt::unlock(&file);
+    }
+}
+
 fn fd_count() -> usize {
     std::fs::read_dir("/dev/fd").map_or(0, |d| d.count())
 }
@@ -1223,6 +1241,7 @@ fn job_recovery_releases_stale_dir_locks_and_removes_empty_dirs() {
         jobs.wait_recovery();
         drop(jobs);
     }
+    wait_owner_locks_released(&jobs_root);
     let fds0 = fd_count();
     let t = Instant::now();
     let jobs = JobRegistry::new();

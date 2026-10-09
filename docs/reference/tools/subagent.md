@@ -36,7 +36,7 @@ Waits for the child's turn to settle. Success returns its session ID and final a
 
 Returns a job ID. Observe it with `job_output`. Role and generic-child policy validation occurs before accepting a background job. A returned job ID still does not prove child creation or execution succeeded; inspect the job's result.
 
-`job_kill` cancels the child's turn (it ends `cancelled`) and the job settles as `killed`, with one completion notice. The kill also stops the background subagents that child started. Its Bash jobs keep running. A kill that lands before the child exists creates no child.
+`job_kill` cancels the child's turn (it ends `cancelled`) and the job settles as `killed`, with one completion notice. The kill also stops the background subagents that child started. Its background Bash jobs are not stopped: they keep running until they finish or the rness process exits. Their completion notices are logged to the killed child without waking it. A kill that lands before the child exists creates no child.
 
 ## Continuable
 
