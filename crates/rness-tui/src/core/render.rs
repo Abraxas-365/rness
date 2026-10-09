@@ -7,7 +7,7 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::core::highlight::highlight_code;
+use crate::core::highlight::highlight_code_limited;
 use crate::core::terminal_text::expand_tabs;
 use crate::theme::Theme;
 
@@ -15,6 +15,10 @@ use crate::theme::Theme;
 pub fn render_markdown(source: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     render_markdown_configured(source, width, theme, &serde_json::Value::Null)
 }
+
+/// Fenced code blocks are syntax-highlighted up to this many lines; the
+/// rest of a longer block renders with the plain code-block style.
+const MAX_HIGHLIGHT_LINES: usize = 2000;
 
 struct CachedMarkdown {
     source: String,
@@ -225,11 +229,23 @@ fn render_markdown_uncached(
                     let highlighted = if config["code_block"]["syntax_highlight"] == false {
                         None
                     } else {
-                        highlight_code(&code_buf, &code_lang)
+                        highlight_code_limited(&code_buf, &code_lang, MAX_HIGHLIGHT_LINES)
                     };
-                    let code_lines = highlighted.unwrap_or_else(|| {
-                        code_buf.lines().map(|l| Line::raw(l.to_owned())).collect()
-                    });
+                    // Syntect costs ~35 µs/line (release): a 10k-line block took
+                    // ~0.4 s per render and its spans were too big to memoize.
+                    // Lines past the cap stay plain (text is unchanged).
+                    let code_lines = match highlighted {
+                        Some(mut lines) => {
+                            lines.extend(
+                                code_buf
+                                    .lines()
+                                    .skip(lines.len())
+                                    .map(|l| Line::raw(l.to_owned())),
+                            );
+                            lines
+                        }
+                        None => code_buf.lines().map(|l| Line::raw(l.to_owned())).collect(),
+                    };
                     let left = config["code_block"]["padding"]["left"]
                         .as_u64()
                         .unwrap_or(0)
@@ -654,6 +670,23 @@ mod tests {
             .spans
             .iter()
             .any(|s| matches!(s.style.fg, Some(ratatui::style::Color::Rgb(..)))));
+    }
+
+    #[test]
+    fn huge_code_blocks_highlight_a_prefix_and_keep_every_line() {
+        let total = MAX_HIGHLIGHT_LINES + 50;
+        let body: String = (0..total).map(|i| format!("let v{i} = {i};\n")).collect();
+        let lines = render_markdown(&format!("```rust\n{body}```"), 80, &Theme::default());
+        let text = plain(&lines);
+        assert_eq!(text.len(), total + 2);
+        assert_eq!(text[1], "let v0 = 0;");
+        assert_eq!(text[total], format!("let v{} = {};", total - 1, total - 1));
+        // Plain rows are [left pad, text, right pad]; highlighted rows split the text.
+        let colored = |line: &Line<'_>| line.spans.len() > 3;
+        assert!(colored(&lines[1]));
+        assert!(colored(&lines[MAX_HIGHLIGHT_LINES]));
+        assert!(!colored(&lines[MAX_HIGHLIGHT_LINES + 1]));
+        assert!(!colored(&lines[total]));
     }
 
     #[test]

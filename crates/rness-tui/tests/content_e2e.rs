@@ -293,13 +293,11 @@ fn pathological_content_unconfigured() {
     assert!(hard.is_empty(), "{hard:#?}");
 }
 
-/// Strict variant of the matrix: every violation fails. Cell safety
-/// (B4-1) is fixed and asserted by the two tests above; what still fails
-/// here is not terminal safety: the unconfigured user path clips (does not
-/// wrap) a 50-deep quote at w20, and a 10k-line code block renders in
-/// > 5 s in debug builds (P5 / markdown perf).
+/// Strict variant of the matrix: every violation fails (cell safety, MARK
+/// visible — i.e. unconfigured user lines wrap rather than clip — and every
+/// single render under 5 s even in a debug build, which the 10k-line code
+/// block meets via the capped highlight in `render_markdown`).
 #[test]
-#[ignore = "strict: unconfigured user lines clip, 10k-line code block slow in debug"]
 fn pathological_content_strict() {
     let mut all = run_matrix(flavor_config(), "configured").failures;
     all.extend(run_matrix(Value::Null, "unconfigured").failures);

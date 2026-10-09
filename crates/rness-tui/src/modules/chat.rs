@@ -2150,12 +2150,27 @@ impl Component for Chat {
                                         )));
                                     }
                                     if let ContentPart::Text { text } = part {
+                                        // Wrap (not clip) under the 2-column prefix;
+                                        // continuation rows are indented like the
+                                        // following source lines.
+                                        let body_width =
+                                            usize::from(width).saturating_sub(2).max(1);
                                         for (i, l) in text.lines().enumerate() {
-                                            let prefix = if i == 0 { "> " } else { "  " };
-                                            lines.push(Line::from(vec![
-                                                Span::styled(prefix.to_string(), theme.user_prefix),
-                                                Span::raw(sanitize(l)),
-                                            ]));
+                                            let rows = visual_rows(
+                                                Line::raw(sanitize(l)),
+                                                body_width,
+                                                true,
+                                            );
+                                            for (j, row) in rows.into_iter().enumerate() {
+                                                let prefix =
+                                                    if i == 0 && j == 0 { "> " } else { "  " };
+                                                let mut spans = vec![Span::styled(
+                                                    prefix.to_string(),
+                                                    theme.user_prefix,
+                                                )];
+                                                spans.extend(row.spans);
+                                                lines.push(Line::from(spans));
+                                            }
                                         }
                                     }
                                 }
@@ -5386,6 +5401,42 @@ mod tests {
                 text.split_whitespace().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn unconfigured_user_lines_wrap_under_the_prompt_marker() {
+        use super::*;
+        use crate::{app::Model, theme::Theme};
+        let mut model = Model::new("qa".into(), "fake".into());
+        model.entries.push(Entry::User {
+            content: vec![ContentPart::Text {
+                text: "abcdefghijklmnop\nxy".into(),
+            }],
+            source: None,
+        });
+        let theme = Theme::default();
+        let mut chat = Chat::default();
+        let area = Rect::new(0, 0, 8, 6);
+        let mut buf = Buffer::empty(area);
+        chat.render(
+            &Ctx {
+                model: &model,
+                theme: &theme,
+            },
+            area,
+            &mut buf,
+        );
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .filter(|row| !row.is_empty())
+            .collect();
+        assert_eq!(rows, vec!["> abcdef", "  ghijkl", "  mnop", "  xy"]);
     }
 
     #[test]
