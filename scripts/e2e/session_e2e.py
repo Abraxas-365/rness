@@ -392,8 +392,7 @@ rness.compaction = { default = {
         print(f"INFO  instr: after AGENTS.md change: {len(rem)} baselines visible; v1={any('RULE-V1' in x for x in rem)} "
               f"v2={any('RULE-V2' in x for x in rem)}")
         c.check("instr: changed file -> new baseline present", any("RULE-V2" in x for x in rem))
-        c.xcheck("instr: changed file -> stale V1 baseline no longer visible", not any("RULE-V1" in x for x in rem),
-                 "B1-8 old baseline stays model-visible")
+        c.check("instr: changed file -> stale V1 baseline no longer visible", not any("RULE-V1" in x for x in rem), rem)
         # Force compaction folds with big turns; afterwards exactly one baseline.
         for i in range(4):
             run(f"big {i} " + "w" * 6000, sid)

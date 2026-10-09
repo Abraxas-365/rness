@@ -1431,11 +1431,12 @@ mod instructions_e2e {
         assert!(!b.text.contains("claude rules"), "AGENTS.md must win");
     }
 
-    /// Changing AGENTS.md between turns appends a new baseline; the old one
-    /// stays model-visible (both identities in context), so the model sees
-    /// two instruction versions after every edit.
+    /// Changing AGENTS.md between turns appends a new baseline and the old
+    /// one is superseded (B1-8): both stay in the append-only log, but only
+    /// the current version is model-visible — across cold replay, forks and
+    /// compaction-style prune/fold of the log.
     #[test]
-    fn changed_file_appends_second_visible_baseline() {
+    fn changed_file_supersedes_previous_baseline() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
         let agents = dir.path().join("AGENTS.md");
@@ -1460,9 +1461,26 @@ mod instructions_e2e {
             rendered.contains("version one"),
             rendered.contains("version two")
         );
+        // Both baselines are durable history, one per identity...
         assert_eq!(ids.len(), 2);
-        // At most one baseline per identity.
         assert_eq!(ids.iter().collect::<HashSet<_>>().len(), ids.len());
+        // ...but only the current one reaches the model.
+        assert!(rendered.contains("version two"));
+        assert!(!rendered.contains("version one"), "stale baseline visible");
+        // Same through a cold store and through a fork of the session.
+        let cold = SessionStore::new(dir.path().join("sessions"));
+        let fork = cold.fork(&sid, None).unwrap();
+        for session in [&sid, fork.session()] {
+            let rendered =
+                serde_json::to_string(&replay(&cold, session).unwrap().context.turns).unwrap();
+            assert!(rendered.contains("version two") && !rendered.contains("version one"));
+        }
+        // Reverting the file re-injects a fresh baseline for the old identity
+        // (it is superseded, hence not visible) and hides version two.
+        fs::write(&agents, "version one").unwrap();
+        assert!(ensure(&store, &mut log, &c).unwrap());
+        let rendered = serde_json::to_string(&replay(&store, &sid).unwrap().context.turns).unwrap();
+        assert!(rendered.contains("version one") && !rendered.contains("version two"));
     }
 
     /// After a checkpoint folds the baseline, ensure re-injects exactly once.

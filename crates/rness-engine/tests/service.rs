@@ -1892,8 +1892,15 @@ async fn instructions_change_on_disk_reinjects_with_new_identity() {
         last_seen.contains("version-dos"),
         "fresh content missing: {last_seen}"
     );
-    // Old baseline is still durable history (append-only log).
-    assert!(last_seen.contains("version-uno"), "history is append-only");
+    // B1-8: the superseded baseline is no longer model-visible...
+    assert!(
+        !last_seen.contains("version-uno"),
+        "stale baseline still visible: {last_seen}"
+    );
+    // ...but stays durable history (append-only log).
+    let history = svc.store().history(&sid).unwrap();
+    let durable = serde_json::to_string(&history).unwrap();
+    assert!(durable.contains("version-uno"), "history is append-only");
 }
 
 /// Tool whose output alone crosses the mid-turn compaction threshold.
@@ -2255,11 +2262,13 @@ async fn queued_followup_rechecks_instructions() {
     assert!(order(&seen[0], &["version-uno", "|m1"]), "{}", seen[0]);
     assert!(!seen[0].contains("version-dos"), "{}", seen[0]);
     assert!(
-        order(&seen[1], &["version-uno", "|m1", "version-dos", "|m2"]),
+        order(&seen[1], &["m1", "version-dos", "|m2"]),
         "fresh baseline must sit between m1 and the followup: {}",
         seen[1]
     );
     assert_eq!(seen[1].matches("version-dos").count(), 1, "{}", seen[1]);
+    // B1-8: the superseded baseline is gone from the model's view.
+    assert!(!seen[1].contains("version-uno"), "{}", seen[1]);
 }
 
 #[tokio::test]

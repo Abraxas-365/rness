@@ -457,7 +457,10 @@ Build order follows the dependency graph:
   additive plugin label used only for TUI presentation; no format bump.) Before each turn `ensure_instructions`
   checks the PROJECTED surface for a visible baseline with the current
   identity; absent (first turn, compaction folded it, file changed on
-  disk) → re-read disk, append fresh. Config is explicit
+  disk) → re-read disk, append fresh. A newer baseline supersedes the
+  older ones in the projection (the log keeps them; the model, transcript
+  and search surfaces see only the newest), so an edited AGENTS.md never
+  leaves two versions model-visible. Config is explicit
   (`InstructionsConfig { cwd, candidates, max_bytes }`, zero engine
   defaults); the CLI seeds it visibly (`--instructions
   AGENTS.md,CLAUDE.md`, `--instructions-bytes 65536`, `none`
