@@ -1194,6 +1194,82 @@ async fn prune_pass_skips_image_results() {
     assert!(!again, "second prune pass re-pruned already-pruned results");
 }
 
+/// The prune pass commits its prunes in batches (plan P6): 1100 oversized
+/// results -> 1100 Prune events in history order, 3 syncs (512 cap), and
+/// the projection replaces every pruned result.
+#[tokio::test]
+async fn prune_pass_is_batched_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    let mut batch = Vec::new();
+    for i in 0..1100 {
+        batch.push(user(&format!("u{i}")));
+        batch.push(SessionEvent::AssistantMessage(assistant(
+            "c",
+            &[(&format!("c{i}"), "Big")],
+        )));
+        batch.push(SessionEvent::ToolResult(ToolResult {
+            call: format!("c{i}"),
+            name: "Big".into(),
+            content: vec![],
+            output: format!("{i:05}").repeat(2000),
+            is_error: false,
+            duration_ms: 1,
+            tasks: None,
+            plan_review: None,
+            presentation: None,
+        }));
+        batch.push(SessionEvent::AssistantMessage(assistant("ok", &[])));
+    }
+    log.append_batch(&batch).unwrap();
+    let mut policy = stack_policy();
+    policy.prune_threshold = 8192;
+    policy.prune_head = 100;
+    policy.prune_tail = 100;
+    policy.threshold_tokens = 100_000_000; // only the prune pass
+    policy.retain_tokens = 100;
+    let provider = Refuser;
+    let syncs = log.sync_count();
+    let changed = compaction::reduce(
+        &store,
+        &mut log,
+        &provider,
+        "",
+        &[],
+        &policy,
+        false,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(changed);
+    assert_eq!(
+        log.sync_count() - syncs,
+        3,
+        "1100 prunes in 512-event batches"
+    );
+    let history = read_session(dir.path(), &sid).unwrap();
+    let calls: Vec<String> = history
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::Prune(p) => Some(p.result.call.clone()),
+            _ => None,
+        })
+        .collect();
+    let pruned = calls.len();
+    assert!(pruned >= 1090, "{pruned}");
+    let expected: Vec<String> = (0..pruned).map(|i| format!("c{i}")).collect();
+    assert_eq!(calls, expected, "prunes follow history order");
+    let replayed = replay(&store, &sid).unwrap();
+    let rendered = serde_json::to_string(&replayed.context.turns).unwrap();
+    assert_eq!(
+        rendered.matches("[tool result middle pruned]").count(),
+        pruned
+    );
+}
+
 /// recover(): a compaction/started with a later checkpoint but no finished
 /// is closed as committed_before_interruption; a bare one as interrupted.
 #[test]

@@ -650,6 +650,7 @@ async fn perf_reduce_prune_pass() {
     let extra = json!({"events": line_count(dir.path(), &sid), "big_results": 2000, "mb": file_mb(dir.path(), &sid)});
     let mut log = store.open(&sid).unwrap();
     let policy = default_policy();
+    let syncs0 = log.sync_count();
     let t = Instant::now();
     let changed = compaction::reduce(
         &store,
@@ -677,6 +678,7 @@ async fn perf_reduce_prune_pass() {
     e["prunes"] = json!(prunes);
     e["checkpoints"] = json!(ckpts);
     e["changed"] = json!(changed);
+    e["syncs"] = json!(log.sync_count() - syncs0);
     rep.sample("reduce_first_ms", ms, "ms", e);
     // Steady state: nothing to do, but reduce still runs every step.
     rep.time("reduce_noop_ms", 5, extra.clone(), || {

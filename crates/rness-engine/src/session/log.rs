@@ -147,7 +147,19 @@ pub struct SessionLog {
     /// `rness.record_stream`: keep the exact timed stream of committed
     /// outputs. Off by default — see [`drop_committed_stream`].
     record_stream: bool,
+    /// Event ids from this writer are strictly increasing, also within one
+    /// millisecond and within a batch.
+    ids: ulid::Generator,
+    /// Durability syncs issued by appends (observability for batching).
+    syncs: u64,
+    /// A failed write could not be rolled back: the tail may hold a partial
+    /// line, so nothing more is appended through this handle.
+    poisoned: bool,
 }
+
+/// Buffered bytes per `write_all` in [`SessionLog::append_batch`]; the
+/// whole batch still gets a single sync.
+const BATCH_WRITE_CHUNK: usize = 8 << 20;
 
 impl SessionLog {
     /// Create a fresh session under `root`. Writes the header line.
@@ -206,6 +218,9 @@ impl SessionLog {
                 file,
                 path,
                 record_stream: false,
+                ids: ulid::Generator::new(),
+                syncs: 0,
+                poisoned: false,
             }),
             Err(_) => Err(LogError::Locked(session.clone())),
         }
@@ -226,27 +241,57 @@ impl SessionLog {
 
     /// Append one event and fsync. Returns the committed envelope.
     pub fn append(&mut self, event: &SessionEvent) -> Result<Envelope, LogError> {
-        let mut event = event.clone();
-        if !self.record_stream {
-            drop_committed_stream(&mut event);
-        }
-        let envelope = Envelope {
-            id: ulid::Ulid::new().to_string(),
-            at: now_rfc3339(),
-            event,
-        };
-        let mut line = serde_json::to_string(&envelope)?;
-        line.push('\n');
-        self.write_durable(line.as_bytes())?;
-        Ok(envelope)
+        let mut committed = self.append_batch(std::slice::from_ref(event))?;
+        Ok(committed.pop().expect("one event in, one envelope out"))
     }
 
-    /// Write `bytes` (whole lines) at the end and fsync. On any failure the
-    /// file is rolled back (best effort) to its previous length, so a
-    /// partial write never glues onto the next append.
+    /// Append `events` in order with ONE durability sync (bytes are written
+    /// in chunks of at most 8 MiB). Empty slice: no write, no sync.
+    ///
+    /// Not atomic: a crash mid-batch leaves a whole-line prefix of the batch
+    /// (plus a torn line that `open` truncates) — exactly what consecutive
+    /// single appends could leave. Nothing is acknowledged before the sync;
+    /// on error the file is rolled back to its previous length.
+    pub fn append_batch(&mut self, events: &[SessionEvent]) -> Result<Vec<Envelope>, LogError> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let at = now_rfc3339();
+        let mut envelopes = Vec::with_capacity(events.len());
+        let mut bytes = Vec::new();
+        for event in events {
+            let mut event = event.clone();
+            if !self.record_stream {
+                drop_committed_stream(&mut event);
+            }
+            let id = self.ids.generate().unwrap_or_else(|_| ulid::Ulid::new());
+            let envelope = Envelope {
+                id: id.to_string(),
+                at: at.clone(),
+                event,
+            };
+            serde_json::to_writer(&mut bytes, &envelope)?;
+            bytes.push(b'\n');
+            envelopes.push(envelope);
+        }
+        self.write_durable(&bytes)?;
+        Ok(envelopes)
+    }
+
+    /// Durability syncs issued by appends through this handle so far.
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
+    }
+
+    /// Write `bytes` (whole lines) at the end and fsync once. On any failure
+    /// the file is rolled back to its previous length, so a partial write
+    /// never glues onto the next append; if even that fails the handle is
+    /// poisoned (later appends error instead of writing after garbage).
     pub(crate) fn write_durable(&mut self, bytes: &[u8]) -> Result<(), LogError> {
         self.write_durable_with(bytes, |file, bytes| {
-            file.write_all(bytes)?;
+            for chunk in bytes.chunks(BATCH_WRITE_CHUNK) {
+                file.write_all(chunk)?;
+            }
             file.sync_data()
         })
     }
@@ -256,13 +301,20 @@ impl SessionLog {
         bytes: &[u8],
         write: impl FnOnce(&mut File, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), LogError> {
+        if self.poisoned {
+            return Err(LogError::Io(std::io::Error::other(
+                "session log handle is poisoned by an earlier failed write; reopen the session",
+            )));
+        }
         let before = self.file.metadata()?.len();
         let result = write(&mut self.file, bytes);
+        self.syncs += 1;
         if let Err(error) = result {
             let rolled_back = self
                 .file
                 .set_len(before)
                 .and_then(|()| self.file.sync_data());
+            self.poisoned = rolled_back.is_err();
             tracing::warn!(
                 session = %self.session,
                 %error,
@@ -708,7 +760,7 @@ pub fn tip(root: &Path, session: &SessionId) -> Result<EventId, LogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rness_protocol::events::{ContentPart, UserIntent, UserMessage};
+    use rness_protocol::events::{AssistantMessage, ContentPart, UserIntent, UserMessage};
 
     fn user_msg(text: &str) -> SessionEvent {
         SessionEvent::UserMessage(UserMessage {
@@ -1169,6 +1221,104 @@ mod tests {
         // The torn part is truncated; the terminated region is quarantined.
         assert_eq!(repair.bytes, 4096 + 8);
         assert_eq!(repair.lines, 2);
+    }
+
+    #[test]
+    fn append_batch_writes_lines_in_order_with_one_sync() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "batch".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let syncs = log.sync_count();
+        assert!(log.append_batch(&[]).unwrap().is_empty());
+        assert_eq!(log.sync_count(), syncs, "empty batch: no write, no sync");
+        let events: Vec<_> = (0..100).map(|i| user_msg(&format!("m{i}"))).collect();
+        let committed = log.append_batch(&events).unwrap();
+        assert_eq!(log.sync_count(), syncs + 1);
+        let read = log.read_all().unwrap();
+        assert_eq!(read.len(), 101);
+        assert_eq!(&read[1..], &committed[..]);
+        // Ids strictly increasing, also across the single-append path.
+        let next = log.append(&user_msg("after")).unwrap();
+        let ids: Vec<_> = log
+            .read_all()
+            .unwrap()
+            .into_iter()
+            .skip(1)
+            .map(|e| e.id)
+            .collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+        assert_eq!(ids.last(), Some(&next.id));
+    }
+
+    #[test]
+    fn append_batch_drops_committed_stream_unless_recording() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "batch-stream".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let message = SessionEvent::AssistantMessage(AssistantMessage {
+            model: "m".into(),
+            content: vec![],
+            stop: rness_protocol::events::StopReason::EndTurn,
+            usage: Default::default(),
+            estimated_input: 0,
+            chunks: vec![rness_protocol::events::TimedChunk {
+                ms: 1,
+                delta: rness_protocol::events::ChunkDelta::Text { t: "x".into() },
+            }],
+        });
+        let off = log.append_batch(std::slice::from_ref(&message)).unwrap();
+        log.set_record_stream(true);
+        let on = log.append_batch(std::slice::from_ref(&message)).unwrap();
+        let chunks = |e: &Envelope| match &e.event {
+            SessionEvent::AssistantMessage(m) => m.chunks.len(),
+            _ => unreachable!(),
+        };
+        assert_eq!((chunks(&off[0]), chunks(&on[0])), (0, 1));
+    }
+
+    #[test]
+    fn batch_cut_at_every_byte_heals_to_a_whole_event_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "batch-cut".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let before = fs::metadata(log.path()).unwrap().len();
+        let events: Vec<_> = (0..5)
+            .map(|i| user_msg(&format!("event {i} \"q\"")))
+            .collect();
+        let committed = log.append_batch(&events).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let full = fs::read(&path).unwrap();
+        for cut in before..=full.len() as u64 {
+            fs::write(&path, &full[..cut as usize]).unwrap();
+            let log = SessionLog::open(root.path(), &sid).unwrap();
+            let read = log.read_all().unwrap();
+            let k = read.len() - 1;
+            assert_eq!(&read[1..], &committed[..k], "cut {cut}");
+            assert!(read
+                .iter()
+                .all(|e| !matches!(e.event, SessionEvent::Repair(_))));
+        }
+    }
+
+    #[test]
+    fn failed_batch_is_rolled_back_and_unrollbackable_failure_poisons() {
+        let root = tempfile::tempdir().unwrap();
+        let sid = "batch-fail".to_string();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        let before = fs::read(log.path()).unwrap();
+        let result = log.write_durable_with(b"{\"a\":1}\n{\"b\"", |file, bytes| {
+            file.write_all(bytes)?;
+            Err(std::io::Error::other("EIO"))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(log.path()).unwrap(), before);
+        assert!(!log.poisoned);
+        log.append(&user_msg("fine")).unwrap();
+        // Simulate a rollback that cannot happen.
+        log.poisoned = true;
+        assert!(log.append(&user_msg("refused")).is_err());
+        assert_eq!(log.read_all().unwrap().len(), 2);
     }
 
     #[test]
