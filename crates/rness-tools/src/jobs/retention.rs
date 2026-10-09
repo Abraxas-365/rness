@@ -9,6 +9,8 @@ pub struct Retention {
     /// Zero disables this limit.
     pub max_job_bytes: u64,
     /// Total output bytes owned by this registry; zero disables the limit.
+    /// Reaching it evicts the oldest settled, delivered artifacts first; a
+    /// producer is cancelled only when nothing is evictable.
     pub max_total_bytes: u64,
     /// Age after settlement; zero disables automatic deletion.
     pub max_age_secs: u64,

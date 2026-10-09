@@ -241,6 +241,8 @@ impl JobState {
 
 struct Job {
     budget: Arc<Mutex<retention::Budget>>,
+    /// For evicting old artifacts when the total quota is reached.
+    registry: std::sync::Weak<Registry>,
     path: Option<std::path::PathBuf>,
     state: Mutex<JobState>,
     /// Ephemeral compositions keep full output without JSON metadata.
@@ -449,8 +451,30 @@ impl JobWriter {
         if state.settled || state.output_error.is_some() {
             return;
         }
-        let mut budget = self.job.budget.lock().unwrap();
         let count = bytes.len() as u64;
+        let mut evicted = false;
+        let mut budget = loop {
+            let budget = self.job.budget.lock().unwrap();
+            let max = budget.policy.max_total_bytes;
+            if evicted || max == 0 || budget.used.saturating_add(count) <= max {
+                break budget;
+            }
+            // Over the total quota: make room by evicting the oldest
+            // settled, delivered artifacts (never this job or pending
+            // output) before refusing. The registry lock comes before job
+            // locks, so release ours first.
+            let need = budget.used.saturating_add(count) - max;
+            drop(budget);
+            drop(state);
+            if let Some(registry) = self.job.registry.upgrade() {
+                (JobRegistry { inner: registry }).evict(need);
+            }
+            evicted = true;
+            state = self.job.state.lock().expect("job lock");
+            if state.settled || state.output_error.is_some() {
+                return;
+            }
+        };
         let reason = if budget.policy.max_job_bytes != 0
             && (state.output_bytes as u64).saturating_add(count) > budget.policy.max_job_bytes
         {
@@ -675,19 +699,74 @@ impl JobRegistry {
             .take(excess)
             .map(|(_, id)| id.clone())
             .collect();
+        let candidates: Vec<String> = jobs
+            .iter()
+            .filter(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                expired(&state) || over_cap.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        let (removed, errors) = self.remove_artifacts(&mut jobs, candidates, u64::MAX);
+        if errors.is_empty() {
+            Ok(removed)
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// Make room for `need` more output bytes under the total quota by
+    /// removing the oldest settled artifacts nobody waits on (delivered, or
+    /// never owed a notice) and no reader holds. Returns the bytes freed.
+    fn evict(&self, need: u64) -> u64 {
+        let mut jobs = self.inner.jobs.lock().unwrap();
+        let mut oldest: Vec<(u64, String)> = jobs
+            .iter()
+            .filter_map(|(id, job)| {
+                let state = job.state.lock().unwrap();
+                (state.charged_bytes > 0).then(|| (state.settled_at_ms.unwrap_or(0), id.clone()))
+            })
+            .collect();
+        oldest.sort();
+        let before = self.inner.budget.lock().unwrap().used;
+        let (removed, errors) =
+            self.remove_artifacts(&mut jobs, oldest.into_iter().map(|(_, id)| id), need);
+        drop(jobs);
+        let freed = before.saturating_sub(self.inner.budget.lock().unwrap().used);
+        if removed > 0 {
+            tracing::info!(removed, freed, "evicted old job output for the total quota");
+        }
+        if !errors.is_empty() {
+            tracing::warn!(errors = %errors.join("; "), "job output eviction incomplete");
+        }
+        freed
+    }
+
+    /// Remove the removable artifacts among `ids` (in order) until `limit`
+    /// charged bytes are freed: settled, not owed an undelivered notice,
+    /// and not held by a reader or producer. Returns how many left the
+    /// registry, and the errors met.
+    fn remove_artifacts(
+        &self,
+        jobs: &mut HashMap<String, Arc<Job>>,
+        ids: impl IntoIterator<Item = String>,
+        limit: u64,
+    ) -> (usize, Vec<String>) {
         let mut removed = Vec::new();
         let mut errors = Vec::new();
-        for (id, job) in jobs.iter() {
+        let mut freed = 0u64;
+        for id in ids {
+            if freed >= limit {
+                break;
+            }
+            let Some(job) = jobs.get(&id) else { continue };
             // The registry lock prevents acquisition of new readers. Existing
             // readers/producers must finish before either spool can disappear.
             if Arc::strong_count(job) > 1 {
                 continue;
             }
             let state = job.state.lock().unwrap();
-            if !state.settled
-                || (!state.delivered && state.owner.is_some())
-                || !(expired(&state) || over_cap.contains(id))
-            {
+            if !state.settled || (!state.delivered && state.owner.is_some()) {
                 continue;
             }
             if let (Some(path), false) = (&job.path, job.durable) {
@@ -734,6 +813,7 @@ impl JobRegistry {
                 // The job must leave the registry once its output is removed.
                 if let Err(e) = sync_directory(path.parent().unwrap()) {
                     errors.push(e.to_string());
+                    freed = freed.saturating_add(state.charged_bytes);
                     removed.push((id.clone(), state.charged_bytes));
                     continue;
                 }
@@ -744,6 +824,7 @@ impl JobRegistry {
                     }
                 }
             }
+            freed = freed.saturating_add(state.charged_bytes);
             removed.push((id.clone(), state.charged_bytes));
         }
         for (id, bytes) in &removed {
@@ -751,11 +832,7 @@ impl JobRegistry {
             let mut budget = self.inner.budget.lock().unwrap();
             budget.used = budget.used.saturating_sub(*bytes);
         }
-        if errors.is_empty() {
-            Ok(removed.len())
-        } else {
-            Err(errors.join("; "))
-        }
+        (removed.len(), errors)
     }
 
     pub fn enable_persistence(&self, root: &std::path::Path) -> Result<(), String> {
@@ -953,6 +1030,7 @@ impl JobRegistry {
                 let durable = state.kind != "bash-output";
                 let job = Arc::new(Job {
                     budget: self.inner.budget.clone(),
+                    registry: Arc::downgrade(&self.inner),
                     spool: Mutex::new(None),
                     out: Mutex::new(None),
                     durable,
@@ -1159,6 +1237,7 @@ impl JobRegistry {
         let spool = ephemeral.then(|| Spool::Memory(Vec::new()));
         let job = Arc::new(Job {
             budget: self.inner.budget.clone(),
+            registry: Arc::downgrade(&self.inner),
             spool: Mutex::new(spool),
             out: Mutex::new(None),
             durable: !capture,
@@ -1410,6 +1489,51 @@ mod inspection_tests {
         second.append(b"3");
         assert!(second.cancelled().is_cancelled());
         assert!(second.output_error().unwrap().contains("total"));
+    }
+
+    #[test]
+    fn total_quota_evicts_oldest_settled_delivered_output_before_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = JobRegistry::new();
+        jobs.configure_retention(Retention {
+            max_total_bytes: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        jobs.enable_persistence(dir.path()).unwrap();
+        let owner = String::from("owner");
+        // Oldest: settled and delivered (an unowned job owes no notice).
+        let (old, writer) = jobs.start("test", "old".into());
+        writer.append(b"1234");
+        writer.settle(JobStatus::Exited(Some(0)));
+        writer.job.state.lock().unwrap().settled_at_ms = Some(1);
+        let old_output = writer.job.path.clone().unwrap().with_extension("output");
+        drop(writer);
+        // Settled but its notice is still owed: never evicted.
+        let (pending, writer) = jobs.start_owned("test", "pending".into(), Some(&owner));
+        writer.append(b"123");
+        writer.settle(JobStatus::Exited(Some(0)));
+        writer.job.state.lock().unwrap().settled_at_ms = Some(0);
+        drop(writer);
+        // Still running: never evicted.
+        let (_, running) = jobs.start("test", "running".into());
+        running.append(b"12");
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 9);
+
+        let (_, new) = jobs.start("test", "new".into());
+        new.append(b"123");
+        assert!(new.output_error().is_none(), "{:?}", new.output_error());
+        assert!(!new.cancelled().is_cancelled());
+        assert!(jobs.get(&old).is_err(), "oldest delivered output evicted");
+        assert!(!old_output.exists());
+        assert!(jobs.get(&pending).is_ok(), "undelivered output kept");
+        assert_eq!(jobs.inner.budget.lock().unwrap().used, 8);
+
+        // Nothing evictable left: refuse as before.
+        new.append(b"123");
+        assert!(new.output_error().unwrap().contains("total"));
+        assert!(jobs.get(&pending).is_ok());
+        assert!(!running.cancelled().is_cancelled());
     }
 
     #[test]

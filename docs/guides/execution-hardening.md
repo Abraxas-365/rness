@@ -162,9 +162,12 @@ Zero disables the corresponding byte limit, age-based deletion or capture cap. C
 must be 1–86400 seconds. Quotas count output bytes owned/recovered by this host,
 not metadata or other live instances. Running jobs, outstanding readers and
 undelivered owned completions are protected. Expired settled artifacts are
-removed; interrupted deletions are reconciled on recovery. A full quota cancels
-the producer and exposes an explicit incomplete-output error; it does not evict
-recent output merely to admit a write. Disk failures also cancel producers.
+removed; interrupted deletions are reconciled on recovery. When a write would
+exceed `max_total_bytes`, the oldest settled artifacts that are not protected
+(delivered or never owed a notice, no reader) are evicted first to make room.
+Only when nothing is evictable does the full quota cancel the producer and
+expose an explicit incomplete-output error. `max_job_bytes` never evicts. Disk
+failures also cancel producers.
 Background job count is not capped; treat artifacts as sensitive.
 
 ## Bash process cleanup
