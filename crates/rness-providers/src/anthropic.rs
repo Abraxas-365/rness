@@ -6,7 +6,7 @@
 //!   turns map 1:1 onto Anthropic messages; tool results become
 //!   `tool_result` user messages)
 //! - accumulates streamed deltas into final content while recording every
-//!   delta as a [`TimedChunk`] (traceability: the committed message embeds
+//!   delta as a [`TimedChunk`](rness_protocol::events::TimedChunk) (traceability: the committed message embeds
 //!   its exact stream)
 //! - maps HTTP/stream failures onto retryable/fatal [`ProviderError`]s
 //!   (429/5xx/transport → retryable; 4xx → fatal)
@@ -17,9 +17,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rness_engine::session::projection::ModelTurn;
 use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepRequest};
-use rness_protocol::events::{
-    AssistantMessage, ChunkDelta, ContentPart, Reasoning, StopReason, TimedChunk, Usage,
-};
+use rness_protocol::events::{AssistantMessage, ContentPart, Reasoning, StopReason, Usage};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -729,14 +727,14 @@ enum Block {
 }
 
 #[derive(Default)]
-struct Accumulator {
+struct Accumulator<'a> {
     blocks: Vec<Block>,
-    chunks: Vec<TimedChunk>,
+    chunks: crate::chunks::ChunkLog<'a>,
     stop: Option<StopReason>,
     usage: Usage,
 }
 
-impl Accumulator {
+impl Accumulator<'_> {
     fn finish(self, model: &str) -> AssistantMessage {
         let content = self
             .blocks
@@ -792,7 +790,7 @@ impl Accumulator {
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks,
+            chunks: self.chunks.into_committed(),
         }
     }
 
@@ -831,18 +829,12 @@ impl Accumulator {
                     ("text_delta", Block::Text(text)) => {
                         let t = delta["text"].as_str().unwrap_or("");
                         text.push_str(t);
-                        self.chunks.push(TimedChunk {
-                            ms: at_ms,
-                            delta: ChunkDelta::Text { t: t.to_string() },
-                        });
+                        self.chunks.text(t, at_ms);
                     }
                     ("thinking_delta", Block::Thinking { text, .. }) => {
                         let t = delta["thinking"].as_str().unwrap_or("");
                         text.push_str(t);
-                        self.chunks.push(TimedChunk {
-                            ms: at_ms,
-                            delta: ChunkDelta::Thinking { t: t.to_string() },
-                        });
+                        self.chunks.thinking(t, at_ms);
                     }
                     (
                         "input_json_delta",
@@ -852,13 +844,7 @@ impl Accumulator {
                     ) => {
                         let t = delta["partial_json"].as_str().unwrap_or("");
                         args_json.push_str(t);
-                        self.chunks.push(TimedChunk {
-                            ms: at_ms,
-                            delta: ChunkDelta::ToolArgs {
-                                call: call.clone(),
-                                t: t.to_string(),
-                            },
-                        });
+                        self.chunks.tool_args(call, t, at_ms);
                     }
                     // The thinking block's integrity signature — required
                     // by the API when the block is replayed.
@@ -1028,15 +1014,17 @@ impl Provider for AnthropicProvider {
             };
 
             let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
-            let mut acc = Accumulator::default();
-            let mut emitted = 0usize;
+            let mut acc = Accumulator {
+                chunks: crate::chunks::ChunkLog::new(request.on_delta),
+                ..Default::default()
+            };
             loop {
                 match reader.pull(cancel).await {
                     SsePull::Event { event, data } => {
                         if let Some(error) = crate::stream_overflow(&event, &data) {
                             return StepOutcome::Failed {
                                 error,
-                                partial: acc.chunks,
+                                partial: acc.chunks.into_partial(),
                             };
                         }
                         let at_ms = started.elapsed().as_millis() as u64;
@@ -1048,14 +1036,8 @@ impl Provider for AnthropicProvider {
                                     message,
                                     retryable: true,
                                 },
-                                partial: acc.chunks,
+                                partial: acc.chunks.into_partial(),
                             };
-                        }
-                        if let Some(sink) = request.on_delta {
-                            for chunk in &acc.chunks[emitted..] {
-                                sink(&chunk.delta);
-                            }
-                            emitted = acc.chunks.len();
                         }
                         if event == "message_stop" {
                             return StepOutcome::Committed(acc.finish(&self.model));
@@ -1069,15 +1051,19 @@ impl Provider for AnthropicProvider {
                                 message: "TIMEOUT: provider stream inactivity timeout".into(),
                                 retryable: true,
                             },
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         }
                     }
                     SsePull::Done => {
-                        return crate::truncated("anthropic", "message_stop", acc.chunks)
+                        return crate::truncated(
+                            "anthropic",
+                            "message_stop",
+                            acc.chunks.into_partial(),
+                        )
                     }
                     SsePull::Cancelled => {
                         return StepOutcome::Cancelled {
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         }
                     }
                     SsePull::Error(e) => {
@@ -1088,7 +1074,7 @@ impl Provider for AnthropicProvider {
                                 message: format!("stream: {e}"),
                                 retryable: true,
                             },
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         }
                     }
                 }

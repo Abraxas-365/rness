@@ -853,6 +853,115 @@ fn tool_args_len(o: &StepOutcome) -> Option<usize> {
     })
 }
 
+/// B5-8 (P3): every delta still reaches the live sink verbatim, but the
+/// retained record coalesces them, and a committed message with > 1 MiB of
+/// tool args keeps no ToolArgs chunks (the args live in `ToolUse.args`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_is_coalesced_and_tool_args_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    for shape in SHAPES {
+        // Text: 4096 deltas of 16 B, delivered at once.
+        let n = 4096;
+        let deltas: Vec<&str> = std::iter::repeat_n("0123456789abcdef", n).collect();
+        let base = serve_once(sse_head(), text_stream(shape, &deltas).concat()).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(30)), dir.path());
+        let sunk = Mutex::new(String::new());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let sink = |d: &ChunkDelta| {
+            if let ChunkDelta::Text { t } = d {
+                sunk.lock().unwrap().push_str(t);
+                calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let c = ctx();
+        let out = p
+            .step(
+                StepRequest {
+                    context: &c,
+                    system: "",
+                    tools: &[],
+                    on_delta: Some(&sink),
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        let StepOutcome::Committed(m) = &out else {
+            panic!("{shape:?}: {}", describe(&out));
+        };
+        let full = deltas.concat();
+        assert_eq!(calls.into_inner(), n, "{shape:?}: one sink call per delta");
+        assert_eq!(*sunk.lock().unwrap(), full, "{shape:?}");
+        let recorded: String = m
+            .chunks
+            .iter()
+            .map(|c| match &c.delta {
+                ChunkDelta::Text { t } => t.as_str(),
+                other => panic!("{shape:?}: unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(recorded, full, "{shape:?}: record is byte-identical");
+        // 64 KiB of text: at most 16 KiB per chunk, so ~4 (+ window splits).
+        assert!(m.chunks.len() <= 64, "{shape:?}: {} chunks", m.chunks.len());
+
+        // Tool args: 2 MiB in 512 B pieces -> committed record drops them.
+        let body = tool_stream(shape, 2, 512);
+        let base = serve_once(sse_head(), String::from_utf8(body).unwrap()).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(30)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        assert_eq!(tool_args_len(&out), Some(2 * 1024 * 1024), "{shape:?}");
+        assert_eq!(chunk_bytes(&out), 0, "{shape:?}: no ToolArgs retained");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_tool_args_and_failed_attempts_keep_their_record() {
+    let dir = tempfile::tempdir().unwrap();
+    for shape in SHAPES {
+        // Below the 1 MiB limit the committed record keeps the args.
+        let body = String::from_utf8(tool_stream(shape, 0, 4)).unwrap();
+        let base = serve_once(sse_head(), body).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(30)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        let StepOutcome::Committed(m) = &out else {
+            panic!("{shape:?}: {}", describe(&out));
+        };
+        let args: String = m
+            .chunks
+            .iter()
+            .filter_map(|c| match &c.delta {
+                ChunkDelta::ToolArgs { t, .. } => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(args, "{\"pad\":\"\"}", "{shape:?}");
+
+        // A failed attempt keeps all of its (large) tool args.
+        let mut body = String::from_utf8(tool_stream(shape, 2, 512)).unwrap();
+        let marker = match shape {
+            Shape::Anthropic => "event: message_delta",
+            Shape::OpenAi => "\"finish_reason\":\"tool_calls\"",
+            Shape::Responses => "event: response.output_item.done",
+        };
+        let at = body.rfind(marker).unwrap();
+        let cut = body[..=at].rfind("\n\n").map_or(0, |i| i + 2);
+        body.truncate(cut);
+        let base = serve_once(sse_head(), body).await;
+        let p = provider(shape, &base, Some(Duration::from_secs(30)), dir.path());
+        let out = step(p.as_ref(), &CancellationToken::new()).await;
+        let StepOutcome::Failed { partial, .. } = &out else {
+            panic!("{shape:?}: {}", describe(&out));
+        };
+        let kept: usize = partial
+            .iter()
+            .map(|c| match &c.delta {
+                ChunkDelta::ToolArgs { t, .. } => t.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(kept, 2 * 1024 * 1024 + "{\"pad\":\"\"}".len(), "{shape:?}");
+    }
+}
+
 fn chunk_bytes(o: &StepOutcome) -> usize {
     let StepOutcome::Committed(m) = o else {
         return 0;

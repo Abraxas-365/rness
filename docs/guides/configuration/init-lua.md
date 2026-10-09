@@ -123,6 +123,13 @@ summary, usage, timing of the event); only the token-by-token recording is
 left out. Failed, cancelled and rejected requests always keep what streamed,
 because that is their only record.
 
+The recorded stream is coalesced: pieces of the same kind that arrive within
+50 ms of each other share one chunk (at most 16 KiB), so the text is
+byte-identical but the timing granularity is ~20 fps. The live display still
+gets every piece. When a reply's tool arguments exceed 1 MiB, its recording
+leaves the tool-argument pieces out (the arguments themselves are stored in
+the message); failed and cancelled requests keep them.
+
 ```lua
 rness.record_stream = true -- debug provider streaming; grows logs ~20-30%
 ```

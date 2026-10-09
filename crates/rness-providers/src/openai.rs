@@ -7,7 +7,7 @@
 //!   messages; assistant tool calls carry `tool_calls`
 //! - streamed `delta.content` / `delta.tool_calls[].function.arguments`
 //!   accumulate into final content while every delta is recorded as a
-//!   [`TimedChunk`]
+//!   [`TimedChunk`](rness_protocol::events::TimedChunk)
 //! - `finish_reason`: `tool_calls` → ToolUse, `length` → MaxTokens,
 //!   else EndTurn
 //! - reasoning models' `delta.reasoning_content` (DeepSeek style) maps to
@@ -22,9 +22,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rness_engine::session::projection::{ModelContext, ModelTurn};
 use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepRequest};
-use rness_protocol::events::{
-    AssistantMessage, ChunkDelta, ContentPart, Reasoning, StopReason, TimedChunk, Usage,
-};
+use rness_protocol::events::{AssistantMessage, ContentPart, Reasoning, StopReason, Usage};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -482,7 +480,7 @@ struct PendingCall {
 }
 
 #[derive(Default)]
-struct Accumulator {
+struct Accumulator<'a> {
     text: String,
     thinking: String,
     calls: Vec<PendingCall>,
@@ -490,12 +488,12 @@ struct Accumulator {
     /// index already holding another id opens a new call (some servers
     /// reuse index 0 for every call).
     slot_of_index: std::collections::HashMap<usize, usize>,
-    chunks: Vec<TimedChunk>,
+    chunks: crate::chunks::ChunkLog<'a>,
     stop: Option<StopReason>,
     usage: Usage,
 }
 
-impl Accumulator {
+impl Accumulator<'_> {
     fn finish(self, model: &str) -> AssistantMessage {
         let mut content = Vec::new();
         if !self.thinking.is_empty() {
@@ -522,7 +520,7 @@ impl Accumulator {
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks,
+            chunks: self.chunks.into_committed(),
         }
     }
 
@@ -562,20 +560,14 @@ impl Accumulator {
         let delta = &choice["delta"];
         if let Some(t) = delta["content"].as_str().filter(|t| !t.is_empty()) {
             self.text.push_str(t);
-            self.chunks.push(TimedChunk {
-                ms: at_ms,
-                delta: ChunkDelta::Text { t: t.into() },
-            });
+            self.chunks.text(t, at_ms);
         }
         if let Some(t) = delta["reasoning_content"]
             .as_str()
             .filter(|t| !t.is_empty())
         {
             self.thinking.push_str(t);
-            self.chunks.push(TimedChunk {
-                ms: at_ms,
-                delta: ChunkDelta::Thinking { t: t.into() },
-            });
+            self.chunks.thinking(t, at_ms);
         }
         if let Some(tool_calls) = delta["tool_calls"].as_array() {
             for tc in tool_calls {
@@ -604,13 +596,7 @@ impl Accumulator {
                 }
                 if let Some(args) = tc["function"]["arguments"].as_str() {
                     call.args.push_str(args);
-                    self.chunks.push(TimedChunk {
-                        ms: at_ms,
-                        delta: ChunkDelta::ToolArgs {
-                            call: call.id.clone(),
-                            t: args.into(),
-                        },
-                    });
+                    self.chunks.tool_args(&call.id, args, at_ms);
                 }
             }
         }
@@ -726,15 +712,17 @@ impl Provider for OpenAiProvider {
             Err(outcome) => return outcome,
         };
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
-        let mut acc = Accumulator::default();
-        let mut emitted = 0usize;
+        let mut acc = Accumulator {
+            chunks: crate::chunks::ChunkLog::new(request.on_delta),
+            ..Default::default()
+        };
         loop {
             match reader.pull(cancel).await {
                 SsePull::Event { data, .. } => {
                     if let Some(error) = crate::stream_overflow("", &data) {
                         return StepOutcome::Failed {
                             error,
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         };
                     }
                     if data.trim() == "[DONE]" {
@@ -749,14 +737,8 @@ impl Provider for OpenAiProvider {
                                 message,
                                 retryable: true,
                             },
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         };
-                    }
-                    if let Some(sink) = request.on_delta {
-                        for chunk in &acc.chunks[emitted..] {
-                            sink(&chunk.delta);
-                        }
-                        emitted = acc.chunks.len();
                     }
                 }
                 SsePull::Timeout => {
@@ -767,7 +749,7 @@ impl Provider for OpenAiProvider {
                             message: "TIMEOUT: provider stream inactivity timeout".into(),
                             retryable: true,
                         },
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
                 // `[DONE]` returns above; a `finish_reason` without it is
@@ -776,11 +758,15 @@ impl Provider for OpenAiProvider {
                     return StepOutcome::Committed(acc.finish(&self.model))
                 }
                 SsePull::Done => {
-                    return crate::truncated("openai", "[DONE]/finish_reason", acc.chunks)
+                    return crate::truncated(
+                        "openai",
+                        "[DONE]/finish_reason",
+                        acc.chunks.into_partial(),
+                    )
                 }
                 SsePull::Cancelled => {
                     return StepOutcome::Cancelled {
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
                 SsePull::Error(e) => {
@@ -791,7 +777,7 @@ impl Provider for OpenAiProvider {
                             message: format!("stream: {e}"),
                             retryable: true,
                         },
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
             }

@@ -17,9 +17,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use rness_engine::session::projection::{ModelContext, ModelTurn};
 use rness_engine::turn::provider::{Provider, ProviderError, StepOutcome, StepRequest};
-use rness_protocol::events::{
-    AssistantMessage, ChunkDelta, ContentPart, Reasoning, StopReason, TimedChunk, Usage,
-};
+use rness_protocol::events::{AssistantMessage, ContentPart, Reasoning, StopReason, Usage};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -293,54 +291,48 @@ fn input_items(
 // -- stream accumulation ---------------------------------------------------
 
 #[derive(Default)]
-struct Accumulator {
+struct Accumulator<'a> {
     /// Finished output items (`response.output_item.done`), model order.
     items: Vec<Value>,
-    chunks: Vec<TimedChunk>,
+    chunks: crate::chunks::ChunkLog<'a>,
     usage: Usage,
     status: Option<String>,
     error: Option<String>,
     done: bool,
 }
 
-impl Accumulator {
+impl Accumulator<'_> {
     /// Unknown event types are ignored; an empty payload is skipped; a
     /// non-JSON payload is an error (the stream is corrupt).
     fn apply(&mut self, event: &str, data: &str, at_ms: u64) -> Result<(), String> {
         if data.trim().is_empty() {
             return Ok(());
         }
-        let v: Value =
+        let mut v: Value =
             serde_json::from_str(data).map_err(|e| format!("responses: bad json: {e}"))?;
         match event {
             "response.output_text.delta" => {
-                if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
-                    self.chunks.push(TimedChunk {
-                        ms: at_ms,
-                        delta: ChunkDelta::Text { t: t.into() },
-                    });
+                if let Some(t) = v["delta"].as_str() {
+                    self.chunks.text(t, at_ms);
                 }
             }
             "response.reasoning_summary_text.delta" => {
-                if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
-                    self.chunks.push(TimedChunk {
-                        ms: at_ms,
-                        delta: ChunkDelta::Thinking { t: t.into() },
-                    });
+                if let Some(t) = v["delta"].as_str() {
+                    self.chunks.thinking(t, at_ms);
                 }
             }
             "response.function_call_arguments.delta" => {
-                if let Some(t) = v["delta"].as_str().filter(|t| !t.is_empty()) {
+                if let Some(t) = v["delta"].as_str() {
                     let call = v["item_id"].as_str().unwrap_or_default().to_string();
-                    self.chunks.push(TimedChunk {
-                        ms: at_ms,
-                        delta: ChunkDelta::ToolArgs { call, t: t.into() },
-                    });
+                    self.chunks.tool_args(&call, t, at_ms);
                 }
             }
             "response.output_item.done" => {
-                if !v["item"].is_null() {
-                    self.items.push(v["item"].clone());
+                // Moved, not cloned: the item can hold tens of MiB of args.
+                if let Some(item) = v.get_mut("item").map(Value::take) {
+                    if !item.is_null() {
+                        self.items.push(item);
+                    }
                 }
             }
             "response.completed" | "response.incomplete" => {
@@ -379,8 +371,10 @@ impl Accumulator {
                 // The completed payload's output array can be empty; only
                 // trust it when we accumulated nothing.
                 if self.items.is_empty() {
-                    if let Some(output) = response["output"].as_array() {
-                        self.items = output.clone();
+                    if let Some(Value::Array(output)) =
+                        v.pointer_mut("/response/output").map(Value::take)
+                    {
+                        self.items = output;
                     }
                 }
                 self.done = true;
@@ -405,7 +399,7 @@ impl Accumulator {
     fn finish(self, model: &str) -> AssistantMessage {
         let mut content = Vec::new();
         let mut saw_tool_use = false;
-        for item in &self.items {
+        for mut item in self.items {
             match item["type"].as_str().unwrap_or_default() {
                 "message" => {
                     for c in item["content"].as_array().into_iter().flatten() {
@@ -443,11 +437,14 @@ impl Accumulator {
                 }
                 "function_call" => {
                     saw_tool_use = true;
-                    let args = item["arguments"].as_str().unwrap_or("{}");
+                    let args = serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
+                        .unwrap_or(json!({}));
+                    // Free the raw argument string before the next item.
+                    item["arguments"].take();
                     content.push(ContentPart::ToolUse {
                         call: item["call_id"].as_str().unwrap_or_default().into(),
                         name: item["name"].as_str().unwrap_or_default().into(),
-                        args: serde_json::from_str(args).unwrap_or(json!({})),
+                        args,
                     });
                 }
                 _ => {}
@@ -466,7 +463,7 @@ impl Accumulator {
             stop,
             usage: self.usage,
             estimated_input: 0,
-            chunks: self.chunks,
+            chunks: self.chunks.into_committed(),
         }
     }
 }
@@ -591,15 +588,17 @@ impl Provider for ResponsesProvider {
         };
 
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
-        let mut acc = Accumulator::default();
-        let mut emitted = 0usize;
+        let mut acc = Accumulator {
+            chunks: crate::chunks::ChunkLog::new(request.on_delta),
+            ..Default::default()
+        };
         loop {
             match reader.pull(cancel).await {
                 SsePull::Event { event, data } => {
                     if let Some(error) = crate::stream_overflow(&event, &data) {
                         return StepOutcome::Failed {
                             error,
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         };
                     }
                     let at_ms = started.elapsed().as_millis() as u64;
@@ -611,14 +610,8 @@ impl Provider for ResponsesProvider {
                                 message,
                                 retryable: true,
                             },
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         };
-                    }
-                    if let Some(sink) = request.on_delta {
-                        for chunk in &acc.chunks[emitted..] {
-                            sink(&chunk.delta);
-                        }
-                        emitted = acc.chunks.len();
                     }
                     if acc.done {
                         if let Some(message) = acc.error {
@@ -629,7 +622,7 @@ impl Provider for ResponsesProvider {
                                     message,
                                     retryable: true,
                                 },
-                                partial: acc.chunks,
+                                partial: acc.chunks.into_partial(),
                             };
                         }
                         return StepOutcome::Committed(acc.finish(&self.model));
@@ -643,7 +636,7 @@ impl Provider for ResponsesProvider {
                             message: "TIMEOUT: provider stream inactivity timeout".into(),
                             retryable: true,
                         },
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
                 SsePull::Done => {
@@ -655,17 +648,21 @@ impl Provider for ResponsesProvider {
                                 message,
                                 retryable: true,
                             },
-                            partial: acc.chunks,
+                            partial: acc.chunks.into_partial(),
                         };
                     }
                     if !acc.done {
-                        return crate::truncated("responses", "response.completed", acc.chunks);
+                        return crate::truncated(
+                            "responses",
+                            "response.completed",
+                            acc.chunks.into_partial(),
+                        );
                     }
                     return StepOutcome::Committed(acc.finish(&self.model));
                 }
                 SsePull::Cancelled => {
                     return StepOutcome::Cancelled {
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
                 SsePull::Error(e) => {
@@ -676,7 +673,7 @@ impl Provider for ResponsesProvider {
                             message: format!("stream: {e}"),
                             retryable: true,
                         },
-                        partial: acc.chunks,
+                        partial: acc.chunks.into_partial(),
                     }
                 }
             }

@@ -640,13 +640,18 @@ async fn tool_use_stream_assembles_args_and_advertises_tools() {
             args: json!({"path": "a.txt"}),
         }
     );
-    // Tool-arg deltas recorded chunk by chunk.
-    let arg_chunks = msg
+    // Tool-arg deltas are recorded byte-exact; pieces arriving within the
+    // coalescing window share one chunk (see chunks.rs).
+    let recorded: Vec<&str> = msg
         .chunks
         .iter()
-        .filter(|c| matches!(c.delta, ChunkDelta::ToolArgs { .. }))
-        .count();
-    assert_eq!(arg_chunks, 2);
+        .filter_map(|c| match &c.delta {
+            ChunkDelta::ToolArgs { call, t } if call == "call_1" => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded.concat(), "{\"path\":\"a.txt\"}");
+    assert!(!recorded.is_empty() && recorded.len() <= 2);
 }
 
 #[tokio::test]
