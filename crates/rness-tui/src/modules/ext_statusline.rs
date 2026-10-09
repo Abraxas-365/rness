@@ -269,7 +269,8 @@ mod tests {
             "left":[{"text":"a\u{1b}[31mred\u{1b}[0m\u{9b}b"}], "right":"r"
         }));
         let text = row(&mut component);
-        assert!(text.starts_with("aredb"), "{text:?}");
+        // `\u{9b}b` is a whole C1 CSI (final byte `b`), dropped like `ESC [ b`.
+        assert!(text.starts_with("ared "), "{text:?}");
         assert!(!text.contains("[31m"), "{text:?}");
     }
 

@@ -34,7 +34,8 @@ use is_terminal_unsafe as is_unsafe;
 #[derive(Default)]
 struct Sanitizer {
     col: usize,
-    /// 0 none, 1 after ESC, 2 CSI, 3 OSC/string, 4 ESC inside OSC.
+    /// 0 none, 1 after ESC, 2 CSI, 3 OSC/string, 4 ESC inside OSC,
+    /// 5 ESC intermediates (`ESC ( B`, `ESC # 8`, `ESC SP F`…).
     escape: u8,
     /// Pass `\t` through instead of expanding it (markdown source).
     keep_tabs: bool,
@@ -55,13 +56,38 @@ impl Sanitizer {
                     '[' => 2,
                     // OSC, DCS, SOS, PM, APC: a string until BEL or ST.
                     ']' | 'P' | 'X' | '^' | '_' => 3,
+                    // nF: intermediates, then one final byte (charset
+                    // designation `ESC ( B`, DEC tests `ESC # 8`…).
+                    '\u{20}'..='\u{2f}' => 5,
                     _ => 0,
                 };
                 return;
             }
+            5 => {
+                match ch {
+                    '\u{20}'..='\u{2f}' => {}
+                    '\u{30}'..='\u{7e}' => self.escape = 0,
+                    // Not a final byte: the sequence is malformed; end it
+                    // and treat the character as text.
+                    _ => {
+                        self.escape = 0;
+                        self.push(ch, out);
+                    }
+                }
+                return;
+            }
             2 => {
-                if ('\u{40}'..='\u{7e}').contains(&ch) {
-                    self.escape = 0;
+                match ch {
+                    // Parameters and intermediates.
+                    '\u{20}'..='\u{3f}' => {}
+                    '\u{40}'..='\u{7e}' => self.escape = 0,
+                    // Not a CSI byte: the sequence is malformed (often a
+                    // stray C1 from mis-decoded text); end it and treat the
+                    // character as text (an ESC starts a new sequence).
+                    _ => {
+                        self.escape = 0;
+                        self.push(ch, out);
+                    }
                 }
                 return;
             }
@@ -81,6 +107,8 @@ impl Sanitizer {
         }
         match ch {
             '\u{1b}' => self.escape = 1,
+            // C1 CSI: 8-bit `ESC [`; its parameters and final byte go too.
+            '\u{9b}' => self.escape = 2,
             '\t' if self.keep_tabs => out.push('\t'),
             '\t' => {
                 let next = (self.col / 8 + 1) * 8;
@@ -252,8 +280,32 @@ mod tests {
 
     #[test]
     fn c1_controls_drop_only_the_control() {
-        assert_eq!(clean("a\u{9b}31mb"), "a31mb");
         assert_eq!(clean("a\u{85}b\u{90}c\u{9c}d"), "abcd");
+    }
+
+    #[test]
+    fn c1_csi_is_dropped_like_esc_bracket() {
+        assert_eq!(clean("a\u{9b}31mb"), "ab");
+        assert_eq!(clean("a\u{9b}?1049lb\u{9b}2Jc"), "abc");
+        assert_eq!(sanitize("\u{9b}1;31mred\u{9b}0m"), "red");
+        assert_eq!(sanitize_markdown("x\u{9b}31m\ty"), "x\ty");
+        // A stray C1 CSI before non-CSI text does not swallow the text.
+        assert_eq!(clean("a\u{9b}漢字 b"), "a漢字 b");
+        assert_eq!(clean("a\x1b[1;漢b"), "a漢b");
+        assert_eq!(clean("a\u{9b}1\x1b[31mb"), "ab");
+    }
+
+    #[test]
+    fn esc_intermediate_sequences_are_dropped_whole() {
+        // Charset designation (G0..G3), DEC line attributes/tests, S7C1T.
+        assert_eq!(clean("a\x1b(Bb\x1b)0c\x1b*Ad\x1b+<e"), "abcde");
+        assert_eq!(clean("a\x1b#8b\x1b#6c\x1b F\x1b%Gd"), "abcd");
+        // Several intermediates before the final byte.
+        assert_eq!(clean("a\x1b(!@b"), "ab");
+        assert_eq!(sanitize("\x1b(0lqk\x1b(B"), "lqk");
+        // A malformed nF sequence ends at a non-final byte, which stays.
+        assert_eq!(clean("a\x1b(漢b"), "a漢b");
+        assert_eq!(clean("a\x1b(\nb"), "a\nb");
     }
 
     #[test]
@@ -336,9 +388,10 @@ mod tests {
     fn idempotent_and_never_emits_controls() {
         // Deterministic pseudo-random strings (xorshift) over a hostile alphabet.
         let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let alphabet: Vec<char> = "\x1b[]0;?\x07\\\r\n\t\x08\x00ab漢 \u{9b}\u{9c}\u{85}\u{202e}mPX"
-            .chars()
-            .collect();
+        let alphabet: Vec<char> =
+            "\x1b[]0;?\x07\\\r\n\t\x08\x00ab漢 \u{9b}\u{9c}\u{85}\u{202e}mPX(#B"
+                .chars()
+                .collect();
         for _ in 0..2000 {
             seed ^= seed << 13;
             seed ^= seed >> 7;
