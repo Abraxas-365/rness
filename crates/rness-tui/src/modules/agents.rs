@@ -15,6 +15,7 @@ use rness_protocol::{api::History, events::Envelope, frames::Frame};
 
 use crate::app::{Action, Model};
 use crate::component::{Component, Ctx, KeyOutcome};
+use crate::core::terminal_text::{sanitize, sanitize_text};
 use crate::modules::{chat::Chat, tool_cards::CardCache};
 use crate::slots::{Slots, OVERLAY};
 
@@ -522,7 +523,9 @@ struct ListView {
 
 /// A fixed cell-width column, clipping whole graphemes rather than bytes.
 fn column(text: &str, width: usize) -> String {
-    let line = Line::raw(text.replace(['\n', '\r', '\t'], " "));
+    // Agent names, aliases and tasks are model-controlled: strip escapes
+    // and controls, then flatten to one row.
+    let line = Line::raw(sanitize_text(text).replace('\n', " "));
     let mut out = String::new();
     let mut used = 0;
     for span in &line.spans {
@@ -891,8 +894,8 @@ impl Agents {
             right.push((format!("{age:>9}"), ctx.theme.dim));
         }
         let word = match a.status.as_str() {
-            "finished" => self.text("status_finished", "done"),
-            other => other,
+            "finished" => self.text("status_finished", "done").to_owned(),
+            other => sanitize(other),
         };
         right.push((format!("{word:>12}"), status));
         let used = 2 + 2 + 5 + role_width + 2;
@@ -1281,13 +1284,16 @@ impl Component for Agents {
                 .find(|a| a.session == session)
                 .expect("authorized agent");
             let header = Line::from(vec![
-                Span::styled(format!(" {}  {}", info.alias, info.name), ctx.theme.heading),
                 Span::styled(
-                    format!("   {}", info.status),
+                    format!(" {}  {}", sanitize(&info.alias), sanitize(&info.name)),
+                    ctx.theme.heading,
+                ),
+                Span::styled(
+                    format!("   {}", sanitize(&info.status)),
                     status_style(&info.status, ctx.theme),
                 ),
                 Span::styled(
-                    format!(" · {} · {}", elapsed(info.elapsed_ms), info.mode),
+                    format!(" · {} · {}", elapsed(info.elapsed_ms), sanitize(&info.mode)),
                     ctx.theme.dim,
                 ),
             ]);
@@ -1296,20 +1302,20 @@ impl Component for Agents {
             }
             // Task is always first; raw identities remain available by scrolling
             // this small metadata pane, never ahead of the assignment.
-            let task_rows =
-                textwrap::wrap(&info.task, usize::from(body.width.saturating_sub(2).max(1)))
-                    .len()
-                    .max(1);
+            let task = sanitize_text(&info.task);
+            let task_rows = textwrap::wrap(&task, usize::from(body.width.saturating_sub(2).max(1)))
+                .len()
+                .max(1);
             let metadata_height = (task_rows.min(usize::from(self.number("metadata_rows", 3)))
                 as u16)
                 .min(body.height.saturating_sub(1) / 3);
             let heading = format!(
                 "{}\n\nSession: {}\nParent: {} · depth {}\nCall: {}",
-                info.task,
-                info.session,
-                info.parent.as_deref().unwrap_or("—"),
+                task,
+                sanitize(&info.session),
+                sanitize(info.parent.as_deref().unwrap_or("—")),
                 info.depth,
-                info.call.as_deref().unwrap_or("—")
+                sanitize(info.call.as_deref().unwrap_or("—"))
             );
             let rows = heading
                 .lines()
@@ -1624,6 +1630,36 @@ mod tests {
         let footer = (1..79).map(|x| buf[(x, 8)].symbol()).collect::<String>();
         assert_eq!(footer.trim(), "q list");
         assert_eq!(buf[(1, 8)].fg, ratatui::style::Color::Red);
+    }
+
+    #[test]
+    fn hostile_agent_text_never_reaches_cells() {
+        let hostile = |s: &str| format!("{s}\u{1b}]0;EVIL\u{7}\u{1b}[2J\u{1b}[?1049l\tx\r\u{85}");
+        let mut agent = info("child");
+        agent.alias = hostile("al");
+        agent.name = hostile("name");
+        agent.task = hostile("task");
+        agent.status = hostile("st");
+        agent.mode = hostile("mode");
+        let state = AgentMonitorState::default();
+        state.publish_agents("root", vec![agent]);
+        let mut drawer = Agents::new(state);
+        let model = Model::new("root".into(), String::new());
+        let theme = Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        assert_eq!(column("a\u{1b}[31mb\tc", 6), "ab    ");
+        for agent in [None, Some("child")] {
+            open(&mut drawer, &ctx, agent);
+            let area = Rect::new(0, 0, 100, 25);
+            let mut buf = Buffer::empty(area);
+            drawer.render(&ctx, area, &mut buf);
+            let text = buf.content.iter().map(|c| c.symbol()).collect::<String>();
+            assert!(!text.chars().any(char::is_control), "{agent:?}: {text:?}");
+            assert!(!text.contains("EVIL") && !text.contains("[2J"), "{text:?}");
+        }
     }
 
     #[test]

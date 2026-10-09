@@ -46,7 +46,13 @@ impl Component for Statusline {
             buf[(x, area.y)].set_style(theme.statusline).set_symbol(" ");
         }
         Line::from(vec![
-            Span::styled(format!(" {} ", model.model_name), theme.statusline_accent),
+            Span::styled(
+                format!(
+                    " {} ",
+                    crate::core::terminal_text::sanitize(&model.model_name)
+                ),
+                theme.statusline_accent,
+            ),
             Span::styled(format!("· {phase}{scroll}"), theme.statusline),
             Span::styled(
                 format!(

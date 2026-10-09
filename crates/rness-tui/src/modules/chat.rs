@@ -676,7 +676,7 @@ fn panel_body(
         let label_style = theme
             .resolve_style(&options["label"]["style"], style)
             .unwrap_or(style);
-        content.insert(0, Line::styled(label.to_owned(), label_style));
+        content.insert(0, Line::styled(sanitize(label), label_style));
     }
     let mut output = Vec::new();
     for _ in 0..padding("top") {
@@ -1915,7 +1915,7 @@ impl Component for Chat {
                                             let prefix = if i == 0 { "> " } else { "  " };
                                             lines.push(Line::from(vec![
                                                 Span::styled(prefix.to_string(), theme.user_prefix),
-                                                Span::raw(l.to_string()),
+                                                Span::raw(sanitize(l)),
                                             ]));
                                         }
                                     }
@@ -1939,7 +1939,7 @@ impl Component for Chat {
                                         ContentPart::Thinking { text, .. } => {
                                             for l in text.lines().take(3) {
                                                 lines.push(Line::styled(
-                                                    format!("· {l}"),
+                                                    format!("· {}", sanitize(l)),
                                                     theme.thinking,
                                                 ));
                                             }
@@ -1953,7 +1953,7 @@ impl Component for Chat {
                                             }
                                             lines.push(Line::from(vec![
                                                 Span::styled("⚙ ".to_string(), theme.tool_name),
-                                                Span::styled(name.clone(), theme.tool_name),
+                                                Span::styled(sanitize(name), theme.tool_name),
                                             ]));
                                         }
                                     }
@@ -2059,7 +2059,7 @@ impl Component for Chat {
                                                 if options["header"]["show_name"] == false {
                                                     String::new()
                                                 } else {
-                                                    name.clone()
+                                                    sanitize(name)
                                                 };
                                             if options["header"]["show_status"] == true {
                                                 title.push_str(
@@ -2173,8 +2173,9 @@ impl Component for Chat {
                                 if total > TOOL_CARD_MAX_LINES {
                                     lines.push(Line::styled(
                                         format!(
-                                            "  │ … {} more lines ({name})",
-                                            total - TOOL_CARD_MAX_LINES
+                                            "  │ … {} more lines ({})",
+                                            total - TOOL_CARD_MAX_LINES,
+                                            sanitize(name)
                                         ),
                                         theme.dim,
                                     ));
@@ -2308,7 +2309,7 @@ impl Component for Chat {
                         .collect();
                     lines.extend(panel(rows, &options, width, theme, background));
                 } else if let Some(l) = live.thinking.lines().last() {
-                    lines.push(Line::styled(format!("· {l}"), theme.thinking));
+                    lines.push(Line::styled(format!("· {}", sanitize(l)), theme.thinking));
                 }
             }
             if !live.text.is_empty() {
@@ -2369,7 +2370,7 @@ impl Component for Chat {
                         let mut title = if options["header"]["show_name"] == false {
                             String::new()
                         } else {
-                            name.clone()
+                            sanitize(name)
                         };
                         if options["header"]["show_status"] == true {
                             title.push_str(" · running");
@@ -2386,7 +2387,10 @@ impl Component for Chat {
                         ));
                     }
                 } else {
-                    lines.push(Line::styled(format!("{name}…"), theme.tool_name));
+                    lines.push(Line::styled(
+                        format!("{}…", sanitize(name)),
+                        theme.tool_name,
+                    ));
                 }
             }
         }

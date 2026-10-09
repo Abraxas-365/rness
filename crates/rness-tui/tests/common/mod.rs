@@ -92,6 +92,16 @@ pub fn render(app: &mut App, w: u16, h: u16) -> Buffer {
     buf
 }
 
+/// Like [`render`] but without the final control-character scrub, so
+/// content checks see what the text sources produced.
+#[allow(dead_code)]
+pub fn render_unscrubbed(app: &mut App, w: u16, h: u16) -> Buffer {
+    let area = Rect::new(0, 0, w, h);
+    let mut buf = Buffer::empty(area);
+    app.render_unscrubbed(area, &mut buf);
+    buf
+}
+
 /// Rows as text, skipping cells hidden behind wide glyphs.
 pub fn rows(buf: &Buffer) -> Vec<String> {
     let a = buf.area;

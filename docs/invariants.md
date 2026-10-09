@@ -45,3 +45,9 @@ invariant without an ADR in `docs/decisions/`.
 12. **Frontends speak protocol only.** `rness-tui` and server clients
     import `rness-protocol`, never engine internals. Enforced by Cargo
     dependency direction.
+13. **No control character reaches the terminal from content.** Model,
+    tool, sub-agent and plugin text is display-sanitized in `rness-tui`
+    (`core::terminal_text`): escape sequences (CSI/OSC/DCS…) are dropped
+    whole, other controls and bidi overrides are removed, tabs expand to
+    8-column stops, `\r` becomes a line break. `App::render` scrubs the final
+    buffer as a guard. The session log keeps the raw text.

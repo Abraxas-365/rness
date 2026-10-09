@@ -68,9 +68,10 @@ impl Component for ApprovalOverlay {
             return;
         };
         Clear.render(area, buf);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" approve: {} ", pending.request.tool));
+        let block = Block::default().borders(Borders::ALL).title(format!(
+            " approve: {} ",
+            crate::core::terminal_text::sanitize(&pending.request.tool)
+        ));
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -124,8 +125,35 @@ fn render_args(request: &ApprovalRequest) -> Vec<Line<'static>> {
         lines.push(Line::raw("…"));
     }
     if let Some(reason) = request.reason.as_deref().filter(|r| !r.trim().is_empty()) {
-        let reason: String = reason.lines().next().unwrap_or("").chars().take(MAX_WIDTH).collect();
+        let reason = crate::core::terminal_text::sanitize(reason.lines().next().unwrap_or(""));
+        let reason: String = reason.chars().take(MAX_WIDTH).collect();
         lines.insert(0, Line::raw(format!("reason: {reason}")));
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reason_escapes_are_stripped() {
+        let request = ApprovalRequest {
+            session: "s1".into(),
+            call: "c1".into(),
+            tool: "Bash".into(),
+            args: serde_json::json!({"command": "echo \u{1b}]0;x\u{7}"}),
+            reason: Some("hook \u{1b}]0;EVIL\u{7}says\u{1b}[2J ok\tnow".into()),
+        };
+        let lines = render_args(&request);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text[0], "reason: hook says ok    now");
+        assert!(
+            text.iter().all(|l| !l.chars().any(char::is_control)),
+            "{text:?}"
+        );
+    }
 }

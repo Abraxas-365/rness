@@ -34,6 +34,12 @@ pub fn render_markdown_configured(
     theme: &Theme,
     config: &serde_json::Value,
 ) -> Vec<Line<'static>> {
+    // Model/tool text may carry terminal escapes and control characters;
+    // strip them before parsing (escapes can span Text events, and `\r`
+    // changes parsing) so every caller renders terminal-safe lines. The
+    // clean text is also the cache key.
+    let clean = crate::core::terminal_text::sanitize_text(source);
+    let source = &*clean;
     if let Some(lines) = MARKDOWN_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let index = cache.iter().position(|entry| {
@@ -536,6 +542,28 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn assert_terminal_safe(source: &str) -> Vec<String> {
+        let lines = render_markdown(source, 40, &Theme::default());
+        let text = plain(&lines);
+        assert!(
+            text.iter().all(|l| !l.chars().any(char::is_control)),
+            "{source:?} -> {text:?}"
+        );
+        text
+    }
+
+    #[test]
+    fn markdown_strips_escapes_in_prose_tables_and_code() {
+        let text = assert_terminal_safe("a\x1b]0;EVILTITLE\x07b \x1b[?1049l\x1b[2Jc");
+        assert_eq!(text, vec!["ab c"]);
+        let text = assert_terminal_safe("| h\x1b[31m |\n| --- |\n| x\x07y\x1b]8;;u\x1b\\z |");
+        assert!(text.iter().any(|l| l.contains("xyz")), "{text:?}");
+        let text = assert_terminal_safe("```\nlet a = 1;\x1b[2J\x08\x00\n\tb\n```");
+        assert!(text.iter().any(|l| l == "let a = 1;"), "{text:?}");
+        assert!(text.iter().any(|l| l == "        b"), "{text:?}");
+        assert_terminal_safe("`in\x1bline` \u{9b}31m and\tprose\r\nnext\rline");
     }
 
     #[test]

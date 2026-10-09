@@ -201,8 +201,8 @@ fn surfaces(name: &str, content: &str) -> Vec<(&'static str, LogBuilder)> {
 /// whose MARK is at the start we scroll to the top to look for it.
 fn render_top(app: &mut rness_tui::app::App, w: u16, h: u16) -> ratatui::buffer::Buffer {
     app.model.scroll_from_bottom = u16::MAX;
-    let _ = render(app, w, h);
-    let b = render(app, w, h); // second frame: anchors settle
+    let _ = render_unscrubbed(app, w, h);
+    let b = render_unscrubbed(app, w, h); // second frame: anchors settle
     app.model.scroll_from_bottom = 0;
     b
 }
@@ -216,7 +216,7 @@ fn run_matrix(config: Value, tag: &str) -> Outcome {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let (mut app, _be) = new_app(&b.session, b.history(), config.clone());
                     let t = Instant::now();
-                    let bottom = render(&mut app, w, 40);
+                    let bottom = render_unscrubbed(&mut app, w, 40);
                     let d1 = t.elapsed();
                     let t = Instant::now();
                     let top = render_top(&mut app, w, 40);
@@ -270,13 +270,13 @@ fn report(tag: &str, out: &Outcome) {
 fn pathological_content_configured() {
     let out = run_matrix(flavor_config(), "configured");
     report("configured", &out);
-    // Known bugs are reported in e2e-findings/wp-4.md; this test lists
-    // every violation and fails only on panics / timeouts so other
-    // regressions stay visible without blocking on known rendering bugs.
+    // Cell safety (B4-1: no control character / zero-width cell) is
+    // asserted in full. The remaining non-safety items (see the strict
+    // test) are listed but only panics / timeouts fail here.
     let hard: Vec<_> = out
         .failures
         .iter()
-        .filter(|f| f.contains("PANIC") || f.contains("slow render"))
+        .filter(|f| f.contains("PANIC") || f.contains("slow render") || f.contains("violations"))
         .collect();
     assert!(hard.is_empty(), "{hard:#?}");
 }
@@ -288,15 +288,18 @@ fn pathological_content_unconfigured() {
     let hard: Vec<_> = out
         .failures
         .iter()
-        .filter(|f| f.contains("PANIC") || f.contains("slow render"))
+        .filter(|f| f.contains("PANIC") || f.contains("slow render") || f.contains("violations"))
         .collect();
     assert!(hard.is_empty(), "{hard:#?}");
 }
 
-/// Strict variant of the matrix: every violation fails. Expected to fail
-/// until the bugs in wp-4.md (B4-*) are fixed.
+/// Strict variant of the matrix: every violation fails. Cell safety
+/// (B4-1) is fixed and asserted by the two tests above; what still fails
+/// here is not terminal safety: the unconfigured user path clips (does not
+/// wrap) a 50-deep quote at w20, and a 10k-line code block renders in
+/// > 5 s in debug builds (P5 / markdown perf).
 #[test]
-#[ignore = "strict: fails on known content bugs (see wp-4.md)"]
+#[ignore = "strict: unconfigured user lines clip, 10k-line code block slow in debug"]
 fn pathological_content_strict() {
     let mut all = run_matrix(flavor_config(), "configured").failures;
     all.extend(run_matrix(Value::Null, "unconfigured").failures);
@@ -336,7 +339,7 @@ fn pathological_live_stream() {
                     chunk: ChunkDelta::Thinking { t },
                 });
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    render(&mut app, 80, 30)
+                    render_unscrubbed(&mut app, 80, 30)
                 }));
                 match r {
                     Err(_) => {
@@ -364,10 +367,7 @@ fn pathological_live_stream() {
     for f in &failures {
         eprintln!("live FAIL {f}");
     }
-    assert!(
-        !failures.iter().any(|f| f.contains("PANIC")),
-        "{failures:#?}"
-    );
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// Tiny terminals: 1×1 … 80×3 must not panic with any content.

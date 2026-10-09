@@ -1642,6 +1642,17 @@ impl App {
     }
 
     pub fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        self.render_unscrubbed(area, buf);
+        // Guard: whatever a module or plugin rendered, no control
+        // character leaves the process (the sources sanitize precisely;
+        // this catches unlisted paths).
+        crate::core::terminal_text::scrub_buffer(buf);
+    }
+
+    /// [`App::render`] without the final control-character scrub, so tests
+    /// can assert that the text sources themselves are terminal-safe.
+    #[doc(hidden)]
+    pub fn render_unscrubbed(&mut self, area: Rect, buf: &mut Buffer) {
         let ctx = Ctx {
             model: &self.model,
             theme: &self.theme,
@@ -1707,7 +1718,11 @@ fn edit_prompt(payload: &serde_json::Value) -> Result<String, String> {
 /// normalized on write; control characters are stripped again because the
 /// log is a file anyone could edit.
 pub fn terminal_title_text(title: Option<&str>) -> String {
-    match title.map(|t| t.chars().filter(|c| !c.is_control()).collect::<String>()) {
+    match title.map(|t| {
+        t.chars()
+            .filter(|c| !crate::core::terminal_text::is_terminal_unsafe(*c))
+            .collect::<String>()
+    }) {
         Some(t) if !t.trim().is_empty() => format!("{} — rness", t.trim()),
         _ => "rness".into(),
     }
