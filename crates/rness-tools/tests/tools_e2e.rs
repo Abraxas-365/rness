@@ -1209,11 +1209,11 @@ fn terminal_retired_reasons_reset_after_64() {
     assert!(err_last.contains("owner finished"));
 }
 
-/// Recovery locks every stale owner directory it visits and keeps the lock
-/// (and the fd) for the life of the process; empty directories are never
-/// removed. N past runs => N open fds in every new rness process.
+/// P2 phase 3 (was a bug pin): recovery locks a stale owner directory only
+/// while scanning it and removes directories left empty, so N past runs
+/// leave neither N open fds nor N directories behind.
 #[test]
-fn bug_job_recovery_holds_one_fd_per_stale_dir_forever() {
+fn job_recovery_releases_stale_dir_locks_and_removes_empty_dirs() {
     let dir = tmp("recover-fds");
     let jobs_root = dir.path().join("jobs");
     let runs = 300;
@@ -1233,12 +1233,14 @@ fn bug_job_recovery_holds_one_fd_per_stale_dir_forever() {
     let dirs = std::fs::read_dir(&jobs_root).unwrap().count();
     report(
         "job_recovery_fds",
-        json!({"stale_dirs":dirs,"recovery_ms":ms,"fds_before":fds0,"fds_after":fds,"fds_held":fds - fds0}),
+        json!({"stale_dirs":dirs,"recovery_ms":ms,"fds_before":fds0,"fds_after":fds,"fds_held":fds as i64 - fds0 as i64}),
     );
-    assert!(dirs > runs, "empty owner dirs are never removed");
+    // Only this registry's own directory remains.
+    assert!(dirs <= 1, "empty owner dirs are not removed: {dirs}");
+    // Concurrent tests open fds too; 300 leaked locks would dwarf that.
     assert!(
-        fds - fds0 >= runs,
-        "expected one held lock fd per stale dir"
+        (fds as i64 - fds0 as i64) <= 5 + 50,
+        "lock fds held per stale dir: {fds0} -> {fds}"
     );
 }
 

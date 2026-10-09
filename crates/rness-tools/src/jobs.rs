@@ -773,8 +773,24 @@ impl JobRegistry {
     }
 
     /// Background: recover settled jobs from stale owner directories.
+    ///
+    /// Each directory is locked only while it is scanned. The lock is kept
+    /// only when the directory still holds owned completions that were never
+    /// delivered, so no other instance delivers them as well. Records that
+    /// were already settled are never rewritten, tails load lazily, records
+    /// already past `max_age_secs` are deleted directly, and directories left
+    /// empty are removed.
     fn recover_stale_jobs(&self, dirs: &[std::path::PathBuf]) {
         use fs2::FileExt;
+        let max_age_ms = self
+            .inner
+            .budget
+            .lock()
+            .unwrap()
+            .policy
+            .max_age_secs
+            .saturating_mul(1000);
+        let now = retention::now_ms();
         for dir in dirs {
             let lock = match std::fs::OpenOptions::new()
                 .create(true)
@@ -791,87 +807,131 @@ impl JobRegistry {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => continue,
             }
-            // Reconcile interrupted deletion only while holding this owner's
-            // exclusive lock. Never touch another live instance's artifacts.
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for file in entries {
-                    let Ok(file) = file else { continue };
-                    let path = file.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("deleted") {
-                        let _ = std::fs::remove_file(path.with_extension("output"));
-                        let _ = std::fs::remove_file(path.with_extension("json"));
-                        let _ = sync_directory(path.parent().unwrap());
-                        let _ = std::fs::remove_file(&path);
-                    }
+            // Reconcile only while holding this owner's exclusive lock.
+            // Never touch another live instance's artifacts.
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut names = std::collections::HashSet::new();
+            for entry in entries.flatten() {
+                names.insert(entry.path());
+            }
+            let has = |path: &std::path::Path, ext: &str| names.contains(&path.with_extension(ext));
+            let with_ext = |ext: &str| {
+                let mut paths: Vec<_> = names
+                    .iter()
+                    .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
+                    .cloned()
+                    .collect();
+                paths.sort();
+                paths
+            };
+            // Finish interrupted deletions: drop the data, sync once, then
+            // the tombstones.
+            let tombstones = with_ext("deleted");
+            for tombstone in &tombstones {
+                let _ = std::fs::remove_file(tombstone.with_extension("output"));
+                let _ = std::fs::remove_file(tombstone.with_extension("json"));
+            }
+            if !tombstones.is_empty() {
+                let _ = sync_directory(dir);
+                for tombstone in &tombstones {
+                    let _ = std::fs::remove_file(tombstone);
                 }
             }
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                for file in entries {
-                    let Ok(file) = file else { continue };
-                    let path = file.path();
-                    if path.extension().and_then(|s| s.to_str()) == Some("output")
-                        && !path.with_extension("json").exists()
-                    {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
+            // A dead owner's half-written metadata (crash before rename).
+            for temporary in with_ext("tmp") {
+                let _ = std::fs::remove_file(temporary);
+            }
+            let tombstoned = |path: &std::path::Path| has(path, "deleted");
+            let mut remaining = 0usize;
+            let mut pending = false;
+            for path in with_ext("output") {
+                if tombstoned(&path) {
+                    continue;
+                }
+                if !has(&path, "json") {
+                    let _ = std::fs::remove_file(&path);
+                } else {
+                    remaining += 1;
+                }
+            }
+            for path in with_ext("json") {
+                if tombstoned(&path) {
+                    continue;
+                }
+                remaining += 1;
+                let Ok(data) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(mut state) = serde_json::from_slice::<JobState>(&data) else {
+                    continue;
+                };
+                let Ok(meta) = std::fs::metadata(path.with_extension("output")) else {
+                    continue;
+                };
+                state.output_bytes = meta.len() as usize;
+                if state.read_from > state.output_bytes {
+                    continue;
+                }
+                let releasable = state.delivered || state.owner.is_none();
+                if state.settled
+                    && releasable
+                    && max_age_ms != 0
+                    && state
+                        .settled_at_ms
+                        .is_some_and(|at| now.saturating_sub(at) >= max_age_ms)
+                {
+                    // Expired before this run: delete without loading. The
+                    // record goes first so no record outlives its output.
+                    if std::fs::remove_file(&path).is_ok() {
+                        let _ = std::fs::remove_file(path.with_extension("output"));
+                        remaining -= 2;
                     }
-                    if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                        continue;
-                    }
-                    let Ok(data) = std::fs::read(&path) else {
-                        continue;
-                    };
-                    let Ok(mut state) = serde_json::from_slice::<JobState>(&data) else {
-                        continue;
-                    };
-                    use std::io::{Read, Seek, SeekFrom};
-                    let Ok(mut file) = std::fs::File::open(path.with_extension("output")) else {
-                        continue;
-                    };
-                    let Ok(meta) = file.metadata() else {
-                        continue;
-                    };
-                    state.output_bytes = meta.len() as usize;
-                    let _ = file.seek(SeekFrom::Start(
-                        state.output_bytes.saturating_sub(MAX_READ_BYTES) as u64,
-                    ));
-                    let _ = file
-                        .take(MAX_READ_BYTES as u64)
-                        .read_to_end(&mut state.output);
-                    if state.read_from > state.output_bytes {
-                        continue;
-                    }
-                    if !state.settled {
-                        state.status = JobStatus::Interrupted;
-                        state.settled = true;
-                    }
-                    let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    let id = id.to_owned();
-                    state.settled_at_ms.get_or_insert_with(retention::now_ms);
-                    state.charged_bytes = state.output_bytes as u64;
-                    self.inner.budget.lock().unwrap().used += state.charged_bytes;
-                    Job::release_tail(&mut state);
-                    let durable = state.kind != "bash-output";
-                    let job = Arc::new(Job {
-                        budget: self.inner.budget.clone(),
-                        spool: Mutex::new(None),
-                        out: Mutex::new(None),
-                        durable,
-                        path: Some(path),
-                        state: Mutex::new(state),
-                        cancel: Default::default(),
-                        changed: Arc::new(tokio::sync::Notify::new()),
-                        completion: None,
-                    });
+                    continue;
+                }
+                let interrupted = !state.settled;
+                if interrupted {
+                    state.status = JobStatus::Interrupted;
+                    state.settled = true;
+                }
+                let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let id = id.to_owned();
+                state.settled_at_ms.get_or_insert_with(retention::now_ms);
+                state.charged_bytes = state.output_bytes as u64;
+                self.inner.budget.lock().unwrap().used += state.charged_bytes;
+                pending |= !(state.delivered || state.owner.is_none());
+                let durable = state.kind != "bash-output";
+                let job = Arc::new(Job {
+                    budget: self.inner.budget.clone(),
+                    spool: Mutex::new(None),
+                    out: Mutex::new(None),
+                    durable,
+                    path: Some(path),
+                    state: Mutex::new(state),
+                    cancel: Default::default(),
+                    changed: Arc::new(tokio::sync::Notify::new()),
+                    completion: None,
+                });
+                // Only a record whose status changed is rewritten (and
+                // synced); settled records stay untouched.
+                if interrupted {
                     if let Ok(s) = job.state.lock() {
                         let _ = job.persist(&s);
                     }
-                    self.inner.jobs.lock().unwrap().insert(id, job);
                 }
+                self.inner.jobs.lock().unwrap().insert(id, job);
             }
-            self.inner.locks.lock().unwrap().push(lock);
+            if remaining == 0 {
+                // Nothing left but the lock (and stray files remove_dir
+                // refuses to drop): remove the directory while locked.
+                let _ = std::fs::remove_file(dir.join("owner.lock"));
+                let _ = std::fs::remove_dir(dir);
+            } else if pending {
+                self.inner.locks.lock().unwrap().push(lock);
+            }
         }
     }
 
@@ -1488,6 +1548,74 @@ mod inspection_tests {
 #[cfg(test)]
 mod durability_tests {
     use super::*;
+
+    #[test]
+    fn recovery_leaves_settled_records_untouched_and_drops_stale_dirs() {
+        let directory = tempfile::tempdir().unwrap();
+        let (settled, path, empty) = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "done".into());
+            writer.append(b"out");
+            writer.settle(JobStatus::Exited(Some(0)));
+            let path = writer.job.path.clone().unwrap();
+            // A second, empty owner directory from another past run.
+            let empty = JobRegistry::new();
+            empty.enable_persistence(directory.path()).unwrap();
+            let empty = empty.inner.directory.lock().unwrap().clone().unwrap();
+            (id, path, empty)
+        };
+        std::fs::write(path.with_extension("tmp"), b"{partial").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let recovered = restart_for_test(directory.path());
+        // A rewrite (tmp + rename + fsync) would replace the inode's mtime.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "settled records are not rewritten"
+        );
+        assert!(!path.with_extension("tmp").exists());
+        assert!(!empty.exists(), "empty owner dir removed");
+        assert!(path.parent().unwrap().exists());
+        let (text, status, _) = drain_output(&recovered.get(&settled).unwrap());
+        assert_eq!((text.as_str(), status), ("out", JobStatus::Exited(Some(0))));
+        // Delivered (no owner): the stale dir's lock is released at once.
+        assert_eq!(recovered.inner.locks.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recovery_deletes_expired_records_and_their_dir_without_loading() {
+        let directory = tempfile::tempdir().unwrap();
+        let (id, dir) = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let id = capture(&registry, b"old");
+            let job = registry.get(&id).unwrap();
+            let mut state = job.state.lock().unwrap();
+            state.settled_at_ms = Some(retention::now_ms() - 8 * 24 * 3600 * 1000);
+            job.persist(&state).unwrap();
+            let dir = job.path.clone().unwrap().parent().unwrap().to_path_buf();
+            (id, dir)
+        };
+        let recovered = restart_for_test(directory.path());
+        assert!(recovered.get(&id).is_err());
+        assert!(!dir.exists(), "dir of expired records removed");
+    }
+
+    #[test]
+    fn recovery_keeps_lock_of_dirs_with_undelivered_completions() {
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let owner = "owner".to_string();
+            let (_, writer) = registry.start_owned("bash", "pending".into(), Some(&owner));
+            writer.settle(JobStatus::Exited(Some(0)));
+        }
+        let recovered = restart_for_test(directory.path());
+        assert_eq!(recovered.inner.locks.lock().unwrap().len(), 2);
+    }
 
     fn capture(registry: &JobRegistry, bytes: &[u8]) -> String {
         let (id, writer) = registry.capture("cmd".into(), None);
