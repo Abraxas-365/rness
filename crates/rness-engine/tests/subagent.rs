@@ -1438,3 +1438,94 @@ async fn failed_child_run_carries_the_provider_error() {
     assert!(error.contains("CONTEXT_OVERFLOW"), "{error}");
     assert!(error.contains("prompt is too long"), "{error}");
 }
+
+/// B6-3: a host killed mid-turn leaves children whose log ends in an open
+/// `turn/started`. The next host closes each turn `cancelled` and tells a
+/// continuable child's parent exactly once; a second reconcile is a no-op.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconcile_closes_turns_left_open_by_a_dead_host() {
+    use rness_protocol::branch::{Delegation, DelegationMode};
+    let dir = tempfile::tempdir().unwrap();
+    // "Crashed host": write the logs directly, as a dead process left them.
+    let (root, cont, oneshot, done) = {
+        let store = SessionStore::new(dir.path());
+        let root = store.create(None).unwrap().session().clone();
+        let child = |mode| {
+            let mut log = store
+                .create_delegated(
+                    None,
+                    Delegation {
+                        parent: root.clone(),
+                        call: None,
+                        depth: 1,
+                        mode,
+                    },
+                )
+                .unwrap();
+            log.append(&SessionEvent::TurnStarted { turn: 1 }).unwrap();
+            log
+        };
+        let cont = child(DelegationMode::Continuable).session().clone();
+        let oneshot = child(DelegationMode::OneShot).session().clone();
+        let mut done = child(DelegationMode::Continuable);
+        done.append(&SessionEvent::TurnEnded {
+            turn: 1,
+            outcome: TurnOutcome::Completed,
+        })
+        .unwrap();
+        (root, cont, oneshot, done.session().clone())
+    };
+    let sessions = service(dir.path());
+    let rt = runtime(&sessions, 3);
+    let within = std::time::Duration::from_secs(10);
+    let reconciled = tokio::time::timeout(within, rt.reconcile_children())
+        .await
+        .expect("reconcile finishes")
+        .unwrap();
+    assert_eq!(reconciled, 2);
+    let ends = |s: &SessionId| -> Vec<TurnOutcome> {
+        sessions
+            .store()
+            .history(s)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::TurnEnded { outcome, .. } => Some(*outcome),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(ends(&cont), vec![TurnOutcome::Cancelled]);
+    assert_eq!(ends(&oneshot), vec![TurnOutcome::Cancelled]);
+    assert_eq!(ends(&done), vec![TurnOutcome::Completed]);
+    let notices = |sessions: &SessionService| -> Vec<String> {
+        sessions
+            .store()
+            .history(&root)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event {
+                SessionEvent::UserMessage(m) => m.content.iter().find_map(|p| match p {
+                    ContentPart::Text { text } if text.starts_with("[subagent ") => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    };
+    let got = notices(&sessions);
+    assert_eq!(got.len(), 1, "one notice, continuable child only: {got:?}");
+    assert!(got[0].starts_with(&format!("[subagent {cont} settled: interrupted]")));
+    // Idempotent: the turns are closed now, and the source id dedupes.
+    tokio::time::timeout(within, sessions.join(&root))
+        .await
+        .expect("parent notice turn finishes");
+    let again = tokio::time::timeout(within, rt.reconcile_children())
+        .await
+        .expect("second reconcile finishes")
+        .unwrap();
+    assert_eq!(again, 0);
+    assert_eq!(notices(&sessions).len(), 1);
+}

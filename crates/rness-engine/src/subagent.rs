@@ -696,10 +696,6 @@ impl SubagentRuntime {
         Ok(disposition)
     }
 
-    /// Stop only the target's current turn (dsh interrupt_agent): queued
-    /// followups stay parked, descendants keep running, the child stays
-    /// available. Caller must be a delegation ancestor of the target.
-    /// Interrupting an idle child is an accepted no-op.
     /// Close a killed ONE-SHOT child for good: its run is over, so its tree
     /// is cancelled and nothing (e.g. a grandchild's job notice) wakes it
     /// again. Returns the child's delegated descendants.
@@ -707,6 +703,119 @@ impl SubagentRuntime {
         self.sessions.close_tree(child)
     }
 
+    /// Startup reconcile for children whose host died mid-turn (their log
+    /// ends in `turn/started` with no `turn/ended`, and no live burst will
+    /// ever emit the idle that drives the settle watch). Shallowest first,
+    /// each gets `turn/ended{cancelled}`. A CONTINUABLE child's direct
+    /// parent is told first, once (`[subagent <id> settled: interrupted]`,
+    /// deduplicated by the durable source id `settle:<child>:<turn>`), so a
+    /// crash between the two stays idempotent. One-shot children get no
+    /// notice here: job recovery reports their background job as
+    /// `interrupted`. Sessions that are live here or whose log another
+    /// process holds are skipped. Returns how many turns were closed.
+    /// [`Self::reconcile_children`] on a background task, so host startup
+    /// never waits on the store scan. Idempotent; failures are logged.
+    pub fn spawn_reconcile_children(self: &Arc<Self>) {
+        let rt = Arc::clone(self);
+        tokio::spawn(async move {
+            match rt.reconcile_children().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(closed = n, "closed interrupted child turns"),
+                Err(error) => tracing::warn!(%error, "interrupted child reconcile failed"),
+            }
+        });
+    }
+
+    pub async fn reconcile_children(&self) -> Result<usize, SubagentError> {
+        let sessions = Arc::clone(&self.sessions);
+        let mut open: Vec<(SessionId, Delegation, u32, String)> =
+            tokio::task::spawn_blocking(move || -> Result<_, SubagentError> {
+                let mut open = Vec::new();
+                for (child, d) in sessions.store().delegations()? {
+                    if sessions.phase(&child) != crate::inbox::Phase::Idle {
+                        continue;
+                    }
+                    let history = sessions.store().history(&child)?;
+                    let Some(start) = history
+                        .iter()
+                        .rposition(|e| matches!(e.event, SessionEvent::TurnStarted { .. }))
+                    else {
+                        continue;
+                    };
+                    let SessionEvent::TurnStarted { turn } = history[start].event else {
+                        continue;
+                    };
+                    if history[start..]
+                        .iter()
+                        .any(|e| matches!(e.event, SessionEvent::TurnEnded { .. }))
+                    {
+                        continue;
+                    }
+                    let run = settle_events(&history, start, &child)?;
+                    open.push((child, d, turn, run.output));
+                }
+                Ok(open)
+            })
+            .await
+            .map_err(|e| ServiceError::InvalidConfig(format!("reconcile failed: {e}")))??;
+        open.sort_by_key(|(child, d, ..)| (d.depth, child.clone()));
+        let mut reconciled = 0;
+        for (child, d, turn, output) in open {
+            // Re-check: a turn may have started since the scan.
+            if self.sessions.phase(&child) != crate::inbox::Phase::Idle {
+                continue;
+            }
+            // Holding the writer keeps this host's turns out until closed;
+            // a lock held by another process means the child is live there.
+            let mut log = match self.sessions.store().open(&child) {
+                Ok(log) => log,
+                Err(error) => {
+                    tracing::warn!(child = %child, %error, "interrupted child not reconciled");
+                    continue;
+                }
+            };
+            let text = format!(
+                "[subagent {child} settled: interrupted]\nThe host stopped while this child's \
+                 turn was running; the turn was closed as cancelled.\n{}",
+                if output.is_empty() {
+                    "(no output)"
+                } else {
+                    &output
+                }
+            );
+            if d.mode == DelegationMode::Continuable {
+                if let Err(error) = self
+                    .sessions
+                    .notify_job_once(&d.parent, &format!("settle:{child}:{turn}"), text)
+                    .await
+                {
+                    tracing::warn!(parent = %d.parent, %error, "interrupted child notice failed");
+                    continue;
+                }
+            }
+            log.append(&SessionEvent::TurnEnded {
+                turn,
+                outcome: TurnOutcome::Cancelled,
+            })
+            .map_err(ServiceError::from)?;
+            drop(log);
+            self.sessions.bus().emit::<crate::service::SubagentStopEv>(
+                &crate::service::SubagentStopNotice {
+                    parent: d.parent.clone(),
+                    child: child.clone(),
+                    outcome: "interrupted".into(),
+                    mode: d.mode,
+                },
+            );
+            reconciled += 1;
+        }
+        Ok(reconciled)
+    }
+
+    /// Stop only the target's current turn (dsh interrupt_agent): queued
+    /// followups stay parked, descendants keep running, the child stays
+    /// available. Caller must be a delegation ancestor of the target.
+    /// Interrupting an idle child is an accepted no-op.
     pub fn interrupt(&self, caller: &SessionId, target: &SessionId) -> Result<(), SubagentError> {
         self.authorize_descendant(caller, target)?;
         self.sessions.cancel(target);

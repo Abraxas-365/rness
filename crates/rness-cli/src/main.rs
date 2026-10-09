@@ -1127,6 +1127,7 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("bind {addr}"))?;
         jobs.attach_sessions(&sessions);
+        subagents.spawn_reconcile_children();
         eprintln!(
             "rness serving on http://{addr} (model: {})",
             selection.model
@@ -1155,6 +1156,9 @@ async fn main() -> anyhow::Result<()> {
             format!("apply startup model/reasoning configuration to session {session}")
         })?;
     jobs.attach_sessions(&sessions);
+    if cli.prompt.is_none() {
+        subagents.spawn_reconcile_children();
+    }
 
     let Some(prompt) = cli.prompt else {
         // Interactive: hot-reload Lua plugins while the TUI runs. The
