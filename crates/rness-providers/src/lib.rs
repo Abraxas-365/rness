@@ -77,6 +77,21 @@ pub(crate) fn http_client(connect: std::time::Duration) -> reqwest::Client {
         .expect("http client")
 }
 
+/// Total budget for one OAuth token/profile request. A refresh holds the
+/// cross-process credentials lease for its duration, so a stalled token
+/// endpoint must not hold it forever (other processes wait at most
+/// [`auth::REFRESH_LOCK_WAIT`]).
+pub const OAUTH_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The HTTP client for OAuth endpoints: bounded connect and total time.
+pub(crate) fn oauth_http_client(total: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT.min(total))
+        .timeout(total)
+        .build()
+        .expect("http client")
+}
+
 /// A failed `send()`: a connect timeout is a retryable `TIMEOUT` naming the
 /// host; anything else a retryable `PROVIDER` transport error.
 pub(crate) fn transport_error(e: &reqwest::Error) -> rness_engine::turn::provider::ProviderError {

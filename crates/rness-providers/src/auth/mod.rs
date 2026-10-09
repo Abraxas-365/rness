@@ -216,8 +216,15 @@ impl OAuthClient {
     pub fn new(config: OAuthConfig) -> Self {
         Self {
             config,
-            http: crate::http_client(crate::CONNECT_TIMEOUT),
+            http: crate::oauth_http_client(crate::OAUTH_REQUEST_TIMEOUT),
         }
+    }
+
+    /// Override the total request timeout (tests).
+    #[cfg(test)]
+    pub(crate) fn with_request_timeout(mut self, total: std::time::Duration) -> Self {
+        self.http = crate::oauth_http_client(total);
+        self
     }
 
     pub fn authorize_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
@@ -615,6 +622,71 @@ mod tests {
             S::INTERNAL_SERVER_ERROR,
             r#"{"error":"invalid_grant"}"#
         ));
+    }
+
+    /// A token endpoint that accepts the request and never answers.
+    pub(crate) async fn stalling_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        url
+    }
+
+    pub(crate) fn expired(access: &str) -> Tokens {
+        Tokens {
+            access_token: access.into(),
+            refresh_token: "rt0".into(),
+            expires_at: Some(
+                (jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60)).to_string(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oauth_requests_have_a_total_timeout_within_the_lease_wait() {
+        assert_eq!(crate::OAUTH_REQUEST_TIMEOUT.as_secs(), 30);
+        assert!(crate::OAUTH_REQUEST_TIMEOUT <= REFRESH_LOCK_WAIT);
+    }
+
+    #[tokio::test]
+    async fn stalled_token_endpoint_times_out_and_releases_the_refresh_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = CredentialStore::new(&path);
+        store.save_tokens("anthropic", &expired("at0")).unwrap();
+        let client = OAuthClient::new(OAuthConfig {
+            token_url: format!("{}/token", stalling_endpoint().await),
+            ..Default::default()
+        })
+        .with_request_timeout(std::time::Duration::from_millis(300));
+        let source = CredentialSource::new(CredentialStore::new(&path))
+            .with_oauth_client(client)
+            .oauth_only("anthropic".into());
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), source.resolve())
+            .await
+            .expect("refresh must not hang on a stalled endpoint")
+            .unwrap_err();
+        assert!(
+            matches!(&err, AuthError::Transport(e) if e.is_timeout()),
+            "{err}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // The lease is free again and the stored tokens are untouched.
+        store
+            .lock_for_refresh(std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.tokens("anthropic").unwrap().unwrap().access_token,
+            "at0"
+        );
     }
 
     #[test]

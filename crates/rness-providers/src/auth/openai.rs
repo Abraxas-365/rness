@@ -118,7 +118,7 @@ impl Default for CodexOAuthClient {
         Self {
             token_url: TOKEN_URL.into(),
             authorize_url: AUTHORIZE_URL.into(),
-            http: crate::http_client(crate::CONNECT_TIMEOUT),
+            http: crate::oauth_http_client(crate::OAUTH_REQUEST_TIMEOUT),
         }
     }
 }
@@ -129,8 +129,15 @@ impl CodexOAuthClient {
         Self {
             token_url: format!("{base}/oauth/token"),
             authorize_url: format!("{base}/oauth/authorize"),
-            http: crate::http_client(crate::CONNECT_TIMEOUT),
+            http: crate::oauth_http_client(crate::OAUTH_REQUEST_TIMEOUT),
         }
+    }
+
+    /// Override the total request timeout (tests).
+    #[cfg(test)]
+    pub(crate) fn with_request_timeout(mut self, total: std::time::Duration) -> Self {
+        self.http = crate::oauth_http_client(total);
+        self
     }
 
     pub fn authorize_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
@@ -385,6 +392,37 @@ mod tests {
             enc(payload.to_string().as_bytes()),
             enc(b"sig")
         )
+    }
+
+    #[tokio::test]
+    async fn stalled_token_endpoint_times_out_and_releases_the_refresh_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        let store = CredentialStore::new(&path);
+        store
+            .save_tokens(STORE_KEY, &super::super::tests::expired("at0"))
+            .unwrap();
+        let base = super::super::tests::stalling_endpoint().await;
+        let client = CodexOAuthClient::with_base_url(&base)
+            .with_request_timeout(std::time::Duration::from_millis(300));
+        let source =
+            CodexCredentialSource::new(CredentialStore::new(&path)).with_oauth_client(client);
+        let err = tokio::time::timeout(std::time::Duration::from_secs(10), source.resolve())
+            .await
+            .expect("refresh must not hang on a stalled endpoint")
+            .unwrap_err();
+        assert!(
+            matches!(&err, AuthError::Transport(e) if e.is_timeout()),
+            "{err}"
+        );
+        store
+            .lock_for_refresh(std::time::Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.tokens(STORE_KEY).unwrap().unwrap().access_token,
+            "at0"
+        );
     }
 
     #[test]
