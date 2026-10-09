@@ -11,7 +11,7 @@ This page explains where you may run into problems, what to expect, and what you
 
 ## Terminal display and performance
 
-- **Resizing a long conversation can still pause the display.** Changing the terminal width makes rness lay out the transcript again. Code previews now do less work, but expanded code and diffs still cost more to render. Collapsing tool output can help; it does not eliminate the cost of resizing a long history.
+- **After opening a long conversation or resizing, off-screen heights are estimates for a moment.** rness lays out only what is on screen (plus about two screens) right away and finishes the rest in the background, within a small per-frame time budget. Until that finishes, a jump far up (for example to a tool card or the top) can land a few rows off; what is on screen is always exact. Theme or configuration changes still lay out the whole transcript again, and expanded code and diffs cost more to render.
 - **The display cache setting is not a total memory limit.** `cache_bytes` limits cached display rows, not the conversation itself or all Markdown, tool-card, and temporary rendering data.
 - **Expanded tool output and thinking are not saved preferences.** Expansion state belongs to the current UI session; do not expect it to survive a restart. Expanding or collapsing content does not change what the model receives.
 - **Custom statuslines may show incomplete or outdated information.** Some older model-registry examples are not session-aware. Treat displayed context size as an estimate, and do not assume every custom statusline shows the active session's selected model.
