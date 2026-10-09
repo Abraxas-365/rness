@@ -994,9 +994,10 @@ impl JobRegistry {
                     continue;
                 };
                 state.output_bytes = meta.len() as usize;
-                if state.read_from > state.output_bytes {
-                    continue;
-                }
+                // Output lost to a crash (never synced) can leave the cursor
+                // past the end: clamp it, so the record still loads, expires
+                // and lets its directory go like any other.
+                state.read_from = state.read_from.min(state.output_bytes);
                 let releasable = state.delivered || state.owner.is_none();
                 if state.settled
                     && releasable
@@ -1774,6 +1775,51 @@ mod durability_tests {
         let recovered = restart_for_test(directory.path());
         assert!(recovered.get(&id).is_err());
         assert!(!dir.exists(), "dir of expired records removed");
+    }
+
+    #[test]
+    fn recovery_clamps_a_cursor_past_lost_output_and_still_cleans_the_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = |expired: bool| {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "x".into());
+            writer.append(b"0123456789");
+            writer.settle(JobStatus::Exited(Some(0)));
+            let job = registry.get(&id).unwrap();
+            {
+                let mut state = job.state.lock().unwrap();
+                state.read_from = 10;
+                if expired {
+                    state.settled_at_ms = Some(retention::now_ms() - 8 * 24 * 3600 * 1000);
+                }
+                job.persist(&state).unwrap();
+            }
+            let path = job.path.clone().unwrap();
+            // The crash lost the unsynced tail of the output.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path.with_extension("output"))
+                .unwrap()
+                .set_len(4)
+                .unwrap();
+            (id, path.parent().unwrap().to_path_buf())
+        };
+        let (id, _) = record(false);
+        let recovered = restart_for_test(directory.path());
+        let job = recovered
+            .get(&id)
+            .expect("record with a stale cursor loads");
+        let state = job.state.lock().unwrap();
+        assert_eq!((state.read_from, state.output_bytes), (4, 4));
+        drop(state);
+        drop(job);
+        drop(recovered);
+
+        let (id, dir) = record(true);
+        let recovered = restart_for_test(directory.path());
+        assert!(recovered.get(&id).is_err(), "expired record deleted");
+        assert!(!dir.exists(), "its directory is cleaned up");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
