@@ -36,6 +36,10 @@ use crate::tools::ToolRegistry;
 use crate::turn::provider::Provider;
 use crate::turn::{run_turn, TurnConfig};
 
+/// How long an async-admitted send queues for the per-session operation lock
+/// (held only for the duration of another admission) before reporting `Busy`.
+const SEND_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -1454,6 +1458,28 @@ impl SessionService {
         self.send_or_retry(session, intent, content, false, Notice::None, None)
     }
 
+    /// [`Self::send`] for a blocking thread (never an async worker): waits up
+    /// to [`SEND_QUEUE_WAIT`] for the operation lock so concurrent sends to one
+    /// session serialize (later ones queue as followups) instead of failing
+    /// `Busy`. Maintenance and running commands still reject.
+    fn send_blocking(
+        &self,
+        session: &SessionId,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+    ) -> Result<Disposition, ServiceError> {
+        self.send_admitted(
+            session,
+            intent,
+            content,
+            false,
+            Notice::None,
+            None,
+            None,
+            SEND_QUEUE_WAIT,
+        )
+    }
+
     /// Deliver a background completion at the next step, waking an idle owner.
     pub fn notify_job(
         &self,
@@ -1772,6 +1798,36 @@ impl SessionService {
         )>,
         source: Option<rness_protocol::events::MessageSource>,
     ) -> Result<Disposition, ServiceError> {
+        self.send_admitted(
+            session,
+            intent,
+            content,
+            retry,
+            notice,
+            reservation,
+            source,
+            std::time::Duration::ZERO,
+        )
+    }
+
+    /// [`Self::send_or_retry_sourced`]; `wait` bounds how long to queue for the
+    /// per-session operation lock when another short operation (typically a
+    /// concurrent send) holds it. Non-zero only from a blocking thread.
+    #[allow(clippy::too_many_arguments)]
+    fn send_admitted(
+        &self,
+        session: &SessionId,
+        intent: UserIntent,
+        content: Vec<ContentPart>,
+        retry: bool,
+        notice: Notice,
+        reservation: Option<(
+            tokio::sync::OwnedRwLockReadGuard<()>,
+            tokio::sync::OwnedMutexGuard<()>,
+        )>,
+        source: Option<rness_protocol::events::MessageSource>,
+        wait: std::time::Duration,
+    ) -> Result<Disposition, ServiceError> {
         if notice == Notice::None && !matches!(source, Some(MessageSource::ExternalPrompt { .. })) {
             if let [ContentPart::Text { text }] = content.as_slice() {
                 if let Some(command) = self.prepare_command(session, text)? {
@@ -1831,11 +1887,18 @@ impl SessionService {
                     .clone()
                     .try_read_owned()
                     .map_err(|_| ServiceError::Busy)?;
-                let operation = live
-                    .operation
-                    .clone()
-                    .try_lock_owned()
-                    .map_err(|_| ServiceError::Busy)?;
+                let operation = match live.operation.clone().try_lock_owned() {
+                    Ok(operation) => operation,
+                    Err(_) if !wait.is_zero() => {
+                        // Blocking thread only (`wait` is non-zero from
+                        // `send_blocking`): queue FIFO behind the holder.
+                        let lock = live.operation.clone().lock_owned();
+                        tokio::runtime::Handle::current()
+                            .block_on(tokio::time::timeout(wait, lock))
+                            .map_err(|_| ServiceError::Busy)?
+                    }
+                    Err(_) => return Err(ServiceError::Busy),
+                };
                 (activity, operation)
             }
         };
@@ -2088,7 +2151,7 @@ impl SessionService {
             let prepared = prepared?;
             tokio::task::spawn_blocking(move || match prepared {
                 Some(command) => command.execute(&service),
-                None => service.send(&session, intent, content),
+                None => service.send_blocking(&session, intent, content),
             })
             .await
             .map_err(|e| ServiceError::InvalidConfig(format!("submission failed: {e}")))?

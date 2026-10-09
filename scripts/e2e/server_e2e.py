@@ -76,6 +76,7 @@ class SseClient(threading.Thread):
         super().__init__(daemon=True)
         self.addr, self.path, self.slow, self.nodrain, self.rcvbuf = addr, path, slow, nodrain, rcvbuf
         self.frames, self.ready, self.stop, self.error = [], threading.Event(), threading.Event(), None
+        self.names = []  # SSE `event:` name per frame ("" = default message)
         self.drain = threading.Event()
         self.first_at = None
         self.sock = None
@@ -100,7 +101,7 @@ class SseClient(threading.Thread):
                     if self.stop.is_set():
                         return
             s.settimeout(1.0)
-            data = []
+            data, name = [], ""
             while not self.stop.is_set():
                 try:
                     line = f.readline()
@@ -112,12 +113,15 @@ class SseClient(threading.Thread):
                 if not line:
                     if data:
                         self.frames.append((time.monotonic(), b"\n".join(data)))
+                        self.names.append(name)
                         self.first_at = self.first_at or time.monotonic()
-                        data = []
+                        data, name = [], ""
                         if self.slow:
                             time.sleep(self.slow)
                 elif line.startswith(b"data:"):
                     data.append(line[5:].lstrip())
+                elif line.startswith(b"event:"):
+                    name = line[6:].strip().decode()
         except Exception as e:  # noqa: BLE001
             self.error = e
             self.ready.set()
@@ -133,11 +137,14 @@ class SseClient(threading.Thread):
 
     def parsed(self):
         out = []
-        for _, d in self.frames:
+        for (_, d), name in zip(list(self.frames), list(self.names)):
             try:
-                out.append(json.loads(d))
+                f = json.loads(d)
             except ValueError:
-                pass
+                continue
+            if name and isinstance(f, dict):
+                f.setdefault("type", name)  # named events (e.g. lagged) carry their name as type
+            out.append(f)
         return out
 
 
@@ -296,8 +303,10 @@ def g_lag(t, fp):
         print(f"      turn {turn_s:.2f}s; fast deltas={fd}; stuck-then-drained deltas={sd} (lost {n - sd})")
         t.check("stuck client lost frames (lagged) and still received turn_idle", sd < n and got_idle, f"{sd} idle={got_idle}")
         types = {f.get("type") for f in stuck.parsed()}
-        t.xcheck("stuck client is told it lagged (resync hint)", "lagged" in types or "resync" in types,
-                 "B5-9 Lagged is swallowed (sse.rs:27,58): no event tells the client to reconcile", f"lost={n - sd}")
+        lagged = [f for f in stuck.parsed() if f.get("type") == "lagged"]
+        t.check("stuck client is told it lagged (resync hint)",
+                bool(lagged) and all(isinstance(f.get("missed"), int) and f["missed"] > 0 for f in lagged),
+                f"lost={n - sd} events={lagged[:2]} types={sorted(map(str, types))}")
         hist = r.api("GET", f"/api/sessions/{sid}")["envelopes"]
         text = "".join(c.get("text", "") for e in hist if e["type"] == "assistant/message" for c in e["content"])
         t.check("reconcile: history holds the full text", len(text) == n * 64, len(text))
@@ -384,12 +393,9 @@ def g_concurrent(t, fp):
         ths = [threading.Thread(target=one, args=(i,)) for i in range(20)]
         [th.start() for th in ths]
         [th.join() for th in ths]
-        busy = sum("session is busy" in e for e in errs)
-        print(f"      20 concurrent sends: ok={len(results)} busy-500={busy} other-errors={len(errs) - busy}")
-        t.xcheck("20 concurrent sends: none rejected", not errs,
-                 "B5-10 concurrent sends race on operation.try_lock -> 500 'session is busy' instead of queueing",
-                 f"busy={busy} other={[e for e in errs if 'busy' not in e][:1]}")
-        t.check("rejections are busy-500 only (no other errors)", len(errs) == busy, errs[:2])
+        print(f"      20 concurrent sends: ok={len(results)} errors={len(errs)}")
+        t.check("20 concurrent sends: none rejected", not errs, errs[:2])
+        t.check("no 500s: any rejection is 409 busy (none expected)", not any("500" in e for e in errs), errs[:2])
         t.check("at most one 'started'", results.count("started") == 1, {s: results.count(s) for s in set(results)})
         done = wait_until(lambda: (r.api("GET", f"/api/sessions/{sid}/phase")["phase"] == "idle"
                                    and len([e for e in r.api("GET", f"/api/sessions/{sid}")["envelopes"]

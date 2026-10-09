@@ -1,6 +1,8 @@
 //! SSE frame streams. Frames are ephemeral by contract (protocol
 //! invariant #9): a lagging client LOSES frames rather than stalling
 //! anyone, and reconciles from durable history via GET /api/sessions/:id.
+//! A lagged client is told so with an `event: lagged` SSE event carrying
+//! `{"missed": n}` at the point the gap occurred.
 
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -17,14 +19,22 @@ fn frame_event(frame: &Frame) -> Event {
     Event::default().data(serde_json::to_string(frame).expect("frame serializes"))
 }
 
+/// The in-band notice that a slow client missed `missed` frames: it must
+/// refetch `GET /api/sessions/:id` (frames are ephemeral, history is durable).
+fn lagged_event(missed: u64) -> Event {
+    Event::default()
+        .event("lagged")
+        .data(serde_json::json!({ "missed": missed }).to_string())
+}
+
 /// Every frame from every session (a dashboard's feed).
 pub async fn all_events(
     State(s): State<ServerState>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let stream = BroadcastStream::new(s.frames.subscribe()).filter_map(|item| match item {
         Ok(frame) => Some(Ok(frame_event(&frame))),
-        // Lagged: frames dropped for this client; it reconciles later.
-        Err(BroadcastStreamRecvError::Lagged(_)) => None,
+        // Frames dropped for this client: say so, it reconciles from history.
+        Err(BroadcastStreamRecvError::Lagged(missed)) => Some(Ok(lagged_event(missed))),
     });
     let questions = BroadcastStream::new(s.questions.subscribe()).filter_map(|item| {
         item.ok().map(|event| {
@@ -51,7 +61,9 @@ pub async fn session_events(
     let stream = BroadcastStream::new(s.frames.subscribe()).filter_map(move |item| match item {
         Ok(frame) if frame_session(&frame) == id => Some(Ok(frame_event(&frame))),
         Ok(_) => None,
-        Err(BroadcastStreamRecvError::Lagged(_)) => None,
+        // The broadcast is shared, so the count may include other sessions'
+        // frames; it is a "something was missed" signal for this session.
+        Err(BroadcastStreamRecvError::Lagged(missed)) => Some(Ok(lagged_event(missed))),
     });
     Sse::new(stream.merge(questions)).keep_alive(KeepAlive::default())
 }

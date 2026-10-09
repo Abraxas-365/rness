@@ -33,8 +33,11 @@ It initializes no provider/configuration and cannot answer dialogs. IDs must be
 unique across the session root, not just a connection. Use a UUID or equivalent.
 
 Unix sockets require an existing current-user-owned 0700 parent; the socket is
-0600. Existing paths, including stale sockets, are never overwritten. Normal
-shutdown removes the owned socket. After a crash, use a fresh socket path.
+0600. Normal shutdown removes the owned socket. After a crash (e.g. `kill -9`)
+the socket file stays behind; the next start removes it only when it is a
+socket you own that refuses connections (nothing is listening). A socket with a
+live listener, and any other existing path (regular file, directory, symlink),
+is never overwritten and start fails.
 
 ## Windows implementation (not validated on Windows yet)
 

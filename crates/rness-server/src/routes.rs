@@ -103,15 +103,29 @@ async fn dismiss_questions(
 }
 
 /// Service errors become plain-text 4xx/5xx. Unknown sessions are the
-/// caller's fault; everything else is ours.
+/// caller's fault; everything else is ours. A busy session is transient, not
+/// a server fault: 409 with `Retry-After`.
 fn err_response(e: impl std::fmt::Display) -> Response {
     let msg = e.to_string();
+    if is_busy(&msg) {
+        return (
+            StatusCode::CONFLICT,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            msg,
+        )
+            .into_response();
+    }
     let status = if msg.contains("not found") || msg.contains("unknown") {
         StatusCode::NOT_FOUND
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, msg).into_response()
+}
+
+/// `ServiceError::Busy`'s text (the only error whose Display starts so).
+fn is_busy(msg: &str) -> bool {
+    msg.starts_with("session is busy")
 }
 
 async fn file_references(

@@ -893,3 +893,106 @@ async fn cancelling_the_turn_withdraws_the_question() {
     );
     assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
 }
+
+/// B5-10: a send refused as busy is a transient 409 with `Retry-After`,
+/// never a 500.
+#[tokio::test(flavor = "multi_thread")]
+async fn busy_send_is_409_with_retry_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    let maintenance = sessions.try_extension_maintenance().unwrap();
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/request"))
+        .json(&serde_json::json!({
+            "type":"send", "session":id, "intent":"followup",
+            "content":[{"kind":"text","text":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(response.text().await.unwrap().contains("busy"));
+    drop(maintenance);
+}
+
+/// B5-10: concurrent sends to one idle session all succeed: one starts,
+/// the rest queue as followups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_remote_sends_all_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, _kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let url = format!("{base}/api/request");
+        let id = id.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .post(url)
+                .json(&serde_json::json!({
+                    "type":"send", "session":id, "intent":"followup",
+                    "content":[{"kind":"text","text":format!("msg {i}")}]
+                }))
+                .send()
+                .await
+                .unwrap();
+            (
+                response.status(),
+                response.json::<serde_json::Value>().await.unwrap(),
+            )
+        }));
+    }
+    let mut started = 0;
+    for task in tasks {
+        let (status, body) = task.await.unwrap();
+        assert_eq!(status, 200, "{body}");
+        if body["status"] == "started" {
+            started += 1;
+        }
+    }
+    assert_eq!(started, 1);
+}
+
+/// B5-9: a client that falls behind the broadcast buffer is told with an
+/// `event: lagged` / `{"missed": n}` event rather than silently losing frames.
+#[tokio::test(flavor = "current_thread")]
+async fn lagged_sse_client_is_told_to_resync() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, sessions, kernel) = serve(dir.path()).await;
+    let id = sessions.create(None).unwrap();
+    for path in ["api/events", &format!("api/events/{id}")] {
+        let mut response = reqwest::get(format!("{base}/{path}")).await.unwrap();
+        // Current-thread runtime: the server cannot poll the stream while
+        // this synchronous burst (4x the 1024-frame buffer) runs.
+        for i in 0..4096 {
+            kernel
+                .bus()
+                .emit::<FrameEv>(&rness_protocol::frames::Frame::Notice {
+                    session: id.clone(),
+                    text: format!("n{i}"),
+                });
+        }
+        let mut body = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !body.contains("event: lagged") {
+            let Ok(Ok(Some(chunk))) = tokio::time::timeout_at(deadline, response.chunk()).await
+            else {
+                break;
+            };
+            body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        let at = body
+            .find("event: lagged")
+            .unwrap_or_else(|| panic!("{path}: no lagged event in {body}"));
+        let data = body[at..]
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .unwrap();
+        let missed = serde_json::from_str::<serde_json::Value>(data.trim()).unwrap()["missed"]
+            .as_u64()
+            .unwrap();
+        assert!(missed > 0, "{path}: {data}");
+    }
+}
