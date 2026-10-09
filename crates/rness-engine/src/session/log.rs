@@ -604,6 +604,78 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
     read_envelopes_with(path, false)
 }
 
+/// Committed envelopes of `path` from byte `offset` (a line start), each
+/// with its line's start offset, reading no further than byte `limit`.
+/// Only `\n`-terminated lines are consumed: an unterminated last line (a
+/// torn tail or an append in progress) is left for a later call. Returns
+/// the offset just past the last consumed line. At `offset == 0` the first
+/// line must be a supported header. Line numbers in errors count from
+/// `offset`. Payloads are not elided (search indexes full events).
+pub(crate) fn read_envelopes_from(
+    path: &Path,
+    offset: u64,
+    limit: u64,
+) -> Result<(Vec<(Envelope, u64)>, u64), LogError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file.take(limit.saturating_sub(offset)));
+    let mut out = Vec::new();
+    let mut bytes = Vec::new();
+    let mut position = offset;
+    let mut line_no = 0usize;
+    loop {
+        bytes.clear();
+        let n = reader.read_until(b'\n', &mut bytes)?;
+        if n == 0 || !bytes.ends_with(b"\n") {
+            break;
+        }
+        line_no += 1;
+        let start = position;
+        position += n as u64;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let envelope = if offset == 0 && out.is_empty() {
+            parse_header_line(&bytes, line_no)?
+        } else {
+            parse_line(&bytes, line_no, start)?
+        };
+        out.push((envelope, start));
+    }
+    if offset == 0 && out.is_empty() {
+        return Err(LogError::Corrupt {
+            line: 0,
+            offset: 0,
+            reason: "empty log".into(),
+        });
+    }
+    Ok((out, position))
+}
+
+/// Bytes `[start, end)` of `path`; shorter if the file ends first.
+pub(crate) fn read_path_range(path: &Path, start: u64, end: u64) -> Result<Vec<u8>, LogError> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(end.saturating_sub(start))
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// The first line of `path` (the header), at most `MAX_HEADER_BYTES` bytes.
+pub(crate) fn read_header_bytes(path: &Path) -> Result<Vec<u8>, LogError> {
+    let mut bytes = Vec::new();
+    BufReader::new(File::open(path)?.take(MAX_HEADER_BYTES)).read_until(b'\n', &mut bytes)?;
+    if !bytes.ends_with(b"\n") {
+        return Err(LogError::Corrupt {
+            line: 1,
+            offset: 0,
+            reason: "missing or oversized header line".into(),
+        });
+    }
+    Ok(bytes)
+}
+
 fn read_envelopes_with(path: &Path, elide: bool) -> Result<Vec<Envelope>, LogError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);

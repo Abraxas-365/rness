@@ -75,6 +75,15 @@ struct UsageLine {
     usage: Option<rness_protocol::events::Usage>,
 }
 
+/// One `stat` of a session log for search indexing.
+pub(crate) struct SearchProbe {
+    pub len: u64,
+    /// `dev:ino` on Unix; empty where no stable file identity is available.
+    pub identity: String,
+    /// The opaque [`SessionStore::search_revision`] string.
+    pub revision: String,
+}
+
 /// Root directory holding one subdirectory per session.
 pub struct SessionStore {
     root: PathBuf,
@@ -634,6 +643,13 @@ impl SessionStore {
     /// Cheap per-session revision. Includes replacement identity on Unix; never
     /// opens a body. Call before reading so concurrent appends refresh next time.
     pub fn search_revision(&self, session: &SessionId) -> Result<String, BranchError> {
+        Ok(self.search_probe(session)?.revision)
+    }
+
+    /// [`Self::search_revision`] plus what incremental indexing decides on:
+    /// the log length and its file identity (`dev:ino` on Unix, empty
+    /// elsewhere), from one `stat`.
+    pub(crate) fn search_probe(&self, session: &SessionId) -> Result<SearchProbe, BranchError> {
         let directory = self.root.join(session);
         let path = super::log::log_file(&directory);
         if std::fs::symlink_metadata(&directory)
@@ -669,7 +685,70 @@ impl SessionStore {
                 meta.ctime_nsec()
             )
         };
-        Ok(revision)
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            format!("{}:{}", meta.dev(), meta.ino())
+        };
+        #[cfg(not(unix))]
+        let identity = String::new();
+        Ok(SearchProbe {
+            len: meta.len(),
+            identity,
+            revision,
+        })
+    }
+
+    /// SHA-256 (hex) of the session's header line, read without parsing the
+    /// body: incremental search checks the file still starts the same.
+    pub(crate) fn search_header_digest(&self, session: &SessionId) -> Result<String, BranchError> {
+        use sha2::Digest;
+        let bytes = super::log::read_header_bytes(&super::log::log_file(&self.root.join(session)))?;
+        Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+    }
+
+    /// Committed local events of `target` in bytes `[offset, limit)` with
+    /// their line starts, and the offset after the last complete line
+    /// (unterminated tails are left unread). Authorized like
+    /// [`Self::search_events`]; from offset 0 the header identity is checked
+    /// in the same read, later ranges rely on [`Self::search_header_digest`].
+    pub(crate) fn search_events_from(
+        &self,
+        caller: &SessionId,
+        target: &SessionId,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(Vec<(Envelope, u64)>, u64), BranchError> {
+        let workspace = self.search_workspace(caller, Some(target))?;
+        let path = super::log::log_file(&self.root.join(target));
+        let (events, end) = super::log::read_envelopes_from(&path, offset, limit)?;
+        if offset == 0
+            && !matches!(events.first().map(|(event, _)| &event.event),
+                Some(SessionEvent::Header(header)) if header.session == *target
+                    && header.workspace.as_deref() == Some(workspace.as_str()))
+        {
+            return Err(LogError::Corrupt {
+                line: 1,
+                offset: 0,
+                reason: "search session identity changed".into(),
+            }
+            .into());
+        }
+        Ok((events, end))
+    }
+
+    /// SHA-256 (hex) of bytes `[start, end)` of the session log (shorter
+    /// if the file is): incremental search re-checks its last indexed line.
+    pub(crate) fn search_range_digest(
+        &self,
+        session: &SessionId,
+        start: u64,
+        end: u64,
+    ) -> Result<String, BranchError> {
+        use sha2::Digest;
+        let path = super::log::log_file(&self.root.join(session));
+        let bytes = super::log::read_path_range(&path, start, end)?;
+        Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
     }
 
     /// Read searchable text from its original local JSONL event, without SQLite.

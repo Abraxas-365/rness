@@ -1,9 +1,12 @@
 //! Incremental query API. Metadata is checked on search; only changed session
 //! bodies are read/reindexed. Cursors are bound to scope, filters and revisions.
 use super::SqliteSessionSearch;
-use crate::session::{branch::SessionStore, projection::search_surfaces};
+use crate::session::{
+    branch::{BranchError, SearchProbe, SessionStore},
+    projection::{fast_surface, search_surfaces},
+};
 use rness_protocol::events::{Envelope, SessionEvent};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -11,6 +14,11 @@ use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Derived index layout. v4: `surface` moved from the FTS row to
+/// `event_scope`, per-session `session_cursor` for append-only refresh.
+/// Older (v2/v3) indexes are dropped and rebuilt once on open.
+const SCHEMA_VERSION: i64 = 4;
 fn invalid(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message).into()
 }
@@ -160,7 +168,7 @@ impl SqliteSessionSearch {
                 [],
                 |r| r.get(0),
             )?;
-            if (app != 0x524e5351 || !matches!(version, 2 | 3))
+            if (app != 0x524e5351 || !matches!(version, 2..=SCHEMA_VERSION))
                 && !(app == 0 && version == 0 && tables == 0)
             {
                 return Err(invalid(
@@ -168,35 +176,53 @@ impl SqliteSessionSearch {
                 ));
             }
             let tx = connection.transaction()?;
+            if (2..SCHEMA_VERSION).contains(&version) {
+                // v2/v3 kept `surface` inside the FTS row, so re-labelling an
+                // event rewrote its body. The index is derived: drop it and
+                // let the next refresh rebuild every session once.
+                tx.execute_batch(
+                    "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS event_scope;
+                     DROP TABLE IF EXISTS revisions; DROP TABLE IF EXISTS session_cursor;",
+                )?;
+            }
+            // `events` holds the searchable text only; mutable labels live in
+            // `event_scope`, keyed by the FTS rowid. `session_cursor` records
+            // how far each session log is indexed (byte offset, last line).
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS revisions (
                 workspace TEXT NOT NULL, session TEXT NOT NULL, revision TEXT NOT NULL,
                 PRIMARY KEY(workspace, session));
                 CREATE VIRTUAL TABLE IF NOT EXISTS events USING fts5(
                     workspace UNINDEXED, session UNINDEXED, event UNINDEXED,
-                    kind UNINDEXED, surface UNINDEXED, time UNINDEXED, body);
-                PRAGMA application_id = 1380864849;
-                PRAGMA user_version = 2;",
+                    kind UNINDEXED, time UNINDEXED, body);
+                CREATE TABLE IF NOT EXISTS event_scope (
+                    rowid INTEGER PRIMARY KEY, workspace TEXT NOT NULL, session TEXT NOT NULL,
+                    surface TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS event_scope_session ON event_scope(workspace,session);
+                CREATE TABLE IF NOT EXISTS session_cursor (
+                    workspace TEXT NOT NULL, session TEXT NOT NULL,
+                    offset INTEGER NOT NULL, last_line_start INTEGER NOT NULL,
+                    last_line_hash TEXT NOT NULL, header_hash TEXT NOT NULL,
+                    identity TEXT NOT NULL, events INTEGER NOT NULL,
+                    PRIMARY KEY(workspace, session));
+                PRAGMA application_id = 1380864849;",
             )?;
-            if version < 3 {
-                // Preserve the existing FTS rowids. Indexed metadata supports
-                // scoped lookup/deletion without scanning FTS content columns.
-                tx.execute_batch(
-                    "CREATE TABLE event_scope (
-                    rowid INTEGER PRIMARY KEY, workspace TEXT NOT NULL, session TEXT NOT NULL);
-                    CREATE INDEX event_scope_session ON event_scope(workspace,session);
-                    INSERT INTO event_scope SELECT rowid,workspace,session FROM events;
-                    PRAGMA user_version = 3;",
-                )?;
-            } else {
-                tx.execute_batch("PRAGMA user_version = 3;")?;
-            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
             self.connection = Some(connection);
         }
         Ok(self.connection.as_mut().unwrap())
     }
 
+    /// Bring the index up to date with every session log of `workspace`.
+    ///
+    /// Per session (one SQLite transaction each, so cancelled refreshes keep
+    /// their progress): unchanged revision → nothing; same file grown past
+    /// its indexed prefix (identity, header and last indexed line verified)
+    /// → index only the new complete lines; anything else, or a delta that
+    /// holds a `Compaction`/`Prune` (they re-label earlier events) → rebuild
+    /// that session. A session that cannot be read is dropped from the index
+    /// with a warning instead of failing the whole search.
     fn refresh(
         &mut self,
         store: &SessionStore,
@@ -218,68 +244,98 @@ impl SqliteSessionSearch {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<HashMap<_, _>>>()?;
-        let mut revisions = Vec::new();
+        let mut probes = Vec::new();
         for session in store.list()? {
-            let revision = store.search_revision(&session)?;
-            if store.workspace(&session)?.as_deref() == Some(workspace) {
-                revisions.push((session, revision));
+            let in_workspace = store
+                .workspace(&session)
+                .map(|ws| ws.as_deref() == Some(workspace))
+                .and_then(|member| member.then(|| store.search_probe(&session)).transpose());
+            match in_workspace {
+                Ok(Some(probe)) => probes.push((session, probe)),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%session, %error, "session search skips an unreadable session")
+                }
             }
         }
         let present: std::collections::HashSet<_> =
-            revisions.iter().map(|(session, _)| session).collect();
+            probes.iter().map(|(session, _)| session).collect();
         let tx = connection.transaction()?;
         for session in old.keys().filter(|id| !present.contains(id)) {
-            tx.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM event_scope WHERE workspace=?1 AND session=?2)", params![workspace, session])?;
-            tx.execute(
-                "DELETE FROM event_scope WHERE workspace=?1 AND session=?2",
-                params![workspace, session],
-            )?;
+            forget(&tx, workspace, session)?;
             tx.execute(
                 "DELETE FROM revisions WHERE workspace=?1 AND session=?2",
                 params![workspace, session],
             )?;
         }
         tx.commit()?;
-        for (session, revision) in &revisions {
-            if old.get(session) == Some(revision) {
+        for (session, probe) in &probes {
+            if old.get(session) == Some(&probe.revision) {
                 continue;
             }
             cancelled()?;
-            let events = store.search_events(caller, session)?;
-            let surfaces = search_surfaces(&events);
-            // One transaction per session: a cancelled or slow refresh keeps
-            // the sessions it already indexed, so retries make progress.
-            let tx = connection.transaction()?;
-            tx.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM event_scope WHERE workspace=?1 AND session=?2)", params![workspace, session])?;
-            tx.execute(
-                "DELETE FROM event_scope WHERE workspace=?1 AND session=?2",
-                params![workspace, session],
-            )?;
-            let mut scope_insert =
-                tx.prepare("INSERT INTO event_scope(rowid,workspace,session) VALUES(?1,?2,?3)")?;
-            let mut insert = tx.prepare("INSERT INTO events(workspace,session,event,kind,surface,time,body) VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
-            for (index, event) in events.into_iter().enumerate() {
-                if index % 512 == 0 {
-                    cancelled()?;
-                }
-                let value = serde_json::to_value(&event.event)?;
-                let mut parts = Vec::new();
-                searchable(&value, &mut parts);
-                insert.execute(params![
-                    workspace,
-                    session,
-                    event.id,
-                    value["type"].as_str(),
-                    surfaces[&event.id],
-                    timestamp(&event.at)?,
-                    parts.join("\n")
-                ])?;
-                scope_insert.execute(params![tx.last_insert_rowid(), workspace, session])?;
+            // Write lock first, then re-read this session's state: another
+            // process sharing the index may have indexed it meanwhile, and
+            // extending from a stale cursor would duplicate rows.
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let revision: Option<String> = tx
+                .query_row(
+                    "SELECT revision FROM revisions WHERE workspace=?1 AND session=?2",
+                    params![workspace, session],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if revision.as_ref() == Some(&probe.revision) {
+                continue;
             }
-            drop(insert);
-            drop(scope_insert);
-            tx.execute("INSERT INTO revisions VALUES(?1,?2,?3) ON CONFLICT(workspace,session) DO UPDATE SET revision=excluded.revision",
-                params![workspace, session, revision])?;
+            let cursor = tx
+                .query_row(
+                    "SELECT offset,last_line_start,last_line_hash,header_hash,identity,events
+                     FROM session_cursor WHERE workspace=?1 AND session=?2",
+                    params![workspace, session],
+                    |row| {
+                        Ok(Cursor {
+                            offset: row.get::<_, i64>(0)? as u64,
+                            last_line_start: row.get::<_, i64>(1)? as u64,
+                            last_line_hash: row.get(2)?,
+                            header_hash: row.get(3)?,
+                            identity: row.get(4)?,
+                            events: row.get(5)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let outcome = match cursor {
+                Some(cursor) if cursor.identity == probe.identity && probe.len >= cursor.offset => {
+                    extend(
+                        store, caller, &tx, workspace, session, probe, &cursor, &cancelled,
+                    )
+                }
+                _ => Ok(Extended::Rebuild),
+            };
+            let outcome = match outcome {
+                Ok(Extended::Rebuild) => {
+                    rebuild(store, caller, &tx, workspace, session, probe, &cancelled)
+                }
+                other => other.map(|_| ()),
+            };
+            match outcome {
+                Ok(()) => {}
+                Err(error) if error.downcast_ref::<BranchError>().is_some() => {
+                    // Unreadable now (corrupt, newer format, replaced by
+                    // another session…): serve nothing stale from it, and do
+                    // not re-read it until the file changes.
+                    tracing::warn!(%session, %error, "session search skips an unreadable session");
+                    drop(tx);
+                    let tx = connection.transaction()?;
+                    forget(&tx, workspace, session)?;
+                    set_revision(&tx, workspace, session, &probe.revision)?;
+                    tx.commit()?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            set_revision(&tx, workspace, session, &probe.revision)?;
             tx.commit()?;
         }
         Ok(())
@@ -373,7 +429,8 @@ impl SqliteSessionSearch {
                     "events CROSS JOIN event_scope AS scope ON scope.rowid=events.rowid
                      WHERE events MATCH ?1 AND scope.workspace=?2 AND scope.session=?3"
                 } else {
-                    "events WHERE events MATCH ?1 AND workspace=?2 AND (?3 IS NULL OR session=?3)"
+                    "events CROSS JOIN event_scope AS scope ON scope.rowid=events.rowid
+                     WHERE events MATCH ?1 AND events.workspace=?2 AND (?3 IS NULL OR events.session=?3)"
                 };
                 let selection = if operation == "session_search" {
                     "SELECT * FROM (SELECT *, row_number() OVER (PARTITION BY session ORDER BY score,event) AS n FROM matches) WHERE n=1"
@@ -381,7 +438,7 @@ impl SqliteSessionSearch {
                     "SELECT * FROM matches"
                 };
                 let sql = format!("WITH matches AS MATERIALIZED (
-                    SELECT events.rowid AS id,events.session,events.event,kind,surface,time,rank AS score
+                    SELECT events.rowid AS id,events.session,events.event,kind,scope.surface,time,rank AS score
                     FROM {source}
                         AND (?4='[]' OR kind IN (SELECT value FROM json_each(?4)))
                         AND (?5='[]' OR surface IN (SELECT value FROM json_each(?5)))
@@ -402,7 +459,7 @@ impl SqliteSessionSearch {
                 let rowids: Vec<_> = candidates.iter().take(1000).map(|(id, _)| *id).collect();
                 // One FTS cursor for all selected snippets. Reopening MATCH once
                 // per row is expensive for frequent terms even with rowid bounds.
-                let mut snippet = read.prepare("SELECT rowid,substr(snippet(events,6,'','',' … ',32),1,512) FROM events WHERE events MATCH ?1 AND rowid IN (SELECT value FROM json_each(?2))")?;
+                let mut snippet = read.prepare("SELECT rowid,substr(snippet(events,5,'','',' … ',32),1,512) FROM events WHERE events MATCH ?1 AND rowid IN (SELECT value FROM json_each(?2))")?;
                 let mut excerpts = snippet
                     .query_map(params![phrase, serde_json::to_string(&rowids)?], |row| {
                         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -489,6 +546,196 @@ impl SqliteSessionSearch {
             _ => Err(invalid("unknown session query operation")),
         }
     }
+}
+
+/// How far a session log is indexed. `last_line_hash` covers bytes
+/// `[last_line_start, offset)` and `header_hash` the first line: both are
+/// re-checked before trusting the indexed prefix of a grown file.
+struct Cursor {
+    offset: u64,
+    last_line_start: u64,
+    last_line_hash: String,
+    header_hash: String,
+    identity: String,
+    events: i64,
+}
+
+enum Extended {
+    Done,
+    Rebuild,
+}
+
+fn forget(tx: &rusqlite::Transaction<'_>, workspace: &str, session: &str) -> Result<()> {
+    tx.execute("DELETE FROM events WHERE rowid IN (SELECT rowid FROM event_scope WHERE workspace=?1 AND session=?2)", params![workspace, session])?;
+    tx.execute(
+        "DELETE FROM event_scope WHERE workspace=?1 AND session=?2",
+        params![workspace, session],
+    )?;
+    tx.execute(
+        "DELETE FROM session_cursor WHERE workspace=?1 AND session=?2",
+        params![workspace, session],
+    )?;
+    Ok(())
+}
+
+fn set_revision(
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    session: &str,
+    revision: &str,
+) -> Result<()> {
+    tx.execute("INSERT INTO revisions VALUES(?1,?2,?3) ON CONFLICT(workspace,session) DO UPDATE SET revision=excluded.revision",
+        params![workspace, session, revision])?;
+    Ok(())
+}
+
+/// Insert `events` (with their surfaces) as new rows of `session`.
+fn insert_rows<'e>(
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    session: &str,
+    events: impl Iterator<Item = (&'e Envelope, &'static str)>,
+    cancelled: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let mut scope_insert = tx.prepare_cached(
+        "INSERT INTO event_scope(rowid,workspace,session,surface) VALUES(?1,?2,?3,?4)",
+    )?;
+    let mut insert = tx.prepare_cached(
+        "INSERT INTO events(workspace,session,event,kind,time,body) VALUES(?1,?2,?3,?4,?5,?6)",
+    )?;
+    for (index, (event, surface)) in events.enumerate() {
+        if index % 512 == 0 {
+            cancelled()?;
+        }
+        let value = serde_json::to_value(&event.event)?;
+        let mut parts = Vec::new();
+        searchable(&value, &mut parts);
+        insert.execute(params![
+            workspace,
+            session,
+            event.id,
+            value["type"].as_str(),
+            timestamp(&event.at)?,
+            parts.join("\n")
+        ])?;
+        scope_insert.execute(params![tx.last_insert_rowid(), workspace, session, surface])?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn save_cursor(
+    store: &SessionStore,
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    session: &String,
+    probe: &SearchProbe,
+    header_hash: String,
+    last_line_start: u64,
+    offset: u64,
+    events: i64,
+) -> Result<()> {
+    let last_line_hash = store.search_range_digest(session, last_line_start, offset)?;
+    tx.execute(
+        "INSERT INTO session_cursor VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(workspace,session) DO UPDATE SET offset=excluded.offset,
+         last_line_start=excluded.last_line_start, last_line_hash=excluded.last_line_hash,
+         header_hash=excluded.header_hash, identity=excluded.identity, events=excluded.events",
+        params![
+            workspace,
+            session,
+            offset as i64,
+            last_line_start as i64,
+            last_line_hash,
+            header_hash,
+            probe.identity,
+            events
+        ],
+    )?;
+    Ok(())
+}
+
+/// Index only what was appended after `cursor`, if the indexed prefix is
+/// verifiably unchanged and the delta cannot re-label earlier events.
+#[allow(clippy::too_many_arguments)]
+fn extend(
+    store: &SessionStore,
+    caller: &String,
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    session: &String,
+    probe: &SearchProbe,
+    cursor: &Cursor,
+    cancelled: &dyn Fn() -> Result<()>,
+) -> Result<Extended> {
+    // Same file, same first line, same last indexed line: the prefix is
+    // the one indexed (an in-place edit elsewhere in the prefix would break
+    // the append-only contract, invariants #2/#3, and is not detected).
+    if store.search_header_digest(session)? != cursor.header_hash
+        || store.search_range_digest(session, cursor.last_line_start, cursor.offset)?
+            != cursor.last_line_hash
+    {
+        return Ok(Extended::Rebuild);
+    }
+    let (events, end) = store.search_events_from(caller, session, cursor.offset, probe.len)?;
+    let mut labelled = Vec::with_capacity(events.len());
+    for (event, _) in &events {
+        match fast_surface(&event.event) {
+            Some(surface) => labelled.push((event, surface)),
+            None => return Ok(Extended::Rebuild),
+        }
+    }
+    insert_rows(tx, workspace, session, labelled.into_iter(), cancelled)?;
+    if let Some((_, last_start)) = events.last() {
+        save_cursor(
+            store,
+            tx,
+            workspace,
+            session,
+            probe,
+            cursor.header_hash.clone(),
+            *last_start,
+            end,
+            cursor.events + events.len() as i64,
+        )?;
+    }
+    Ok(Extended::Done)
+}
+
+/// Re-index a whole session log.
+fn rebuild(
+    store: &SessionStore,
+    caller: &String,
+    tx: &rusqlite::Transaction<'_>,
+    workspace: &str,
+    session: &String,
+    probe: &SearchProbe,
+    cancelled: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    let header_hash = store.search_header_digest(session)?;
+    let (events, end) = store.search_events_from(caller, session, 0, probe.len)?;
+    let envelopes: Vec<&Envelope> = events.iter().map(|(event, _)| event).collect();
+    let surfaces = search_surfaces(&envelopes);
+    forget(tx, workspace, session)?;
+    insert_rows(
+        tx,
+        workspace,
+        session,
+        envelopes.iter().map(|event| (*event, surfaces[&event.id])),
+        cancelled,
+    )?;
+    let last_start = events.last().map_or(0, |(_, start)| *start);
+    save_cursor(
+        store,
+        tx,
+        workspace,
+        session,
+        probe,
+        header_hash,
+        last_start,
+        end,
+        events.len() as i64,
+    )
 }
 
 /// Direct durable relationships only; no inferred fuzzy provenance. Target

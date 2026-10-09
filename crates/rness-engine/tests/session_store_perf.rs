@@ -800,6 +800,32 @@ fn perf_search_append_reindex() {
         .unwrap();
         q(&mut search, "freshappend")
     });
+    // Rare path: a fold event in the delta re-labels earlier rows, so the
+    // session is rebuilt.
+    let target = read_session(&root, &sid).unwrap()[1].id.clone();
+    let t = Instant::now();
+    log.append(&SessionEvent::Prune(rness_protocol::events::Prune {
+        replaces: target,
+        result: rness_protocol::events::ToolResult {
+            call: "c".into(),
+            name: "Read".into(),
+            content: vec![],
+            output: "pruned".into(),
+            is_error: false,
+            duration_ms: 0,
+            tasks: None,
+            plan_review: None,
+            presentation: None,
+        },
+    }))
+    .unwrap();
+    q(&mut search, "freshappend");
+    rep.sample(
+        "append_fold_then_search_ms",
+        t.elapsed().as_secs_f64() * 1000.0,
+        "ms",
+        extra.clone(),
+    );
     drop(log);
     let _ = Arc::new(()); // keep import used
 }
