@@ -167,6 +167,22 @@ the producer and exposes an explicit incomplete-output error; it does not evict
 recent output merely to admit a write. Disk failures also cancel producers.
 Background job count is not capped; treat artifacts as sensitive.
 
+## Bash process cleanup
+
+Each Bash command runs in its own session (`setsid`). rness registers that
+session with the cleanup helper that terminals use (`rness
+__rness-terminal-reaper`, started on first use). If rness dies in any way,
+including `kill -9`, OOM or abort, the helper ends every process still in a
+registered session: background jobs, foreground commands and their `&`
+children (`SIGHUP`, 0.5 s, `SIGKILL`). A command's `&` children that outlive
+it are also ended when rness exits normally. Background job records store the
+session id and the leader's start time. If the helper died too, the next rness
+start kills the session when the leader is still the same process. It also
+marks the newest crashed run's jobs `interrupted` synchronously (150 ms budget)
+and leaves the rest to background recovery. Processes that start their own
+session (`setsid`, daemons that double-fork) are out of reach. Windows has no
+equivalent yet; a Job Object is the planned mechanism.
+
 ## Process backend configuration
 
 ```lua

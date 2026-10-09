@@ -365,7 +365,7 @@ def group_crash(t, fp, rep):
         wait_until(lambda: not alive(r.pid), 5)
         time.sleep(1)
         orphans = [p for p in sleepers() if alive(p)]
-        t.check("crash: Bash children of killed rness are orphaned (observation; expect 0)",
+        t.check("crash: no Bash children survive kill -9 of rness (B6-2)",
                 len(orphans) == 0, f"{len(orphans)} sleep processes survive kill -9 of rness")
         rep.sample("crash_orphan_bash", len(orphans), unit="count")
         t.check("crash: terminal reapers gone", not any(alive(p) for p in reapers), reapers)

@@ -102,7 +102,7 @@ def kill9_group(c, fp):
                                         "reapers_matching_binary": len(reapers)}
             c.check(f"kill9/{name}: helpers started", got and len(before) >= 1,
                     f"before={len(before)} rc={p.returncode} err={Path(p.err_path).read_text()[-400:]}")
-            c.check(f"kill9/{name}: no orphans 5 s after kill -9 (expected-to-fail = bug)", not after,
+            c.check(f"kill9/{name}: no orphans 5 s after kill -9", not after,
                     f"{len(after)} of {len(before)} survived")
             # Restart in the same HOME: does recovery mark the jobs interrupted?
             if name == "bg_jobs_20":

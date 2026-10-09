@@ -46,6 +46,24 @@ fn counted<T>(result: std::io::Result<T>) -> std::io::Result<T> {
     result
 }
 
+/// Synchronous share of stale-dir recovery at startup (Pass A).
+const RECOVERY_SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// A dead host's job left running: if its shell's session leader is still
+/// the process recorded at spawn (same start time), kill the session. The
+/// reaper helper normally did this already; this covers a helper that died
+/// too (e.g. the whole process group was killed).
+fn kill_leftover_session(state: &JobState) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let (Some(sid), Some(start)) = (state.pid, state.pid_start) {
+        if sid > 1 && crate::terminal::reaper::start_time(sid) == Some(start) {
+            crate::terminal::reaper::kill_session(sid);
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = state;
+}
+
 /// A persistent job's open output file: one fd for the job's run, closed
 /// at settle. `synced` is when its data last reached stable storage.
 struct OutputFile {
@@ -194,6 +212,12 @@ struct JobState {
     settled_at_ms: Option<u64>,
     #[serde(default)]
     output_error: Option<String>,
+    /// Session id of a Bash job's shell and its leader's start time, so a
+    /// later rness can verify and kill a crashed host's leftover session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pid_start: Option<u64>,
 }
 
 impl JobState {
@@ -580,6 +604,17 @@ impl JobWriter {
         }
     }
 
+    /// Record the job's process session (see `JobState::pid`).
+    pub(crate) fn set_process(&self, sid: i32, start: u64) {
+        let mut state = self.job.state.lock().unwrap();
+        if state.settled {
+            return;
+        }
+        state.pid = Some(sid);
+        state.pid_start = Some(start);
+        self.job.checkpoint(&state);
+    }
+
     pub fn output_error(&self) -> Option<String> {
         self.job.state.lock().unwrap().output_error.clone()
     }
@@ -754,6 +789,17 @@ impl JobRegistry {
         *directory = Some(path);
         drop(directory);
 
+        // Pass A: owner dirs are ULIDs, so the newest (a run that just
+        // crashed) come first. Recover them synchronously within a small
+        // budget, so even a short run marks them interrupted (and kills
+        // their leftover sessions); the rest go to the background thread.
+        stale_dirs.sort();
+        let started = std::time::Instant::now();
+        while started.elapsed() < RECOVERY_SYNC_BUDGET {
+            let Some(dir) = stale_dirs.pop() else { break };
+            self.recover_stale_jobs(std::slice::from_ref(&dir));
+        }
+
         // Spawn background recovery for old job directories.
         if !stale_dirs.is_empty() {
             let registry = self.clone();
@@ -894,6 +940,7 @@ impl JobRegistry {
                 if interrupted {
                     state.status = JobStatus::Interrupted;
                     state.settled = true;
+                    kill_leftover_session(&state);
                 }
                 let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
@@ -1136,6 +1183,8 @@ impl JobRegistry {
                 started_at_ms: Some(retention::now_ms()),
                 settled_at_ms: None,
                 output_error: None,
+                pid: None,
+                pid_start: None,
             }),
             completion: owner.map(|owner| {
                 (
@@ -1601,6 +1650,75 @@ mod durability_tests {
         let recovered = restart_for_test(directory.path());
         assert!(recovered.get(&id).is_err());
         assert!(!dir.exists(), "dir of expired records removed");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_kills_a_dead_hosts_session_only_if_the_leader_matches() {
+        fn session() -> std::process::Child {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", "trap '' HUP; while :; do sleep 0.05; done"]);
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn().unwrap()
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut ours = session();
+        let mut other = session();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            for (child, skew) in [(&ours, 0), (&other, 1)] {
+                let sid = child.id() as i32;
+                let start = crate::terminal::reaper::start_time(sid).unwrap();
+                let (_, writer) = registry.start("bash", "left running".into());
+                writer.set_process(sid, start + skew);
+                // Crash: never settled.
+                std::mem::forget(writer);
+            }
+        }
+        let _recovered = restart_for_test(directory.path());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ours.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            ours.try_wait().unwrap().is_some(),
+            "leftover session killed"
+        );
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "a session whose leader started at another time is not ours"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[test]
+    fn startup_recovers_the_newest_stale_dir_synchronously() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = {
+            let registry = JobRegistry::new();
+            registry.enable_persistence(directory.path()).unwrap();
+            let (id, writer) = registry.start("bash", "crashed".into());
+            std::mem::forget(writer);
+            id
+        };
+        // No wait_recovery: Pass A already marked it.
+        let registry = JobRegistry::new();
+        registry.enable_persistence(directory.path()).unwrap();
+        let job = registry.get(&id).expect("recovered synchronously");
+        assert_eq!(job.state.lock().unwrap().status, JobStatus::Interrupted);
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path.as_ref().unwrap()).unwrap()).unwrap();
+        assert_eq!(record["status"], "Interrupted");
+        registry.wait_recovery();
     }
 
     #[test]
