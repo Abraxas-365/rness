@@ -222,6 +222,13 @@ fn prefix(context: &ModelContext, retain: u64, meter: &Meter) -> usize {
 
 /// Close interrupted audit spans on the existing session writer. Never repeat
 /// a paid request or discard a checkpoint that landed before the interruption.
+///
+/// Also closes a trailing unclosed turn (a process killed mid-turn leaves
+/// `turn/started N` as the last turn marker) with `turn/ended N` outcome
+/// `failed`: the turn did not complete and nothing cancelled it, so it reads
+/// like any other failed turn. Only the TRAILING turn is closed — a writer
+/// holding the session lock never leaves an earlier one open, and appending
+/// an end marker for a mid-log turn would misplace it.
 pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError> {
     let history = log.read_all_elided()?;
     let finished: std::collections::HashSet<_> = history
@@ -251,6 +258,17 @@ pub fn recover(log: &mut SessionLog) -> Result<(), crate::session::log::LogError
             .into(),
             usage: Default::default(),
             chunks: vec![],
+        })?;
+    }
+    let trailing = history.iter().rev().find_map(|e| match &e.event {
+        SessionEvent::TurnStarted { turn } => Some(Some(*turn)),
+        SessionEvent::TurnEnded { .. } => Some(None),
+        _ => None,
+    });
+    if let Some(Some(turn)) = trailing {
+        log.append(&SessionEvent::TurnEnded {
+            turn,
+            outcome: rness_protocol::events::TurnOutcome::Failed,
         })?;
     }
     Ok(())

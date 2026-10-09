@@ -1308,6 +1308,46 @@ async fn prune_pass_is_batched_in_order() {
     );
 }
 
+/// B1-9: a process killed mid-turn leaves `turn/started N` unclosed; recover()
+/// closes only that trailing turn, as `failed`, once (idempotent), and the
+/// context is unchanged.
+#[test]
+fn recover_closes_trailing_unclosed_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut log = store.create(None).unwrap();
+    let sid = log.session().clone();
+    for turn in 1..=2u32 {
+        log.append(&SessionEvent::TurnStarted { turn }).unwrap();
+        log.append(&user("q")).unwrap();
+        if turn == 1 {
+            log.append(&SessionEvent::TurnEnded {
+                turn,
+                outcome: TurnOutcome::Completed,
+            })
+            .unwrap();
+        }
+    }
+    let before = replay(&store, &sid).unwrap().context;
+    drop(log);
+    let mut log = store.open(&sid).unwrap();
+    compaction::recover(&mut log).unwrap();
+    compaction::recover(&mut log).unwrap(); // idempotent
+    let ended: Vec<(u32, TurnOutcome)> = read_session(dir.path(), &sid)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::TurnEnded { turn, outcome } => Some((*turn, *outcome)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ended,
+        vec![(1, TurnOutcome::Completed), (2, TurnOutcome::Failed)]
+    );
+    assert_eq!(replay(&store, &sid).unwrap().context, before);
+}
+
 /// recover(): a compaction/started with a later checkpoint but no finished
 /// is closed as committed_before_interruption; a bare one as interrupted.
 #[test]

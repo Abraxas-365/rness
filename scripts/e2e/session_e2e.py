@@ -116,9 +116,8 @@ def sec_lock(c):
         log = read_log(r.root, sid)
         started = [e["turn"] for e in log if e["type"] == "turn/started"]
         ended = [e["turn"] for e in log if e["type"] == "turn/ended"]
-        c.xcheck("lock: every turn/started has a turn/ended after resume",
-                 sorted(set(started)) == sorted(set(ended)), "B1-9 killed turn never closed",
-                 f"started={started} ended={ended}")
+        c.check("lock: every turn/started has a turn/ended after resume",
+                sorted(set(started)) == sorted(set(ended)), f"started={started} ended={ended}")
 
     # serve + headless on one session
     with with_rness(wp=WP, tag="lock-serve", mode="serve", scenario="ok") as r:

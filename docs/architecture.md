@@ -125,6 +125,12 @@ FORMAT_VERSION`, session id matches) and then heals the tail:
 - **Mid-file damage** (valid events after a bad line): never repaired
   automatically. Reads fail with `corrupt log at line N (byte offset O)`.
 
+**Interrupted turns:** a process killed mid-turn leaves `turn/started N`
+without `turn/ended`. When the session is next opened for a turn (or a
+manual compaction), `recover()` appends `turn/ended {N, failed}` for that
+trailing turn (and closes dangling compaction audit spans), so every started
+turn is closed. No new event kind or format bump.
+
 **Forward compatibility:** an event whose `type` this build does not know
 (written by a newer rness) is data, not corruption: it is read as
 `SessionEvent::Unknown`, re-serialized semantically verbatim (same JSON value; object key order and
