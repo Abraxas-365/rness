@@ -251,10 +251,13 @@ impl SessionLog {
     /// Append `events` in order with ONE durability sync (bytes are written
     /// in chunks of at most 8 MiB). Empty slice: no write, no sync.
     ///
-    /// Not atomic: a crash mid-batch leaves a whole-line prefix of the batch
-    /// (plus a torn line that `open` truncates) — exactly what consecutive
-    /// single appends could leave. Nothing is acknowledged before the sync;
-    /// on error the file is rolled back to its previous length.
+    /// Not atomic: a crash mid-batch can leave any prefix of the batch (the
+    /// last line possibly torn; `open` truncates that) — exactly what
+    /// consecutive single appends could leave. Durability is only promised
+    /// once this call returns `Ok`: bytes written before the sync may or may
+    /// not survive a crash, and nothing is acknowledged to callers before it.
+    /// On error the file is rolled back to its previous length (best effort;
+    /// if that fails the handle is poisoned).
     pub fn append_batch(&mut self, events: &[SessionEvent]) -> Result<Vec<Envelope>, LogError> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -512,12 +515,11 @@ fn classify_line(bytes: &[u8]) -> LineClass {
     if Envelope::parse_line(bytes).is_ok() {
         return LineClass::Valid;
     }
-    // Our own writer starts every committed line with `{"id":"`. Never
-    // quarantine such a line, however it fails to parse (e.g. serde_json's
-    // recursion limit, which the plain parse below would also trip over).
-    if bytes.starts_with(br#"{"id":""#) {
-        return LineClass::Suspicious;
-    }
+    // A committed line is always valid JSON (the writer serializes it
+    // first), so a syntax error means it was never acknowledged — even if it
+    // starts with `{"id":"` (a torn line whose newline persisted). The one
+    // valid-JSON-but-unparseable case is serde_json's recursion limit
+    // (deeper than `MAX_JSON_DEPTH`, e.g. from another writer): keep it.
     match serde_json::from_slice::<serde_json::Value>(bytes) {
         Err(error) if error.to_string().starts_with("recursion limit exceeded") => {
             LineClass::Suspicious
@@ -544,6 +546,20 @@ fn read_range(file: &mut File, start: u64, end: u64) -> std::io::Result<Vec<u8>>
     file.seek(SeekFrom::Start(start))?;
     file.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+/// Number of `\n`-terminated lines in `[0, before)`.
+fn count_lines(path: &Path, before: u64) -> std::io::Result<usize> {
+    let mut reader = BufReader::new(File::open(path)?.take(before));
+    let mut buf = [0u8; 64 << 10];
+    let mut lines = 0;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Ok(lines);
+        }
+        lines += buf[..n].iter().filter(|&&b| b == b'\n').count();
+    }
 }
 
 /// Offset just past the last `\n` in `[0, before)`, or 0. Scans backwards
@@ -632,8 +648,9 @@ pub(super) fn read_envelopes(path: &Path) -> Result<Vec<Envelope>, LogError> {
 /// Only `\n`-terminated lines are consumed: an unterminated last line (a
 /// torn tail or an append in progress) is left for a later call. Returns
 /// the offset just past the last consumed line. At `offset == 0` the first
-/// line must be a supported header. Line numbers in errors count from
-/// `offset`. Payloads are not elided (search indexes full events).
+/// line must be a supported header. Line numbers in errors are absolute
+/// (the prefix before `offset` is only counted when an error is reported).
+/// Payloads are not elided (search indexes full events).
 pub(crate) fn read_envelopes_from(
     path: &Path,
     offset: u64,
@@ -658,10 +675,25 @@ pub(crate) fn read_envelopes_from(
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let envelope = if offset == 0 && out.is_empty() {
-            parse_header_line(&bytes, line_no)?
+        let parsed = if offset == 0 && out.is_empty() {
+            parse_header_line(&bytes, line_no)
         } else {
-            parse_line(&bytes, line_no, start)?
+            parse_line(&bytes, line_no, start)
+        };
+        let envelope = match parsed {
+            Ok(envelope) => envelope,
+            Err(LogError::Corrupt {
+                line,
+                offset: at,
+                reason,
+            }) if offset > 0 => {
+                return Err(LogError::Corrupt {
+                    line: line + count_lines(path, offset)?,
+                    offset: at,
+                    reason,
+                })
+            }
+            Err(error) => return Err(error),
         };
         out.push((envelope, start));
     }
@@ -1374,16 +1406,44 @@ mod tests {
     }
 
     #[test]
-    fn id_prefixed_or_recursion_limited_lines_are_never_garbage() {
+    fn recursion_limited_lines_are_never_garbage_but_syntax_errors_are() {
         let deep = format!("{}1{}", "[".repeat(300), "]".repeat(300));
         // Too deep even for the bounded retry, and not our writer's prefix.
         assert!(matches!(
             classify_line(deep.as_bytes()),
             LineClass::Suspicious
         ));
-        let ours = br#"{"id":"01X","at":"t","type":"user/message","oops"#;
-        assert!(matches!(classify_line(ours), LineClass::Suspicious));
+        // A torn (syntactically invalid) line is garbage even with our prefix.
+        let torn = br#"{"id":"01X","at":"t","type":"user/mess"#;
+        assert!(matches!(classify_line(torn), LineClass::Garbage));
         assert!(matches!(classify_line(b"not json"), LineClass::Garbage));
+    }
+
+    #[test]
+    fn read_envelopes_from_reports_absolute_line_numbers() {
+        let root = tempfile::tempdir().unwrap();
+        let sid: SessionId = "01LINES".into();
+        let mut log = SessionLog::create(root.path(), &sid, None, None, None).unwrap();
+        log.append(&user_msg("a")).unwrap();
+        log.append(&user_msg("b")).unwrap();
+        let path = log.path().to_path_buf();
+        drop(log);
+        let offset = fs::metadata(&path).unwrap().len();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"{\"id\":\"1\",\"at\":\"t\",\"type\":\"user/message\"}\n")
+            .unwrap();
+        drop(f);
+        // header + 2 events precede `offset`; the bad line is line 4.
+        let from_offset = read_envelopes_from(&path, offset, u64::MAX).unwrap_err();
+        let from_start = read_envelopes_from(&path, 0, u64::MAX).unwrap_err();
+        assert!(
+            matches!(from_offset, LogError::Corrupt { line: 4, .. }),
+            "{from_offset:?}"
+        );
+        assert!(
+            matches!(from_start, LogError::Corrupt { line: 4, .. }),
+            "{from_start:?}"
+        );
     }
 
     #[test]
