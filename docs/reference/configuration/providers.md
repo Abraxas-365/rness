@@ -78,6 +78,12 @@ With no key positional argument, `set-key` reads standard input. Avoid placing k
 
 Custom OAuth store references select an entry; they do not define an arbitrary OAuth issuer or login implementation.
 
+## The credentials file
+
+Stored keys and OAuth tokens live in `~/.rness/credentials.json` (`$RNESS_HOME/credentials.json` when set), mode 0600. Several rness processes can share it safely: every save is a locked read-modify-write (lock file `credentials.json.lock` next to it, which you can ignore in backups) and replaces the file atomically, so concurrent logins and token refreshes neither lose each other's updates nor leave a half-written file. A symlinked `credentials.json` keeps its link.
+
+If the file is ever corrupt (for example hand-edited JSON), commands that only read it fail with `credentials file … is corrupt`; the next save (`rness auth login`, `set-key`, a token refresh) copies it to `credentials.json.corrupt-<timestamp>` and starts a fresh file.
+
 ## Multiple accounts per provider
 
 A single provider connection can hold more than one stored credential — for example two Anthropic accounts. Credentials are addressed by key in `credentials.json`: the bare entry name (`anthropic`) is the **default account**; a named account uses `entry/account` (`anthropic/work`).

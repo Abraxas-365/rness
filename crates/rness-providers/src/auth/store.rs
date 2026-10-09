@@ -4,8 +4,11 @@
 //! { "providers": { "anthropic": { "oauthTokens": {...}, "apiKey": "..." } } }
 //! ```
 //!
-//! Plaintext JSON at mode 0600. Keychain backends can layer on later
-//! behind this same interface. Unknown fields are preserved on rewrite,
+//! Plaintext JSON at mode 0600. Every save is a read-modify-write under an
+//! exclusive lock on the sidecar `credentials.json.lock` and replaces the
+//! file by atomic rename (temp file + fsync), so concurrent rness
+//! processes neither lose each other's updates nor see a torn file.
+//! Keychain backends can layer on later behind this same interface. Unknown fields are preserved on rewrite,
 //! and a legacy top-level `oauthTokens`/`apiKey` layout is migrated on
 //! read.
 
@@ -90,6 +93,35 @@ impl FileData {
     }
 }
 
+/// Guard for the store's sidecar lock (`<file>.lock`); unlocks on drop.
+/// `file` is `None` where the filesystem has no locking.
+struct StoreLock {
+    file: Option<std::fs::File>,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
+/// `rename` over an existing file. Windows can refuse while another
+/// process has the target open without delete sharing: retry briefly.
+fn rename_replace(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    for attempt in 1..=5u64 {
+        match std::fs::rename(from, to) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt));
+            }
+            other => return other,
+        }
+    }
+    std::fs::rename(from, to)
+}
+
 /// File-backed credential store.
 #[derive(Clone)]
 pub struct CredentialStore {
@@ -118,38 +150,192 @@ impl CredentialStore {
         &self.path
     }
 
+    /// Lock-free read. Writes replace the file by atomic rename, so a
+    /// reader sees either the old or the new complete file.
     fn read(&self) -> Result<FileData, TokensError> {
         let raw = match std::fs::read(&self.path) {
             Ok(r) => r,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileData::default()),
             Err(e) => return Err(TokensError::Io(e)),
         };
-        let mut data: FileData = serde_json::from_slice(&raw)?;
+        // A zero-length file (torn by an older binary) is corrupt too.
+        let mut data: FileData =
+            serde_json::from_slice(&raw).map_err(|source| TokensError::Corrupt {
+                path: self.path.clone(),
+                source,
+            })?;
         data.migrate();
         Ok(data)
     }
 
-    fn write(&self, data: &FileData) -> Result<(), TokensError> {
-        if let Some(parent) = self.path.parent() {
+    /// The sidecar lock file. Never renamed or deleted: the data file is
+    /// replaced by rename, so a lock on it would not exclude anything.
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self
+            .path
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_else(|| "credentials.json".into());
+        name.push(".lock");
+        self.path.with_file_name(name)
+    }
+
+    /// Exclusive cross-process lock on the store (blocking). Held only
+    /// around read-modify-write; released on drop.
+    fn lock_exclusive(&self) -> Result<StoreLock, TokensError> {
+        let path = self.lock_path();
+        if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let raw = serde_json::to_vec_pretty(data)?;
-        // 0600: owner-only.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
         {
-            use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&self.path)?;
-            f.write_all(&raw)?;
+            options.mode(0o600);
         }
-        #[cfg(not(unix))]
-        std::fs::write(&self.path, &raw)?;
-        Ok(())
+        let file = options.open(&path)?;
+        match file.lock() {
+            Ok(()) => Ok(StoreLock { file: Some(file) }),
+            // Network filesystems without flock: still atomic, not exclusive.
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "file locking unsupported; credential saves are atomic but not exclusive"
+                    )
+                });
+                Ok(StoreLock { file: None })
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Read-modify-write under the store lock. A corrupt file is backed up
+    /// (`<file>.corrupt-<unix-ts>`) and replaced, so saving self-heals;
+    /// read-only paths keep returning [`TokensError::Corrupt`].
+    fn update<R>(&self, f: impl FnOnce(&mut FileData) -> R) -> Result<R, TokensError> {
+        let _lock = self.lock_exclusive()?;
+        let mut data = match self.read() {
+            Ok(data) => data,
+            Err(TokensError::Corrupt { source, .. }) => {
+                let backup = self.quarantine_corrupt()?;
+                tracing::warn!(
+                    path = %self.path.display(),
+                    backup = %backup.display(),
+                    "credentials file was corrupt ({source}); moved it aside and started a new one"
+                );
+                FileData::default()
+            }
+            Err(e) => return Err(e),
+        };
+        let out = f(&mut data);
+        self.write_atomic(&data)?;
+        Ok(out)
+    }
+
+    /// Copy the corrupt file to `<file>.corrupt-<unix-ts>` (0600).
+    fn quarantine_corrupt(&self) -> Result<PathBuf, TokensError> {
+        use std::io::Write as _;
+        let raw = std::fs::read(&self.path)?;
+        let target = self.resolved();
+        let ts = jiff::Timestamp::now().as_second();
+        for n in 0u32.. {
+            let mut name = target.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".corrupt-{ts}"));
+            if n > 0 {
+                name.push(format!("-{n}"));
+            }
+            let backup = target.with_file_name(name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&backup) {
+                Ok(mut f) => {
+                    f.write_all(&raw)?;
+                    f.sync_all()?;
+                    return Ok(backup);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        unreachable!("unbounded backup name search")
+    }
+
+    /// The file a write must replace: a symlinked `credentials.json`
+    /// (dotfile managers) keeps its link; the target is rewritten.
+    fn resolved(&self) -> PathBuf {
+        if let Ok(path) = std::fs::canonicalize(&self.path) {
+            return path;
+        }
+        match std::fs::read_link(&self.path) {
+            // Dangling link: write where it points.
+            Ok(link) => match self.path.parent() {
+                Some(parent) => parent.join(link),
+                None => link,
+            },
+            Err(_) => self.path.clone(),
+        }
+    }
+
+    /// Write a temp file next to the target (0600 from creation), fsync,
+    /// rename over the target, fsync the directory. Never truncates in
+    /// place. The temp file is removed on any failure.
+    fn write_atomic(&self, data: &FileData) -> Result<(), TokensError> {
+        use std::io::Write as _;
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let raw = serde_json::to_vec_pretty(data)?;
+        let target = self.resolved();
+        let dir = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        std::fs::create_dir_all(&dir)?;
+        let mut name = target.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let tmp = dir.join(name);
+        let result = (|| -> Result<(), TokensError> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut f = options.open(&tmp)?;
+            // Keep a mode the user chose (e.g. 0640); default 0600.
+            #[cfg(unix)]
+            if let Ok(meta) = std::fs::metadata(&target) {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode() & 0o7777;
+                if mode != 0o600 {
+                    f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+            f.write_all(&raw)?;
+            f.sync_all()?;
+            drop(f);
+            rename_replace(&tmp, &target)?;
+            #[cfg(unix)]
+            if let Ok(d) = std::fs::File::open(&dir) {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     // -- account-aware key helpers ----------------------------------------
@@ -193,12 +379,12 @@ impl CredentialStore {
     }
 
     pub fn save_tokens(&self, provider: &str, tokens: &Tokens) -> Result<(), TokensError> {
-        let mut data = self.read()?;
-        data.providers
-            .entry(provider.into())
-            .or_default()
-            .oauth_tokens = Some(tokens.clone());
-        self.write(&data)
+        self.update(|data| {
+            data.providers
+                .entry(provider.into())
+                .or_default()
+                .oauth_tokens = Some(tokens.clone());
+        })
     }
 
     pub fn api_key(&self, provider: &str) -> Result<Option<String>, TokensError> {
@@ -211,15 +397,15 @@ impl CredentialStore {
     }
 
     pub fn save_api_key(&self, provider: &str, key: &str) -> Result<(), TokensError> {
-        let mut data = self.read()?;
-        data.providers.entry(provider.into()).or_default().api_key = key.to_string();
-        self.write(&data)
+        self.update(|data| {
+            data.providers.entry(provider.into()).or_default().api_key = key.to_string();
+        })
     }
 
     pub fn delete(&self, provider: &str) -> Result<(), TokensError> {
-        let mut data = self.read()?;
-        data.providers.remove(provider);
-        self.write(&data)
+        self.update(|data| {
+            data.providers.remove(provider);
+        })
     }
 
     /// Providers with any stored credential, sorted.
@@ -325,11 +511,128 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn saves_leave_no_temp_file_even_when_the_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("credentials.json"));
+        store.save_api_key("a", "k1").unwrap();
+        store.save_api_key("b", "k2").unwrap();
+        store.delete("a").unwrap();
+        assert!(leftovers(dir.path()).is_empty());
+        assert_eq!(store.list().unwrap(), vec!["b".to_string()]);
+
+        // Injected failure: the target is a non-empty directory, so the
+        // final rename fails after the temp file was written.
+        let blocked = dir.path().join("blocked.json");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("x"), "x").unwrap();
+        let store = CredentialStore::new(&blocked);
+        let err = store.write_atomic(&FileData::default()).unwrap_err();
+        assert!(matches!(err, TokensError::Io(_)), "{err}");
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "{:?}",
+            leftovers(dir.path())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mode_stays_0600_and_a_user_chosen_mode_is_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("credentials.json"));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        store.save_api_key("a", "k").unwrap();
+        store.save_api_key("a", "k2").unwrap();
+        assert_eq!(mode(store.path()), 0o600);
+        assert_eq!(mode(&store.lock_path()), 0o600);
+        std::fs::set_permissions(store.path(), std::fs::Permissions::from_mode(0o640)).unwrap();
+        store.save_api_key("b", "k").unwrap();
+        assert_eq!(mode(store.path()), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_keeps_its_link_and_the_target_is_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles").join("credentials.json");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, r#"{"providers":{"x":{"apiKey":"old"}}}"#).unwrap();
+        let link = dir.path().join("credentials.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = CredentialStore::new(&link);
+        store.save_api_key("y", "new").unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&real).unwrap()).unwrap();
+        assert_eq!(raw["providers"]["x"]["apiKey"], "old");
+        assert_eq!(raw["providers"]["y"]["apiKey"], "new");
+        assert!(leftovers(real.parent().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn corrupt_file_reads_fail_clearly_and_a_save_quarantines_it() {
+        for garbage in [&b"{\"providers\": {}}}"[..], &b""[..]] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("credentials.json");
+            std::fs::write(&path, garbage).unwrap();
+            let store = CredentialStore::new(&path);
+            let err = store.tokens("anthropic").unwrap_err();
+            assert!(matches!(&err, TokensError::Corrupt { path: p, .. } if p == &path));
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&path.display().to_string()) && msg.contains("rness auth login"),
+                "{msg}"
+            );
+            // Reads never clear it.
+            assert_eq!(std::fs::read(&path).unwrap(), garbage);
+
+            store.save_api_key("anthropic", "k").unwrap();
+            assert_eq!(store.api_key("anthropic").unwrap().as_deref(), Some("k"));
+            let backups: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.to_string_lossy().contains(".corrupt-"))
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(std::fs::read(&backups[0]).unwrap(), garbage);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
+    }
+
     #[test]
     fn credential_key_helper() {
-        assert_eq!(CredentialStore::credential_key("anthropic", None), "anthropic");
-        assert_eq!(CredentialStore::credential_key("anthropic", Some("")), "anthropic");
-        assert_eq!(CredentialStore::credential_key("anthropic", Some("work")), "anthropic/work");
+        assert_eq!(
+            CredentialStore::credential_key("anthropic", None),
+            "anthropic"
+        );
+        assert_eq!(
+            CredentialStore::credential_key("anthropic", Some("")),
+            "anthropic"
+        );
+        assert_eq!(
+            CredentialStore::credential_key("anthropic", Some("work")),
+            "anthropic/work"
+        );
     }
 
     #[test]

@@ -185,9 +185,9 @@ async fn cross_process_refresh_race_with_rotating_refresh_tokens() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_save_of_different_keys_loses_updates() {
+async fn concurrent_save_of_different_keys_keeps_both() {
     // Two processes logging into different providers at the same time:
-    // save_tokens is read-modify-write without a file lock.
+    // each save_tokens is a read-modify-write that must not lose the other.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("credentials.json");
     let n = 200;
@@ -238,15 +238,76 @@ async fn concurrent_save_of_different_keys_loses_updates() {
         raw.len(),
         String::from_utf8_lossy(&raw[raw.len().saturating_sub(60)..])
     );
-    if !parses {
-        println!("WP5 BUG auth.concurrent_save: credentials file left PERMANENTLY corrupt (every later read fails)");
+    assert!(parses, "credentials file left corrupt");
+    assert_eq!(e1 + e2, 0, "save errors");
+    assert!(final_ok);
+    assert_eq!(a.as_deref(), Some("a199"), "lost update of prov-a");
+    assert_eq!(b.as_deref(), Some("b199"), "lost update of prov-b");
+    assert_eq!(lost.load(Ordering::SeqCst), 0);
+}
+
+/// Child mode for `multi_process_saves_keep_every_key`: save 200
+/// versions of one key, then exit.
+const CHILD_KEY: &str = "RNESS_AUTH_E2E_CHILD_KEY";
+const CHILD_PATH: &str = "RNESS_AUTH_E2E_CHILD_PATH";
+
+#[test]
+fn multi_process_saves_keep_every_key() {
+    if let (Ok(key), Ok(path)) = (std::env::var(CHILD_KEY), std::env::var(CHILD_PATH)) {
+        let store = CredentialStore::new(path);
+        for i in 0..200 {
+            let t = Tokens {
+                access_token: format!("{key}-{i}"),
+                ..Default::default()
+            };
+            store.save_tokens(&key, &t).unwrap();
+        }
+        return;
     }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials.json");
+    let exe = std::env::current_exe().unwrap();
+    let children: Vec<_> = (0..4)
+        .map(|n| {
+            std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    "multi_process_saves_keep_every_key",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(CHILD_KEY, format!("prov-{n}"))
+                .env(CHILD_PATH, &path)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in children {
+        assert!(child.wait().unwrap().success(), "child process failed");
+    }
+    let raw = std::fs::read(&path).unwrap();
+    assert!(serde_json::from_slice::<serde_json::Value>(&raw).is_ok());
+    let store = CredentialStore::new(path);
+    for n in 0..4 {
+        let key = format!("prov-{n}");
+        assert_eq!(
+            store.tokens(&key).unwrap().map(|t| t.access_token),
+            Some(format!("{key}-199"))
+        );
+    }
+    let stray: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp.") || n.contains(".corrupt-"))
+        .collect();
+    assert!(stray.is_empty(), "{stray:?}");
 }
 
 #[test]
-fn reader_during_write_sees_truncated_file() {
-    // write() truncates then writes in place: a concurrent reader (another
-    // process resolving credentials) can observe an empty/partial file.
+fn reader_during_write_never_sees_a_torn_file() {
+    // A concurrent reader (another process resolving credentials) must
+    // never observe an empty/partial file while saves are in flight.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("credentials.json");
     let mut big = Tokens {
@@ -285,12 +346,13 @@ fn reader_during_write_sees_truncated_file() {
     println!(
         "WP5 auth.torn_read writes={writes} reads={reads} parse_errors={errors} missing={missing}"
     );
-    if errors + missing > 0 {
-        println!(
-            "WP5 BUG auth.torn_read: {} of {reads} reads saw a torn credentials file",
-            errors + missing
-        );
-    }
+    assert!(writes > 0 && reads > 0);
+    assert_eq!(
+        errors + missing,
+        0,
+        "{} of {reads} reads saw a torn credentials file",
+        errors + missing
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

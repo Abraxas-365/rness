@@ -19,6 +19,14 @@ pub enum TokensError {
     Io(#[from] std::io::Error),
     #[error("credentials file: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error(
+        "credentials file {} is corrupt ({source}); fix or delete it, then run `rness auth login`",
+        path.display()
+    )]
+    Corrupt {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
