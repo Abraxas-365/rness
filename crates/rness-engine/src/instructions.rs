@@ -77,13 +77,35 @@ pub fn discover(config: &InstructionsConfig) -> Vec<InstructionFile> {
     for dir in dirs {
         for name in &config.candidates {
             let path = dir.join(name);
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Ok(bytes) = std::fs::read(&path) {
+                let text = match String::from_utf8(bytes) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        // Inject lossily rather than silently dropping the
+                        // user's rules (B1-7); warn once per file.
+                        warn_invalid_utf8(&path);
+                        String::from_utf8_lossy(e.as_bytes()).into_owned()
+                    }
+                };
                 found.push(InstructionFile { path, text });
                 break; // first candidate wins per directory
             }
         }
     }
     found
+}
+
+fn warn_invalid_utf8(path: &Path) {
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned.iter().any(|p| p == path) {
+        return;
+    }
+    warned.push(path.to_path_buf());
+    tracing::warn!(
+        "{} is not valid UTF-8; invalid bytes were replaced with U+FFFD",
+        path.display()
+    );
 }
 
 /// Render the baseline message under the byte budget. dsh's budget

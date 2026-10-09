@@ -424,8 +424,8 @@ rness.compaction = { default = {
         warned = "AGENTS.md" in p.stderr or "utf" in p.stderr.lower()
         print(f"INFO  instr: invalid UTF-8 AGENTS.md -> rc={p.returncode} baselines={len(rem)} warned={warned}")
         c.check("instr: invalid UTF-8 AGENTS.md does not fail the turn", p.returncode == 0)
-        c.xcheck("instr: invalid UTF-8 AGENTS.md is injected lossily or warned", bool(rem) or warned,
-                 "B1-7 silently skipped")
+        c.check("instr: invalid UTF-8 AGENTS.md is injected lossily (B1-7)",
+                len(rem) == 1 and "RULE-BAD \ufffd\ufffd bytes" in rem[0], rem[0][-120:] if rem else rem)
 
 
 def main():

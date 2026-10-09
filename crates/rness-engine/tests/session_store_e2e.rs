@@ -1378,20 +1378,19 @@ mod instructions_e2e {
         assert!(b.text.len() > 1000);
     }
 
-    /// AGENTS.md with invalid UTF-8 is silently skipped (read_to_string
-    /// fails) and the next candidate (CLAUDE.md) wins without any warning.
+    /// AGENTS.md with invalid UTF-8 is injected lossily (B1-7): the first
+    /// candidate still wins, invalid bytes become U+FFFD, and a warning is
+    /// logged instead of silently falling through to CLAUDE.md.
     #[test]
-    fn invalid_utf8_agents_md_falls_through_silently() {
+    fn invalid_utf8_agents_md_is_injected_lossily() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join("AGENTS.md"), b"rules \xFF\xFE here").unwrap();
         fs::write(dir.path().join("CLAUDE.md"), "claude rules").unwrap();
         let b = render(&cfg(dir.path(), 65536)).unwrap();
         println!("rendered: {}", b.text.replace('\n', " | "));
-        assert!(b.text.contains("claude rules"));
-        assert!(!b.text.contains("rules "), "AGENTS.md content present");
-        fs::remove_file(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(render(&cfg(dir.path(), 65536)).is_none());
+        assert!(b.text.contains("rules \u{FFFD}\u{FFFD} here"), "{}", b.text);
+        assert!(!b.text.contains("claude rules"), "AGENTS.md must win");
     }
 
     /// Changing AGENTS.md between turns appends a new baseline; the old one
