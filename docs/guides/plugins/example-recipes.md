@@ -415,8 +415,10 @@ local off = rness.context.ensure({
   fresh block; a block folded by compaction is re-rendered.
 - `identity` defaults to a hash of the text. Return your own (e.g. a version or
   mtime) to control when the block counts as changed. A new identity appends a
-  fresh block *next to* the old one (the old one leaves context at the next
-  compaction), so keep the text stable: no timestamps or turn numbers.
+  fresh block that supersedes the older blocks of the same `name`: the log keeps
+  them, but only the newest reaches the model (blocks of other names are
+  unaffected). Each change still costs one new block of tokens, so keep the
+  text stable: no timestamps or turn numbers.
 - Returning `nil` or `""` injects nothing this time. A throwing renderer, or a
   non-string result, is logged and skipped; it never fails the turn. Keep
   `render` cheap: it shares the hook timeout, and a timeout stops the whole chain.

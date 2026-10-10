@@ -469,7 +469,9 @@ Build order follows the dependency graph:
   disk) → re-read disk, append fresh. A newer baseline supersedes the
   older ones in the projection (the log keeps them; the model, transcript
   and search surfaces see only the newest), so an edited AGENTS.md never
-  leaves two versions model-visible. Config is explicit
+  leaves two versions model-visible. Plugin context blocks
+  (`context {name, identity}`, `rness.context.ensure`) follow the same
+  rule per `name`. Config is explicit
   (`InstructionsConfig { cwd, candidates, max_bytes }`, zero engine
   defaults); the CLI seeds it visibly (`--instructions
   AGENTS.md,CLAUDE.md`, `--instructions-bytes 65536`, `none`

@@ -91,11 +91,30 @@ struct CompactionPlan {
     /// original tool/result id -> (prune event id, pruned result).
     /// Replayed in the original's place; latest prune wins.
     pruned: std::collections::HashMap<EventId, (EventId, ToolResult)>,
-    /// Instruction baselines (`MessageSource::Instructions`) replaced by a
-    /// later one in the same history: only the newest baseline can reach the
-    /// model. "Newest" ignores compaction, so a baseline folded into a
-    /// summary never resurrects the older ones it superseded.
+    /// Injected blocks replaced by a later one of the same kind in the same
+    /// history: only the newest AGENTS.md baseline
+    /// (`MessageSource::Instructions`) and the newest plugin block per name
+    /// (`MessageSource::Context{name}`) can reach the model. "Newest"
+    /// ignores compaction, so a block folded into a summary never
+    /// resurrects the older ones it superseded.
     superseded: HashSet<EventId>,
+}
+
+/// What a newer injected block replaces: `Some(None)` for the AGENTS.md
+/// baseline, `Some(Some(name))` for a plugin context block, `None` for
+/// anything else (never superseded).
+fn supersede_key(event: &SessionEvent) -> Option<Option<&str>> {
+    match event {
+        SessionEvent::UserMessage(UserMessage {
+            source: Some(MessageSource::Instructions { .. }),
+            ..
+        }) => Some(None),
+        SessionEvent::UserMessage(UserMessage {
+            source: Some(MessageSource::Context { name, .. }),
+            ..
+        }) => Some(Some(name.as_str())),
+        _ => None,
+    }
 }
 
 fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> CompactionPlan {
@@ -123,24 +142,18 @@ fn compaction_plan<E: std::borrow::Borrow<Envelope>>(history: &[E]) -> Compactio
             pruned.insert(pr.replaces.clone(), (env.id.clone(), pr.result.clone()));
         }
     }
-    // Every instruction baseline but the newest is superseded.
-    let is_baseline = |env: &Envelope| {
-        matches!(
-            &env.event,
-            SessionEvent::UserMessage(UserMessage {
-                source: Some(MessageSource::Instructions { .. }),
-                ..
-            })
-        )
-    };
-    let newest = history.iter().rposition(|env| is_baseline(env.borrow()));
-    let superseded = history
-        .iter()
-        .take(newest.unwrap_or(0))
-        .map(|env| env.borrow())
-        .filter(|env| is_baseline(env))
-        .map(|env| env.id.clone())
-        .collect();
+    // Every injected block but the newest of its kind is superseded: one
+    // AGENTS.md baseline, and one plugin context block per name.
+    let mut newest_seen: HashSet<Option<&str>> = HashSet::new();
+    let mut superseded = HashSet::new();
+    for env in history.iter().rev() {
+        let env: &Envelope = env.borrow();
+        if let Some(key) = supersede_key(&env.event) {
+            if !newest_seen.insert(key) {
+                superseded.insert(env.id.clone());
+            }
+        }
+    }
     CompactionPlan {
         shadowed,
         anchors,
@@ -183,11 +196,8 @@ pub fn search_surfaces<E: std::borrow::Borrow<Envelope>>(
 /// arrival requires the full derivation.
 pub fn fast_surface(event: &SessionEvent) -> Option<&'static str> {
     Some(match event {
-        // A new instruction baseline supersedes (re-labels) the previous one.
-        SessionEvent::UserMessage(UserMessage {
-            source: Some(MessageSource::Instructions { .. }),
-            ..
-        }) => return None,
+        // A new injected block supersedes (re-labels) the previous one.
+        event if supersede_key(event).is_some() => return None,
         SessionEvent::UserMessage(_)
         | SessionEvent::AssistantMessage(_)
         | SessionEvent::ToolResult(_) => "current",

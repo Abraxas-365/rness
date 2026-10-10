@@ -2115,7 +2115,8 @@ fn context_blocks(svc: &SessionService, sid: &SessionId) -> Vec<(String, String)
 }
 
 /// Plugin context is injected before the first request of a turn, only
-/// once while visible, again when its identity changes.
+/// once while visible, again when its identity changes — and the new
+/// version supersedes the old one in the model's view (the log keeps both).
 #[tokio::test]
 async fn plugin_context_injected_at_turn_start_and_on_change() {
     let dir = tempfile::tempdir().unwrap();
@@ -2137,12 +2138,68 @@ async fn plugin_context_injected_at_turn_start_and_on_change() {
     hooks.set("memory", "v2", "MEMORIA-dos");
     run_turns(&svc, &sid, 1).await;
     assert!(provider.seen()[2].contains("MEMORIA-dos"));
+    assert!(
+        !provider.seen()[2].contains("MEMORIA-uno"),
+        "stale plugin block visible: {}",
+        provider.seen()[2]
+    );
     assert_eq!(
         context_blocks(&svc, &sid),
         vec![
             ("memory".into(), "v1".into()),
             ("memory".into(), "v2".into())
         ]
+    );
+}
+
+/// Superseding is per block name: a changed `memory` block hides only the
+/// older `memory` block, never another plugin's block.
+#[tokio::test]
+async fn plugin_context_supersedes_only_same_name() {
+    struct Two(Mutex<String>);
+    #[async_trait]
+    impl rness_engine::turn::hooks::LoopHooks for Two {
+        async fn context(
+            &self,
+            _: &rness_engine::turn::hooks::LoopEvent,
+            _: &CancellationToken,
+        ) -> Result<Vec<rness_engine::turn::hooks::ContextBlock>, String> {
+            let memory = self.0.lock().unwrap().clone();
+            Ok(vec![
+                rness_engine::turn::hooks::ContextBlock {
+                    name: "memory".into(),
+                    identity: memory.clone(),
+                    text: memory,
+                },
+                rness_engine::turn::hooks::ContextBlock {
+                    name: "skills".into(),
+                    identity: "s1".into(),
+                    text: "SKILLS-fijo".into(),
+                },
+            ])
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Scripted::new(scripted_answers(2));
+    let svc = service(dir.path(), provider.clone());
+    let hooks = Arc::new(Two(Mutex::new("MEMORIA-uno".into())));
+    svc.set_loop_hooks(Some(hooks.clone()));
+    let sid = svc.create(None).unwrap();
+    run_turns(&svc, &sid, 1).await;
+    *hooks.0.lock().unwrap() = "MEMORIA-dos".into();
+    run_turns(&svc, &sid, 1).await;
+
+    let last = provider.seen().last().unwrap().clone();
+    assert!(last.contains("MEMORIA-dos"), "{last}");
+    assert!(!last.contains("MEMORIA-uno"), "{last}");
+    assert_eq!(last.matches("SKILLS-fijo").count(), 1, "{last}");
+    // skills was unchanged: injected once, still visible after memory changed.
+    assert_eq!(
+        context_blocks(&svc, &sid)
+            .iter()
+            .filter(|(n, _)| n == "skills")
+            .count(),
+        1
     );
 }
 

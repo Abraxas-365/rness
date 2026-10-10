@@ -288,7 +288,9 @@ pub fn ensure_source(
 
 /// [`ensure_source`] against an already derived `replayed` of `log`'s
 /// session. A snapshot taken before other `ensure*` appends stays valid for
-/// a *different* source: appending a message never hides another one.
+/// a source of a *different* kind or name: a new block hides only older
+/// blocks of its own kind (the AGENTS.md baseline, or a plugin block of the
+/// same name), never another source.
 pub fn ensure_source_in(
     log: &mut crate::session::log::SessionLog,
     replayed: &crate::session::replay::Replayed,
