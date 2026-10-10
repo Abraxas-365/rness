@@ -55,13 +55,66 @@ struct Run {
     finished_ms: Option<u64>,
     streams: std::collections::BTreeMap<String, String>,
     tools: Vec<Value>,
+    /// Lifetime counts of tool details dropped by [`Run::trim_tools`], so
+    /// cards show totals while `tools` stays a bounded window.
+    trimmed: ToolCounts,
+    /// Calls trimmed while still running: counted in `trimmed.running`
+    /// until their result (or the turn's end) settles them.
+    trimmed_running: std::collections::HashSet<String>,
     recovered: bool,
     start_ms: Option<u64>,
     /// Child log length at the last history sync; None forces a sync.
     synced_len: Option<u64>,
 }
 
+/// Tool counts by status (`running`/`done`/`failed`/`cancelled`).
+#[derive(Default, Clone, Copy, Debug, PartialEq)]
+struct ToolCounts {
+    running: u64,
+    done: u64,
+    failed: u64,
+    cancelled: u64,
+}
+
+impl ToolCounts {
+    fn slot(&mut self, status: &str) -> &mut u64 {
+        match status {
+            "done" => &mut self.done,
+            "failed" => &mut self.failed,
+            "cancelled" => &mut self.cancelled,
+            _ => &mut self.running,
+        }
+    }
+
+    fn add(&mut self, tool: &Value) {
+        *self.slot(tool["status"].as_str().unwrap_or("running")) += 1;
+    }
+}
+
 impl Run {
+    /// Lifetime tool totals: the retained window plus everything trimmed.
+    fn tool_totals(&self) -> Value {
+        let mut counts = self.trimmed;
+        for tool in &self.tools {
+            counts.add(tool);
+        }
+        json!({
+            "total": counts.running + counts.done + counts.failed + counts.cancelled,
+            "running": counts.running, "done": counts.done,
+            "failed": counts.failed, "cancelled": counts.cancelled,
+        })
+    }
+
+    /// Settle a trimmed, still-running call; false if `call` is not one.
+    fn settle_trimmed(&mut self, call: &str, status: &str) -> bool {
+        if !self.trimmed_running.remove(call) {
+            return false;
+        }
+        self.trimmed.running = self.trimmed.running.saturating_sub(1);
+        *self.trimmed.slot(status) += 1;
+        true
+    }
+
     fn elapsed_ms(&self) -> u64 {
         self.finished_ms.unwrap_or_else(|| {
             self.start_ms
@@ -95,7 +148,11 @@ impl Run {
     fn trim_tools(&mut self) {
         while self.tools.len() > MAX_TOOLS {
             let removed = self.tools.remove(0);
+            self.trimmed.add(&removed);
             if let Some(call) = removed["call"].as_str() {
+                if removed["status"].as_str().unwrap_or("running") == "running" {
+                    self.trimmed_running.insert(call.to_owned());
+                }
                 self.streams.remove(call);
             }
         }
@@ -146,20 +203,21 @@ impl Run {
                     rness_protocol::events::ToolResult::text_output(&result.effective_content());
                 // Tool output is kept once, in the bounded tool detail, not in lines too.
                 let output = tail(&output, MAX_TEXT_BYTES);
+                let status = if result.is_error { "failed" } else { "done" };
                 if let Some(tool) = self
                     .tools
                     .iter_mut()
                     .find(|tool| tool["call"] == result.call)
                 {
-                    tool["status"] = json!(if result.is_error { "failed" } else { "done" });
+                    tool["status"] = json!(status);
                     tool["output"] = json!(output);
                     if let Some(object) = tool.as_object_mut() {
                         object.remove("stream");
                     }
-                } else {
+                } else if !self.settle_trimmed(&result.call, status) {
                     self.tools.push(
                         json!({"call":result.call,"name":result.name,"args":Value::Null,
-                        "status":if result.is_error { "failed" } else { "done" },"output":output}),
+                        "status":status,"output":output}),
                     );
                     self.trim_tools();
                 }
@@ -176,15 +234,20 @@ impl Run {
                     _ => "error",
                 }
                 .into();
+                let settled = match self.status.as_str() {
+                    "cancelled" => "cancelled",
+                    "error" => "failed",
+                    _ => "done",
+                };
                 for tool in &mut self.tools {
                     if tool["status"] == "running" {
-                        tool["status"] = json!(match self.status.as_str() {
-                            "cancelled" => "cancelled",
-                            "error" => "failed",
-                            _ => "done",
-                        });
+                        tool["status"] = json!(settled);
                     }
                 }
+                let stale = self.trimmed_running.len() as u64;
+                self.trimmed_running.clear();
+                self.trimmed.running = self.trimmed.running.saturating_sub(stale);
+                *self.trimmed.slot(settled) += stale;
                 self.activity = self.status.clone();
                 self.live.clear();
                 self.finished_ms = Some(
@@ -271,6 +334,8 @@ impl SubagentActivity {
                 finished_ms: None,
                 streams: Default::default(),
                 tools: Vec::new(),
+                trimmed: ToolCounts::default(),
+                trimmed_running: Default::default(),
                 recovered: false,
                 start_ms: None,
                 synced_len: None,
@@ -300,7 +365,8 @@ impl SubagentActivity {
             if !args.is_null() {
                 tool["args"] = args;
             }
-        } else {
+        } else if !run.trimmed_running.contains(call) {
+            // A call already trimmed out of the window stays counted once.
             run.tools
                 .push(json!({"call":call,"name":name,"args":args,"status":"running"}));
             run.trim_tools();
@@ -309,6 +375,9 @@ impl SubagentActivity {
 
     pub fn stream(&self, session: &str, call: &str, text: &str) {
         if let Some(run) = self.runs.lock().unwrap().get_mut(session) {
+            if run.trimmed_running.contains(call) {
+                return;
+            }
             if !run.tools.iter().any(|tool| tool["call"] == call) {
                 Self::tool_start(run, call, "", Value::Null);
             }
@@ -366,6 +435,8 @@ impl SubagentActivity {
                     finished_ms: Some(0),
                     streams: Default::default(),
                     tools: Vec::new(),
+                    trimmed: ToolCounts::default(),
+                    trimmed_running: Default::default(),
                     recovered: true,
                     start_ms: None,
                     synced_len: None,
@@ -495,6 +566,7 @@ impl SubagentActivity {
                 "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
                 "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
                 "lines":run.lines, "live":run.live, "streams":run.streams, "tools":run.tools,
+                "tool_totals":run.tool_totals(),
             }))
         }).collect()
     }
@@ -531,6 +603,7 @@ impl SubagentActivity {
                         "activity":run.activity, "elapsed_ms":run.elapsed_ms(),
                         "mode":run.args.get("background_mode").or_else(|| run.args.get("mode")),
                         "live":tail(&run.live, MAX_CARD_LIVE_BYTES), "tools":card_tools,
+                        "tool_totals":run.tool_totals(),
                     }),
                 )
             })

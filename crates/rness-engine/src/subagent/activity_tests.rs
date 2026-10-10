@@ -19,6 +19,8 @@ fn run(recovered: bool) -> Run {
         finished_ms: None,
         streams: Default::default(),
         tools: vec![],
+        trimmed: ToolCounts::default(),
+        trimmed_running: Default::default(),
         recovered,
         start_ms: None,
         synced_len: None,
@@ -188,6 +190,73 @@ fn tool_details_and_stream_keys_are_bounded() {
     assert_eq!(
         run.tools.last().unwrap()["call"],
         (MAX_TOOLS * 2 - 1).to_string()
+    );
+}
+
+fn result(call: &str, is_error: bool) -> SessionEvent {
+    SessionEvent::ToolResult(
+        serde_json::from_value(json!({
+            "call":call, "name":"Bash", "is_error":is_error, "duration_ms":0, "output":"ok",
+        }))
+        .unwrap(),
+    )
+}
+
+/// The detail window stops at MAX_TOOLS, but the card's totals keep
+/// counting every call of the run (they used to freeze at 100).
+#[test]
+fn tool_totals_keep_counting_past_the_window() {
+    let mut run = run(false);
+    // Call "0" starts first and is still running when the window drops it.
+    SubagentActivity::tool_start(&mut run, "0", "Bash", Value::Null);
+    for call in 1..=MAX_TOOLS * 3 {
+        let call = call.to_string();
+        SubagentActivity::tool_start(&mut run, &call, "Bash", Value::Null);
+        run.apply_event(result(&call, call == "7"), None);
+    }
+    assert_eq!(run.tools.len(), MAX_TOOLS);
+    let n = (MAX_TOOLS * 3) as u64;
+    assert_eq!(
+        run.tool_totals(),
+        json!({"total": n + 1, "running": 1, "done": n - 1, "failed": 1, "cancelled": 0})
+    );
+    // A late stream for the trimmed call neither re-adds nor double-counts it.
+    let activity = SubagentActivity::default();
+    activity.runs.lock().unwrap().insert("child".into(), run);
+    activity.stream("child", "0", "late output");
+    let mut runs = activity.runs.lock().unwrap();
+    let run = runs.get_mut("child").unwrap();
+    assert_eq!(run.tool_totals()["total"], n + 1);
+    // Its result settles it in the totals without re-entering the window.
+    run.apply_event(result("0", false), None);
+    assert_eq!(
+        run.tool_totals(),
+        json!({"total": n + 1, "running": 0, "done": n, "failed": 1, "cancelled": 0})
+    );
+    assert!(run.tools.iter().all(|tool| tool["call"] != "0"));
+}
+
+/// A trimmed call still running when the turn ends is settled like the
+/// windowed ones (cancelled here), not left `running` forever.
+#[test]
+fn trimmed_running_calls_settle_at_turn_end() {
+    let mut run = run(false);
+    run.apply_event(SessionEvent::TurnStarted { turn: 1 }, Some(1));
+    for call in 0..=MAX_TOOLS {
+        SubagentActivity::tool_start(&mut run, &call.to_string(), "Bash", Value::Null);
+    }
+    assert_eq!(run.tool_totals()["running"], (MAX_TOOLS + 1) as u64);
+    run.apply_event(
+        SessionEvent::TurnEnded {
+            turn: 1,
+            outcome: TurnOutcome::Cancelled,
+        },
+        Some(2),
+    );
+    assert_eq!(
+        run.tool_totals(),
+        json!({"total": (MAX_TOOLS + 1) as u64, "running": 0, "done": 0, "failed": 0,
+            "cancelled": (MAX_TOOLS + 1) as u64})
     );
 }
 

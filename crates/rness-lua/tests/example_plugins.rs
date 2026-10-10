@@ -291,6 +291,37 @@ async fn default_subagent_renderer_handles_missing_metadata_and_errors() {
     }
 }
 
+/// With engine `tool_totals`, the card shows lifetime totals (not the
+/// bounded recent window, which used to freeze the line at 100).
+#[tokio::test]
+async fn default_subagent_renderer_prefers_lifetime_tool_totals() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root).unwrap();
+    let window: Vec<_> = (0..100)
+        .map(|_| serde_json::json!({"name":"Bash", "status":"done"}))
+        .collect();
+    let lines = host
+        .tool_card_presented(
+            "subagent",
+            serde_json::json!({"agent":"worker", "prompt":"p"}),
+            "",
+            false,
+            Some(
+                serde_json::json!({"kind":"subagent_activity", "status":"running",
+                "tools":window, "tool_totals":{"total":431, "running":1, "done":428,
+                "failed":2, "cancelled":0}}),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lines[3].text,
+        "Tools: 431 · 1 running · 428 done · 2 failed · 0 cancelled"
+    );
+    assert_eq!(lines[3].style, "error");
+}
+
 #[tokio::test]
 async fn default_send_message_renderer_preserves_actual_long_multiline_message() {
     let root =

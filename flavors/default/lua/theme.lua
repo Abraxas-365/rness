@@ -242,7 +242,16 @@ rness.ui.messagebox = {
       -- Older metadata has only activity/live text. Never flatten lines,
       -- streams, or nested tool arguments/results into the parent card.
       body[#body + 1] = { text = "Activity: " .. (current or preview(meta.activity, 160, state)), style = "tool_name" }
-      if tools then
+      -- `tools` is a bounded recent window; `tool_totals` (newer engines)
+      -- counts every call of the run, so the card keeps moving past it.
+      local totals = type(meta.tool_totals) == "table" and meta.tool_totals or nil
+      local function num(v) v = tonumber(v); return v and v >= 0 and v < math.huge and math.floor(v) or 0 end
+      if totals then
+        local failed_n = num(totals.failed)
+        body[#body + 1] = { text = string.format("Tools: %d · %d running · %d done · %d failed · %d cancelled",
+          num(totals.total), num(totals.running), num(totals.done), failed_n, num(totals.cancelled)),
+          style = failed_n > 0 and "error" or "dim" }
+      elseif tools then
         body[#body + 1] = { text = string.format("Recent tools: %d · %d running · %d done · %d failed · %d cancelled",
           total, counts.running, counts.done, counts.failed, counts.cancelled), style = counts.failed > 0 and "error" or "dim" }
       end
