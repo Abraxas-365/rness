@@ -1,0 +1,57 @@
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/jetbrains-mono';
+@import './tokens.css';
+
+/* Map the Gruvbox tokens to Starlight, in both color schemes. */
+:root,
+:root[data-theme='light'] {
+  --sl-font: var(--font-body-family);
+  --sl-font-mono: var(--font-code-family);
+  --sl-color-white: var(--foreground);
+  --sl-color-black: var(--background);
+  --sl-color-gray-1: var(--foreground);
+  --sl-color-gray-2: var(--secondary-foreground);
+  --sl-color-gray-3: var(--muted-foreground);
+  --sl-color-gray-4: var(--muted-foreground);
+  --sl-color-gray-5: var(--border-strong);
+  --sl-color-gray-6: var(--card);
+  --sl-color-gray-7: var(--background);
+  --sl-color-accent: var(--primary);
+  --sl-color-accent-high: var(--primary);
+  --sl-color-accent-low: var(--muted);
+  --sl-color-text: var(--foreground);
+  --sl-color-text-accent: var(--primary);
+  --sl-color-text-invert: var(--primary-foreground);
+  --sl-color-bg: var(--background);
+  --sl-color-bg-nav: var(--background);
+  --sl-color-bg-sidebar: var(--sidebar);
+  --sl-color-bg-inline-code: var(--muted);
+  --sl-color-bg-accent: var(--primary);
+  --sl-color-hairline: var(--border);
+  --sl-color-hairline-light: var(--border);
+  --sl-color-hairline-shade: var(--border);
+  --sl-color-green: var(--accent-green);
+  --sl-color-blue: var(--accent-blue);
+  --sl-color-orange: var(--accent-orange);
+  --sl-color-red: var(--accent-red);
+  --sl-color-purple: var(--accent-purple);
+  --sl-content-width: 48rem;
+  --sl-sidebar-width: 18rem;
+  --sl-text-h1: 2.25rem;
+  --sl-text-h2: 1.5rem;
+  --sl-text-h3: 1.125rem;
+}
+
+body { font-feature-settings: 'cv11', 'ss01'; -webkit-font-smoothing: antialiased; }
+h1, h2, h3, h4, .site-title { font-family: var(--font-code-family); letter-spacing: -0.035em; }
+h1 { line-height: 1.25; }
+.site-title { gap: 0.65rem; color: var(--foreground); font-weight: 600; }
+.site-title img { height: 1.9rem; }
+.sidebar-content a, .pagination-links a, starlight-theme-select select { border-radius: var(--radius); }
+.sl-markdown-content table { font-size: 0.875rem; }
+.sl-markdown-content :is(th, td) { padding: 0.8rem; }
+.sl-markdown-content th { background: var(--card); }
+.sl-markdown-content img { border-radius: var(--radius); }
+.sl-markdown-content a:hover { text-decoration-thickness: 2px; }
+:focus-visible { outline-color: var(--ring); }
+@media (max-width: 50rem) { :root { --sl-text-h1: 1.75rem; } }

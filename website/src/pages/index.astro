@@ -1,0 +1,273 @@
+---
+import { Code } from 'astro:components'
+import mark from '../assets/rness-mark.svg'
+import { repository } from '../../scripts/docs.mjs'
+import '../styles/landing.css'
+
+const bootstrap = `curl --proto '=https' --tlsv1.2 -sSfL \\
+  https://raw.githubusercontent.com/Abraxas-365/rness/main/bootstrap.sh | sh`
+const installs = [
+  { id: 'bootstrap', label: 'curl | sh', note: 'Builds the current main source. Needs Rust/Cargo, a C/C++ toolchain, Bash, curl and tar.', code: bootstrap },
+  { id: 'rustup', label: 'No Rust yet', note: 'Lets the bootstrapper install Rust through rustup when Cargo is unavailable.', code: `curl --proto '=https' --tlsv1.2 -sSfL \\\n  https://raw.githubusercontent.com/Abraxas-365/rness/main/bootstrap.sh | RNESS_INSTALL_RUST=1 sh` },
+  { id: 'checkout', label: 'From a checkout', note: 'Clone, review, then install. Upgrade later with --replace-binary.', code: `git clone ${repository}.git\ncd rness\n./install.sh` },
+]
+const connect = `# ChatGPT: browser sign-in (OAuth)
+rness auth login --provider openai-chatgpt
+
+# Anthropic: an API key (default)…
+export ANTHROPIC_API_KEY="your-api-key"
+# …or OAuth: set auth = { oauth = "anthropic" }
+# in ~/.rness/lua/providers.lua, then
+rness auth login --provider anthropic
+
+# Local: an installed, tool-capable model
+rness -m ollama/YOUR_INSTALLED_MODEL`
+const run = `# Interactive terminal UI in your project
+rness -m chatgpt/gpt-6-astra --reasoning high
+
+# Headless, one prompt
+rness -m chatgpt/gpt-6-astra -p "Explain the entry points."`
+const initLua = `-- ~/.rness/init.lua · load exactly what you want
+require("providers")
+require("agents")
+require("theme")
+
+rness.plugins.setup({
+  { name = "sessions", file = "plugins/sessions.lua" },
+  { name = "branches", file = "plugins/branches.lua" },
+  { name = "tasks",    file = "plugins/tasks.lua" },
+})
+
+rness.keymap.setup({
+  { scope = "global", key = "ctrl+u", action = "core.scroll_up_page" },
+  { scope = "global", key = "ctrl+d", action = "core.scroll_down_page" },
+})`
+const roles = `rness.agents.declare("scout", {
+  description = "Cheap, read-only codebase exploration.",
+  profile = "small", subagent = true,
+  tools = { "Glob", "Grep", "Read" },
+})`
+const features = [
+  { number: '01', title: 'Own the workflow.', text: 'Configure agents, actions, keybindings, hooks and presentation in Lua. Build a setup, not just a system prompt.', tags: 'init.lua · Keymaps · Hooks', href: '/docs/guides/configuration/init-lua/' },
+  { number: '02', title: 'Build the missing pieces.', text: 'Add tools, slash commands and terminal views through plugins, without modifying the Rust engine.', tags: 'Plugins · Commands · Views', href: '/docs/guides/plugins/loading-and-lifecycle/' },
+  { number: '03', title: 'Choose your specialists.', text: 'Define the roster, instructions, model profiles and tool access. Delegation uses your named roles.', tags: 'Agents · Profiles · Subagents', href: '/docs/tutorials/first-agent/' },
+  { number: '04', title: "Compose, don't conform.", text: 'Session pickers, plan review, task views and agent controls are Lua plugins. Keep them, or replace them.', tags: 'Default flavor · Gruvbox', href: `${repository}/tree/main/flavors/default` },
+  { number: '05', title: 'Fan work out.', text: 'Let the model orchestrate many subagents with a Lua workflow script: audits, reviews, migrations. Opt-in.', tags: 'Workflows · Background jobs', href: '/docs/guides/workflows/' },
+  { number: '06', title: 'Keep processes alive.', text: 'Persistent terminals for dev servers, REPLs and watchers the model keeps using across turns.', tags: 'Terminals · Jobs · Reminders', href: '/docs/guides/terminals/' },
+]
+---
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rness — A coding agent you make your own.</title>
+    <meta name="description" content="A terminal-first coding agent with a Rust engine and a Lua-configurable workflow. Choose the models, shape the interface, build your own way of working." />
+    <meta property="og:title" content="rness — A coding agent you make your own." />
+    <meta property="og:description" content="Your terminal. Your models. Your agent. A Rust engine with a Lua-configurable workflow." />
+    <meta property="og:type" content="website" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <script is:inline>
+      // Share the user's explicit choice with the documentation, before first paint.
+      try {
+        const saved = localStorage.getItem('starlight-theme');
+        document.documentElement.dataset.theme = saved === 'light' || (!saved && matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="header">
+      <nav class="wrap navigation" aria-label="Main navigation">
+        <a class="brand" href="/" aria-label="rness home"><img src={mark.src} width="28" height="28" alt="" />rness<span class="cursor" aria-hidden="true">_</span></a>
+        <div class="nav-links"><a href="#what">What it is</a><a href="#install">Install</a><a href="#make-it-yours">Make it yours</a><a href="/docs/">Documentation</a></div>
+        <div class="nav-actions">
+          <button id="theme-toggle" type="button" aria-label="Switch to light theme" title="Switch theme"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5" /></svg></button>
+          <a class="github-link" href={repository}>GitHub <span aria-hidden="true">↗</span></a>
+        </div>
+      </nav>
+    </header>
+    <main id="main">
+      <section class="hero wrap" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="signal" aria-hidden="true"></span> Terminal-first coding agent</p>
+          <h1 id="hero-title">A coding agent<br /><span>you make your own.</span></h1>
+          <p class="hero-description">A Rust engine with a Lua-configurable workflow.<br class="desktop-break" /> Choose the models. Shape the interface. Build your own way of working.</p>
+          <div class="install-box" aria-label="Install command">
+            <div class="install-bar"><span class="mono">install · builds from source</span><button class="copy" type="button" data-copy={bootstrap}>Copy</button></div>
+            <pre><code><span class="prompt">$</span> {bootstrap}</code></pre>
+          </div>
+          <div class="actions"><a class="button primary" href="#install">Get started <span aria-hidden="true">→</span></a><a class="button secondary" href="/docs/">Read the docs <span aria-hidden="true">↗</span></a></div>
+          <p class="hero-note">Rust engine <span aria-hidden="true">/</span> Lua workflow <span aria-hidden="true">/</span> Your rules</p>
+        </div>
+      </section>
+
+      <section class="showcase wrap" aria-label="The rness terminal interface">
+        <figure class="terminal">
+          <div class="window-bar"><span class="window-dots" aria-hidden="true"><i></i><i></i><i></i></span><span>~/projects/api — rness</span></div>
+          <div class="tui" aria-hidden="true">
+            <div class="tui-user"><b class="y">You</b><br />Find where the upstream timeout is set, raise it to 30s and run the tests.</div>
+            <div class="tui-card"><div class="tui-head"><span><b class="b">Read</b><span class="g">&nbsp; src/client.rs</span></span><b class="g">done</b></div><pre><span class="m">   1 </span><span class="kw">use</span><span class="c"> std::time::Duration;</span>
+<span class="m">   2 </span>
+<span class="m">   3 </span><span class="kw">pub fn</span><span class="c"> </span><span class="fn">upstream_timeout</span><span class="c">() -&gt; Duration {'{'}</span>
+<span class="m">   4 </span><span class="c">    Duration::from_secs(</span><span class="num">10</span><span class="c">)</span>
+<span class="m">   5 </span><span class="c">{'}'}</span>
+<span class="m">… 8 more lines (file has 13 lines; continue with offset=6)</span></pre></div>
+            <div class="tui-card"><div class="tui-head"><b class="b">Edit&nbsp; src/client.rs</b></div><pre><span class="r">-     Duration::from_secs(10)</span>
+<span class="g">+     Duration::from_secs(30)</span></pre></div>
+            <div class="tui-card"><div class="tui-head"><span><b class="b">Bash</b><span class="m"> · </span><b class="g">done</b></span><span class="m">1307 ms</span></div><pre><span class="fn">cargo</span><span class="c"> test</span><span class="flag"> -q</span>
+
+running 1 test
+.
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+<span class="m">… more lines</span></pre></div>
+            <div class="tui-text">Raised the upstream timeout to 30s in <span class="g">src/client.rs:4</span>. <span class="g">cargo test</span> passes (1 test).</div>
+            <div class="tui-prompt"><b class="y">❯</b> <span class="tui-cursor"></span></div>
+            <div class="tui-status"><span><span class="b">anthropic/claude-sonnet-4-5</span> · idle · (01M4HM3F) · 6.0k/165.0k est tok</span><span>coding</span></div>
+          </div>
+          <figcaption>Redrawn from a terminal capture of rness with the default Gruvbox flavor. Cards, colors and the statusline come from Lua you can change.</figcaption>
+        </figure>
+      </section>
+
+      <div class="provider-strip"><div class="wrap provider-inner"><p>Bring your own model connection.</p><ul aria-label="Supported model connections"><li>Anthropic</li><li>ChatGPT</li><li>OpenRouter</li><li>Ollama</li><li>OpenAI-compatible</li></ul></div></div>
+
+      <section id="what" class="section wrap" aria-labelledby="what-title">
+        <div class="section-heading"><div><p class="eyebrow">What is rness</p><h2 id="what-title">A harness you own,<br />not one you adapt to.</h2></div><p>You own the setup. Choose the model, define specialist agents, remap keys, change the tool cards and load exactly the plugins you want. Start with the included Gruvbox flavor; keep what you like, rewrite the rest.</p></div>
+        <div class="feature-grid">{features.map(feature => <article class="feature"><span class="feature-number">{feature.number} /</span><h3><a href={feature.href}>{feature.title}<span aria-hidden="true">↗</span></a></h3><p>{feature.text}</p><span class="feature-tags">{feature.tags}</span></article>)}</div>
+        <p class="split-note"><strong>Rust handles the mechanisms.</strong> Lua shapes the experience. <span>You own the decisions.</span></p>
+      </section>
+
+      <section id="install" class="install-section" aria-labelledby="install-title"><div class="wrap">
+        <div class="section-heading"><div><p class="eyebrow">Get started</p><h2 id="install-title">From install<br />to first prompt.</h2></div><p>Installs <code>~/.local/bin/rness</code> and copies the default flavor to <code>~/.rness</code> only when it does not exist. It never overwrites your config, edits shell startup files, uses sudo or downloads models.</p></div>
+        <ol class="steps-grid">
+          <li class="step">
+            <span class="step-number">01 / Install</span>
+            <h3>Build it from source.</h3>
+            <div class="tabs" role="tablist" aria-label="Installation method">{installs.map((item, i) => <button type="button" role="tab" id={`tab-${item.id}`} aria-controls={`panel-${item.id}`} aria-selected={i === 0 ? 'true' : 'false'} tabindex={i === 0 ? 0 : -1}>{item.label}</button>)}</div>
+            {installs.map((item, i) => <div class="tab-panel code-panel" role="tabpanel" id={`panel-${item.id}`} aria-labelledby={`tab-${item.id}`} hidden={i !== 0}><button class="copy floating" type="button" data-copy={item.code}>Copy</button><Code code={item.code} lang="sh" theme="css-variables" /><p class="code-note">{item.note}</p></div>)}
+            <p class="step-foot">Pin <code>RNESS_REF</code> to a reviewed tag or commit for reproducible installs. Add <code>~/.local/bin</code> to your <code>PATH</code> if needed.</p>
+          </li>
+          <li class="step">
+            <span class="step-number">02 / Connect</span>
+            <h3>Sign in or bring a key.</h3>
+            <div class="code-panel"><Code code={connect} lang="sh" theme="css-variables" /></div>
+            <p class="step-foot">The default flavor declares Anthropic, ChatGPT, OpenRouter and Ollama connections. No principal model is chosen for you. <a class="text-link" href="/docs/reference/configuration/providers/">Provider reference →</a></p>
+          </li>
+          <li class="step">
+            <span class="step-number">03 / Run</span>
+            <h3>Put it to work.</h3>
+            <div class="code-panel"><Code code={run} lang="sh" theme="css-variables" /></div>
+            <p class="step-foot">Resume with <code>-s SESSION_ID</code>, fork with <code>--fork</code>, or serve HTTP/SSE with <code>--serve 127.0.0.1:7777</code>. <a class="text-link" href="/docs/tutorials/first-configuration/">First configuration →</a></p>
+          </li>
+        </ol>
+        <p class="warning"><strong>Heads-up:</strong> the default approval policy is <code>allow</code>, so sensitive tools run without confirmation. Use <code>--approval ask</code> to be asked, or <code>--approval never</code> to reject them. Neither is an OS sandbox; see <a href="/docs/reference/configuration/sandbox/">sandbox configuration</a>.</p>
+      </div></section>
+
+      <section id="make-it-yours" class="section wrap make-section" aria-labelledby="make-title">
+        <div>
+          <p class="eyebrow">Make it yours</p>
+          <h2 id="make-title">Ordinary configuration.<br /><span>No hidden preset.</span></h2>
+          <p class="section-description">The default flavor is plain Lua in your home directory. The startup file lists plugins explicitly: no directory-scanning surprises. Restart after changes; watched plugins can reload.</p>
+          <pre class="tree" aria-label="Default configuration layout"><span class="dir">~/.rness/</span>
+├── init.lua             <span class="cm">Load exactly what you want</span>
+├── lua/
+│   ├── providers.lua    <span class="cm">Connections and model profiles</span>
+│   ├── agents.lua       <span class="cm">Principal and specialist agents</span>
+│   └── theme.lua        <span class="cm">Gruvbox, message cards, diffs</span>
+└── plugins/             <span class="cm">Explicitly loaded Lua plugins</span></pre>
+          <div class="link-row"><a class="text-link" href="/docs/guides/configuration/init-lua/">The init.lua guide →</a><a class="text-link" href="/docs/guides/configuration/colorschemes/">Colorschemes →</a><a class="text-link" href={`${repository}/tree/main/flavors/default`}>Browse the default flavor ↗</a></div>
+        </div>
+        <div class="code-panel big"><div class="panel-bar"><span class="panel-label">~/.rness/init.lua</span><span class="panel-caption">Lua</span></div><Code code={initLua} lang="lua" theme="css-variables" /></div>
+      </section>
+
+      <section class="section wrap delegate-section" aria-labelledby="delegate-title">
+        <div class="code-panel big"><div class="panel-bar"><span class="panel-label">~/.rness/lua/agents.lua</span><span class="panel-caption">Lua</span></div><Code code={roles} lang="lua" theme="css-variables" />
+          <div class="roles"><div><span class="mono">scout</span><p>Finds relevant code; returns a concise handoff on a cheaper profile.</p></div><div><span class="mono">worker</span><p>Makes changes and runs checks (in the examples).</p></div><div><span class="mono">reviewer</span><p>Inspects changes and reports risks.</p></div></div>
+        </div>
+        <div>
+          <p class="eyebrow">Delegate the search</p>
+          <h2 id="delegate-title">Keep the context.<br /><span>Name the specialists.</span></h2>
+          <p class="section-description">Send a focused scout to investigate, a worker to implement and a reviewer to inspect. Generic children are off by default. Background jobs notify the parent and wake it when idle; profiles resolve against the parent's connection with no silent cross-provider fallback.</p>
+          <p class="note">A child session is not a sandbox: specialists share the workspace, and read-only instructions are not enforced tool restrictions.</p>
+          <div class="link-row"><a class="text-link" href="/docs/tutorials/first-agent/">Your first agent →</a><a class="text-link" href="/docs/guides/subagent-commands/">Subagent commands →</a></div>
+        </div>
+      </section>
+
+      <section class="section wrap" aria-labelledby="modes-title">
+        <div class="section-heading"><div><p class="eyebrow">Run it your way</p><h2 id="modes-title">One engine.<br />Every surface.</h2></div><p>Durable sessions with branches and forks, long conversations with explicit compaction, and the same engine behind the TUI, scripts and services.</p></div>
+        <div class="mode-grid">
+          <a class="mode-card" href="/docs/guides/configuration/tui-commands/"><span class="mono card-kicker">01 / TUI</span><h3>Interactive terminal <span aria-hidden="true">↗</span></h3><p>Slash commands with completion, queue and steer while a turn runs, plugin views and a Lua statusline.</p></a>
+          <a class="mode-card" href="/docs/tutorials/first-configuration/"><span class="mono card-kicker">02 / HEADLESS</span><h3>Scripts and CI <span aria-hidden="true">↗</span></h3><p><code>rness -p "..."</code> prints the transcript and exits non-zero on failure (130 when cancelled), so scripts can check the outcome.</p></a>
+          <a class="mode-card" href="/docs/reference/http-api/"><span class="mono card-kicker">03 / SERVICE</span><h3>HTTP / SSE <span aria-hidden="true">↗</span></h3><p>Drive sessions from your own tools with <code>--serve</code>. Bind to loopback unless you have reviewed it.</p></a>
+          <a class="mode-card" href="/docs/architecture/"><span class="mono card-kicker">04 / SESSIONS</span><h3>Durable history <span aria-hidden="true">↗</span></h3><p>Resume, branch and fork. Compaction shrinks model context only; the transcript and log keep everything.</p></a>
+        </div>
+      </section>
+
+      <section class="section wrap status-section" aria-labelledby="status-title">
+        <div><p class="eyebrow">Know what you're adopting</p><h2 id="status-title">Early-stage software.<br /><span>Honest about it.</span></h2></div>
+        <div class="status-grid">
+          <article><span class="mono card-kicker">SOURCE</span><h3>Read the code.</h3><p>Rust crates for the engine, providers, tools, Lua runtime, TUI and server. Inspect how things work, not just a feature list.</p><a class="text-link" href={repository}>Browse the repository ↗</a></article>
+          <article><span class="mono card-kicker">LIMITS</span><h3>Read the caveats.</h3><p>Configuration and extension APIs are evolving and formats have no release-level compatibility guarantee yet.</p><a class="text-link" href="/docs/project/known-limitations/">Known limitations →</a></article>
+          <article><span class="mono card-kicker">TRUST</span><h3>Review your plugins.</h3><p>Lua plugins and native extensions run with your authority. A tool allowlist is not full isolation. Load only what you trust.</p><a class="text-link" href="/docs/guides/execution-hardening/">Execution hardening →</a></article>
+        </div>
+      </section>
+
+      <section class="section wrap faq-section" aria-labelledby="faq-title"><div><p class="eyebrow">A few useful answers</p><h2 id="faq-title">Before you install.</h2></div><div class="faq-list">
+        <details><summary>Do I need an API key?</summary><p>Not necessarily. ChatGPT and Anthropic support browser sign-in with OAuth; Anthropic also works with an API key, and Ollama runs local models. Access and model availability depend on your account and the provider's policies. <a href="/docs/reference/configuration/providers/">Provider configuration.</a></p></details>
+        <details><summary>Are there prebuilt binaries?</summary><p>Not yet. The installers build from source, so you need Rust/Cargo and a native C/C++ toolchain (embedded Lua is built from vendored sources). The bootstrapper can install Rust for you with <code>RNESS_INSTALL_RUST=1</code>. <a href="/docs/guides/installation/from-source/">Install from source.</a></p></details>
+        <details><summary>How do I upgrade without losing my setup?</summary><p>Run <code>./install.sh --replace-binary</code> from an updated checkout. Your <code>~/.rness</code> is never touched; the installer lists flavor files that differ so you can review and copy new plugin versions yourself.</p></details>
+        <details><summary>Which platforms are supported?</summary><p>The installers need a Bash-compatible environment. Some features are platform-specific: the enforced filesystem sandbox currently uses the macOS backend, and persistent terminals are Unix-only in practice. <a href="/docs/project/known-limitations/">Known limitations.</a></p></details>
+        <details><summary>Is it safe to let it run commands?</summary><p>By default sensitive tools run without confirmation. Choose an approval policy, restrict agent tools, and opt into the filesystem sandbox where supported. None of these replaces reviewing what you run. <a href="/docs/reference/configuration/sandbox/">Sandbox configuration.</a></p></details>
+      </div></section>
+
+      <section class="closing wrap" aria-labelledby="closing-title"><p class="eyebrow">Your terminal. Your models. Your agent.</p><h2 id="closing-title">An agent should adapt to your workflow.<br /><span>Not the other way around.</span></h2><div class="actions"><a class="button primary" href="#install">Install rness <span aria-hidden="true">→</span></a><a class="button secondary" href="/docs/">Read the documentation <span aria-hidden="true">↗</span></a></div></section>
+    </main>
+    <footer class="footer"><div class="wrap footer-inner"><div><a class="brand" href="/"><img src={mark.src} width="22" height="22" alt="" />rness</a><p>A coding agent you make your own.</p></div><nav aria-label="Footer navigation"><a href="/docs/">Documentation</a><a href="/docs/guides/installation/from-source/">Install</a><a href="/docs/project/known-limitations/">Known limitations</a><a href="/docs/contributing/">Contributing</a><a href={repository}>GitHub</a></nav><span class="footer-note">Rust engine. Lua workflow. Your rules.</span></div></footer>
+    <script>
+      const toggle = document.querySelector<HTMLButtonElement>('#theme-toggle')!
+      function labelTheme() {
+        toggle.setAttribute('aria-label', `Switch to ${document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'} theme`)
+      }
+      labelTheme()
+      toggle.addEventListener('click', () => {
+        const theme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'
+        document.documentElement.dataset.theme = theme
+        try { localStorage.setItem('starlight-theme', theme) } catch {}
+        labelTheme()
+      })
+
+      for (const button of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+        button.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(button.dataset.copy ?? '')
+            button.textContent = 'Copied'
+          } catch {
+            button.textContent = 'Select & copy'
+          }
+          setTimeout(() => { button.textContent = 'Copy' }, 1600)
+        })
+      }
+
+      const tabs = [...document.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      function select(tab: HTMLButtonElement) {
+        for (const other of tabs) {
+          const selected = other === tab
+          other.setAttribute('aria-selected', String(selected))
+          other.tabIndex = selected ? 0 : -1
+          document.getElementById(other.getAttribute('aria-controls')!)!.hidden = !selected
+        }
+      }
+      tabs.forEach((tab, i) => {
+        tab.addEventListener('click', () => select(tab))
+        tab.addEventListener('keydown', event => {
+          const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+          if (!step) return
+          const next = tabs[(i + step + tabs.length) % tabs.length]
+          select(next)
+          next.focus()
+        })
+      })
+    </script>
+  </body>
+</html>
