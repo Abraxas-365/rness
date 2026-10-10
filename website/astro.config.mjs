@@ -1,11 +1,13 @@
 import { defineConfig } from 'astro/config'
 import starlight from '@astrojs/starlight'
 import { unified } from '@astrojs/markdown-remark'
-import { remarkDocs, repository } from './scripts/docs.mjs'
+import { remarkDocs, repository, site, base } from './scripts/docs.mjs'
 import { sidebar } from './src/sidebar.mjs'
 
 export default defineConfig({
-  // Add the public site URL when a domain is selected; no invented canonical URL.
+  // GitHub Pages serves the project at https://abraxas-365.github.io/rness/ (SITE_BASE=/rness in CI).
+  site,
+  base,
   trailingSlash: 'always',
   markdown: { processor: unified({ remarkPlugins: [remarkDocs] }) },
   integrations: [starlight({

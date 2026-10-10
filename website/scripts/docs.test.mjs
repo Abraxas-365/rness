@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import path from 'node:path'
-import { docId, docsRoot, metadata, resolveLink, repository, allSlugs, sidebarSlugs } from './docs.mjs'
+import { docId, docsRoot, metadata, resolveLink, repository, base, allSlugs, sidebarSlugs } from './docs.mjs'
 
 const tutorial = path.join(docsRoot, 'tutorials/first-configuration.md')
 test('routes preserve directories and collapse README/index', () => {
@@ -16,11 +16,13 @@ test('metadata comes from source Markdown and edit link points to source', () =>
   assert.equal(data.editUrl, `${repository}/edit/main/docs/tutorials/first-configuration.md`)
 })
 test('rewrites document links while preserving anchors and external URLs', () => {
-  assert.equal(resolveLink('../guides/installation/from-source.md', tutorial), '/docs/guides/installation/from-source/')
-  assert.equal(resolveLink('../reference/configuration/providers.md#multiple-accounts-per-provider', tutorial), '/docs/reference/configuration/providers/#multiple-accounts-per-provider')
+  assert.equal(base, process.env.SITE_BASE ? `/${process.env.SITE_BASE.replace(/^\/+|\/+$/g, '')}/` : '/')
+  const b = base.slice(0, -1)
+  assert.equal(resolveLink('../guides/installation/from-source.md', tutorial), `${b}/docs/guides/installation/from-source/`)
+  assert.equal(resolveLink('../reference/configuration/providers.md#multiple-accounts-per-provider', tutorial), `${b}/docs/reference/configuration/providers/#multiple-accounts-per-provider`)
   assert.equal(resolveLink('#before-you-begin', tutorial), '#before-you-begin')
   assert.equal(resolveLink('https://example.com/a.md', tutorial), 'https://example.com/a.md')
-  assert.equal(resolveLink('../README.md', tutorial), '/docs/')
+  assert.equal(resolveLink('../README.md', tutorial), `${b}/docs/`)
   assert.equal(resolveLink('../../README.md#get-started', tutorial), `${repository}/blob/main/README.md#get-started`)
   assert.equal(resolveLink('../../examples/workflows/', tutorial), `${repository}/tree/main/examples/workflows`)
 })

@@ -32,9 +32,12 @@ changes. Development mode does not provide the production search index.
 - The sidebar is curated in `src/sidebar.mjs` (reading order, nested groups).
   Titles come from each page's H1. `npm test` fails when a document under
   `../docs` is missing from the sidebar or listed twice, so add new pages there.
-- The terminal on the landing page is an HTML illustration, labeled as such,
-  not a screenshot. Landing copy follows the root README; keep install commands
+- The terminal on the landing page is HTML redrawn from a tmux capture of rness
+  with the default flavor (Gruvbox colors copied from the capture). Keep it in
+  sync with the real TUI. Landing copy follows the root README; keep install commands
   and claims in sync with it.
+- Internal links on the landing page go through `u(...)`, which adds the deploy
+  base. Do not hard-code `/docs/...` paths.
 
 ## Validation
 
@@ -46,7 +49,17 @@ npm run check:links
 ```
 
 `check:links` checks rendered local links, anchors and assets, not remote URLs.
+Starlight logs harmless warnings for its empty optional i18n collection and
+default 404 fallback.
 
-No production domain or deployment is configured. The build skips sitemap
-creation until `site` is set in `astro.config.mjs`; Starlight also logs warnings
-for its empty optional i18n collection and default 404 fallback.
+## Deployment
+
+`.github/workflows/website.yml` publishes to GitHub Pages at
+<https://abraxas-365.github.io/rness/> on every push to `main` that touches
+`website/`, `docs/` or the workflow. It runs `npm test`, the build and
+`check:links` before deploying.
+
+The site lives under `/rness/`, so CI sets `SITE_BASE=/rness`. Locally
+`SITE_BASE` is unset and the site serves from `/`. To reproduce the Pages
+build: `SITE_BASE=/rness npm run build && SITE_BASE=/rness npm run check:links`.
+For a custom domain, set `SITE_URL` and drop `SITE_BASE` in the workflow.

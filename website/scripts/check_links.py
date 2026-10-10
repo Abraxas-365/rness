@@ -1,9 +1,12 @@
 """Check rendered local links, fragments and assets without network access."""
+import os
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urljoin, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1] / 'dist'
+# dist/ is served under the deploy base (SITE_BASE=/rness on GitHub Pages).
+BASE = '/' + os.environ.get('SITE_BASE', '').strip('/') + '/' if os.environ.get('SITE_BASE', '').strip('/') else '/'
 
 
 class Page(HTMLParser):
@@ -24,12 +27,15 @@ class Page(HTMLParser):
 pages = {p: Page(p.read_text()) for p in ROOT.rglob('*.html')}
 errors = []
 for file, page in pages.items():
-    url = '/' + file.relative_to(ROOT).as_posix().removesuffix('index.html')
+    url = BASE + file.relative_to(ROOT).as_posix().removesuffix('index.html')
     for link in page.links:
         target = urlsplit(urljoin(url, link))
         if target.scheme or target.netloc:
             continue
-        dest = ROOT / unquote(target.path).lstrip('/')
+        if not target.path.startswith(BASE):
+            errors.append(f'{url}: outside base {BASE}: {link}')
+            continue
+        dest = ROOT / unquote(target.path)[len(BASE):]
         if dest.is_dir():
             dest /= 'index.html'
         if not dest.exists():

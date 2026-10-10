@@ -6,6 +6,9 @@ import { visit } from 'unist-util-visit'
 export const root = fileURLToPath(new URL('../../', import.meta.url))
 export const docsRoot = path.join(root, 'docs')
 export const repository = 'https://github.com/Abraxas-365/rness'
+// Public URL; SITE_BASE is '/rness' on GitHub Pages and '/' locally.
+export const site = process.env.SITE_URL ?? 'https://abraxas-365.github.io'
+export const base = `/${(process.env.SITE_BASE ?? '').replace(/^\/+|\/+$/g, '')}/`.replace('//', '/')
 
 export function docId(file) {
   return `docs/${file.replace(/\\/g, '/').replace(/\.md$/, '').replace(/(^|\/)(index|README)$/, '')}`.replace(/\/$/, '')
@@ -51,7 +54,7 @@ export function resolveLink(url, file) {
   const relative = path.relative(root, target).split(path.sep).join('/')
   if (relative.startsWith('../') || !existsSync(target)) throw new Error(`Broken source link in ${file}: ${url}`)
   if (target.startsWith(docsRoot + path.sep) && target.endsWith('.md')) {
-    return `/${docId(path.relative(docsRoot, target))}/${suffix}`
+    return `${base}${docId(path.relative(docsRoot, target))}/${suffix}`
   }
   const kind = statSync(target).isDirectory() ? 'tree' : 'blob'
   return `${repository}/${kind}/main/${relative}${suffix}`
