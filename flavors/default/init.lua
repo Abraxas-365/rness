@@ -64,6 +64,9 @@ rness.plugins.setup({
   { name = "tasks", file = "plugins/tasks.lua" },
   { name = "questions", file = "plugins/questions.lua" },
   { name = "plan", file = "plugins/plan.lua", dependencies = { "questions" } },
+  -- When a reply is cut at the output token limit, tell the model and let it
+  -- retry in smaller pieces instead of ending the turn silently.
+  { name = "truncation-notice", file = "plugins/truncation-notice.lua" },
   -- Optional context injection: give the model awareness of current time and
   -- tmux location. Useful for long-running sessions, scheduled tasks, or when
   -- the model needs to reason about time gaps between messages. Each injects a

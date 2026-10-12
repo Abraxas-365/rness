@@ -94,6 +94,14 @@ pub struct RequestError {
 
 // ── turn_stopping ─────────────────────────────────────────────────────
 
+/// Facts about the stop that is about to close the turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnStop {
+    /// `EndTurn`, or `MaxTokens` when the provider cut the output at its
+    /// limit (any truncated tool call has already been dropped).
+    pub stop: rness_protocol::events::StopReason,
+}
+
 /// After the model says "end turn" and before the turn actually closes,
 /// `turn_stopping` lets listeners inject one last steer. If the handler
 /// returns messages, the turn does NOT close — it continues with those
@@ -180,9 +188,10 @@ pub trait LoopHooks: Send + Sync {
     async fn turn_stopping(
         &self,
         event: &LoopEvent,
+        stop: &TurnStop,
         cancel: &CancellationToken,
     ) -> Result<TurnStoppingAction, String> {
-        let _ = (event, cancel);
+        let _ = (event, stop, cancel);
         Ok(TurnStoppingAction::default())
     }
 }

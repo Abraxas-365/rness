@@ -704,7 +704,8 @@ async fn drive(
                     turn: turn_no,
                     step: step_no,
                 };
-                match hooks.turn_stopping(&loop_event, cancel).await {
+                let turn_stop = hooks::TurnStop { stop };
+                match hooks.turn_stopping(&loop_event, &turn_stop, cancel).await {
                     Err(_) if cancel.is_cancelled() => return Ok(TurnOutcome::Cancelled),
                     Err(e) => tracing::warn!(session = %session, "turn_stopping hook failed: {e}"),
                     Ok(TurnStoppingAction::Continue { messages }) if !messages.is_empty() => {

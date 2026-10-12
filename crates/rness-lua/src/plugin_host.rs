@@ -759,16 +759,20 @@ impl rness_engine::turn::hooks::LoopHooks for LuaHost {
     async fn turn_stopping(
         &self,
         event: &rness_engine::turn::hooks::LoopEvent,
+        stop: &rness_engine::turn::hooks::TurnStop,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> Result<rness_engine::turn::hooks::TurnStoppingAction, String> {
         use rness_engine::turn::hooks::TurnStoppingAction;
         if !self.has_hook("turn_stopping") {
             return Ok(TurnStoppingAction::Stop);
         }
+        let mut payload = loop_payload(event);
+        // "end_turn" | "max_tokens" (output cut at the request's limit).
+        payload["stop"] = serde_json::to_value(stop.stop).map_err(|e| e.to_string())?;
         let decision = self
             .intercept(
                 "turn_stopping",
-                loop_payload(event),
+                payload,
                 serde_json::json!({"kind": "stop"}),
                 cancel,
             )

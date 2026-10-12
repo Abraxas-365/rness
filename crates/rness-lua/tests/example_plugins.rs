@@ -201,6 +201,57 @@ async fn default_subagent_renderer_preserves_bounded_old_metadata_fallback() {
 }
 
 #[tokio::test]
+async fn default_truncation_notice_steers_on_max_tokens_then_gives_up() {
+    use rness_engine::turn::hooks::{LoopEvent, LoopHooks, TurnStop, TurnStoppingAction};
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
+    let (host, _) = LuaHost::spawn_from_init(root.clone()).unwrap();
+    // init.lua only declares plugins; check it is enabled, then load it.
+    assert!(std::fs::read_to_string(&root)
+        .unwrap()
+        .contains("{ name = \"truncation-notice\", file = \"plugins/truncation-notice.lua\" }"));
+    host.load(
+        "truncation-notice",
+        include_str!("../../../flavors/default/plugins/truncation-notice.lua"),
+    )
+    .await
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let event = |step| LoopEvent {
+        session: SessionId::from("01M2DTFV0CNHXA1QKQ02V5Q2J4".to_string()),
+        turn: 1,
+        step,
+    };
+    let cut = TurnStop {
+        stop: StopReason::MaxTokens,
+    };
+    let done = TurnStop {
+        stop: StopReason::EndTurn,
+    };
+    // A normal end of turn is untouched.
+    assert_eq!(
+        host.turn_stopping(&event(1), &done, &cancel).await.unwrap(),
+        TurnStoppingAction::Stop
+    );
+    // Truncation: steer the model (twice by default), tagged for the theme.
+    for step in [2, 3] {
+        let TurnStoppingAction::Continue { messages } =
+            host.turn_stopping(&event(step), &cut, &cancel).await.unwrap()
+        else {
+            panic!("truncation must continue the turn")
+        };
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tag.as_deref(), Some("truncated"));
+        assert!(messages[0].text.contains("output token limit"));
+    }
+    // A third consecutive truncation stops instead of looping forever.
+    assert_eq!(
+        host.turn_stopping(&event(4), &cut, &cancel).await.unwrap(),
+        TurnStoppingAction::Stop
+    );
+}
+
+#[tokio::test]
 async fn default_subagent_renderer_handles_missing_metadata_and_errors() {
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default/init.lua");
@@ -650,7 +701,7 @@ async fn default_flavor_loads_with_explicit_plugins_and_small_scout() {
         "the optional worker role stays disabled by default"
     );
     assert_eq!(config.messagebox["user"]["style"]["bg"], "#3c3836");
-    assert_eq!(config.plugin_specs.len(), 15);
+    assert_eq!(config.plugin_specs.len(), 16);
     assert_eq!(config.images.max_input_dimension, 8192);
     assert_eq!(config.image_reader.processing_concurrency, 2);
     assert_eq!(config.images.max_pixels, 2048 * 2048);

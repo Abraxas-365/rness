@@ -124,6 +124,8 @@ rness.ui.messagebox = {
         -- no blank row. display/label below apply only while revealed with
         -- keys.toggle_hidden (alt+i), or if you set visible = true.
         visible = false, display = "collapsed", label = { text = "Hook", style = "dim" },
+        -- Output-limit notices (plugins/truncation-notice.lua) stay visible.
+        tags = { truncated = { visible = true, label = { text = "Truncated", style = "dim" } } },
       },
       -- Same for the AGENTS.md / CLAUDE.md baseline: hidden entirely unless revealed.
       instructions = { visible = false, display = "collapsed", label = { text = "AGENTS.md", style = "dim" } },

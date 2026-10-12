@@ -2058,8 +2058,8 @@ mod loop_hooks_tests {
             self.log.lock().unwrap().push(format!("request_error:{}:{}:{}", ev.turn, ev.step, err.code));
             Ok(self.request_error.lock().unwrap().pop().unwrap_or_default())
         }
-        async fn turn_stopping(&self, ev: &LoopEvent, _: &CancellationToken) -> Result<TurnStoppingAction, String> {
-            self.log.lock().unwrap().push(format!("turn_stopping:{}:{}", ev.turn, ev.step));
+        async fn turn_stopping(&self, ev: &LoopEvent, stop: &rness_engine::turn::hooks::TurnStop, _: &CancellationToken) -> Result<TurnStoppingAction, String> {
+            self.log.lock().unwrap().push(format!("turn_stopping:{}:{}:{:?}", ev.turn, ev.step, stop.stop));
             Ok(self.turn_stopping.lock().unwrap().pop().unwrap_or_default())
         }
     }
@@ -2164,6 +2164,41 @@ mod loop_hooks_tests {
         assert_eq!(provider.seen_contexts.lock().unwrap().len(), 2, "two steps");
         let texts = provider.seen_texts.lock().unwrap();
         assert!(texts[1].contains("keep going"), "model should see steer: {}", texts[1]);
+    }
+
+    #[tokio::test]
+    async fn turn_stopping_reports_max_tokens_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(dir.path());
+        let mut log = store.create(None).unwrap();
+        log.append(&SessionEvent::UserMessage(UserMessage {
+            intent: UserIntent::Followup,
+            content: vec![ContentPart::Text { text: "write it all".into() }],
+            source: None,
+        })).unwrap();
+        // The truncated tool call was dropped by the provider: an empty
+        // MaxTokens message, then a normal answer after the hook's steer.
+        let provider = Scripted::new(vec![
+            StepOutcome::Committed(assistant("", StopReason::MaxTokens, vec![])),
+            StepOutcome::Committed(assistant("split", StopReason::EndTurn, vec![])),
+        ]);
+        let hooks = ScriptedLoop::new();
+        hooks.turn_stopping.lock().unwrap().push(TurnStoppingAction::Stop);
+        hooks.turn_stopping.lock().unwrap().push(TurnStoppingAction::Continue {
+            messages: vec!["output was cut; split it".into()],
+        });
+        let outcome = run_turn(
+            &store, &mut log, &provider, &ToolRegistry::default(),
+            &TurnConfig::default(), &CancellationToken::new(),
+            &mut no_steers(), 1, &|_| {},
+            Some(&hooks),
+        ).await.unwrap();
+        assert_eq!(outcome, TurnOutcome::Completed);
+        let entries = hooks.log.lock().unwrap();
+        let stops: Vec<_> = entries.iter().filter(|e| e.starts_with("turn_stopping")).cloned().collect();
+        assert_eq!(stops, vec!["turn_stopping:1:1:MaxTokens", "turn_stopping:1:2:EndTurn"]);
+        let texts = provider.seen_texts.lock().unwrap();
+        assert!(texts[1].contains("output was cut"), "model sees the steer: {}", texts[1]);
     }
 
     #[tokio::test]
