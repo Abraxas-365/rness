@@ -957,16 +957,21 @@ impl SessionService {
                 route: selection.route.clone(),
                 model: selection.model.clone(),
             })?;
-        let provider = resolver(selection).map_err(|message| ServiceError::ProviderResolution {
-            route: selection.route.clone(),
-            model: selection.model.clone(),
-            message,
-        })?;
-        if self
-            .models
-            .capabilities(selection)
-            .is_some_and(|caps| caps.image_input == Some(false))
-        {
+        let mut provider =
+            resolver(selection).map_err(|message| ServiceError::ProviderResolution {
+                route: selection.route.clone(),
+                model: selection.model.clone(),
+                message,
+            })?;
+        let caps = self.models.capabilities(selection);
+        // The declared model limit is the default output cap; a profile,
+        // session or CLI `max_output_tokens` still wins per request.
+        if let Some(limit) = caps.and_then(|caps| caps.max_output_tokens) {
+            if let Some(provider) = Arc::get_mut(&mut provider) {
+                provider.configure_output_limit(limit);
+            }
+        }
+        if caps.is_some_and(|caps| caps.image_input == Some(false)) {
             Ok(Arc::new(crate::turn::provider::ImageCapabilityProvider {
                 inner: provider,
             }))

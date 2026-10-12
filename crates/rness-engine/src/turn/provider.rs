@@ -264,6 +264,12 @@ pub trait Provider: Send + Sync {
     ) {
     }
 
+    /// Configure the output cap used when a request sets no
+    /// `max_output_tokens`: the selected model's declared limit. Adapters
+    /// whose API requires a cap (Anthropic) adopt it; others keep the
+    /// provider's own default.
+    fn configure_output_limit(&mut self, _max_output_tokens: u32) {}
+
     /// Whether this provider accepts `max_output_tokens` in requests.
     fn supports_max_output_tokens(&self) -> bool {
         true

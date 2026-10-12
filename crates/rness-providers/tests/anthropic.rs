@@ -452,6 +452,41 @@ async fn anthropic_omits_empty_text_blocks_without_shifting_images() {
 }
 
 #[tokio::test]
+async fn configured_output_limit_is_default_and_request_config_overrides_it() {
+    use rness_engine::turn::provider::Provider;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(sse_response(&stream_happy("ok")))
+        .mount(&server)
+        .await;
+    let mut provider = AnthropicProvider::new("fake", "test").with_base_url(server.uri());
+    provider.configure_output_limit(128_000);
+    let mut context = user_context("hi");
+    let last_max_tokens = || async {
+        let body: Value = server
+            .received_requests()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .body_json()
+            .unwrap();
+        body["max_tokens"].clone()
+    };
+    assert!(matches!(
+        step(&provider, &context, "", &[]).await,
+        StepOutcome::Committed(_)
+    ));
+    assert_eq!(last_max_tokens().await, json!(128_000));
+    context.config.max_output_tokens = Some(4096);
+    assert!(matches!(
+        step(&provider, &context, "", &[]).await,
+        StepOutcome::Committed(_)
+    ));
+    assert_eq!(last_max_tokens().await, json!(4096));
+}
+
+#[tokio::test]
 async fn clean_eof_without_terminal_event_is_failure_not_commit() {
     let server = MockServer::start().await;
     let mut events = stream_happy("partial");

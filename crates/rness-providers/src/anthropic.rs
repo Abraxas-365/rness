@@ -910,6 +910,9 @@ impl Provider for AnthropicProvider {
     ) {
         self.images = Some((store, policy));
     }
+    fn configure_output_limit(&mut self, max_output_tokens: u32) {
+        self.max_tokens = max_output_tokens;
+    }
     fn model(&self) -> &str {
         &self.model
     }

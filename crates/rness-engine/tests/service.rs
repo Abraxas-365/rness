@@ -2524,6 +2524,57 @@ async fn request_config_survives_compaction() {
     );
 }
 
+#[tokio::test]
+async fn declared_max_output_tokens_is_the_provider_default_cap() {
+    use rness_engine::config::{ModelCapabilities, ModelDeclaration, ModelRegistry};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    struct Capped(Arc<AtomicU32>);
+    #[async_trait]
+    impl Provider for Capped {
+        fn model(&self) -> &str {
+            "big"
+        }
+        fn configure_output_limit(&mut self, max_output_tokens: u32) {
+            self.0.store(max_output_tokens, Ordering::SeqCst);
+        }
+        async fn step(&self, _: StepRequest<'_>, _: &CancellationToken) -> StepOutcome {
+            StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![]))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut models = ModelRegistry::default();
+    models
+        .declare_model(ModelDeclaration {
+            provider: "test".into(),
+            model: "big".into(),
+            capabilities: ModelCapabilities {
+                max_output_tokens: Some(128_000),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+    let cap = Arc::new(AtomicU32::new(0));
+    let seen = cap.clone();
+    let svc = service(dir.path(), Scripted::new(vec![]))
+        .with_agents(Default::default(), models)
+        .with_provider_resolver(
+            CallConfig {
+                selection: Some(ModelSelection {
+                    route: "test".into(),
+                    model: "big".into(),
+                }),
+                ..Default::default()
+            },
+            Arc::new(move |_| Ok(Arc::new(Capped(seen.clone())) as Arc<dyn Provider>)),
+        );
+    let sid = svc.create(None).unwrap();
+    // No explicit max_output_tokens: the request config stays unset and
+    // the provider adopts the declared model limit as its default.
+    assert_eq!(svc.config(&sid).unwrap().max_output_tokens, None);
+    run_turns(&svc, &sid, 1).await;
+    assert_eq!(cap.load(Ordering::SeqCst), 128_000);
+}
+
 // -- session titles ----------------------------------------------------------
 
 /// Answers turn requests immediately; title requests (recognised by the

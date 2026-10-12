@@ -20,6 +20,9 @@ rness.providers.register("ollama", {
 })
 -- Model metadata: OpenAI model pages and platform.claude.com/docs/en/models/overview.
 -- These are declarations, not availability guarantees for your account.
+-- max_output_tokens is the model's output limit and the default request cap
+-- (Anthropic sends it as max_tokens). Lower it per use with a profile's
+-- options.max_output_tokens.
 for _, model in ipairs({ "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna","gpt-6-sol", "gpt-6-luna" }) do
   rness.models.declare {
     provider = "chatgpt", model = model,
