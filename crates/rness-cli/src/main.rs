@@ -3078,7 +3078,9 @@ async fn run_tui(
     #[cfg(feature = "experimental-control")]
     let control = control_path
         .as_deref()
-        .map(|path| control_socket::start(path, sessions.clone(), displayed, host_tx.clone()))
+        .map(|path| {
+            control_socket::start(path, sessions.clone(), displayed.clone(), host_tx.clone())
+        })
         .transpose()?;
     #[cfg(not(feature = "experimental-control"))]
     let _ = control_path;
@@ -3096,10 +3098,17 @@ async fn run_tui(
     monitor_task.abort();
     apps_task.abort();
 
-    // Suppress child-result wakes before letting the in-flight turn settle.
-    sessions.begin_teardown(&session);
-    sessions.join(&session).await;
-    eprintln!("session: {session}");
+    // The session on screen at exit (a ctrl+s switch or fork moves it off
+    // the startup one) is the one to report for resuming.
+    let last = displayed.read().unwrap().clone();
+    // Suppress child-result wakes before letting the in-flight turns settle.
+    for id in std::iter::once(&session).chain((last != session).then_some(&last)) {
+        sessions.begin_teardown(id);
+    }
+    for id in std::iter::once(&session).chain((last != session).then_some(&last)) {
+        sessions.join(id).await;
+    }
+    eprintln!("session: {last}");
     Ok(())
 }
 
