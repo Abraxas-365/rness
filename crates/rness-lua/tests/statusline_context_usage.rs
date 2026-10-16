@@ -97,6 +97,28 @@ async fn old_binary_and_resume_show_unknown_estimate_without_provider_ratio() {
 }
 
 #[tokio::test]
+async fn activity_belongs_to_the_viewed_session_only() {
+    let host = host().await;
+    // A subagent / fork / previously viewed session is mid-tool.
+    host.fire_hook("turn_start", json!({"session":"two"}));
+    host.fire_hook(
+        "frame",
+        json!({"type":"tool_started", "session":"two", "name":"Bash"}),
+    );
+    let text = status(&host, "one").await;
+    assert!(text.contains("idle") && !text.contains("Bash"), "{text}");
+    let other = status(&host, "two").await;
+    assert!(other.contains("Bash") && !other.contains("idle"), "{other}");
+
+    host.fire_hook("turn_start", json!({"session":"one"}));
+    let text = status(&host, "one").await;
+    assert!(text.contains("working") && !text.contains("Bash"), "{text}");
+    host.fire_hook("turn_end", json!({"session":"one"}));
+    assert!(status(&host, "one").await.contains("idle"));
+    assert!(status(&host, "two").await.contains("Bash"));
+}
+
+#[tokio::test]
 async fn estimates_are_session_local_and_remain_visible_during_compaction() {
     let host = host().await;
     host.fire_hook(

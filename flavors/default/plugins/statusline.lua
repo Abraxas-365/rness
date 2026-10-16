@@ -7,7 +7,8 @@
 local frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧" }
 
 -- session id → start time; several sessions can run at once
--- (subagents, server clients) — busy means ANY turn is live.
+-- (subagents, forks, server clients). The left side shows only the
+-- session being viewed.
 local running = {}
 
 -- session id → what it is doing ("thinking", "writing", a tool name).
@@ -108,19 +109,16 @@ rness.ui.statusline = {
       append_usage(parts, ctx.session)
       return parts
     end
-    local count, oldest, act = 0, nil, nil
-    for id, started in pairs(running) do
-      count = count + 1
-      if oldest == nil or started < oldest then
-        oldest, act = started, doing[id]
-      end
-    end
-    if count == 0 then
+    -- Only the viewed session's turn: subagents, forks and sessions left
+    -- running after a switch have their own counters on the right.
+    local started = ctx.session and running[ctx.session]
+    if started == nil then
       parts[#parts + 1] = "idle"
     else
-      local secs = os.time() - oldest
+      local secs = os.time() - started
       local spin = frames[(secs % #frames) + 1]
-      parts[#parts + 1] = { text = spin .. " " .. (act or "working"), style = { fg = "#83a598" } }
+      parts[#parts + 1] = { text = spin .. " " .. (doing[ctx.session] or "working"),
+        style = { fg = "#83a598" } }
       parts[#parts + 1] = { text = tostring(secs) .. "s" }
     end
     parts[#parts + 1] = "(" .. (ctx.session or ""):sub(1, 8) .. ")"
