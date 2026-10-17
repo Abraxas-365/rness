@@ -149,21 +149,31 @@ impl Input {
             return Vec::new();
         }
         let query = text[1..].to_lowercase();
-        self.commands
+        let mut ranked: Vec<(u8, &(String, String))> = self
+            .commands
             .iter()
             .chain(
                 self.candidates
                     .iter()
                     .filter(|(name, _)| !self.commands.iter().any(|(command, _)| command == name)),
             )
-            .filter(|(name, _)| {
-                if query.contains(' ') {
-                    name.contains(' ') && name.to_lowercase().starts_with(&query)
-                } else {
-                    !name.contains(' ') && name.to_lowercase().starts_with(&query)
-                }
+            .filter_map(|entry| {
+                let name = entry.0.to_lowercase();
+                let rank = match query.split_once(' ') {
+                    // Command arguments match fuzzily: `/model opus` finds
+                    // `model anthropic/claude-opus-4`. The command word
+                    // itself must still match exactly.
+                    Some((command, argument)) => name
+                        .strip_prefix(command)
+                        .and_then(|rest| rest.strip_prefix(' '))
+                        .and_then(|rest| fuzzy_rank(rest, argument)),
+                    None => (!name.contains(' ') && name.starts_with(&query)).then_some(0),
+                };
+                rank.map(|rank| (rank, entry))
             })
-            .collect()
+            .collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, entry)| entry).collect()
     }
 
     fn picker_height(&self) -> u16 {
@@ -180,9 +190,88 @@ impl Input {
     }
 }
 
+/// Ranks `candidate` against `query` (both lowercase): 0 prefix, 1 substring,
+/// 2 in-order subsequence (only for single-word queries, to keep multi-word
+/// arguments from matching loosely). `None` means no match.
+fn fuzzy_rank(candidate: &str, query: &str) -> Option<u8> {
+    if candidate.starts_with(query) {
+        return Some(0);
+    }
+    if candidate.contains(query) {
+        return Some(1);
+    }
+    if query.contains(char::is_whitespace) {
+        return None;
+    }
+    let mut chars = candidate.chars();
+    query
+        .chars()
+        .all(|wanted| chars.any(|c| c == wanted))
+        .then_some(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_arguments_match_fuzzily_with_prefix_first() {
+        let model = crate::app::Model::new("s".into(), "m".into());
+        let theme = crate::theme::Theme::default();
+        let ctx = Ctx {
+            model: &model,
+            theme: &theme,
+        };
+        let mut input = Input::new();
+        input.editor.insert_str("/model sonnet");
+        input.on_action(
+            &ctx,
+            "input:completion",
+            &serde_json::json!({"text":"/model sonnet", "values":[
+                "anthropic/claude-opus-4", "anthropic/claude-sonnet-4", "openai/gpt-5",
+                "sonnet-local"
+            ]}),
+        );
+        let names: Vec<_> = input
+            .matches()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["model sonnet-local", "model anthropic/claude-sonnet-4"]
+        );
+        input.editor.take();
+        input.editor.insert_str("/model snt4");
+        input.on_action(
+            &ctx,
+            "input:completion",
+            &serde_json::json!({"text":"/model snt4", "values":[
+                "anthropic/claude-opus-4", "anthropic/claude-sonnet-4", "openai/gpt-5",
+                "sonnet-local"
+            ]}),
+        );
+        let names: Vec<_> = input
+            .matches()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(names, ["model anthropic/claude-sonnet-4"]);
+        input.editor.take();
+        input.editor.insert_str("/model OPUS-4");
+        input.on_action(
+            &ctx,
+            "input:completion",
+            &serde_json::json!({"text":"/model OPUS-4", "values":["anthropic/claude-opus-4", "openai/gpt-5"]}),
+        );
+        assert_eq!(input.matches().len(), 1);
+        input.on_key(&ctx, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(input.editor.text().trim(), "/model anthropic/claude-opus-4");
+        // The command word itself is not fuzzy.
+        input.editor.take();
+        input.editor.insert_str("/mdl opus");
+        assert!(input.matches().is_empty());
+    }
 
     #[test]
     fn named_submit_is_not_redirected_by_configured_clipboard_key() {
