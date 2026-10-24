@@ -22,11 +22,37 @@ local compacting = {}
 local tokens = {}
 local estimates = {}
 
+-- session id → running background agents, filled off the render path.
+local agents = {}
+
+-- Rust-backed lookups can take far longer than the 250 ms render budget:
+-- the first usage() of a long session (or a fork of one) folds its whole
+-- log, and the first agent listing reads every session header in the
+-- store. Overrunning 3 renders in a row disables the statusline, so render
+-- reads only the caches above and background tasks (no wall-clock budget)
+-- refill them.
+local queued = {}
+
+local function background(key, fn, arg)
+  if queued[key] then return end
+  queued[key] = true
+  local ok = pcall(rness.task.spawn, function(a)
+    -- Cleared first: a request made while this one runs queues another.
+    queued[key] = nil
+    fn(a)
+  end, arg)
+  if not ok then
+    -- No task runner (bare host, older binary): run inline.
+    queued[key] = nil
+    fn(arg)
+  end
+end
+
 local function k(n)
   return string.format("%.1fk", n / 1000)
 end
 
-local function refresh(session)
+local function load_usage(session)
   local ok, usage = pcall(rness.session.usage, session)
   if not ok then return end
   local text = k(usage.input) .. " last input"
@@ -35,6 +61,21 @@ local function refresh(session)
     text = text .. " (+" .. k(cached) .. " cached)"
   end
   tokens[session] = text
+end
+
+local function refresh(session)
+  background("usage:" .. session, load_usage, session)
+end
+
+local function load_agents(session)
+  if not rness.subagents then return end
+  local ok, list = pcall(rness.subagents.list, session)
+  if not ok or type(list) ~= "table" then return end
+  local count = 0
+  for _, agent in ipairs(list) do
+    if agent.running then count = count + 1 end
+  end
+  agents[session] = count
 end
 
 local function append_usage(parts, session)
@@ -131,16 +172,13 @@ rness.ui.statusline = {
     -- Both counters remain visible while the model is idle or compacting. Missing
     -- APIs are tolerated when this plugin is copied to an older binary.
     if ctx.session and rness.subagents then
-      local ok, agents = pcall(rness.subagents.list, ctx.session)
-      if ok and type(agents) == "table" then
-        local count = 0
-        for _, agent in ipairs(agents) do
-          if agent.running then count = count + 1 end
-        end
-        if count > 0 then
-          parts[#parts + 1] = { text = count .. " bg agent" .. (count == 1 and "" or "s"),
-            style = { fg = "#83a598" } }
-        end
+      -- Listing scans the session store: refresh off the render path and
+      -- show the previous count meanwhile (one poll behind).
+      background("agents:" .. ctx.session, load_agents, ctx.session)
+      local count = agents[ctx.session] or 0
+      if count > 0 then
+        parts[#parts + 1] = { text = count .. " bg agent" .. (count == 1 and "" or "s"),
+          style = { fg = "#83a598" } }
       end
     end
     if ctx.session and rness.jobs then

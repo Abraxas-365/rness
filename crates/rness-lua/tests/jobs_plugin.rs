@@ -3,6 +3,13 @@ use rness_kernel::presentation::TextProvider;
 use rness_lua::plugin_host::LuaHost;
 use serde_json::json;
 
+/// Agent counts load in a background task queued by a render, so they land
+/// one poll later: render twice.
+async fn status(host: &LuaHost, context: serde_json::Value) -> String {
+    host.status(context.clone()).await;
+    host.status(context).await.unwrap().to_string()
+}
+
 #[tokio::test]
 async fn default_manifest_resolves_statusline_and_jobs_plugins() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../flavors/default");
@@ -38,16 +45,12 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
     .await
     .unwrap();
     let one = json!({"session":"one","model":"test"});
-    let text = host.status(one.clone()).await.unwrap().to_string();
+    let text = status(&host, one.clone()).await;
     assert!(
         text.contains("idle") && text.contains("2 bg jobs") && text.contains("2 bg agents"),
         "{text}"
     );
-    let text = host
-        .status(json!({"session":"two"}))
-        .await
-        .unwrap()
-        .to_string();
+    let text = status(&host, json!({"session":"two"})).await;
     assert!(
         text.contains("1 bg job") && text.contains("1 bg agent") && !text.contains("2 bg jobs"),
         "{text}"
@@ -56,7 +59,7 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
         "frame",
         json!({"type":"compaction_started","session":"one"}),
     );
-    let text = host.status(one.clone()).await.unwrap().to_string();
+    let text = status(&host, one.clone()).await;
     assert!(
         text.contains("compacting context")
             && text.contains("2 bg jobs")
@@ -66,7 +69,7 @@ async fn statusline_counts_current_session_jobs_while_idle_and_compacting() {
     host.load("settle", "counts.one = 0; agents.one = {}")
         .await
         .unwrap();
-    let settled = host.status(one.clone()).await.unwrap().to_string();
+    let settled = status(&host, one.clone()).await;
     assert!(
         !settled.contains("bg job") && !settled.contains("bg agent"),
         "{settled}"
@@ -99,11 +102,7 @@ async fn statusline_shows_background_agents_without_total_running_agent_count() 
     .unwrap();
     host.fire_hook("turn_start", json!({"session":"parent"}));
     host.fire_hook("turn_start", json!({"session":"child"}));
-    let text = host
-        .status(json!({"session":"parent","model":"test"}))
-        .await
-        .unwrap()
-        .to_string();
+    let text = status(&host, json!({"session":"parent","model":"test"})).await;
     assert!(text.contains("working"), "{text}");
     assert!(text.contains("1 bg agent"), "{text}");
     assert!(!text.contains("2 agents"), "{text}");

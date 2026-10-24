@@ -31,11 +31,12 @@ async fn host() -> LuaHost {
     host
 }
 
+/// Render twice: lookups run in a background task queued by the first
+/// render, so values land one poll later (the TUI polls every 500 ms).
 async fn status(host: &LuaHost, session: &str) -> String {
-    host.status(json!({"session": session, "model": "test"}))
-        .await
-        .unwrap()
-        .to_string()
+    let context = json!({"session": session, "model": "test"});
+    host.status(context.clone()).await;
+    host.status(context).await.unwrap().to_string()
 }
 
 #[tokio::test]
