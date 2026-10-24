@@ -50,6 +50,7 @@ fn configured_routes() -> HashMap<String, Route> {
                 stream_idle_timeout: None,
                 prompt_caching: matches!(kind, Kind::Anthropic),
                 cache_ttl: rness_providers::routes::CacheTtl::Auto,
+                request_compression: Default::default(),
             },
         )
     })

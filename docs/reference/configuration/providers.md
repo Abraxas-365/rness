@@ -220,6 +220,39 @@ credential acquisition uses its own transport and is not covered by this setting
 Timeout failures are retryable; Ctrl+C remains cancellation. Partial failed output
 is never committed as a successful assistant message.
 
+## Request compression
+
+Agent requests resend the whole conversation on every step, so a long session
+uploads hundreds of KB to a few MB per step. For `anthropic` connections rness
+gzip-compresses request bodies of 4096 bytes or more (fast level; transcript
+JSON typically shrinks about 6×) and sends them with `Content-Encoding: gzip`.
+The server decodes the body before anything else, so token counts and prompt
+caching are unchanged. The gain is upload time before the model can start: large
+on slow or mobile uplinks, small on fast fibre.
+
+```lua
+-- Default: gzip only toward https://api.anthropic.com with no HTTPS proxy.
+rness.providers.set_request_compression("anthropic", "auto")
+-- An Anthropic-wire gateway known to decode gzip bodies.
+rness.providers.set_request_compression("my-gateway", "gzip")
+-- Never compress.
+rness.providers.set_request_compression("anthropic", "off")
+```
+
+| Mode | Behavior |
+| --- | --- |
+| `auto` (default) | Compress only when `base_url` is `https://api.anthropic.com` and none of `HTTPS_PROXY`, `https_proxy`, `ALL_PROXY`, `all_proxy` is set |
+| `gzip` | Compress for any endpoint of this connection |
+| `off` | Always send plain JSON |
+
+If the endpoint rejects a compressed body (HTTP 415, or HTTP 400 saying the
+body is not valid JSON or naming the content encoding), rness resends that
+request uncompressed and stops compressing for that connection until restart.
+Other errors are reported as usual and are not resent. OpenAI-compatible and
+ChatGPT connections always send plain JSON, and the setting is ignored for them.
+Like the other `rness.providers.set_*` calls, this is a startup declaration:
+unknown connection names fail startup.
+
 ## Failures and recovery
 
 Each failed provider attempt remains in durable session history. The TUI shows

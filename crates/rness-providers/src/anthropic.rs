@@ -71,6 +71,11 @@ pub struct AnthropicProvider {
     cache_ttl_setting: crate::routes::CacheTtl,
     /// Whether the cache TTL has been resolved (latched once).
     cache_ttl_resolved: std::sync::atomic::AtomicBool,
+    /// Request-body compression preference.
+    request_compression: crate::routes::RequestCompression,
+    /// Latched when the endpoint rejected a gzip body: later requests from
+    /// this provider go out uncompressed.
+    gzip_rejected: std::sync::atomic::AtomicBool,
 }
 
 impl AnthropicProvider {
@@ -117,6 +122,8 @@ impl AnthropicProvider {
             cache_ttl_downgraded: std::sync::atomic::AtomicBool::new(false),
             cache_ttl_setting: crate::routes::CacheTtl::Auto,
             cache_ttl_resolved: std::sync::atomic::AtomicBool::new(false),
+            request_compression: crate::routes::RequestCompression::Auto,
+            gzip_rejected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -138,6 +145,8 @@ impl AnthropicProvider {
             cache_ttl_downgraded: std::sync::atomic::AtomicBool::new(false),
             cache_ttl_setting: crate::routes::CacheTtl::Auto,
             cache_ttl_resolved: std::sync::atomic::AtomicBool::new(false),
+            request_compression: crate::routes::RequestCompression::Auto,
+            gzip_rejected: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -168,6 +177,32 @@ impl AnthropicProvider {
             crate::routes::CacheTtl::Auto => {} // Resolved on first request based on auth type.
         }
         self
+    }
+
+    /// Set the request-body compression preference (default `Auto`).
+    pub fn with_request_compression(mut self, mode: crate::routes::RequestCompression) -> Self {
+        self.request_compression = mode;
+        self
+    }
+
+    /// Whether this request body should be gzip-compressed. `Auto` only
+    /// compresses toward Anthropic's own API with no HTTPS proxy configured:
+    /// gateways and inspecting proxies may not decode request bodies.
+    fn compress_requests(&self) -> bool {
+        use crate::routes::RequestCompression;
+        if self
+            .gzip_rejected
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        match self.request_compression {
+            RequestCompression::Off => false,
+            RequestCompression::Gzip => true,
+            RequestCompression::Auto => {
+                is_first_party_api(&self.base_url) && !crate::https_proxy_configured()
+            }
+        }
     }
 
     /// Latch the cache TTL on first use when set to Auto.
@@ -577,12 +612,22 @@ impl AnthropicProvider {
         Ok(())
     }
 
-    fn request_for(&self, credential: &Credential, body: &Value) -> reqwest::RequestBuilder {
+    /// Build the request; the flag reports whether the body went out
+    /// gzip-compressed (so a rejection can fall back to plain JSON).
+    fn request_for(
+        &self,
+        credential: &Credential,
+        body: &Value,
+    ) -> (reqwest::RequestBuilder, bool) {
         let base = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("anthropic-version", API_VERSION);
-        let base = crate::json_body(base, body);
+        let (base, compressed) = if self.compress_requests() {
+            crate::gzip_json_body(base, body)
+        } else {
+            (crate::json_body(base, body), false)
+        };
 
         // Build caching beta headers when prompt caching is active.
         let cache_betas = if self.prompt_caching {
@@ -596,7 +641,7 @@ impl AnthropicProvider {
             None
         };
 
-        match credential {
+        let request = match credential {
             Credential::ApiKey(key) => {
                 let req = base.header("x-api-key", key);
                 if let Some(betas) = cache_betas {
@@ -618,7 +663,68 @@ impl AnthropicProvider {
                     .header("anthropic-dangerous-direct-browser-access", "true")
                     .header("x-app", "cli")
             }
+        };
+        (request, compressed)
+    }
+}
+
+/// Anthropic's own API host: the one endpoint known to decode gzip bodies.
+fn is_first_party_api(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .is_ok_and(|url| url.scheme() == "https" && url.host_str() == Some("api.anthropic.com"))
+}
+
+/// Whether an error response means the server could not take the gzip
+/// body itself (unsupported encoding, or gzip bytes read as JSON).
+fn is_gzip_rejection(status: u16, body: &str) -> bool {
+    if status == 415 {
+        return true;
+    }
+    if status != 400 {
+        return false;
+    }
+    let lower = body.to_lowercase();
+    [
+        "not valid json",
+        "content-encoding",
+        "content encoding",
+        "gzip",
+        "decompress",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use super::{is_first_party_api, is_gzip_rejection};
+
+    #[test]
+    fn auto_compression_targets_only_the_anthropic_api() {
+        assert!(is_first_party_api("https://api.anthropic.com"));
+        assert!(is_first_party_api("https://api.anthropic.com/"));
+        for url in [
+            "http://api.anthropic.com",
+            "https://api.anthropic.com.evil.example",
+            "https://gateway.example/anthropic",
+            "http://127.0.0.1:8080",
+            "not a url",
+        ] {
+            assert!(!is_first_party_api(url), "{url}");
         }
+    }
+
+    #[test]
+    fn only_encoding_failures_count_as_gzip_rejections() {
+        assert!(is_gzip_rejection(415, ""));
+        assert!(is_gzip_rejection(
+            400,
+            r#"{"error":{"message":"The request body is not valid JSON: EOF while parsing"}}"#
+        ));
+        assert!(is_gzip_rejection(400, "unsupported Content-Encoding"));
+        assert!(!is_gzip_rejection(400, "max_tokens: must be at most 64000"));
+        assert!(!is_gzip_rejection(413, "gzip"));
+        assert!(!is_gzip_rejection(429, "not valid json"));
     }
 }
 
@@ -962,11 +1068,12 @@ impl Provider for AnthropicProvider {
                     partial: vec![],
                 };
             }
+            let (http_request, compressed) = self.request_for(&credential, &body);
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
                 _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
-                r = self.request_for(&credential, &body).send() => r,
+                r = http_request.send() => r,
             };
 
             let response = match response {
@@ -999,6 +1106,17 @@ impl Provider for AnthropicProvider {
                     _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: crate::image_error("timeout reading provider error".into()), partial: vec![] },
                     text = response.text() => text.unwrap_or_default(),
                 };
+                // The endpoint cannot take gzip bodies: stop compressing for
+                // this provider and resend the same request as plain JSON.
+                if compressed && is_gzip_rejection(status.as_u16(), &body) {
+                    self.gzip_rejected
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    tracing::warn!(
+                        status = status.as_u16(),
+                        "anthropic: endpoint rejected a gzip request body; sending uncompressed from now on"
+                    );
+                    continue;
+                }
                 if rejected.is_empty() && matches!(status.as_u16(), 400 | 404 | 410 | 422) {
                     rejected = crate::rejected_uploads(&body, &used);
                     if !rejected.is_empty() {

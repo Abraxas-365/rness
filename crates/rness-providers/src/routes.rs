@@ -33,6 +33,31 @@ pub enum CacheTtl {
     OneHour,
 }
 
+/// Request-body compression for Anthropic routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestCompression {
+    /// gzip large bodies sent to `https://api.anthropic.com` when no HTTPS
+    /// proxy is configured; plain JSON everywhere else.
+    #[default]
+    Auto,
+    /// gzip large bodies to any endpoint (gateways known to decode gzip).
+    Gzip,
+    /// Never compress.
+    Off,
+}
+
+impl RequestCompression {
+    /// Parse the `rness.providers.set_request_compression` value.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "gzip" => Some(Self::Gzip),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Route {
     pub kind: Kind,
@@ -48,6 +73,8 @@ pub struct Route {
     pub prompt_caching: bool,
     /// Cache TTL preference (Anthropic only). Ignored when `prompt_caching` is false.
     pub cache_ttl: CacheTtl,
+    /// Request-body compression (Anthropic only; other kinds send plain JSON).
+    pub request_compression: RequestCompression,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -137,6 +164,7 @@ pub fn build_with_api_key(
             if route.prompt_caching {
                 provider = provider.with_prompt_caching(route.cache_ttl);
             }
+            provider = provider.with_request_compression(route.request_compression);
             Ok(Arc::new(
                 provider
                     .with_headers(route.headers.clone())
@@ -172,6 +200,7 @@ pub fn build_with_oauth(
             if route.prompt_caching {
                 provider = provider.with_prompt_caching(route.cache_ttl);
             }
+            provider = provider.with_request_compression(route.request_compression);
             Ok(Arc::new(
                 provider
                     .with_headers(route.headers.clone())
@@ -228,6 +257,7 @@ pub fn parse_route_spec(spec: &str) -> Result<(String, Route), RouteError> {
             stream_idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
             prompt_caching: false,
             cache_ttl: CacheTtl::Auto,
+            request_compression: RequestCompression::Auto,
         },
     ))
 }
@@ -316,6 +346,7 @@ pub fn build(
             if route.prompt_caching {
                 provider = provider.with_prompt_caching(route.cache_ttl);
             }
+            provider = provider.with_request_compression(route.request_compression);
             Ok(Arc::new(
                 provider
                     .with_headers(route.headers.clone())?

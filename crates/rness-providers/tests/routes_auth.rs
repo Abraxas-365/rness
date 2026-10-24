@@ -51,6 +51,7 @@ async fn body_inactivity_timeout_is_explicit_and_retryable() {
             stream_idle_timeout: Some(std::time::Duration::from_millis(50)),
             prompt_caching: false,
             cache_ttl: routes::CacheTtl::Auto,
+            request_compression: Default::default(),
         };
         let dir = tempfile::tempdir().unwrap();
         let provider = if matches!(kind, Kind::ChatGptResponses) {
@@ -132,6 +133,7 @@ async fn api_keys_use_protocol_specific_headers() {
             stream_idle_timeout: None,
             prompt_caching: false,
             cache_ttl: routes::CacheTtl::Auto,
+            request_compression: Default::default(),
         };
         let provider = routes::build_with_api_key(&route, "test", "fake-key".into()).unwrap();
         send(provider.as_ref()).await;
@@ -175,6 +177,7 @@ async fn no_auth_means_no_authorization_header() {
             stream_idle_timeout: None,
             prompt_caching: false,
             cache_ttl: routes::CacheTtl::Auto,
+            request_compression: Default::default(),
         },
     )]
     .into();
@@ -224,6 +227,7 @@ async fn oauth_uses_named_tokens_not_stored_api_keys() {
             stream_idle_timeout: None,
             prompt_caching: false,
             cache_ttl: routes::CacheTtl::Auto,
+            request_compression: Default::default(),
         };
         let provider =
             routes::build_with_oauth(&route, "test", store, "custom-login".into()).unwrap();

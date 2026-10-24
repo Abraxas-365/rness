@@ -417,6 +417,58 @@ pub(crate) fn json_body(
     }
 }
 
+/// Bodies smaller than this are sent uncompressed: below a few KiB gzip
+/// saves less upload time than it costs.
+pub(crate) const GZIP_MIN_BODY_BYTES: usize = 4096;
+
+/// Like [`json_body`], but gzip-compresses (fast level) bodies of at least
+/// [`GZIP_MIN_BODY_BYTES`] and marks them `Content-Encoding: gzip`. Returns
+/// whether the body went out compressed. Agent requests are large,
+/// repetitive JSON (~6x smaller compressed), so on slow uplinks this cuts
+/// the time before the provider can start working.
+pub(crate) fn gzip_json_body(
+    request: reqwest::RequestBuilder,
+    body: &serde_json::Value,
+) -> (reqwest::RequestBuilder, bool) {
+    use std::io::Write;
+    let Ok(raw) = rness_protocol::events::to_vec_exact(body) else {
+        return (request.json(body), false);
+    };
+    let request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
+    if raw.len() < GZIP_MIN_BODY_BYTES {
+        return (request.body(raw), false);
+    }
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(raw.len() / 4),
+        flate2::Compression::fast(),
+    );
+    match encoder.write_all(&raw).and_then(|_| encoder.finish()) {
+        Ok(compressed) => {
+            tracing::debug!(
+                raw_bytes = raw.len(),
+                gzip_bytes = compressed.len(),
+                "request body gzip-compressed"
+            );
+            (
+                request
+                    .header(reqwest::header::CONTENT_ENCODING, "gzip")
+                    .body(compressed),
+                true,
+            )
+        }
+        Err(_) => (request.body(raw), false),
+    }
+}
+
+/// True when the environment routes HTTPS through a proxy (reqwest honors
+/// these variables). Automatic compression is skipped there: inspecting
+/// proxies may not accept encoded request bodies.
+pub(crate) fn https_proxy_configured() -> bool {
+    ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
+}
+
 #[cfg(test)]
 mod error_message_tests {
     use super::error_message;

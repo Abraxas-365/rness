@@ -69,6 +69,8 @@ pub struct StartupConfig {
     pub stream_idle_timeouts: BTreeMap<String, u64>,
     /// Per-provider cache TTL override ("5m" or "1h"). Absent = auto.
     pub cache_ttls: BTreeMap<String, String>,
+    /// Per-provider request compression ("auto", "gzip" or "off"). Absent = auto.
+    pub request_compression: BTreeMap<String, String>,
     pub default_profile: Option<String>,
     pub agents: BTreeMap<String, rness_engine::config::AgentDefinition>,
     /// Generic children are disabled unless explicitly enabled at startup.
@@ -355,6 +357,29 @@ mod permission_tests {
         }
         std::fs::write(&path, "rness.providers.set_cache_ttl('anthropic', '1h')").unwrap();
         assert_eq!(super::load(&path).unwrap().cache_ttls["anthropic"], "1h");
+    }
+
+    #[test]
+    fn request_compression_is_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        assert!(super::load(&path).unwrap().request_compression.is_empty());
+        for source in [
+            "rness.providers.set_request_compression('anthropic', 'zstd')",
+            "rness.providers.set_request_compression('', 'off')",
+        ] {
+            std::fs::write(&path, source).unwrap();
+            assert!(super::load(&path).is_err());
+        }
+        std::fs::write(
+            &path,
+            "rness.providers.set_request_compression('anthropic', 'off')",
+        )
+        .unwrap();
+        assert_eq!(
+            super::load(&path).unwrap().request_compression["anthropic"],
+            "off"
+        );
     }
 
     #[test]
@@ -1190,6 +1215,25 @@ pub fn evaluate(
     )?;
     let s = state.clone();
     providers.set(
+        "set_request_compression",
+        lua.create_function(move |_, (name, mode): (String, String)| {
+            if name.trim().is_empty() {
+                return Err(mlua::Error::runtime("provider name must be nonempty"));
+            }
+            match mode.as_str() {
+                "auto" | "gzip" | "off" => {}
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "request_compression must be 'auto', 'gzip' or 'off'",
+                    ))
+                }
+            }
+            s.lock().unwrap().request_compression.insert(name, mode);
+            Ok(())
+        })?,
+    )?;
+    let s = state.clone();
+    providers.set(
         "set_default_account",
         lua.create_function(move |_, (name, account): (String, String)| {
             if name.trim().is_empty() {
@@ -1545,6 +1589,7 @@ pub fn evaluate(
         ("plugins", "setup"),
         ("providers", "set_stream_idle_timeout"),
         ("providers", "set_cache_ttl"),
+        ("providers", "set_request_compression"),
         ("providers", "set_default_account"),
         ("plugins", "load"),
         ("agents", "declare"),

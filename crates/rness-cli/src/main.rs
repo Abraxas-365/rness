@@ -431,6 +431,7 @@ async fn run() -> anyhow::Result<u8> {
                 stream_idle_timeout: Some(std::time::Duration::from_secs(300)),
                 prompt_caching: matches!(kind, routes::Kind::Anthropic),
                 cache_ttl: routes::CacheTtl::Auto,
+                request_compression: routes::RequestCompression::Auto,
                 headers: rness_providers::headers::ProviderHeaders::new(&declaration.headers)
                     .map_err(|e| anyhow::anyhow!("provider {name}: {e}"))?,
             },
@@ -459,6 +460,13 @@ async fn run() -> anyhow::Result<u8> {
             "5m" => routes::CacheTtl::FiveMinutes,
             _ => routes::CacheTtl::Auto,
         };
+    }
+    for (name, mode) in &startup.request_compression {
+        let route = route_table.get_mut(name).with_context(|| {
+            format!("request_compression configured for unknown provider: {name}")
+        })?;
+        route.request_compression = routes::RequestCompression::parse(mode)
+            .with_context(|| format!("provider {name}: invalid request_compression {mode:?}"))?;
     }
 
     // -- account selection: --account flag overrides per-provider default_account.
