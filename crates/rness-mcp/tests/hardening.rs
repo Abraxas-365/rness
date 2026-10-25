@@ -31,6 +31,7 @@ fn spec() -> StdioServer {
         command: "python3".into(),
         args: vec!["-u".into(), "-c".into(), SERVER.into()],
         env: vec![("EXPLICIT_KEY".into(), "chosen".into())],
+        cwd: None,
         timeout: Duration::from_secs(2),
     }
 }

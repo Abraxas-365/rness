@@ -34,6 +34,7 @@ fn spec(
         command: "python3".into(),
         args,
         env: vec![],
+        cwd: None,
         timeout: Duration::from_millis(timeout_ms),
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "rness-cli"
-description = "The rness binary: config layers, composition root, mode selection (tui/server/headless)."
+description = "The rness binary: config layers, composition root, mode selection (tui/server/acp/headless)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ rness-tools.workspace = true
 rness-lua.workspace = true
 rness-tui.workspace = true
 rness-server.workspace = true
+rness-acp.workspace = true
 axum.workspace = true
 clap.workspace = true
 dirs.workspace = true

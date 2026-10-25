@@ -237,6 +237,7 @@ pub fn install(
                     command: command.expect("validated command"),
                     args,
                     env,
+                    cwd: None,
                     timeout: Duration::from_millis(timeout_ms),
                 })
             };

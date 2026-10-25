@@ -10,6 +10,7 @@ Stdlib-only Python 3. Every script runs the **frozen** binaries; nothing here bu
 | `perf.py`, `compare_baseline.py` | JSON-lines perf reporter, baseline comparison (>25 % median = regression) |
 | `selftest.py` | Every scenario × shape through headless rness, plus the harness modes (≈280 checks, ~2 min) |
 | `cli_e2e.py` | WP-7 CLI matrix, `--list` timing, headless exit codes, SIGINT, control socket, install upgrade |
+| `acp_e2e.py` | `rness --acp` over real stdio: handshake, prompt + permission round-trip, load replay, list, EOF exit |
 | `baselines/<probe>.json` | Stored perf medians |
 
 ## Conventions (§0)

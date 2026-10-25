@@ -47,15 +47,36 @@ pub enum McpError {
 }
 
 /// How to reach one MCP server: a child process speaking stdio.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct StdioServer {
     /// Stable local namespace for public tool names. `[A-Za-z0-9_-]{1,32}`.
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Working directory of the child; `None` inherits the host's.
+    pub cwd: Option<std::path::PathBuf>,
     /// Per-request timeout. No default — the host decides (0 magic).
     pub timeout: Duration,
+}
+
+/// Environment values may hold secrets: only names are shown.
+impl std::fmt::Debug for StdioServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env: Vec<_> = self
+            .env
+            .iter()
+            .map(|(name, _)| format!("{name}=<redacted>"))
+            .collect();
+        f.debug_struct("StdioServer")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &env)
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 /// Public, model-facing name for an MCP tool. Deterministic pure
@@ -236,6 +257,9 @@ impl McpConnection {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if let Some(cwd) = &spec.cwd {
+            cmd.current_dir(cwd);
+        }
         let mut child = cmd.spawn().map_err(|source| McpError::Spawn {
             server: spec.name.clone(),
             source,

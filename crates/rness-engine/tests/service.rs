@@ -2943,3 +2943,78 @@ async fn concurrent_async_sends_queue_instead_of_busy() {
         .await
         .unwrap();
 }
+
+/// Records the advertised tool names (and Echo description) of each request.
+struct ToolNames(Mutex<Vec<Vec<String>>>);
+
+#[async_trait]
+impl Provider for ToolNames {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, request: StepRequest<'_>, _cancel: &CancellationToken) -> StepOutcome {
+        self.0.lock().unwrap().push(
+            request
+                .tools
+                .iter()
+                .map(|spec| format!("{}:{}", spec.name, spec.description))
+                .collect(),
+        );
+        StepOutcome::Committed(assistant("ok", StopReason::EndTurn, vec![]))
+    }
+}
+
+struct Named(&'static str, &'static str);
+#[async_trait]
+impl Tool for Named {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn description(&self) -> &str {
+        self.1
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<String, String> {
+        Ok(String::new())
+    }
+}
+
+#[tokio::test]
+async fn session_tools_are_scoped_to_their_session_and_shadow_globals() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(ToolNames(Mutex::new(vec![])));
+    let svc = service(dir.path(), provider.clone());
+    let a = svc.create(None).unwrap();
+    let b = svc.create(None).unwrap();
+    let child = svc
+        .create_delegated(
+            None,
+            rness_protocol::branch::Delegation {
+                parent: a.clone(),
+                call: None,
+                depth: 1,
+                mode: Default::default(),
+            },
+        )
+        .unwrap();
+    let overlay = Arc::new(svc.tool_registry().scoped_empty());
+    overlay.register(Arc::new(Named("mcp__client__ping", "client")));
+    overlay.register(Arc::new(Named("Echo", "shadowed")));
+    svc.set_session_tools(&a, overlay);
+    for session in [&a, &b, &child] {
+        svc.send(session, UserIntent::Followup, text("hi")).unwrap();
+        svc.join(session).await;
+    }
+    svc.clear_session_tools(&a);
+    svc.send(&a, UserIntent::Followup, text("again")).unwrap();
+    svc.join(&a).await;
+
+    let seen = provider.0.lock().unwrap().clone();
+    assert_eq!(seen[0], vec!["Echo:shadowed", "mcp__client__ping:client"]);
+    assert_eq!(seen[1], vec!["Echo:"], "other sessions never see it");
+    assert_eq!(
+        seen[2],
+        vec!["Echo:"],
+        "delegated children do not inherit it"
+    );
+    assert_eq!(seen[3], vec!["Echo:"], "cleared from the next turn");
+}

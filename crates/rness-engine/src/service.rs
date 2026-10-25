@@ -614,6 +614,23 @@ impl SessionService {
         &self.tools.file_references
     }
 
+    /// Layer `tools` over `session`'s own turns (not its delegated
+    /// children's), shadowing same-name process tools. In memory only;
+    /// read at each turn start, so changes apply from the next turn.
+    /// Build it with [`ToolRegistry::scoped_empty`] on [`Self::tool_registry`].
+    pub fn set_session_tools(&self, session: &SessionId, tools: Arc<ToolRegistry>) {
+        self.tools.session_tools.set(session, Some(tools));
+    }
+
+    pub fn clear_session_tools(&self, session: &SessionId) {
+        self.tools.session_tools.set(session, None);
+    }
+
+    /// The process-wide tool registry (for building session overlays).
+    pub fn tool_registry(&self) -> &Arc<ToolRegistry> {
+        &self.tools
+    }
+
     /// In-memory structured-output attachments (child-scoped capture).
     pub fn structured_outputs(&self) -> &Arc<crate::structured::StructuredOutputs> {
         &self.tools.structured

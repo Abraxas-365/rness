@@ -282,6 +282,7 @@ rness/
 │   ├── rness-lua/              # runtime, plugin_host, reload, api/ (rness.*)
 │   ├── rness-tui/              # app, slots, component, core/, modules/, theme
 │   ├── rness-server/           # axum HTTP/SSE over SessionService
+│   ├── rness-acp/              # ACP v1 (JSON-RPC stdio) over SessionService
 │   └── rness-cli/              # the binary; sole composition root
 ├── examples/                     # example Lua plugins (copyable)
 │   ├── init.lua
@@ -328,7 +329,7 @@ Rules:
 | Session log | serde_json + tokio::fs, fd-lock, ulid, jiff | No DB |
 | TUI | ratatui, crossterm, pulldown-cmark (own renderer), syntect, unicode-width, textwrap | tui-textarea as editor base, expect to fork; ratatui-image later |
 | Tools | portable-pty, ignore, globset, grep-* (ripgrep internals), similar, notify | Grep tool = ripgrep-as-a-library |
-| Server | axum (built-in SSE) | ONE wire protocol (dsh's RPC+SDK+ACP sprawl is a lesson) |
+| Server | axum (built-in SSE) | ONE native wire protocol (dsh's RPC+SDK+ACP sprawl is a lesson). `rness-acp` is a thin *interop* frontend for ACP clients (editors, channel gateways), not a second native protocol: it translates committed log events and owns no state |
 | CLI | clap, dirs, keyring (OS keychain for API keys), include_dir | |
 | Errors/obs | thiserror (libs) + anyhow (edges), tracing stack | Spans map to turn/step/tool |
 | Testing | insta + ratatui TestBackend, wiremock, proptest, tempfile | FTS via SQLite FTS5 later if needed (not tantivy) |
