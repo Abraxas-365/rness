@@ -48,6 +48,7 @@ fn fake_server(dir: &std::path::Path) -> StdioServer {
         command: "python3".into(),
         args: vec![script.to_string_lossy().into_owned()],
         env: vec![],
+        cwd: None,
         timeout: Duration::from_secs(5),
     }
 }
@@ -115,6 +116,7 @@ async fn spawn_failure_is_a_loud_typed_error() {
         command: "/nonexistent/binary".into(),
         args: vec![],
         env: vec![],
+        cwd: None,
         timeout: Duration::from_secs(1),
     })
     .await;

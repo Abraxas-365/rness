@@ -92,6 +92,12 @@ struct Cli {
     #[arg(long, value_name = "ADDR")]
     serve: Option<String>,
 
+    /// Speak the Agent Client Protocol (ACP v1) on stdin/stdout instead of
+    /// the TUI, for ACP clients (editors, channel gateways, other agents).
+    /// Logs go to stderr; stdout carries only JSON-RPC.
+    #[arg(long, conflicts_with_all = ["serve", "prompt", "list", "session", "fork"])]
+    acp: bool,
+
     /// Experimental native-TUI submission endpoint: private Unix socket or local Windows pipe.
     #[cfg(feature = "experimental-control")]
     #[arg(long, value_name = "PATH", conflicts_with_all = ["serve", "prompt", "list"])]
@@ -316,8 +322,11 @@ async fn run() -> anyhow::Result<u8> {
     // Interactive mode owns the terminal: a stray stderr line would be
     // painted over the TUI. Log to ~/.rness/log instead; headless and
     // server modes keep stderr.
-    let interactive =
-        cli.command.is_none() && cli.prompt.is_none() && cli.serve.is_none() && !cli.list;
+    let interactive = cli.command.is_none()
+        && cli.prompt.is_none()
+        && cli.serve.is_none()
+        && !cli.acp
+        && !cli.list;
     let env_filter =
         || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
     if interactive {
@@ -1203,6 +1212,57 @@ async fn run() -> anyhow::Result<u8> {
             rness_server::auth::authorize,
         ));
         axum::serve(listener, router).await?;
+        return Ok(0);
+    }
+
+    // ACP mode: same engine, same plugins, JSON-RPC on stdio. The client
+    // is the approver under `ask`; there is no TUI to answer.
+    if cli.acp {
+        let _reload = if lua_root.is_dir() {
+            let lua_tools = installed_lua_tools.clone();
+            rness_lua::reload::watch_startup(
+                lua_root,
+                &startup,
+                lua.clone(),
+                Arc::clone(&tools),
+                lua_tools,
+                |_| {},
+            )
+            .ok()
+        } else {
+            None
+        };
+        // No overlay can answer ask_user here.
+        questions.set_available(false);
+        let agent = rness_acp::AcpAgent::new(
+            Arc::clone(&sessions),
+            rness_acp::AcpConfig {
+                // Advertise images unless the startup model declares it
+                // cannot read them; prompts re-check the session's model.
+                images: sessions
+                    .model_capabilities(&rness_protocol::events::ModelSelection {
+                        route: selection.route.clone(),
+                        model: selection.model.clone(),
+                    })
+                    .is_none_or(|caps| caps.image_input != Some(false)),
+                ..Default::default()
+            },
+        );
+        if policy == rness_engine::approval::Policy::Ask
+            || startup
+                .permissions
+                .values()
+                .any(|rule| *rule == rness_engine::approval::ToolPolicy::Ask)
+        {
+            tools.approvals().set_answerer(Arc::clone(&agent) as _);
+        }
+        jobs.attach_sessions(&sessions);
+        subagents.reconcile_on_resume();
+        tracing::info!("rness ACP agent on stdio (model: {})", selection.model);
+        agent
+            .serve(tokio::io::stdin(), tokio::io::stdout())
+            .await
+            .context("ACP connection")?;
         return Ok(0);
     }
 

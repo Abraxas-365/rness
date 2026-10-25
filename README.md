@@ -198,6 +198,7 @@ rness -m chatgpt/gpt-6-astra --reasoning high \
 | Fork a session and continue in the copy | `rness --fork SESSION_ID` |
 | List saved sessions for the current directory | `rness --list` |
 | HTTP/SSE server | `rness --serve 127.0.0.1:7777 -m chatgpt/gpt-6-astra --reasoning high` |
+| Agent Client Protocol (ACP) agent on stdio | `rness --acp --approval ask` |
 | Local Ollama model | `rness -m ollama/YOUR_INSTALLED_MODEL` |
 | One-off OpenAI-compatible connection | `rness --route local=http://localhost:8000/v1,none -m local/YOUR_MODEL` |
 
@@ -309,6 +310,7 @@ Reasoning effort is not a universal model capability. Do not assume every model 
 | `--instructions NAMES` | Comma-separated instruction filenames in precedence order; default: `AGENTS.md,CLAUDE.md`. Use `none` to disable. |
 | `--instructions-bytes BYTES` | Instruction baseline byte budget; default: `65536`. |
 | `--serve ADDR` | Run the HTTP/SSE service instead of the TUI. |
+| `--acp` | Speak the Agent Client Protocol (ACP v1, JSON-RPC on stdin/stdout) instead of the TUI, for ACP clients such as editors or channel gateways. See [docs/guides/acp.md](docs/guides/acp.md). |
 | `--list` | List sessions whose saved workspace matches the current directory and exit (not the entire repository or subdirectories; sessions without a saved workspace are omitted). |
 | `-h`, `--help` | Show the current CLI reference. |
 | `-V`, `--version` | Print the installed version. |

@@ -239,6 +239,40 @@ pub struct ToolCall {
     pub args: serde_json::Value,
 }
 
+/// Tools visible only to one session's own turns — not to its delegated
+/// children (dsh: a child's tool view is not inherited). In memory only.
+/// Each overlay is a live registry (e.g. MCP connections bridge into it and
+/// re-bridge on `tools/list_changed`), read once per turn.
+#[derive(Default)]
+pub struct SessionTools(std::sync::Mutex<HashMap<SessionId, Arc<ToolRegistry>>>);
+
+impl SessionTools {
+    pub fn set(&self, session: &SessionId, tools: Option<Arc<ToolRegistry>>) {
+        let mut map = self.0.lock().expect("session tools lock");
+        match tools {
+            Some(tools) => map.insert(session.clone(), tools),
+            None => map.remove(session),
+        };
+    }
+
+    /// The overlay's current tools, name-sorted.
+    pub fn get(&self, session: &SessionId) -> Vec<Arc<dyn Tool>> {
+        let overlay = self
+            .0
+            .lock()
+            .expect("session tools lock")
+            .get(session)
+            .cloned();
+        overlay.map_or_else(Vec::new, |registry| {
+            registry
+                .names()
+                .iter()
+                .filter_map(|name| registry.get(name))
+                .collect()
+        })
+    }
+}
+
 #[derive(Default)]
 pub struct ToolRegistry {
     /// Interior-mutable so composition roots holding `Arc<ToolRegistry>`
@@ -253,6 +287,9 @@ pub struct ToolRegistry {
     /// In-memory structured-output attachments by child session; shared by
     /// every scoped/restricted clone (never durable, see `structured`).
     pub structured: Arc<crate::structured::StructuredOutputs>,
+    /// Session-scoped tools (e.g. MCP servers an ACP client attached),
+    /// layered over each of that session's turns; shared by every clone.
+    pub session_tools: Arc<SessionTools>,
     approvals: Arc<Approvals>,
     hooks: Arc<HookState>,
     /// Root directory for spill files (oversized tool output).
@@ -498,6 +535,7 @@ impl ToolRegistry {
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             structured: self.structured.clone(),
+            session_tools: self.session_tools.clone(),
             file_references: self.file_references.clone(),
             spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
         }
@@ -520,20 +558,44 @@ impl ToolRegistry {
             hooks: Arc::clone(&self.hooks),
             plan_selections: self.plan_selections.clone(),
             structured: self.structured.clone(),
+            session_tools: self.session_tools.clone(),
             file_references: self.file_references.clone(),
             spill_root: RwLock::new(self.spill_root.read().expect("registry lock").clone()),
+        }
+    }
+
+    /// An empty registry sharing this one's image store — the target for
+    /// session-scoped tools ([`SessionTools`]).
+    pub fn scoped_empty(&self) -> Self {
+        Self {
+            images: self.images.clone(),
+            ..Self::default()
         }
     }
 
     /// A clone with one extra (or overriding) scoped tool — used for the
     /// child-only `structured_output` capture tool.
     pub fn with_tool(&self, tool: Arc<dyn Tool>) -> Self {
+        self.with_tools(std::slice::from_ref(&tool))
+    }
+
+    /// A clone with extra scoped tools layered on top: a same-name tool
+    /// shadows the registered one (and is never deferred). Used for the
+    /// session-scoped overlay ([`crate::service::SessionService::set_session_tools`]).
+    pub fn with_tools(&self, extra: &[Arc<dyn Tool>]) -> Self {
         let clone = self.restricted(&self.names());
-        clone
-            .tools
-            .write()
-            .expect("registry lock")
-            .insert(tool.name().to_string(), tool);
+        {
+            let mut tools = clone.tools.write().expect("registry lock");
+            let mut deferred = clone.deferred.write().expect("registry lock");
+            // Engine-owned names (`ToolSearch`, `run_code`) are never shadowed.
+            for tool in extra
+                .iter()
+                .filter(|t| !matches!(t.name(), "ToolSearch" | "run_code"))
+            {
+                deferred.remove(tool.name());
+                tools.insert(tool.name().to_string(), Arc::clone(tool));
+            }
+        }
         clone
     }
 

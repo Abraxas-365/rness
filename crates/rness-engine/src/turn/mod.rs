@@ -268,6 +268,22 @@ async fn drive(
         .and_then(|agent| agent.tools.as_ref())
         .map(|names| tools.restricted(names));
     let tools = restricted.as_ref().unwrap_or(tools);
+    // Session-scoped tools (ACP mcpServers): added AFTER ceiling/role
+    // restrictions, like dsh's scope-owned registrations, and shadowing a
+    // same-name process tool. Delegated children never see them.
+    let overlay: Vec<_> = tools
+        .session_tools
+        .get(&session)
+        .into_iter()
+        .map(|tool| match &workspace {
+            Some(path) => tool
+                .for_workspace_with_policy(&session, std::path::Path::new(path), sandbox)
+                .unwrap_or(tool),
+            None => tool,
+        })
+        .collect();
+    let with_overlay = (!overlay.is_empty()).then(|| tools.with_tools(&overlay));
+    let tools = with_overlay.as_ref().unwrap_or(tools);
     // Child-scoped structured output (in memory, dsh `attachStructuredRuntime`):
     // added AFTER ceiling/role restrictions so neither can strip it.
     let structured = tools.structured.get(&session);

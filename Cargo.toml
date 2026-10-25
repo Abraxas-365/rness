@@ -11,6 +11,7 @@ members = [
     "crates/rness-mcp",
     "crates/rness-tui",
     "crates/rness-server",
+    "crates/rness-acp",
     "crates/rness-cli",
 ]
 
@@ -103,3 +104,4 @@ rness-tools = { path = "crates/rness-tools" }
 rness-lua = { path = "crates/rness-lua" }
 rness-tui = { path = "crates/rness-tui" }
 rness-server = { path = "crates/rness-server" }
+rness-acp = { path = "crates/rness-acp" }
