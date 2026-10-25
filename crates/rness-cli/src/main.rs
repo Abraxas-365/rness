@@ -329,6 +329,9 @@ async fn run() -> anyhow::Result<u8> {
         && !cli.list;
     let env_filter =
         || tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into());
+    // While the TUI owns the terminal, fd 2 is pointed here too (see
+    // rness_tui::stderr_guard).
+    let mut stderr_sink = None;
     if interactive {
         let log_path = dirs::home_dir()
             .context("no home directory")?
@@ -342,6 +345,7 @@ async fn run() -> anyhow::Result<u8> {
             .append(true)
             .open(&log_path)
             .with_context(|| format!("open log file {}", log_path.display()))?;
+        stderr_sink = file.try_clone().ok();
         tracing_subscriber::fmt()
             .with_env_filter(env_filter())
             .with_writer(std::sync::Mutex::new(file))
@@ -1345,6 +1349,7 @@ async fn run() -> anyhow::Result<u8> {
             startup.skill_roots.clone(),
             terminals.clone(),
             startup.terminal_title.unwrap_or(true),
+            stderr_sink,
         )
         .await
         .map(|()| 0);
@@ -1526,6 +1531,7 @@ fn close_terminals_on_signal(terminals: &rness_tools::terminal::TerminalRegistry
             }
             let _ = tokio::task::spawn_blocking(move || {
                 if tty {
+                    rness_tui::stderr_guard::release();
                     let _ = crossterm::execute!(
                         std::io::stdout(),
                         crossterm::event::DisableMouseCapture,
@@ -2263,6 +2269,7 @@ async fn run_tui(
     custom_skill_roots: Vec<std::path::PathBuf>,
     terminals: rness_tools::terminal::TerminalRegistry,
     terminal_title: bool,
+    stderr_sink: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
     use rness_tui::app::{App, Model};
     use rness_tui::modules::{approval, chat, ext_apps, ext_statusline, input, statusline};
@@ -3116,6 +3123,7 @@ async fn run_tui(
 
     let mut app = App::new(Model::new(session.clone(), model_name), slots, backend);
     app.terminal_title = terminal_title;
+    app.stderr_sink = stderr_sink;
     let displayed = Arc::new(std::sync::RwLock::new(session.clone()));
     app.displayed_session = Some(displayed.clone());
     app.apply(rness_tui::app::Action::Custom(

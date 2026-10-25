@@ -22,4 +22,5 @@ pub mod keymaps;
 pub mod keys;
 pub mod modules;
 pub mod slots;
+pub mod stderr_guard;
 pub mod theme;

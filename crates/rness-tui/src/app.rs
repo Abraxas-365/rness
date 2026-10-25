@@ -627,6 +627,9 @@ pub struct App {
     quit_armed: Option<std::time::Instant>,
     /// Set the terminal window title (OSC 0) from the session title.
     pub terminal_title: bool,
+    /// Where stray stderr goes while the TUI owns the terminal (see
+    /// [`crate::stderr_guard`]). None = stderr stays on the terminal.
+    pub stderr_sink: Option<std::fs::File>,
 }
 
 /// How long a second quit confirms the first.
@@ -652,6 +655,7 @@ impl App {
             backend,
             quit_armed: None,
             terminal_title: false,
+            stderr_sink: None,
         }
     }
 
@@ -1765,6 +1769,16 @@ pub async fn run(
     mut host_actions: mpsc::UnboundedReceiver<Action>,
 ) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
+    let stderr_sink = app.stderr_sink.take();
+    let guard_stderr = || {
+        if let Some(sink) = &stderr_sink {
+            if let Err(error) = crate::stderr_guard::engage(sink) {
+                tracing::warn!("stderr stays on the terminal: {error}");
+            }
+        }
+    };
+    crate::stderr_guard::release_on_panic();
+    guard_stderr();
     let mut shown_title: Option<String> = None;
     // Wheel scroll for the transcript. Best-effort: a terminal without
     // mouse support just keeps keyboard scrolling.
@@ -1891,9 +1905,11 @@ pub async fn run(
                 crossterm::event::DisableBracketedPaste
             );
             ratatui::restore();
+            crate::stderr_guard::release();
             let editor_epoch = app.input_epoch.load(std::sync::atomic::Ordering::SeqCst);
             let mut edited = edit_prompt(&payload);
             terminal = ratatui::init();
+            guard_stderr();
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::EnableMouseCapture,
@@ -1979,6 +1995,7 @@ pub async fn run(
         crossterm::event::DisableMouseCapture
     );
     ratatui::restore();
+    crate::stderr_guard::release();
     result
 }
 
