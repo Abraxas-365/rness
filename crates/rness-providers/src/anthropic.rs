@@ -46,6 +46,9 @@ enum Auth {
     ApiKey(String),
     /// Resolved per request: env > stored key > OAuth with auto-refresh.
     Source(CredentialSource),
+    /// Authentication supplied by a composite transport (GitHub Copilot):
+    /// no key header, no Claude Code attribution, no file uploads.
+    Signed(crate::RequestSigner),
 }
 
 pub struct AnthropicProvider {
@@ -150,6 +153,19 @@ impl AnthropicProvider {
         }
     }
 
+    /// `POST {base_url}/v1/messages` authenticated by `signer`. No prompt
+    /// caching (Copilot manages its own), no gzip, no file uploads.
+    pub(crate) fn signed(
+        signer: crate::RequestSigner,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::new(String::new(), model).with_base_url(base_url);
+        provider.auth = Auth::Signed(signer);
+        provider.request_compression = crate::routes::RequestCompression::Off;
+        provider
+    }
+
     /// Point at a different endpoint (tests, proxies).
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
@@ -251,6 +267,9 @@ impl AnthropicProvider {
         match &self.auth {
             Auth::ApiKey(key) => Ok(Credential::ApiKey(key.clone())),
             Auth::Source(source) => source.resolve().await,
+            // The signer attaches the real credential; this placeholder
+            // only selects the plain (non-subscription) request shape.
+            Auth::Signed(_) => Ok(Credential::ApiKey(String::new())),
         }
     }
 
@@ -460,7 +479,9 @@ impl AnthropicProvider {
         let Some((store, policy)) = &self.images else {
             return Ok(());
         };
-        if !store.effective_request_policy(policy).anthropic_files {
+        if !store.effective_request_policy(policy).anthropic_files
+            || matches!(self.auth, Auth::Signed(_))
+        {
             return Ok(());
         }
         let Credential::ApiKey(key) = credential else {
@@ -628,6 +649,9 @@ impl AnthropicProvider {
         } else {
             (crate::json_body(base, body), false)
         };
+        if let Auth::Signed(signer) = &self.auth {
+            return (signer(base, body), compressed);
+        }
 
         // Build caching beta headers when prompt caching is active.
         let cache_betas = if self.prompt_caching {

@@ -4,6 +4,7 @@
 //! so Pro/Max subscription auth works. Credentials persist through
 //! [`store::CredentialStore`] (`~/.rness/credentials.json`).
 
+pub mod github_copilot;
 pub mod openai;
 pub mod pkce;
 pub mod store;

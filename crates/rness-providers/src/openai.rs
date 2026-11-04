@@ -43,6 +43,14 @@ pub struct OpenAiProvider {
     model: String,
     /// Extra body fields merged into every request (temperature, etc.).
     extra_body: Value,
+    /// Authentication supplied by a composite transport (GitHub Copilot)
+    /// instead of `api_key`.
+    signer: Option<crate::RequestSigner>,
+    /// Replay `reasoning_opaque` / `reasoning_text` on assistant messages
+    /// (GitHub Copilot: Claude and Gemini need their opaque reasoning back
+    /// for multi-turn tool use). Off for generic OpenAI-compatible servers,
+    /// which would reject or misread the fields.
+    replay_reasoning_opaque: bool,
 }
 
 impl OpenAiProvider {
@@ -56,7 +64,23 @@ impl OpenAiProvider {
             api_key: Some(api_key.into()),
             model: model.into(),
             extra_body: json!({}),
+            signer: None,
+            replay_reasoning_opaque: false,
         }
+    }
+
+    /// `POST {base_url}/chat/completions` authenticated by `signer`, with
+    /// Copilot's opaque-reasoning replay.
+    pub(crate) fn signed(
+        signer: crate::RequestSigner,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::new(String::new(), model).with_base_url(base_url);
+        provider.api_key = None;
+        provider.signer = Some(signer);
+        provider.replay_reasoning_opaque = true;
+        provider
     }
 
     pub fn with_images(
@@ -304,7 +328,7 @@ impl OpenAiProvider {
         if !request.system.is_empty() {
             messages.push(json!({ "role": "system", "content": request.system }));
         }
-        let mut conversation = messages_from_context(request.context);
+        let mut conversation = messages_from_context(request.context, self.replay_reasoning_opaque);
         if let Some((store, policy)) = &images {
             let mut index = 0;
             for turn in &request.context.turns {
@@ -419,7 +443,10 @@ impl OpenAiProvider {
     }
 }
 
-fn messages_from_context(context: &ModelContext) -> Vec<Value> {
+/// Origin tag on stored Copilot `reasoning_opaque` thinking signatures.
+const OPAQUE_TAG: &str = "copilot-opaque:";
+
+fn messages_from_context(context: &ModelContext, replay_reasoning_opaque: bool) -> Vec<Value> {
     let mut messages = Vec::new();
     for turn in &context.turns {
         match turn {
@@ -446,6 +473,30 @@ fn messages_from_context(context: &ModelContext) -> Vec<Value> {
                 }
                 if !tool_calls.is_empty() {
                     msg["tool_calls"] = Value::Array(tool_calls);
+                }
+                if replay_reasoning_opaque {
+                    // Copilot replays only the latest opaque blob, with the
+                    // reasoning text that produced it.
+                    let opaque = content.iter().rev().find_map(|p| match p {
+                        ContentPart::Thinking {
+                            signature: Some(signature),
+                            ..
+                        } => signature.strip_prefix(OPAQUE_TAG).filter(|o| !o.is_empty()),
+                        _ => None,
+                    });
+                    if let Some(opaque) = opaque {
+                        let thinking: String = content
+                            .iter()
+                            .filter_map(|p| match p {
+                                ContentPart::Thinking { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect();
+                        msg["reasoning_opaque"] = json!(opaque);
+                        if !thinking.is_empty() {
+                            msg["reasoning_text"] = json!(thinking);
+                        }
+                    }
                 }
                 messages.push(msg);
             }
@@ -487,6 +538,9 @@ struct PendingCall {
 struct Accumulator<'a> {
     text: String,
     thinking: String,
+    /// Latest `reasoning_opaque` (Copilot): kept as the thinking signature.
+    reasoning_opaque: Option<String>,
+    keep_reasoning_opaque: bool,
     calls: Vec<PendingCall>,
     /// Wire `index` → position in `calls`. A delta with a new id at an
     /// index already holding another id opens a new call (some servers
@@ -503,10 +557,10 @@ impl Accumulator<'_> {
         // messages) must not be alive while its arguments are parsed.
         let chunks = self.chunks.into_committed();
         let mut content = Vec::new();
-        if !self.thinking.is_empty() {
+        if !self.thinking.is_empty() || self.reasoning_opaque.is_some() {
             content.push(ContentPart::Thinking {
                 text: self.thinking,
-                signature: None,
+                signature: self.reasoning_opaque,
             });
         }
         if !self.text.is_empty() {
@@ -569,12 +623,24 @@ impl Accumulator<'_> {
             self.text.push_str(t);
             self.chunks.text(t, at_ms);
         }
+        // `reasoning_content` (DeepSeek, vLLM, …) or Copilot's `reasoning_text`.
         if let Some(t) = delta["reasoning_content"]
             .as_str()
+            .or_else(|| delta["reasoning_text"].as_str())
             .filter(|t| !t.is_empty())
         {
             self.thinking.push_str(t);
             self.chunks.thinking(t, at_ms);
+        }
+        // Claude interleaved thinking sends a new opaque blob before each
+        // tool call; Copilot's own client replays only the latest. Stored
+        // with an origin tag so another adapter's signatures (Anthropic)
+        // are never replayed here, nor these anywhere else.
+        if let Some(opaque) = delta["reasoning_opaque"]
+            .as_str()
+            .filter(|o| self.keep_reasoning_opaque && !o.is_empty())
+        {
+            self.reasoning_opaque = Some(format!("{OPAQUE_TAG}{opaque}"));
         }
         if let Some(tool_calls) = delta["tool_calls"].as_array() {
             for tc in tool_calls {
@@ -660,6 +726,9 @@ impl Provider for OpenAiProvider {
             if let Some(key) = &self.api_key {
                 http_request = http_request.bearer_auth(key);
             }
+            if let Some(signer) = &self.signer {
+                http_request = signer(http_request, &body);
+            }
             let response = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
@@ -713,6 +782,7 @@ impl Provider for OpenAiProvider {
         let mut reader = SseReader::new(response.bytes_stream(), self.idle_timeout);
         let mut acc = Accumulator {
             chunks: crate::chunks::ChunkLog::new(request.on_delta),
+            keep_reasoning_opaque: self.replay_reasoning_opaque,
             ..Default::default()
         };
         loop {

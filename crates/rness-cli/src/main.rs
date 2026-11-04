@@ -237,14 +237,18 @@ fn run_plugin(action: PluginAction) -> anyhow::Result<()> {
 
 #[derive(clap::Subcommand)]
 enum AuthAction {
-    /// Log in via browser OAuth (Claude Pro/Max, or ChatGPT Plus/Pro).
+    /// Log in via browser OAuth (Claude Pro/Max, ChatGPT Plus/Pro) or the
+    /// GitHub device flow (GitHub Copilot).
     Login {
-        /// Which provider: anthropic or openai-chatgpt.
+        /// Which provider: anthropic, openai-chatgpt or github-copilot.
         #[arg(long, default_value = "anthropic")]
         provider: String,
         /// Named account (e.g. "work"). Default account when omitted.
         #[arg(long)]
         account: Option<String>,
+        /// GitHub Enterprise host for github-copilot (e.g. company.ghe.com).
+        #[arg(long)]
+        enterprise: Option<String>,
     },
     /// Store an API key for a provider.
     SetKey {
@@ -405,8 +409,13 @@ async fn run() -> anyhow::Result<u8> {
             "openai-chat" => routes::Kind::OpenAiCompatible,
             "anthropic" => routes::Kind::Anthropic,
             "chatgpt-responses" => routes::Kind::ChatGptResponses,
+            "github-copilot" => routes::Kind::GitHubCopilot,
             _ => anyhow::bail!("provider {name}: unknown protocol"),
         };
+        let oauth_only = matches!(
+            kind,
+            routes::Kind::ChatGptResponses | routes::Kind::GitHubCopilot
+        );
         let credential = match &declaration.auth {
             rness_lua::api::config::ProviderAuth::Disabled(false)
                 if matches!(kind, routes::Kind::OpenAiCompatible) =>
@@ -420,19 +429,21 @@ async fn run() -> anyhow::Result<u8> {
                 None
             }
             rness_lua::api::config::ProviderAuth::Store { credential }
-                if !credential.is_empty() && !matches!(kind, routes::Kind::ChatGptResponses) =>
+                if !credential.is_empty() && !oauth_only =>
             {
                 auth_store.insert(name.clone(), credential.clone());
                 Some(credential.clone())
             }
             rness_lua::api::config::ProviderAuth::Env { env }
-                if !env.is_empty()
-                    && !env.contains(['=', '\0'])
-                    && !matches!(kind, routes::Kind::ChatGptResponses) =>
+                if !env.is_empty() && !env.contains(['=', '\0']) && !oauth_only =>
             {
                 auth_env.insert(name.clone(), env.clone());
                 None
             }
+            _ if oauth_only => anyhow::bail!(
+                "provider {name}: protocol {} requires auth = {{ oauth = \"...\" }}",
+                declaration.protocol
+            ),
             _ => anyhow::bail!("provider {name}: invalid credential declaration"),
         };
         route_table.insert(
@@ -3726,7 +3737,14 @@ fn first_available_credential(store: &CredentialStore, base_provider: &str) -> O
 async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
     let store = CredentialStore::new(CredentialStore::default_path());
     match action {
-        AuthAction::Login { provider, account } => {
+        AuthAction::Login {
+            provider,
+            account,
+            enterprise,
+        } => {
+            if enterprise.is_some() && !matches!(provider.as_str(), "github-copilot" | "copilot") {
+                bail!("--enterprise applies only to --provider github-copilot");
+            }
             let cred_key = CredentialStore::credential_key(&provider, account.as_deref());
             let label = if let Some(ref a) = account {
                 format!("{provider} (account: {a})")
@@ -3760,7 +3778,40 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                     }
                     println!("!");
                 }
-                other => bail!("no OAuth login for '{other}' (anthropic or openai-chatgpt)"),
+                "github-copilot" | "copilot" => {
+                    let cred_key = CredentialStore::credential_key(
+                        rness_providers::auth::github_copilot::STORE_KEY,
+                        account.as_deref(),
+                    );
+                    match &enterprise {
+                        Some(domain) => {
+                            println!("Logging in to GitHub Copilot on {domain} ({label})…")
+                        }
+                        None => println!("Logging in to GitHub Copilot ({label})…"),
+                    }
+                    let device = rness_providers::auth::github_copilot::DevicePrompt {
+                        on_code: Box::new(|url, code| {
+                            println!("\nOpen {url} and enter the code:\n\n  {code}\n");
+                            println!("Waiting for authorization…");
+                            let _ = open::that(url);
+                        }),
+                    };
+                    let tokens = rness_providers::auth::github_copilot::login_as(
+                        &store,
+                        &device,
+                        &cred_key,
+                        enterprise.as_deref(),
+                    )
+                    .await?;
+                    print!("Login successful");
+                    if !tokens.subscription_type.is_empty() {
+                        print!(" (Copilot {})", tokens.subscription_type);
+                    }
+                    println!("!");
+                }
+                other => bail!(
+                    "no OAuth login for '{other}' (anthropic, openai-chatgpt or github-copilot)"
+                ),
             }
         }
         AuthAction::SetKey {

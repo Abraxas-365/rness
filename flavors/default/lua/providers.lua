@@ -11,6 +11,15 @@ rness.providers.register("chatgpt", {
   protocol = "chatgpt-responses", base_url = "https://chatgpt.com/backend-api",
   auth = { oauth = "openai-chatgpt" },
 })
+-- GitHub Copilot subscription: `rness auth login --provider github-copilot`
+-- (add `--enterprise company.ghe.com` for GitHub Enterprise). Each model is
+-- routed to the API Copilot serves it on (Claude → Messages, GPT-5 →
+-- Responses, others → Chat Completions); the account's own API host from
+-- login replaces this default URL.
+rness.providers.register("copilot", {
+  protocol = "github-copilot", base_url = "https://api.githubcopilot.com",
+  auth = { oauth = "github-copilot" },
+})
 rness.providers.register("openrouter", {
   protocol = "openai-chat", base_url = "https://openrouter.ai/api/v1",
   auth = { env = "OPENROUTER_API_KEY" },

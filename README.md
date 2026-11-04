@@ -111,9 +111,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ### 2. Connect a model
 
-The default flavor declares connections for **Anthropic**, **ChatGPT**, **OpenRouter**, and **Ollama**. Credentials are configured separately; no principal model is selected for you.
+The default flavor declares connections for **Anthropic**, **ChatGPT**, **GitHub Copilot**, **OpenRouter**, and **Ollama**. Credentials are configured separately; no principal model is selected for you.
 
-**Sign in with ChatGPT or Anthropic using OAuth—an API key is not the only option.** Choose the authentication method for your connection:
+**Sign in with ChatGPT, Anthropic or GitHub Copilot using OAuth—an API key is not the only option.** Choose the authentication method for your connection:
 
 #### ChatGPT: browser sign-in
 
@@ -125,6 +125,17 @@ rness -m chatgpt/gpt-6-astra --reasoning high
 ```
 
 The login provider is `openai-chatgpt`; the configured connection name used by `--model` is `chatgpt`.
+
+#### GitHub Copilot: device sign-in
+
+The default `copilot` connection uses your Copilot subscription (Individual, Business or Enterprise):
+
+```sh
+rness auth login --provider github-copilot   # add --enterprise company.ghe.com for GHE
+rness -m copilot/claude-sonnet-4.5
+```
+
+Enter the printed code at GitHub's device page. rness routes each model to the API Copilot serves it on; see [providers reference](docs/reference/configuration/providers.md#github-copilot).
 
 #### Anthropic: browser sign-in
 

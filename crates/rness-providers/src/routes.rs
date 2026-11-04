@@ -19,6 +19,9 @@ pub enum Kind {
     OpenAiCompatible,
     /// ChatGPT-backend Responses API (subscription OAuth, no API key).
     ChatGptResponses,
+    /// GitHub Copilot (device-flow OAuth): Messages, Responses or Chat
+    /// Completions per model, chosen from Copilot's model list.
+    GitHubCopilot,
 }
 
 /// Cache TTL preference for Anthropic prompt caching.
@@ -108,6 +111,8 @@ pub enum RouteError {
     Store(#[from] crate::auth::TokensError),
     #[error("provider HTTP client: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("{0}")]
+    Provider(String),
 }
 
 /// Parse a `--route` spec into a named OpenAI-compatible route:
@@ -175,6 +180,10 @@ pub fn build_with_api_key(
         Kind::ChatGptResponses => {
             Err("ChatGPT subscription transport requires OAuth, not an API key".into())
         }
+        Kind::GitHubCopilot => Err(
+            "GitHub Copilot requires `rness auth login --provider github-copilot`, not an API key"
+                .into(),
+        ),
     }
 }
 
@@ -222,10 +231,28 @@ pub fn build_with_oauth(
                     .with_stream_idle_timeout(route.stream_idle_timeout),
             ))
         }
+        Kind::GitHubCopilot => Ok(Arc::new(copilot_provider(route, model, store, credential)?)),
         Kind::OpenAiCompatible => {
             Err("OAuth is not implemented for generic OpenAI chat connections".into())
         }
     }
+}
+
+fn copilot_provider(
+    route: &Route,
+    model: &str,
+    store: CredentialStore,
+    credential: String,
+) -> Result<crate::copilot::CopilotProvider, String> {
+    let mut provider =
+        crate::copilot::CopilotProvider::new(store, model).with_credential(credential);
+    if let Some(url) = &route.base_url {
+        provider = provider.with_base_url(url.trim_end_matches('/'));
+    }
+    Ok(provider
+        .with_headers(route.headers.clone())
+        .map_err(|e| e.to_string())?
+        .with_stream_idle_timeout(route.stream_idle_timeout))
 }
 
 pub fn parse_route_spec(spec: &str) -> Result<(String, Route), RouteError> {
@@ -367,6 +394,15 @@ pub fn build(
                     .with_stream_idle_timeout(route.stream_idle_timeout),
             ))
         }
+        Kind::GitHubCopilot => Ok(Arc::new(
+            copilot_provider(
+                route,
+                &model,
+                store,
+                crate::auth::github_copilot::STORE_KEY.into(),
+            )
+            .map_err(RouteError::Provider)?,
+        )),
         Kind::OpenAiCompatible => {
             let key = match &route.credential {
                 Some(credential) => {

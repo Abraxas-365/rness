@@ -27,6 +27,7 @@ axum.workspace = true
 clap.workspace = true
 dirs.workspace = true
 keyring.workspace = true
+open.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 async-trait.workspace = true

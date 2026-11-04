@@ -41,6 +41,11 @@ impl ProviderHeaders {
                     | "openai-beta"
                     | "originator"
                     | "chatgpt-account-id"
+                    | "openai-intent"
+                    | "x-github-api-version"
+                    | "x-initiator"
+                    | "x-interaction-type"
+                    | "copilot-vision-request"
             ) {
                 return Err(format!("provider header '{name}' is reserved"));
             }

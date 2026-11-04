@@ -5,6 +5,7 @@
 pub mod anthropic;
 pub mod auth;
 mod chunks;
+pub mod copilot;
 pub mod headers;
 pub mod ollama;
 pub mod openai;
@@ -400,6 +401,14 @@ async fn upload_with_quota_recovery(
     }
     unreachable!("bounded upload attempts return")
 }
+
+/// Attaches authentication and transport-specific headers to an inference
+/// request the adapter built, given the JSON body it carries. Lets a
+/// composite transport (GitHub Copilot) reuse the wire adapters with its
+/// own auth instead of theirs. Never applied to file uploads.
+pub type RequestSigner = std::sync::Arc<
+    dyn Fn(reqwest::RequestBuilder, &serde_json::Value) -> reqwest::RequestBuilder + Send + Sync,
+>;
 
 /// `request.json(body)` with the body serialized into one exactly-sized
 /// buffer. `reqwest`'s `json` serializes through a `Vec` that doubles as it

@@ -37,8 +37,21 @@ pub struct ResponsesProvider {
     client: reqwest::Client,
     headers: crate::headers::ProviderHeaders,
     base_url: String,
-    source: CodexCredentialSource,
+    /// Path appended to `base_url`: `/codex/responses` for ChatGPT,
+    /// `/responses` for a plain Responses endpoint.
+    path: &'static str,
+    auth: ResponsesAuth,
     model: String,
+    /// Ask for reasoning summaries and encrypted reasoning items. Off for
+    /// models that reject the `reasoning` parameter.
+    reasoning: bool,
+}
+
+enum ResponsesAuth {
+    /// ChatGPT subscription OAuth: refresh near expiry, refresh once on 401.
+    Codex(CodexCredentialSource),
+    /// Authentication supplied by a composite transport (GitHub Copilot).
+    Signed(crate::RequestSigner),
 }
 
 impl ResponsesProvider {
@@ -49,9 +62,37 @@ impl ResponsesProvider {
             client: crate::http_client(crate::connect_timeout(crate::sse::DEFAULT_IDLE_TIMEOUT)),
             headers: Default::default(),
             base_url: DEFAULT_BASE_URL.to_string(),
-            source,
+            path: "/codex/responses",
+            auth: ResponsesAuth::Codex(source),
             model: model.into(),
+            reasoning: true,
         }
+    }
+
+    /// A plain `POST {base_url}/responses` endpoint whose authentication
+    /// headers `signer` attaches (no ChatGPT account headers, no refresh).
+    pub(crate) fn signed(
+        signer: crate::RequestSigner,
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            images: None,
+            idle_timeout: crate::sse::DEFAULT_IDLE_TIMEOUT,
+            client: crate::http_client(crate::connect_timeout(crate::sse::DEFAULT_IDLE_TIMEOUT)),
+            headers: Default::default(),
+            base_url: base_url.into(),
+            path: "/responses",
+            auth: ResponsesAuth::Signed(signer),
+            model: model.into(),
+            reasoning: true,
+        }
+    }
+
+    /// Whether to request reasoning summaries (default on).
+    pub(crate) fn with_reasoning(mut self, reasoning: bool) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     pub fn with_images(
@@ -124,11 +165,16 @@ impl ResponsesProvider {
             "store": false,
             "stream": true,
             "parallel_tool_calls": true,
-            "include": ["reasoning.encrypted_content"],
-            "reasoning": { "summary": "auto" },
         });
+        if self.reasoning {
+            body["include"] = json!(["reasoning.encrypted_content"]);
+            body["reasoning"] = json!({ "summary": "auto" });
+        }
         if let Some(Reasoning::Effort { effort }) = &request.context.config.reasoning {
-            body["reasoning"]["effort"] = json!(effort);
+            // A model without reasoning efforts rejects the field.
+            if self.reasoning {
+                body["reasoning"]["effort"] = json!(effort);
+            }
         }
         if let Some(max_output_tokens) = request.context.config.max_output_tokens {
             body["max_output_tokens"] = json!(max_output_tokens);
@@ -157,17 +203,28 @@ impl ResponsesProvider {
         Ok(body)
     }
 
-    fn request_for(&self, credential: &CodexCredential, body: &Value) -> reqwest::RequestBuilder {
+    fn request_for(
+        &self,
+        credential: Option<&CodexCredential>,
+        body: &Value,
+    ) -> reqwest::RequestBuilder {
         let req = self
             .client
-            .post(format!("{}/codex/responses", self.base_url))
-            .bearer_auth(&credential.access_token)
-            .header("openai-beta", "responses=experimental")
-            .header("originator", ORIGINATOR)
+            .post(format!("{}{}", self.base_url, self.path))
             .header("accept", "text/event-stream");
         let mut req = crate::json_body(req, body);
-        if let Some(account) = &credential.account_id {
-            req = req.header("chatgpt-account-id", account);
+        match (&self.auth, credential) {
+            (ResponsesAuth::Signed(signer), _) => req = signer(req, body),
+            (ResponsesAuth::Codex(_), Some(credential)) => {
+                req = req
+                    .bearer_auth(&credential.access_token)
+                    .header("openai-beta", "responses=experimental")
+                    .header("originator", ORIGINATOR);
+                if let Some(account) = &credential.account_id {
+                    req = req.header("chatgpt-account-id", account);
+                }
+            }
+            (ResponsesAuth::Codex(_), None) => {}
         }
         req
     }
@@ -298,6 +355,8 @@ fn input_items(
 struct Accumulator<'a> {
     /// Finished output items (`response.output_item.done`), model order.
     items: Vec<Value>,
+    /// `output_index` → `call_id` of streamed function calls.
+    call_ids: std::collections::HashMap<u64, String>,
     chunks: crate::chunks::ChunkLog<'a>,
     usage: Usage,
     status: Option<String>,
@@ -325,9 +384,23 @@ impl Accumulator<'_> {
                     self.chunks.thinking(t, at_ms);
                 }
             }
+            "response.output_item.added" => {
+                // Copilot rotates item ids on every event; the output index
+                // and the call id are the stable keys.
+                if v["item"]["type"] == "function_call" {
+                    if let (Some(index), Some(call)) =
+                        (v["output_index"].as_u64(), v["item"]["call_id"].as_str())
+                    {
+                        self.call_ids.insert(index, call.to_string());
+                    }
+                }
+            }
             "response.function_call_arguments.delta" => {
                 if let Some(t) = v["delta"].as_str() {
-                    let call = v["item_id"].as_str().unwrap_or_default().to_string();
+                    let call = v["output_index"]
+                        .as_u64()
+                        .and_then(|index| self.call_ids.get(&index).cloned())
+                        .unwrap_or_else(|| v["item_id"].as_str().unwrap_or_default().to_string());
                     self.chunks.tool_args(&call, t, at_ms);
                 }
             }
@@ -505,7 +578,11 @@ impl Provider for ResponsesProvider {
             }
         };
 
-        let mut credential = match self.source.resolve().await {
+        let resolved = match &self.auth {
+            ResponsesAuth::Signed(_) => Ok(None),
+            ResponsesAuth::Codex(source) => source.resolve().await.map(Some),
+        };
+        let mut credential = match resolved {
             Ok(c) => c,
             Err(e) => {
                 return StepOutcome::Failed {
@@ -526,7 +603,7 @@ impl Provider for ResponsesProvider {
                 biased;
                 _ = cancel.cancelled() => return StepOutcome::Cancelled { partial: vec![] },
                 _ = crate::sse::idle_deadline(self.idle_timeout) => return StepOutcome::Failed { error: ProviderError { code: "TIMEOUT", retry_after: None, message: "TIMEOUT: waiting for provider response".into(), retryable: true }, partial: vec![] },
-                r = self.request_for(&credential, &body).send() => r,
+                r = self.request_for(credential.as_ref(), &body).send() => r,
             };
             let response = match sent {
                 Ok(r) => r,
@@ -539,11 +616,13 @@ impl Provider for ResponsesProvider {
             };
 
             let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+            if let (ResponsesAuth::Codex(source), reqwest::StatusCode::UNAUTHORIZED, false) =
+                (&self.auth, status, refreshed)
+            {
                 refreshed = true;
-                match self.source.handle_unauthorized().await {
+                match source.handle_unauthorized().await {
                     Ok(c) => {
-                        credential = c;
+                        credential = Some(c);
                         continue;
                     }
                     Err(e) => {

@@ -19,7 +19,7 @@ rness.providers.register("router", {
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
 | Name argument | string | Yes | Nonempty connection name; cannot contain `/` |
-| `protocol` | string | Yes | `openai-chat`, `anthropic`, or `chatgpt-responses` |
+| `protocol` | string | Yes | `openai-chat`, `anthropic`, `chatgpt-responses`, or `github-copilot` |
 | `base_url` | string | Yes | HTTP(S) endpoint base appropriate to the adapter |
 | `auth` | boolean or table | Yes | Explicit authentication strategy below |
 | `headers` | table of string names to string values | No | Additional provider request headers; defaults to `{}` |
@@ -28,7 +28,7 @@ Duplicate startup provider names fail. Unknown top-level declaration fields fail
 
 ## Custom headers
 
-`headers` applies to every model on the connection, across all three protocols.
+`headers` applies to every model on the connection, across all protocols.
 It is sent on inference requests (including retries) and supported file upload,
 metadata lookup, and deletion requests. It is **not** sent to OAuth login or
 refresh endpoints. File caches and quota cleanup are isolated by header values,
@@ -47,6 +47,8 @@ Authentication, transport, and adapter-managed headers are reserved:
 - `accept`, `accept-encoding`, `user-agent`
 - `anthropic-version`, `anthropic-beta`, `anthropic-dangerous-direct-browser-access`, `x-app`
 - `openai-beta`, `originator`, `chatgpt-account-id`
+- `openai-intent`, `x-github-api-version`, `x-initiator`, `x-interaction-type`,
+  `copilot-vision-request`
 
 Continue using `auth` for built-in authentication. Treat custom values as secrets:
 header diagnostics redact values, but literals remain in your configuration file.
@@ -65,7 +67,7 @@ Choose one strategy:
 | `auth = { credential = "entry" }` | Read the API key from exactly that credential-store entry |
 | `auth = { oauth = "entry" }` | Use stored OAuth tokens and the adapter's refresh behavior |
 
-Explicit environment and stored-key strategies do not silently fall back to each other. `auth = true` is invalid. OAuth is supported by the Anthropic and ChatGPT Responses adapters, not the generic OpenAI chat adapter. ChatGPT Responses requires OAuth rather than an API key.
+Explicit environment and stored-key strategies do not silently fall back to each other. `auth = true` is invalid. OAuth is supported by the Anthropic, ChatGPT Responses and GitHub Copilot adapters, not the generic OpenAI chat adapter. ChatGPT Responses and GitHub Copilot require OAuth rather than an API key.
 
 Example stored-key management:
 
@@ -74,9 +76,29 @@ rness auth set-key --provider router
 rness auth status
 ```
 
-With no key positional argument, `set-key` reads standard input. Avoid placing keys directly in shell command arguments, where history or process inspection may expose them. Browser login is available through `rness auth login --provider anthropic` and `rness auth login --provider openai-chatgpt`.
+With no key positional argument, `set-key` reads standard input. Avoid placing keys directly in shell command arguments, where history or process inspection may expose them. Browser login is available through `rness auth login --provider anthropic` and `rness auth login --provider openai-chatgpt`; GitHub Copilot uses the device flow through `rness auth login --provider github-copilot`.
 
 Custom OAuth store references select an entry; they do not define an arbitrary OAuth issuer or login implementation.
+
+## GitHub Copilot
+
+```lua
+rness.providers.register("copilot", {
+  protocol = "github-copilot",
+  base_url = "https://api.githubcopilot.com",
+  auth = { oauth = "github-copilot" },
+})
+```
+
+```sh
+rness auth login --provider github-copilot                              # github.com
+rness auth login --provider github-copilot --enterprise company.ghe.com # GitHub Enterprise
+rness -m copilot/claude-sonnet-4.5
+```
+
+Login prints a code to enter at GitHub's device page and checks that the account has Copilot Chat; an account without a seat is refused with the reason. The GitHub token is stored as-is (Copilot accepts it directly; there is no refresh). GitHub reports the account's Copilot API host (individual, business or enterprise) at login and rness uses it instead of `base_url`; set a different `base_url` only to force a proxy.
+
+Copilot serves different models on different APIs. On first use rness reads the account's model list (`GET /models`) and sends each model to the API it supports: Anthropic Messages for Claude, OpenAI Responses for GPT-5-class models, Chat Completions for the rest. If the list is unavailable, the model name decides (`gpt-5`+, `grok-*` and `mai-code-*` use Responses, except `gpt-5-mini`; everything else uses Chat Completions). A model your organization disabled fails with that reason. Requests answering your message are marked user-initiated; tool-loop continuations and compaction are marked agent-initiated, matching how Copilot counts premium requests.
 
 ## The credentials file
 
