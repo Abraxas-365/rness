@@ -223,6 +223,41 @@ pub trait Tool: Send + Sync {
     }
 }
 
+/// Undo a common model slip: an array or object argument sent as a JSON
+/// *string* (`"tasks": "[{...}]"`). Only top-level properties whose schema
+/// type is exactly array/object are touched, and only when the string parses
+/// to that same JSON type, so a legitimate string argument never changes.
+fn unstringify_args(schema: &serde_json::Value, args: &mut serde_json::Value, tool: &str) {
+    let (Some(properties), Some(args)) = (
+        schema.get("properties").and_then(|p| p.as_object()),
+        args.as_object_mut(),
+    ) else {
+        return;
+    };
+    for (name, value) in args.iter_mut() {
+        let serde_json::Value::String(text) = value else {
+            continue;
+        };
+        let declared = properties
+            .get(name)
+            .and_then(|property| property.get("type"))
+            .and_then(|kind| kind.as_str());
+        let decoded = match declared {
+            Some("array") => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_array),
+            Some("object") => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_object),
+            _ => None,
+        };
+        if let Some(decoded) = decoded {
+            tracing::debug!(%tool, argument = %name, "decoded a JSON-string argument");
+            *value = decoded;
+        }
+    }
+}
+
 /// What a provider needs to advertise a tool to the model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolSpec {
@@ -877,6 +912,10 @@ impl ToolRegistry {
             let tool = self
                 .get(&call.name)
                 .filter(|_| exposed.is_none_or(|names| names.contains(&call.name)));
+            let mut call = call.clone();
+            if let Some(tool) = &tool {
+                unstringify_args(&tool.input_schema(), &mut call.args, &call.name);
+            }
             let background_error = tool.as_ref()
                 .filter(|tool| tool.starts_background_job(&call.args) && !missing_job_controls.is_empty())
                 .map(|_| format!(
@@ -892,7 +931,6 @@ impl ToolRegistry {
                 .expect("registry lock")
                 .clone()
                 .filter(|_| tool.as_ref().is_none_or(|tool| tool.spills_output()));
-            let mut call = call.clone();
             let session = session.clone();
             let cancel = cancel.clone();
             handles.push(tokio::spawn(async move {
@@ -1191,6 +1229,39 @@ fn refusal(decision: Decision) -> Option<(&'static str, String)> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn json_string_arguments_are_decoded_only_when_the_schema_wants_that_type() {
+        let schema = serde_json::json!({"type":"object","properties":{
+            "tasks":{"type":"array"},
+            "opts":{"type":"object"},
+            "content":{"type":"string"},
+            "loose":{}
+        }});
+        let mut args = serde_json::json!({
+            "tasks": "[{\"id\":\"a\"}]",
+            "opts": "{\"k\":1}",
+            "content": "[1,2]",
+            "loose": "[1]",
+        });
+        unstringify_args(&schema, &mut args, "T");
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "tasks": [{"id":"a"}],
+                "opts": {"k":1},
+                "content": "[1,2]",
+                "loose": "[1]",
+            })
+        );
+        // Wrong JSON type or invalid JSON: left for the tool to reject.
+        let mut args = serde_json::json!({"tasks": "{\"id\":1}", "opts": "not json"});
+        unstringify_args(&schema, &mut args, "T");
+        assert_eq!(
+            args,
+            serde_json::json!({"tasks": "{\"id\":1}", "opts": "not json"})
+        );
+    }
 
     #[tokio::test]
     async fn unknown_tool_has_durable_error_presentation() {

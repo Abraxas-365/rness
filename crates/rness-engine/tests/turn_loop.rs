@@ -1530,10 +1530,16 @@ async fn tasks_commit_in_model_order_and_survive_compaction_and_resume() {
     let tasks = |content: &str| serde_json::json!({"tasks":[{"id":"one","content":content,"status":"in_progress"}]});
     let mut message = assistant("tracking", StopReason::ToolUse, vec![]);
     for (call, content) in [("a", "first"), ("b", "second")] {
+        let mut args = tasks(content);
+        if call == "b" {
+            // Models sometimes send the array as a JSON string; the
+            // dispatcher decodes it against the schema.
+            args["tasks"] = serde_json::Value::String(args["tasks"].to_string());
+        }
         message.content.push(ContentPart::ToolUse {
             call: call.into(),
             name: "TaskWrite".into(),
-            args: tasks(content),
+            args,
         });
     }
     let provider = Scripted::new(vec![
