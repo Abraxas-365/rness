@@ -35,7 +35,8 @@ fn do_request(lua: &Lua, spec: Table) -> Result<Table, mlua::Error> {
         .enable_all()
         .build()
         .map_err(mlua::Error::external)?;
-    let (status, headers, body) = runtime.block_on(async move {
+    let started = std::time::Instant::now();
+    let outcome = runtime.block_on(async move {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(mlua::Error::runtime("command cancelled")),
@@ -50,7 +51,10 @@ fn do_request(lua: &Lua, spec: Table) -> Result<Table, mlua::Error> {
                 Ok::<_, mlua::Error>((status, headers, body))
             } => result,
         }
-    })?;
+    });
+    // A deliberate blocking wait counts like CPU toward strikes.
+    crate::budget::charge(lua, started.elapsed());
+    let (status, headers, body) = outcome?;
     let out = lua.create_table()?;
     out.set("status", status)?;
     let values = lua.create_table()?;

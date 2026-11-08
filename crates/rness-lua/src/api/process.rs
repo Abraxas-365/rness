@@ -32,8 +32,11 @@ pub fn install(lua: &Lua, rness: &Table) -> mlua::Result<()> {
             let (deadline, tokens) = crate::budget::limits(lua);
             #[cfg(unix)]
             {
-                let result =
-                    run_bounded(spec, cancel, deadline, tokens).map_err(mlua::Error::external)?;
+                let started = std::time::Instant::now();
+                let result = run_bounded(spec, cancel, deadline, tokens);
+                // A deliberate blocking wait counts like CPU toward strikes.
+                crate::budget::charge(lua, started.elapsed());
+                let result = result.map_err(mlua::Error::external)?;
                 lua.to_value(&result)
             }
             #[cfg(not(unix))]

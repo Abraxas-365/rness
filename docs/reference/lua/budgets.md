@@ -19,6 +19,8 @@ All plugins share one Lua VM on one thread. While a callback runs, every other L
 
 "In a row" means consecutive calls: one call that finishes in time resets the count. A disabled handler stays off until its plugin is reloaded. When one is disabled, rness shows a notice in the session, e.g. `Lua 'frame' hook handler exceeded its 500 ms budget 3 times in a row and was disabled until the plugin is reloaded`, and also writes it to the `lua` log target.
 
+Only overruns that are the callback's own fault count as strikes. That means time spent running Lua or waiting in a blocking API it called (`rness.process.run`, `rness.http`). If the deadline passes while the VM thread barely ran (the system was swapping, the thread was descheduled, or an engine lookup waited on a lock), the call is still stopped but gets no strike. Where the platform has no per-thread CPU clock, every overrun counts.
+
 Nested calls use the tightest active budget. For example, `rness.events.emit` called from a hook runs its handlers inside that hook's 500 ms.
 
 ## Budgets cannot be caught

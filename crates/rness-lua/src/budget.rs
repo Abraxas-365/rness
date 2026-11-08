@@ -151,6 +151,44 @@ pub(crate) enum Expiry {
     Cancelled,
     /// The scope ran out of time or instructions: a strike.
     Exceeded,
+    /// The wall-clock deadline passed but the VM thread barely ran: it was
+    /// descheduled, paging (swap), or waiting in a native call. The code
+    /// was stopped like an overrun, but it is not the plugin's fault, so it
+    /// is no strike.
+    Stalled,
+}
+
+/// CPU time the calling thread has used, where the platform reports it.
+fn thread_cpu() -> Option<Duration> {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid, writable timespec.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+/// Whether a time-budget expiry was a real overrun: the thread spent at
+/// least half of the allowed wall time on CPU or waiting in blocking APIs
+/// the plugin itself called ([`charge`]). A runaway loop or a slow
+/// `rness.process.run` uses nearly all of it; a stalled VM (swap,
+/// scheduler, engine lock contention) little. Without a CPU clock every
+/// expiry counts, as before.
+fn burned(cpu_start: Option<Duration>, charged: Duration, allowed: Option<Duration>) -> bool {
+    match (cpu_start, thread_cpu(), allowed) {
+        (Some(start), Some(now), Some(allowed)) => {
+            (now.saturating_sub(start) + charged) * 2 >= allowed
+        }
+        _ => true,
+    }
 }
 
 struct Frame {
@@ -160,6 +198,12 @@ struct Frame {
     instructions: Option<u64>,
     budget: Budget,
     expired: Option<(Expiry, String)>,
+    /// Thread CPU clock and wall length at push, to tell an overrun from
+    /// a stall when the deadline passes.
+    cpu_start: Option<Duration>,
+    allowed: Option<Duration>,
+    /// Wall time spent in plugin-requested blocking calls ([`charge`]).
+    charged: Duration,
 }
 
 impl Frame {
@@ -175,7 +219,12 @@ impl Frame {
         }
         if let Some(deadline) = self.deadline {
             if *now.get_or_insert_with(Instant::now) >= deadline {
-                return Some((Expiry::Exceeded, self.budget.exceeded()));
+                let kind = if burned(self.cpu_start, self.charged, self.allowed) {
+                    Expiry::Exceeded
+                } else {
+                    Expiry::Stalled
+                };
+                return Some((kind, self.budget.exceeded()));
             }
         }
         None
@@ -311,6 +360,9 @@ impl Scope {
             let mut state = shared.lock();
             let id = state.next_id;
             state.next_id += 1;
+            let allowed = self
+                .deadline
+                .map(|d| d.saturating_duration_since(Instant::now()));
             state.frames.push(Frame {
                 id,
                 deadline: self.deadline,
@@ -318,6 +370,9 @@ impl Scope {
                 instructions: self.budget.instructions(),
                 budget: self.budget,
                 expired: None,
+                cpu_start: allowed.and_then(|_| thread_cpu()),
+                allowed,
+                charged: Duration::ZERO,
             });
             id
         };
@@ -372,6 +427,18 @@ pub(crate) fn limits(lua: &Lua) -> (Option<Instant>, Vec<CancellationToken>) {
     (deadline, tokens)
 }
 
+/// Count `waited` (time a blocking API the plugin called spent waiting)
+/// against every active scope, as if it were CPU: a handler that blocks
+/// the VM on purpose overruns like a busy loop, not like a stall.
+pub(crate) fn charge(lua: &Lua, waited: Duration) {
+    let Some(shared) = lua.app_data_ref::<Shared>().map(|s| s.clone()) else {
+        return;
+    };
+    for frame in shared.lock().frames.iter_mut() {
+        frame.charged += waited;
+    }
+}
+
 /// Consecutive budget overruns after which a recurring handler (hook,
 /// statusline, app view, timer) is disabled until the plugin reloads.
 pub(crate) const STRIKES: u32 = 3;
@@ -386,9 +453,9 @@ struct Strikes {
 }
 
 /// Record one bounded call of handler `key`. A clean finish resets its
-/// count; a cancel leaves it; an overrun adds a strike. Returns true when
-/// this call reached [`STRIKES`] and the handler is now disabled. `key` is
-/// built only when needed: the common clean call is nearly free.
+/// count; a cancel or a stall leaves it; an overrun adds a strike. Returns
+/// true when this call reached [`STRIKES`] and the handler is now disabled.
+/// `key` is built only when needed: the common clean call is nearly free.
 pub(crate) fn strike(lua: &Lua, key: impl FnOnce() -> String, expiry: Option<&Expiry>) -> bool {
     let Some(mut strikes) = lua.app_data_mut::<Strikes>() else {
         return false;
@@ -401,6 +468,10 @@ pub(crate) fn strike(lua: &Lua, key: impl FnOnce() -> String, expiry: Option<&Ex
             false
         }
         Some(Expiry::Cancelled) => false,
+        Some(Expiry::Stalled) => {
+            tracing::debug!(target: "lua", handler = %key(), "budget expired while the VM thread was stalled; no strike");
+            false
+        }
         Some(Expiry::Exceeded) => {
             let key = key();
             let count = strikes.counts.entry(key.clone()).or_default();
@@ -495,6 +566,60 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(e, Some(Expiry::Exceeded));
         assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    /// A VM thread that sat off-CPU past the deadline (swap, scheduler,
+    /// engine lock) is stopped but not struck: the 2026-11-08 statusline
+    /// disable came from three such stalls.
+    #[cfg(unix)]
+    #[test]
+    fn stall_is_not_a_strike() {
+        let lua = vm();
+        let stall = lua
+            .create_function(|_, ()| {
+                std::thread::sleep(Duration::from_millis(150));
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("stall", stall).unwrap();
+        let (r, e, _) = spin(
+            &lua,
+            Budget::Card,
+            "stall() local x = 0 for i = 1, 5000 do x = x + i end",
+        );
+        assert!(r.is_err(), "still stopped at the deadline");
+        assert_eq!(e, Some(Expiry::Stalled));
+        for _ in 0..STRIKES + 1 {
+            assert!(!strike(&lua, || "h".into(), e.as_ref()));
+        }
+        assert!(!is_disabled(&lua, "h"));
+    }
+
+    /// Time a plugin chose to block (process.run, http) is its own: it
+    /// counts toward strikes like a busy loop.
+    #[cfg(unix)]
+    #[test]
+    fn charged_blocking_wait_is_a_strike() {
+        let lua = vm();
+        let block = lua
+            .create_function(|lua, ()| {
+                std::thread::sleep(Duration::from_millis(150));
+                charge(lua, Duration::from_millis(150));
+                Ok(())
+            })
+            .unwrap();
+        lua.globals().set("block", block).unwrap();
+        let (_, e, _) = spin(
+            &lua,
+            Budget::Card,
+            "block() local x = 0 for i = 1, 5000 do x = x + i end",
+        );
+        assert_eq!(e, Some(Expiry::Exceeded));
+        let mut disabled = false;
+        for _ in 0..STRIKES {
+            disabled = strike(&lua, || "h".into(), e.as_ref());
+        }
+        assert!(disabled && is_disabled(&lua, "h"));
     }
 
     #[test]
