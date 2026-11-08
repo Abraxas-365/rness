@@ -26,7 +26,7 @@ pub mod rpc;
 pub mod updates;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -51,6 +51,10 @@ use tokio::sync::mpsc;
 use rpc::{Peer, RpcError};
 
 pub const PROTOCOL_VERSION: u64 = 1;
+/// ACP extension method: steer the running turn (see `AcpAgent::steer`).
+pub const STEER_METHOD: &str = "_rness/steer";
+/// How long a steer waits for an in-flight prompt's turn to start.
+const STEER_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const LIST_PAGE: usize = 100;
 
 /// Identity and capability switches chosen by the composition root.
@@ -83,6 +87,10 @@ struct Open {
     cursor: Mutex<Option<EventId>>,
     /// A `session/prompt` is in flight (ACP allows one per session).
     prompting: AtomicBool,
+    /// `session/prompt` requests read off the wire and not yet answered.
+    /// Counted in arrival order (before the request task runs), so a steer
+    /// sent after a prompt always knows that prompt exists.
+    prompts: AtomicUsize,
     /// The client sent `session/cancel` for the in-flight prompt.
     cancelled: AtomicBool,
     /// A flush is already queued for the pump.
@@ -241,9 +249,19 @@ impl AcpAgent {
             None => self.notification(&method, &params),
             Some(id) => {
                 let agent = Arc::clone(self);
+                let counted = (method == "session/prompt")
+                    .then(|| params.get("sessionId").and_then(Value::as_str))
+                    .flatten()
+                    .and_then(|session| self.opened(session));
+                if let Some(open) = &counted {
+                    open.prompts.fetch_add(1, Ordering::SeqCst);
+                }
                 tokio::spawn(async move {
                     let result = agent.request(&method, params).await;
                     agent.peer.respond(id, result);
+                    if let Some(open) = counted {
+                        open.prompts.fetch_sub(1, Ordering::SeqCst);
+                    }
                 });
             }
         }
@@ -269,6 +287,7 @@ impl AcpAgent {
             "session/close" => self.close_session(&params).await,
             "session/prompt" => self.prompt(&params).await,
             "session/set_config_option" => self.set_config_option(&params),
+            STEER_METHOD => self.steer(&params).await,
             other => Err(RpcError::method_not_found(other)),
         }
     }
@@ -288,6 +307,9 @@ impl AcpAgent {
                     "embeddedContext": true,
                 },
                 "sessionCapabilities": { "close": {}, "list": {}, "resume": {} },
+                // ACP extension: `_rness/steer` adds input to the turn an
+                // in-flight `session/prompt` is running.
+                "_meta": { "rness": { "steer": true } },
             },
             "authMethods": [],
         })
@@ -669,6 +691,52 @@ impl AcpAgent {
         Ok(json!({
             "stopReason": if max_tokens == Some(true) { "max_tokens" } else { "end_turn" }
         }))
+    }
+
+    /// `_rness/steer {sessionId, prompt}`: hand text to the turn the client's
+    /// in-flight `session/prompt` is running; the model sees it at its next
+    /// step and that prompt answers when the whole burst ends. `steered:
+    /// false` means no turn is running (send `session/prompt` instead).
+    async fn steer(&self, params: &Value) -> Result<Value, RpcError> {
+        let session = session_param(params)?;
+        let open = self.require_open(&session)?;
+        let blocks = params
+            .get("prompt")
+            .and_then(Value::as_array)
+            .ok_or_else(|| RpcError::invalid_params("prompt must be an array"))?;
+        let mut text = String::new();
+        for block in blocks {
+            match prompt_part(block, false)? {
+                Part::Text(part) => text.push_str(&part),
+                Part::Image(..) => {
+                    return Err(RpcError::invalid_params("steers are text only"));
+                }
+            }
+        }
+        if text.trim().is_empty() {
+            return Err(RpcError::invalid_params("empty prompt"));
+        }
+        // A prompt read before this steer may still be entering the engine:
+        // wait for its turn instead of answering "not running" while it is
+        // about to. No prompt pending means nothing to steer.
+        let deadline = tokio::time::Instant::now() + STEER_ADMISSION_WAIT;
+        loop {
+            if open.prompts.load(Ordering::SeqCst) == 0 {
+                return Ok(json!({ "steered": false }));
+            }
+            let content = vec![ContentPart::Text { text: text.clone() }];
+            if self
+                .sessions
+                .steer_running(&session, content)
+                .map_err(service_error)?
+            {
+                return Ok(json!({ "steered": true }));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(json!({ "steered": false }));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     fn cancel(&self, session: &str) {

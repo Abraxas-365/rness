@@ -1801,6 +1801,42 @@ impl SessionService {
         Ok(true)
     }
 
+    /// Steer a turn that is already running: the content reaches the model at
+    /// its next step boundary (a steer accepted during the final step runs as
+    /// its own turn in the same burst). Never starts a turn: false means the
+    /// session is idle and the caller must prompt instead. Plain chat input,
+    /// never a slash command — for external clients (ACP `_rness/steer`) whose
+    /// prompt is still waiting on this burst.
+    pub fn steer_running(
+        &self,
+        session: &SessionId,
+        content: Vec<ContentPart>,
+    ) -> Result<bool, ServiceError> {
+        if content.is_empty()
+            || content
+                .iter()
+                .any(|part| !matches!(part, ContentPart::Text { text } if !text.trim().is_empty()))
+        {
+            return Err(ServiceError::InvalidConfig(
+                "a steer must be nonempty text".into(),
+            ));
+        }
+        if self.closing.lock().unwrap().contains(session) {
+            return Ok(false);
+        }
+        let live = self.live(session);
+        // The phase check and the submit share the inbox lock, and the turn
+        // loop decides to go idle under the same lock: a steer accepted here
+        // is always drained by this burst.
+        let mut inbox = live.inbox.lock().unwrap();
+        if inbox.phase() != Phase::Running {
+            return Ok(false);
+        }
+        let (_, disposition) = inbox.submit(UserIntent::Steer, content);
+        debug_assert_eq!(disposition, Disposition::Queued);
+        Ok(true)
+    }
+
     pub async fn notify_job_once(
         &self,
         session: &SessionId,

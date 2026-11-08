@@ -1534,3 +1534,143 @@ async fn invalid_or_failing_mcp_servers_create_no_session() {
     let listed = client.call("session/list", json!({})).await;
     assert_eq!(listed["result"]["sessions"], json!([]));
 }
+
+// -- steering ------------------------------------------------------------------
+
+/// Step 1 waits for `go`, then calls the harmless `Noop` tool; step 2 records
+/// the user texts the model sees and ends the turn.
+struct SteerProbe {
+    go: Arc<tokio::sync::Notify>,
+    steps: AtomicUsize,
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for SteerProbe {
+    fn model(&self) -> &str {
+        "fake-1"
+    }
+    async fn step(&self, r: StepRequest<'_>, _c: &CancellationToken) -> StepOutcome {
+        if self.steps.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.go.notified().await;
+            return message(
+                vec![ContentPart::ToolUse {
+                    call: "call-1".into(),
+                    name: "Noop".into(),
+                    args: json!({}),
+                }],
+                StopReason::ToolUse,
+            );
+        }
+        let texts = r.context.turns.iter().filter_map(|turn| match turn {
+            rness_engine::session::projection::ModelTurn::User { content } => {
+                Some(content.iter().filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                }))
+            }
+            _ => None,
+        });
+        *self.seen.lock().unwrap() = texts.flatten().collect();
+        message(
+            vec![ContentPart::Text {
+                text: "visto".into(),
+            }],
+            StopReason::EndTurn,
+        )
+    }
+}
+
+struct Noop;
+
+#[async_trait]
+impl rness_engine::tools::Tool for Noop {
+    fn name(&self) -> &str {
+        "Noop"
+    }
+    async fn execute(&self, _args: Value) -> Result<String, String> {
+        Ok("ok".into())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn steer_reaches_the_running_turn_of_the_inflight_prompt() {
+    let go = Arc::new(tokio::sync::Notify::new());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools = Arc::new(ToolRegistry::default());
+    tools.register(Arc::new(Noop));
+    let provider = Arc::new(SteerProbe {
+        go: go.clone(),
+        steps: AtomicUsize::new(0),
+        seen: seen.clone(),
+    });
+    let mut client = start(provider, tools, false);
+    let init = client
+        .call("initialize", json!({"protocolVersion": 1}))
+        .await;
+    assert_eq!(
+        init["result"]["agentCapabilities"]["_meta"]["rness"]["steer"],
+        true
+    );
+    let session = client.new_session().await;
+
+    // Idle: nothing to steer, the client must prompt instead.
+    let idle = client
+        .call(
+            rness_acp::STEER_METHOD,
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "temprano"}]}),
+        )
+        .await;
+    assert_eq!(idle["result"], json!({"steered": false}), "{idle}");
+
+    let prompt = client
+        .request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "primero"}]}),
+        )
+        .await;
+    // Sent right behind the prompt: the steer waits for its turn to start.
+    let steer = client
+        .call(
+            rness_acp::STEER_METHOD,
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "y además esto"}]}),
+        )
+        .await;
+    assert_eq!(steer["result"], json!({"steered": true}), "{steer}");
+    go.notify_one();
+
+    let (_, response) = client.until_response(prompt).await;
+    assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    // One prompt, one turn: the model saw the steer at its next step.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["primero".to_string(), "y además esto".to_string()]
+    );
+    let steers: Vec<_> = client
+        .sessions
+        .store()
+        .history(&session)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event {
+            SessionEvent::UserMessage(m) => Some(m.intent),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(steers, vec![UserIntent::Followup, UserIntent::Steer]);
+
+    let bad = client
+        .call(
+            rness_acp::STEER_METHOD,
+            json!({"sessionId": session, "prompt": [{"type": "text", "text": "  "}]}),
+        )
+        .await;
+    assert_eq!(bad["error"]["code"], -32602, "{bad}");
+    let unknown = client
+        .call(
+            rness_acp::STEER_METHOD,
+            json!({"sessionId": "nope", "prompt": [{"type": "text", "text": "x"}]}),
+        )
+        .await;
+    assert!(unknown["error"].is_object(), "{unknown}");
+}
