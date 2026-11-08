@@ -235,8 +235,10 @@ async fn default_truncation_notice_steers_on_max_tokens_then_gives_up() {
     );
     // Truncation: steer the model (twice by default), tagged for the theme.
     for step in [2, 3] {
-        let TurnStoppingAction::Continue { messages } =
-            host.turn_stopping(&event(step), &cut, &cancel).await.unwrap()
+        let TurnStoppingAction::Continue { messages } = host
+            .turn_stopping(&event(step), &cut, &cancel)
+            .await
+            .unwrap()
         else {
             panic!("truncation must continue the turn")
         };

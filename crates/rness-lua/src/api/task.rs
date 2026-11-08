@@ -65,7 +65,10 @@ pub fn install(lua: &Lua, rness: &Table) -> mlua::Result<()> {
             spawn(lua, callback, args)
         })?,
     )?;
-    task.set("cancel", lua.create_function(|lua, id: u64| cancel(lua, id))?)?;
+    task.set(
+        "cancel",
+        lua.create_function(|lua, id: u64| cancel(lua, id))?,
+    )?;
     task.set(
         "running",
         lua.create_function(|lua, ()| {
@@ -99,7 +102,9 @@ fn spawn(lua: &Lua, callback: Function, args: mlua::MultiValue) -> mlua::Result<
             .app_data_mut::<TaskState>()
             .ok_or_else(|| mlua::Error::runtime("rness.task unavailable"))?;
         if state.sink.lock().unwrap().is_none() {
-            return Err(mlua::Error::runtime("rness.task: no task runner in this host"));
+            return Err(mlua::Error::runtime(
+                "rness.task: no task runner in this host",
+            ));
         }
         if state.tokens.len() >= MAX_TASKS {
             return Err(mlua::Error::runtime(format!(
@@ -263,7 +268,12 @@ pub fn wake(lua: &Lua, wake: TaskWake) -> Result<(), String> {
         }
         // Cancelled during this resume (itself, or its plugin unloaded):
         // drop whatever it yielded without running it.
-        if lua.globals().get::<Table>(TASKS)?.get::<Option<Table>>(id)?.is_none() {
+        if lua
+            .globals()
+            .get::<Table>(TASKS)?
+            .get::<Option<Table>>(id)?
+            .is_none()
+        {
             return Ok(None);
         }
         let request = match values.pop_front() {
@@ -323,7 +333,11 @@ pub fn wake(lua: &Lua, wake: TaskWake) -> Result<(), String> {
             }
         }
     }
-    let mut completion = Completion { sink, id, result: None };
+    let mut completion = Completion {
+        sink,
+        id,
+        result: None,
+    };
     runtime.spawn(async move {
         completion.result = Some(tokio::select! {
             result = future => result,

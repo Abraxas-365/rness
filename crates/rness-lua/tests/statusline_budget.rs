@@ -68,7 +68,10 @@ async fn slow_lookups_never_disable_the_statusline() {
     // slow render, and three in a row disabled the provider.
     for session in ["one", "two", "three"] {
         let text = render(&host, session).await;
-        assert!(text.is_some(), "statusline disabled while showing {session}");
+        assert!(
+            text.is_some(),
+            "statusline disabled while showing {session}"
+        );
     }
     // The lookups really ran (in tasks) and their results are shown.
     let text = render(&host, "three").await.expect("statusline disabled");

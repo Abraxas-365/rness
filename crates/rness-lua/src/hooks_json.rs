@@ -113,8 +113,13 @@ pub fn generate_lua(config: &HooksConfig) -> String {
                 // it as notification even though it goes through intercept().
                 let is_interception = matches!(
                     point.as_str(),
-                    "pre_tool" | "guard" | "post_tool" | "tool_execute"
-                        | "pre_step" | "request_error" | "turn_stopping"
+                    "pre_tool"
+                        | "guard"
+                        | "post_tool"
+                        | "tool_execute"
+                        | "pre_step"
+                        | "request_error"
+                        | "turn_stopping"
                 );
                 if let Some(matcher) = &group.matcher {
                     let matcher_escaped = matcher.replace('\\', "\\\\").replace('"', "\\\"");
@@ -203,16 +208,24 @@ pub fn run_command(command: &str, timeout_secs: u64, payload_json: &str) -> Comm
     let output = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = child.stdout.take().map(|mut r| {
-                    let mut s = String::new();
-                    std::io::Read::read_to_string(&mut r, &mut s).ok();
-                    s
-                }).unwrap_or_default();
-                let stderr = child.stderr.take().map(|mut r| {
-                    let mut s = String::new();
-                    std::io::Read::read_to_string(&mut r, &mut s).ok();
-                    s
-                }).unwrap_or_default();
+                let stdout = child
+                    .stdout
+                    .take()
+                    .map(|mut r| {
+                        let mut s = String::new();
+                        std::io::Read::read_to_string(&mut r, &mut s).ok();
+                        s
+                    })
+                    .unwrap_or_default();
+                let stderr = child
+                    .stderr
+                    .take()
+                    .map(|mut r| {
+                        let mut s = String::new();
+                        std::io::Read::read_to_string(&mut r, &mut s).ok();
+                        s
+                    })
+                    .unwrap_or_default();
                 break Ok((status, stdout, stderr));
             }
             Ok(None) => {
@@ -354,11 +367,7 @@ mod tests {
     #[test]
     fn run_command_reads_stdin() {
         // The command reads stdin and echoes part of it.
-        let result = run_command(
-            r#"read input; echo "{\"got\": \"$input\"}" "#,
-            5,
-            "hello",
-        );
+        let result = run_command(r#"read input; echo "{\"got\": \"$input\"}" "#, 5, "hello");
         assert_eq!(result.exit_code, 0);
         // Shell read strips trailing newline from stdin, so it should get "hello".
         assert!(result.decision.is_some(), "should parse stdout as JSON");

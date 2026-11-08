@@ -69,7 +69,8 @@ fn host(opts: &str) -> LuaRuntime {
 
 #[test]
 fn title_command_shows_pins_unpins_and_regenerates() {
-    let mut host = host("{ auto = 'off', fallback = false, profile = 'fast', system = 'Custom prompt' }");
+    let mut host =
+        host("{ auto = 'off', fallback = false, profile = 'fast', system = 'Custom prompt' }");
     host.load(
         "assertions",
         r#"
@@ -184,7 +185,9 @@ fn auto_all_prompts_mode_frames_every_prompt_and_supersedes() {
 fn rejects_bad_auto_and_off_mode_only_falls_back() {
     let mut bad = LuaRuntime::new().unwrap();
     bad.load("fixture", FIXTURE).unwrap();
-    assert!(bad.load("bad", &setup(PLUGIN, "{ auto = 'sometimes' }")).is_err());
+    assert!(bad
+        .load("bad", &setup(PLUGIN, "{ auto = 'sometimes' }"))
+        .is_err());
     let mut host = host("{ auto = 'off' }");
     host.load(
         "assertions",
