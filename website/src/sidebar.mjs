@@ -40,6 +40,7 @@ export const sidebar = [
     group('Integration and safety', [
       page('guides/execution-hardening'),
       page('guides/control-socket'),
+      page('guides/acp'),
     ]),
   ], false),
   group('Reference', [
