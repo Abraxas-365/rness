@@ -131,12 +131,15 @@ impl SearchConfig {
             return Err("query must be nonblank and maxResults must be 1..100".into());
         }
         let Some((literal, env, base)) = self.credentials() else {
+            // DuckDuckGo's HTML endpoint answers a GET with a 202 challenge
+            // page; the form POST (what its own page sends) gets results.
             let response = client(proxy)?
                 .timeout(Duration::from_secs(15))
                 .build()
                 .map_err(|e| e.to_string())?
-                .get("https://html.duckduckgo.com/html/")
-                .query(&[("q", &args.query)])
+                .post("https://html.duckduckgo.com/html/")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(duckduckgo_form(&args.query))
                 .send()
                 .await
                 .map_err(|_| "DuckDuckGo search request failed")?;
@@ -312,6 +315,11 @@ fn source(value: &Value, snippet: Option<String>, published: &str) -> Result<Sou
     })
 }
 
+fn duckduckgo_form(query: &str) -> String {
+    let mut form = Url::parse("x:").unwrap();
+    form.query_pairs_mut().append_pair("q", query);
+    form.query().unwrap_or_default().to_string()
+}
 fn parse_duckduckgo(html: &str, limit: usize) -> Result<SearchResult, String> {
     use markup5ever_rcdom::NodeData;
     let tree = htmd::HtmlToMarkdown::new()
@@ -414,6 +422,7 @@ mod tests {
         register(&registry, config).unwrap();
         assert!(registry.get("web_search").is_some());
         assert!(registry.get("web_fetch").is_none());
+        assert_eq!(duckduckgo_form("rust & go=1 ñ"), "q=rust+%26+go%3D1+%C3%B1");
         let html = r#"<div><a class='result__a' href='//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%3Fx%3D1%26y%3D2'>Rust &amp; <b>tools</b></a><a class='result__snippet'>A <b>useful</b> snippet.</a></div><a class='result__a' href='https://second.example'>Second</a>"#;
         let result = parse_duckduckgo(html, 1).unwrap();
         assert!(result.truncated);
