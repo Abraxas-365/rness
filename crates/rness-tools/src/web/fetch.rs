@@ -7,7 +7,7 @@ struct Args {
     url: String,
 }
 impl FetchConfig {
-    pub(super) async fn fetch(&self, args: Value) -> Result<Value, String> {
+    pub(super) async fn fetch(&self, args: Value, proxy: Option<&Url>) -> Result<Value, String> {
         let args: Args = serde_json::from_value(args).map_err(|e| e.to_string())?;
         let mut current = url(&args.url)?;
         for hop in 0..=self.max_redirects {
@@ -16,11 +16,23 @@ impl FetchConfig {
                 .ok_or("URL missing host")?
                 .trim_matches(['[', ']']);
             let port = current.port_or_known_default().ok_or("URL missing port")?;
-            let addresses = public_addresses(host, port).await?;
-            let client = client()
-                .resolve_to_addrs(host, &addresses)
-                .build()
-                .map_err(|e| e.to_string())?;
+            let builder = match proxy {
+                // The proxy resolves the name, so it can't be pinned here; it
+                // must refuse private addresses itself. A literal IP is still
+                // checked, so the URL can't name an internal address directly.
+                Some(_) => {
+                    if let Ok(ip) = host.parse::<IpAddr>() {
+                        if !public_ip(ip) {
+                            return Err("URL resolves to a non-public or empty address set".into());
+                        }
+                    } else if internal_name(host) {
+                        return Err("URL names a local or internal host".into());
+                    }
+                    client(proxy)?
+                }
+                None => client(None)?.resolve_to_addrs(host, &public_addresses(host, port).await?),
+            };
+            let client = builder.build().map_err(|e| e.to_string())?;
             let response = client
                 .get(current.clone())
                 .header(
@@ -156,6 +168,15 @@ fn classify(content_type: &str) -> Result<(bool, &'static encoding_rs::Encoding)
         None => encoding_rs::UTF_8,
     };
     Ok((html, encoding))
+}
+/// Names that are local or internal by convention, refused before a proxy
+/// sees them (it resolves the name, so fetch can't check the addresses).
+fn internal_name(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    !host.contains('.')
+        || ["localhost", "local", "internal", "localdomain", "home.arpa"]
+            .iter()
+            .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 fn public_ip(ip: IpAddr) -> bool {
     match ip {
@@ -310,15 +331,107 @@ mod tests {
     }
     #[tokio::test]
     async fn rejects_private_before_connecting() {
-        assert!(FetchConfig::default()
-            .fetch(json!({"url":"http://127.0.0.1:1"}))
+        let proxy = Url::parse("http://127.0.0.1:1").unwrap();
+        for p in [None, Some(&proxy)] {
+            assert!(FetchConfig::default()
+                .fetch(json!({"url":"http://127.0.0.1:1"}), p)
+                .await
+                .unwrap_err()
+                .contains("non-public"));
+            assert!(FetchConfig::default()
+                .fetch(json!({"url":"http://[::1]:1"}), p)
+                .await
+                .unwrap_err()
+                .contains("non-public"));
+        }
+        for url in [
+            "http://localhost/",
+            "http://LOCALHOST./",
+            "http://app.localhost/",
+            "http://db/",
+            "http://metadata.google.internal/",
+            "http://printer.local/",
+        ] {
+            assert!(
+                FetchConfig::default()
+                    .fetch(json!({ "url": url }), Some(&proxy))
+                    .await
+                    .unwrap_err()
+                    .contains("internal"),
+                "{url}"
+            );
+        }
+        assert!(!internal_name("example.com") && !internal_name("internal.example.com"));
+    }
+    #[tokio::test]
+    async fn tunnels_https_through_the_proxy_with_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let length = socket.read(&mut request).await.unwrap();
+            // Refuse the tunnel: the CONNECT line and its credentials are what count.
+            socket
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..length]).into_owned()
+        });
+        let proxy = Url::parse(&format!("http://slot:secret@{address}")).unwrap();
+        let error = FetchConfig::default()
+            .fetch(json!({"url":"https://example.com/page"}), Some(&proxy))
             .await
-            .unwrap_err()
-            .contains("non-public"));
-        assert!(FetchConfig::default()
-            .fetch(json!({"url":"http://[::1]:1"}))
+            .unwrap_err();
+        assert!(!error.contains("secret"), "{error}");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("CONNECT example.com:443 HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request.lines().any(|line| line
+                .to_ascii_lowercase()
+                .starts_with("proxy-authorization:")
+                && line.ends_with("Basic c2xvdDpzZWNyZXQ=")),
+            "{request}"
+        );
+    }
+    #[tokio::test]
+    async fn goes_through_the_configured_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let length = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..length]).into_owned();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+                .await
+                .unwrap();
+            request
+        });
+        // The name is never resolved locally: the proxy gets the absolute URL.
+        let proxy = Url::parse(&format!("http://slot:secret@{address}")).unwrap();
+        let result = FetchConfig::default()
+            .fetch(
+                json!({"url":"http://unresolvable.invalid/page"}),
+                Some(&proxy),
+            )
             .await
-            .unwrap_err()
-            .contains("non-public"));
+            .unwrap();
+        assert_eq!(result["content"], "hi");
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with("GET http://unresolvable.invalid/page HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request.contains("proxy-authorization: Basic c2xvdDpzZWNyZXQ="),
+            "{request}"
+        );
     }
 }
