@@ -241,13 +241,13 @@ These three providers require credentials; DuckDuckGo and HTTP fetch do not. Duc
 
 ```lua
 rness.web = {
-  proxy = "http://user:password@proxy.internal:3128", -- http(s)://[user:pass@]host:port
+  proxy = os.getenv("HTTPS_PROXY"), -- http(s)://[user:pass@]host[:port]; nil = direct
   search = { provider = "duckduckgo" },
   fetch = {},
 }
 ```
 
-The credentials go as `Proxy-Authorization` (HTTPS through `CONNECT`). With a proxy, fetch can't pin the addresses it resolved (the proxy resolves the name), so the proxy must refuse private and loopback addresses itself; a URL naming a private IP literal is still refused before connecting. Read the value from the environment if it carries credentials: `proxy = os.getenv("HTTPS_PROXY")`.
+The credentials go as `Proxy-Authorization` (HTTPS through `CONNECT`). Reading the URL from the environment, as above, keeps credentials out of the file. With a proxy, fetch can't pin the addresses it resolved (the proxy resolves the name), so the proxy must refuse private and loopback addresses itself. Fetch still refuses, before connecting, a URL naming a private IP literal or a local name: `localhost`, a single label such as `db`, or a name under `.localhost`, `.local`, `.internal`, `.localdomain` or `.home.arpa`.
 
 ### Hook contract
 

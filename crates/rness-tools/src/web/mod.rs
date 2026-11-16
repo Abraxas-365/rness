@@ -15,11 +15,12 @@ mod search;
 pub struct Config {
     pub search: Option<SearchConfig>,
     pub fetch: Option<FetchConfig>,
-    /// An HTTP proxy (`http://[user:pass@]host:port`) every web request goes
+    /// An HTTP proxy (`http(s)://[user:pass@]host[:port]`) every web request goes
     /// through, for sandboxes whose only way out is an egress proxy. Off by
     /// default: environment proxy variables are ignored. With a proxy, fetch
     /// can't pin the addresses it resolved, so the proxy must refuse private
-    /// addresses itself; literal private IPs are still refused here.
+    /// addresses itself; literal private IPs and local names (`localhost`,
+    /// `*.internal`, single labels) are still refused here.
     pub proxy: Option<String>,
 }
 
@@ -183,7 +184,7 @@ fn proxy_url(input: &str) -> Result<Url, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err("web.proxy must be http(s)://[user:pass@]host:port".into());
+        return Err("web.proxy must be http(s)://[user:pass@]host[:port]".into());
     }
     Ok(url)
 }
