@@ -121,13 +121,17 @@ impl SearchConfig {
             ),
         }
     }
-    pub(super) async fn search(&self, args: Value) -> Result<SearchResult, String> {
+    pub(super) async fn search(
+        &self,
+        args: Value,
+        proxy: Option<&Url>,
+    ) -> Result<SearchResult, String> {
         let args: Args = serde_json::from_value(args).map_err(|e| e.to_string())?;
         if args.query.trim().is_empty() || args.max_results.is_some_and(|n| n == 0 || n > 100) {
             return Err("query must be nonblank and maxResults must be 1..100".into());
         }
         let Some((literal, env, base)) = self.credentials() else {
-            let response = client()
+            let response = client(proxy)?
                 .timeout(Duration::from_secs(15))
                 .build()
                 .map_err(|e| e.to_string())?
@@ -156,7 +160,7 @@ impl SearchConfig {
                 format!("web search requires {env}; no fallback backend is configured")
             })?;
         let (path, payload) = self.request(&args.query, args.max_results);
-        let mut request = client()
+        let mut request = client(proxy)?
             .build()
             .map_err(|e| e.to_string())?
             .post(format!("{}/{path}", base.trim_end_matches('/')))
@@ -475,13 +479,13 @@ mod tests {
         )
         .unwrap();
         assert!(c
-            .search(json!({"query":"rust"}))
+            .search(json!({"query":"rust"}), None)
             .await
             .unwrap_err()
             .contains("RNESS_TEST_WEB_ABSENT_CREDENTIAL"));
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(WebTool::Search(c)
+        assert!(WebTool::Search(c, None)
             .run(json!({"query":"rust"}), &cancel)
             .await
             .unwrap_err()

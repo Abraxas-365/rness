@@ -211,6 +211,26 @@ mod permission_tests {
         std::fs::write(&path, "rness.web = {search={provider='brave'}}").unwrap();
         let startup = super::load(&path).unwrap();
         assert!(serde_json::from_value::<rness_tools::web::Config>(startup.web.unwrap()).is_err());
+        for (proxy, ok) in [
+            ("http://slot:token@proxy.internal:8741", true),
+            ("socks5://proxy:1080", false),
+            ("http://proxy:8741/path", false),
+            ("not a url", false),
+        ] {
+            std::fs::write(
+                &path,
+                format!("rness.web = {{ search = {{provider='duckduckgo'}}, proxy = '{proxy}' }}"),
+            )
+            .unwrap();
+            let startup = super::load(&path).unwrap();
+            let config = serde_json::from_value(startup.web.unwrap()).unwrap();
+            let registry = rness_engine::tools::ToolRegistry::default();
+            assert_eq!(
+                rness_tools::web::register(&registry, config).is_ok(),
+                ok,
+                "{proxy}"
+            );
+        }
     }
     #[test]
     fn deep_or_cyclic_config_tables_error_without_abort() {

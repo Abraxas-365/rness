@@ -233,7 +233,21 @@ Alternatively replace the search section with **one** of:
 { provider = "deepseek", api_key_env = "DEEPSEEK_API_KEY", model = "deepseek-v4-flash" }
 ```
 
-These three providers require credentials; DuckDuckGo and HTTP fetch do not. DuckDuckGo depends on HTML markup and may return bot challenges/rate limits. Unexpected HTML is an error, not a fabricated empty result. DeepSeek uses its Anthropic-compatible native search endpoint, not chat-completions. Optional `base_url` overrides for paid providers must use HTTPS. Fetch disables ambient proxies/cookies/credentials, validates and pins public DNS addresses, blocks cross-origin redirects and binary responses, and converts HTML to Markdown. This is not complete DSH parity: proxy routing and auxiliary DeepSeek request audit events are not implemented.
+These three providers require credentials; DuckDuckGo and HTTP fetch do not. DuckDuckGo depends on HTML markup and may return bot challenges/rate limits. Unexpected HTML is an error, not a fabricated empty result. DeepSeek uses its Anthropic-compatible native search endpoint, not chat-completions. Optional `base_url` overrides for paid providers must use HTTPS. Fetch disables ambient proxies/cookies/credentials, validates and pins public DNS addresses, blocks cross-origin redirects and binary responses, and converts HTML to Markdown. Auxiliary DeepSeek request audit events are not implemented.
+
+### Proxy
+
+`HTTP(S)_PROXY` variables are ignored. In a sandbox whose only way out is an egress proxy, name it as `rness.web.proxy`; every search and fetch request then goes through it:
+
+```lua
+rness.web = {
+  proxy = "http://user:password@proxy.internal:3128", -- http(s)://[user:pass@]host:port
+  search = { provider = "duckduckgo" },
+  fetch = {},
+}
+```
+
+The credentials go as `Proxy-Authorization` (HTTPS through `CONNECT`). With a proxy, fetch can't pin the addresses it resolved (the proxy resolves the name), so the proxy must refuse private and loopback addresses itself; a URL naming a private IP literal is still refused before connecting. Read the value from the environment if it carries credentials: `proxy = os.getenv("HTTPS_PROXY")`.
 
 ### Hook contract
 
