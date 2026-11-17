@@ -129,6 +129,9 @@ pub const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 pub const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+/// Where the manual (no local callback) login sends the browser: the page
+/// shows the code to paste back, as `<code>#<state>`.
+pub const MANUAL_REDIRECT_URL: &str = "https://platform.claude.com/oauth/code/callback";
 pub const SCOPES: &[&str] = &[
     "user:profile",
     "user:inference",
@@ -145,6 +148,7 @@ pub struct OAuthConfig {
     pub client_id: String,
     pub authorize_url: String,
     pub token_url: String,
+    pub manual_redirect_url: String,
     pub profile_url: String,
     pub scopes: Vec<String>,
 }
@@ -155,6 +159,7 @@ impl Default for OAuthConfig {
             client_id: CLIENT_ID.into(),
             authorize_url: AUTHORIZE_URL.into(),
             token_url: TOKEN_URL.into(),
+            manual_redirect_url: MANUAL_REDIRECT_URL.into(),
             profile_url: PROFILE_URL.into(),
             scopes: SCOPES.iter().map(|s| s.to_string()).collect(),
         }
@@ -229,7 +234,27 @@ impl OAuthClient {
     }
 
     pub fn authorize_url(&self, challenge: &str, state: &str, redirect_uri: &str) -> String {
+        self.authorize_url_with(challenge, state, redirect_uri, false)
+    }
+
+    /// The authorize URL of the manual login: redirects to
+    /// [`OAuthConfig::manual_redirect_url`] and asks the page to show the
+    /// code (`code=true`) instead of handing it to a local callback.
+    pub fn manual_authorize_url(&self, challenge: &str, state: &str) -> String {
+        self.authorize_url_with(challenge, state, &self.config.manual_redirect_url, true)
+    }
+
+    fn authorize_url_with(
+        &self,
+        challenge: &str,
+        state: &str,
+        redirect_uri: &str,
+        show_code: bool,
+    ) -> String {
         let mut url = reqwest::Url::parse(&self.config.authorize_url).expect("static url");
+        if show_code {
+            url.query_pairs_mut().append_pair("code", "true");
+        }
         url.query_pairs_mut()
             .append_pair("client_id", &self.config.client_id)
             .append_pair("response_type", "code")
@@ -396,8 +421,114 @@ pub async fn login_as(
         return Err(AuthError::OAuth("state mismatch (possible CSRF)".into()));
     }
 
+    finish_login(
+        &client,
+        store,
+        credential_key,
+        &code,
+        &verifier,
+        &redirect_uri,
+        &state,
+    )
+    .await
+}
+
+/// Where the manual login reports progress (CLI prints these).
+pub struct ManualLoginPrompt {
+    /// Called once with the authorize URL to open in any browser.
+    pub on_url: Box<dyn Fn(&str) + Send + Sync>,
+    /// Called when a pasted line isn't this login's code, with why. `true`
+    /// reads the next line (a person at a terminal retries); `false` ends
+    /// the login with that reason (a relay or script gets a clear failure
+    /// instead of a login waiting for another line).
+    pub on_invalid: Box<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+/// The PKCE login without a browser or a local callback, for machines
+/// where neither works (containers, SSH): the person opens the URL
+/// anywhere, signs in, and the page shows `<code>#<state>`, which is read
+/// from `input` (one line; for a line that isn't this login's code,
+/// `on_invalid` decides between reading another and failing). End of
+/// input before a code is an error.
+pub async fn login_manual_as<R>(
+    config: OAuthConfig,
+    store: &CredentialStore,
+    prompt: &ManualLoginPrompt,
+    input: R,
+    credential_key: &str,
+) -> Result<Tokens, AuthError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    let verifier = pkce::code_verifier();
+    let challenge = pkce::code_challenge(&verifier);
+    let state = pkce::state();
+    let client = OAuthClient::new(config);
+    let url = client.manual_authorize_url(&challenge, &state);
+    (prompt.on_url)(&url);
+
+    let mut lines = input.lines();
+    let code = loop {
+        let Some(line) = lines.next_line().await.map_err(TokensError::Io)? else {
+            return Err(AuthError::OAuth("no authorization code entered".into()));
+        };
+        match pasted_code(&line, &state) {
+            Ok(Some(code)) => break code,
+            Ok(None) => {}
+            Err(why) => {
+                if !(prompt.on_invalid)(why) {
+                    return Err(AuthError::OAuth(why.into()));
+                }
+            }
+        }
+    };
+    let redirect_uri = client.config.manual_redirect_url.clone();
+    finish_login(
+        &client,
+        store,
+        credential_key,
+        &code,
+        &verifier,
+        &redirect_uri,
+        &state,
+    )
+    .await
+}
+
+/// The code in a pasted line `<code>#<state>` of the login whose state is
+/// `state`: `Ok(None)` for a blank line, `Err` (why, for the person) for
+/// anything else that isn't it.
+fn pasted_code(line: &str, state: &str) -> Result<Option<String>, &'static str> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let Some((code, got)) = line.split_once('#') else {
+        return Err("that isn't the whole code: copy it with the part after #");
+    };
+    if code.is_empty() || got.is_empty() || code.contains(char::is_whitespace) {
+        return Err("that isn't the whole code: copy it with the part after #");
+    }
+    if got != state {
+        return Err("that code is from another sign-in: paste the one this sign-in's page shows");
+    }
+    Ok(Some(code.to_string()))
+}
+
+/// Exchange the code, fetch the profile (best effort) and save the tokens.
+async fn finish_login(
+    client: &OAuthClient,
+    store: &CredentialStore,
+    credential_key: &str,
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+    state: &str,
+) -> Result<Tokens, AuthError> {
     let mut tokens = client
-        .exchange_code(&code, &verifier, &redirect_uri, &state)
+        .exchange_code(code, verifier, redirect_uri, state)
         .await?;
 
     // Profile fetch is best-effort.
@@ -688,6 +819,200 @@ mod tests {
             store.tokens("anthropic").unwrap().unwrap().access_token,
             "at0"
         );
+    }
+
+    #[test]
+    fn manual_authorize_url_shows_the_code_on_anthropics_page() {
+        let client = OAuthClient::new(OAuthConfig::default());
+        let url = client.manual_authorize_url("chal", "st");
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert!(url.starts_with("https://claude.com/cai/oauth/authorize?code=true&"));
+        assert_eq!(q["redirect_uri"], MANUAL_REDIRECT_URL);
+        assert_eq!(q["code_challenge"], "chal");
+        assert_eq!(q["state"], "st");
+        assert_eq!(q["response_type"], "code");
+        // The callback login never asks for the code to be shown.
+        assert!(!client
+            .authorize_url("chal", "st", "http://localhost:1/callback")
+            .contains("code=true"));
+    }
+
+    #[test]
+    fn pasted_code_needs_this_logins_state() {
+        assert_eq!(pasted_code("  abc#st \n", "st"), Ok(Some("abc".into())));
+        assert_eq!(pasted_code("   ", "st"), Ok(None));
+        assert!(pasted_code("abc", "st").is_err());
+        assert!(pasted_code("#st", "st").is_err());
+        assert!(pasted_code("abc#", "st").is_err());
+        assert!(pasted_code("a bc#st", "st").is_err());
+        assert!(pasted_code("abc#other", "st")
+            .unwrap_err()
+            .contains("another sign-in"));
+    }
+
+    /// A token endpoint that answers one exchange with `answer` and hands
+    /// the request body it got to the test.
+    async fn token_endpoint(
+        answer: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<serde_json::Value>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body = loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).into_owned();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if body.len() >= len {
+                        break body[..len].to_string();
+                    }
+                }
+                if n == 0 {
+                    break String::new();
+                }
+            };
+            let _ = tx.send(serde_json::from_str(&body).unwrap_or_default());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+        });
+        (url, rx)
+    }
+
+    #[tokio::test]
+    async fn manual_login_exchanges_the_pasted_code_and_saves_the_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("credentials.json"));
+        let (endpoint, body) = token_endpoint(
+            r#"{"access_token":"at1","refresh_token":"rt1","expires_in":3600,"scope":"user:inference user:profile"}"#,
+        )
+        .await;
+        let config = OAuthConfig {
+            token_url: format!("{endpoint}/token"),
+            // No profile server (a closed port): the fetch fails and is skipped.
+            profile_url: {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                format!("http://{}/profile", l.local_addr().unwrap())
+            },
+            ..Default::default()
+        };
+        let shown = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let invalid = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (s, i) = (shown.clone(), invalid.clone());
+        let prompt = ManualLoginPrompt {
+            on_url: Box::new(move |url| *s.lock().unwrap() = url.to_string()),
+            on_invalid: Box::new(move |why| {
+                i.lock().unwrap().push(why.to_string());
+                true
+            }),
+        };
+        // The person pastes after seeing the URL: feed stdin through a pipe
+        // once it was shown, with a wrong line first.
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        let feeder = {
+            let shown = shown.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                let state = loop {
+                    let url = shown.lock().unwrap().clone();
+                    if !url.is_empty() {
+                        let parsed = reqwest::Url::parse(&url).unwrap();
+                        break parsed
+                            .query_pairs()
+                            .find(|(k, _)| k == "state")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                };
+                writer.write_all(b"abc\n").await.unwrap();
+                writer
+                    .write_all(format!("the-code#{state}\n").as_bytes())
+                    .await
+                    .unwrap();
+                state
+            })
+        };
+        let tokens = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            login_manual_as(
+                config,
+                &store,
+                &prompt,
+                tokio::io::BufReader::new(reader),
+                "anthropic",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let state = feeder.await.unwrap();
+        assert_eq!(tokens.access_token, "at1");
+        let saved = store.tokens("anthropic").unwrap().unwrap();
+        assert_eq!(saved.access_token, "at1");
+        assert_eq!(saved.refresh_token, "rt1");
+        assert_eq!(invalid.lock().unwrap().len(), 1);
+        let body = body.await.unwrap();
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["code"], "the-code");
+        assert_eq!(body["state"], state.as_str());
+        assert_eq!(body["redirect_uri"], MANUAL_REDIRECT_URL);
+        assert!(!body["code_verifier"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manual_login_without_a_code_fails_and_saves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CredentialStore::new(dir.path().join("credentials.json"));
+        let prompt = ManualLoginPrompt {
+            on_url: Box::new(|_| {}),
+            on_invalid: Box::new(|_| true),
+        };
+        let err = login_manual_as(
+            OAuthConfig::default(),
+            &store,
+            &prompt,
+            tokio::io::BufReader::new(&b"\nnope\n"[..]),
+            "anthropic",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no authorization code"), "{err}");
+        assert!(store.tokens("anthropic").unwrap().is_none());
+
+        // A caller that doesn't retry fails on the first wrong line, with why.
+        let prompt = ManualLoginPrompt {
+            on_url: Box::new(|_| {}),
+            on_invalid: Box::new(|_| false),
+        };
+        let err = login_manual_as(
+            OAuthConfig::default(),
+            &store,
+            &prompt,
+            tokio::io::BufReader::new(&b"abc#other\nnever-read#x\n"[..]),
+            "anthropic",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("another sign-in"), "{err}");
+        assert!(store.tokens("anthropic").unwrap().is_none());
     }
 
     #[test]
