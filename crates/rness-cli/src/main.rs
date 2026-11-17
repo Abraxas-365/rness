@@ -249,6 +249,11 @@ enum AuthAction {
         /// GitHub Enterprise host for github-copilot (e.g. company.ghe.com).
         #[arg(long)]
         enterprise: Option<String>,
+        /// anthropic only: no browser or local callback (containers, SSH).
+        /// Prints the URL to open anywhere, then reads the code the page
+        /// shows (`<code>#<state>`) from standard input.
+        #[arg(long)]
+        manual: bool,
     },
     /// Store an API key for a provider.
     SetKey {
@@ -262,7 +267,11 @@ enum AuthAction {
         account: Option<String>,
     },
     /// Show credential status for every provider.
-    Status,
+    Status {
+        /// Print JSON (one object per credential) instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a provider's stored credentials.
     Logout {
         /// Which provider to log out of.
@@ -3741,9 +3750,13 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             provider,
             account,
             enterprise,
+            manual,
         } => {
             if enterprise.is_some() && !matches!(provider.as_str(), "github-copilot" | "copilot") {
                 bail!("--enterprise applies only to --provider github-copilot");
+            }
+            if manual && provider != "anthropic" {
+                bail!("--manual applies only to --provider anthropic");
             }
             let cred_key = CredentialStore::credential_key(&provider, account.as_deref());
             let label = if let Some(ref a) = account {
@@ -3758,6 +3771,40 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                 }),
             };
             match provider.as_str() {
+                "anthropic" if manual => {
+                    use std::io::{IsTerminal as _, Write as _};
+                    // A person at a terminal gets another try; a relay
+                    // (stdin not a terminal) a failure naming why.
+                    let retry = std::io::stdin().is_terminal();
+                    let prompt = rness_providers::auth::ManualLoginPrompt {
+                        on_url: Box::new(|url| {
+                            println!("Open this address in any browser and sign in with your Claude account:\n\n  {url}\n");
+                            print!("Paste the code the page shows here > ");
+                            let _ = std::io::stdout().flush();
+                        }),
+                        on_invalid: Box::new(move |why| {
+                            if retry {
+                                print!("{why}\nPaste the code the page shows here > ");
+                                let _ = std::io::stdout().flush();
+                            }
+                            retry
+                        }),
+                    };
+                    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+                    let tokens = rness_providers::auth::login_manual_as(
+                        OAuthConfig::default(),
+                        &store,
+                        &prompt,
+                        stdin,
+                        &cred_key,
+                    )
+                    .await?;
+                    print!("\nLogin successful");
+                    if !tokens.subscription_type.is_empty() {
+                        print!(" ({} subscription)", tokens.subscription_type);
+                    }
+                    println!("!");
+                }
                 "anthropic" => {
                     println!("Opening browser to log in with your Claude account ({label})…");
                     let tokens =
@@ -3841,7 +3888,7 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             store.save_api_key(&cred_key, &key)?;
             println!("{label} API key saved to {}", store.path().display());
         }
-        AuthAction::Status => {
+        AuthAction::Status { json } => {
             let config = rness_lua::api::config::load(
                 &dirs::home_dir()
                     .context("no home directory")?
@@ -3849,6 +3896,8 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("startup configuration: {e}"))?;
             let mut names = store.list()?;
+            // Providers whose key comes from an environment variable.
+            let mut envs = Vec::new();
             for (name, declaration) in &config.providers {
                 match &declaration.auth {
                     rness_lua::api::config::ProviderAuth::Store { credential } => {
@@ -3869,15 +3918,13 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
                         }
                     }
                     rness_lua::api::config::ProviderAuth::Env { env } => {
-                        let state = if std::env::var(env).is_ok_and(|v| !v.is_empty()) {
-                            "set"
-                        } else {
-                            "not set"
-                        };
-                        println!("{name:<16}env {env} ({state})");
-                        if let Some(ref default_acct) = declaration.default_account {
-                            println!("{:<16}default account: {default_acct}", "");
-                        }
+                        let set = std::env::var(env).is_ok_and(|v| !v.is_empty());
+                        envs.push((
+                            name.clone(),
+                            env.clone(),
+                            set,
+                            declaration.default_account.clone(),
+                        ));
                     }
                     _ => {}
                 }
@@ -3885,6 +3932,49 @@ async fn run_auth(action: AuthAction) -> anyhow::Result<()> {
             names.sort();
             names.dedup();
 
+            if json {
+                let mut credentials = Vec::new();
+                for name in &names {
+                    let oauth = store
+                        .tokens(name)?
+                        .filter(|t| !t.access_token.is_empty())
+                        .map(|t| {
+                            serde_json::json!({
+                                "expired": t.is_expired(0),
+                                "refreshable": !t.refresh_token.is_empty(),
+                                "subscription": t.subscription_type,
+                            })
+                        });
+                    credentials.push(serde_json::json!({
+                        "name": name,
+                        "api_key": store.api_key(name)?.is_some(),
+                        "oauth": oauth,
+                    }));
+                }
+                let env: Vec<_> = envs
+                    .iter()
+                    .map(|(provider, env, set, _)| {
+                        serde_json::json!({ "provider": provider, "env": env, "set": set })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "credentials": credentials,
+                        "env": env,
+                        "file": store.path(),
+                    })
+                );
+                return Ok(());
+            }
+
+            for (name, env, set, default_acct) in &envs {
+                let state = if *set { "set" } else { "not set" };
+                println!("{name:<16}env {env} ({state})");
+                if let Some(default_acct) = default_acct {
+                    println!("{:<16}default account: {default_acct}", "");
+                }
+            }
             for name in names {
                 let mut states = Vec::new();
                 if store.api_key(&name)?.is_some() {

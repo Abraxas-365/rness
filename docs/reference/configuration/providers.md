@@ -78,6 +78,10 @@ rness auth status
 
 With no key positional argument, `set-key` reads standard input. Avoid placing keys directly in shell command arguments, where history or process inspection may expose them. Browser login is available through `rness auth login --provider anthropic` and `rness auth login --provider openai-chatgpt`; GitHub Copilot uses the device flow through `rness auth login --provider github-copilot`.
 
+`rness auth login --provider anthropic --manual` signs in without a browser or a local callback (containers, SSH, a supervisor relaying the terminal): it prints the address to open in any browser, then reads one line from standard input, the code Anthropic's page shows after sign-in (`<code>#<state>`). A line that is not this login's code (missing the `#<state>` part, or from another sign-in) is reported and, at a terminal, the next line is read; when standard input is not a terminal (a script or a relay) the login fails with that reason instead. End of input before a code fails and saves nothing.
+
+`rness auth status --json` prints the same status as one JSON object, for scripts: `credentials` (each stored or declared credential: `name`, `api_key` stored, `oauth` null or `{expired, refreshable, subscription}`), `env` (providers declared with `auth = { env = … }`: `provider`, `env`, `set`) and `file`. It never prints a key or token.
+
 Custom OAuth store references select an entry; they do not define an arbitrary OAuth issuer or login implementation.
 
 ## GitHub Copilot

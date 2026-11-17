@@ -143,6 +143,8 @@ Enter the printed code at GitHub's device page. rness routes each model to the A
 rness auth login --provider anthropic
 ```
 
+On a machine with no browser or where the browser can't reach a local callback (a container, an SSH session), add `--manual`: rness prints the address to open in any browser and reads the code the page shows (`<code>#<state>`) from standard input.
+
 Then edit the existing `anthropic` connection in `~/.rness/lua/providers.lua`, replacing its `auth = { env = "ANTHROPIC_API_KEY" }` field with:
 
 ```lua
