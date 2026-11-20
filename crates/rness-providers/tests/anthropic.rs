@@ -299,6 +299,61 @@ async fn step(
         .await
 }
 
+/// A session whose stored image is gone (its image store didn't survive a
+/// restart) still gets a turn: the request carries a note in the image's
+/// place and the model answers.
+#[tokio::test]
+async fn missing_stored_image_is_sent_as_a_note() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(sse_response(&stream_happy("ok")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let policy = rness_engine::images::ImagePolicy::default();
+    let store = std::sync::Arc::new(
+        rness_engine::images::ImageStore::new(dir.path().into(), policy.clone()).unwrap(),
+    );
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    let attachment = store.admit(bytes.get_ref(), "image/png").unwrap();
+    let id = attachment.id.clone();
+    std::fs::remove_dir_all(dir.path().join("objects")).unwrap();
+    let context = ModelContext {
+        turns: vec![ModelTurn::User {
+            content: vec![
+                ContentPart::Text {
+                    text: "what is this?".into(),
+                },
+                ContentPart::Image { attachment },
+            ],
+        }],
+        ..Default::default()
+    };
+    let provider = AnthropicProvider::new("key", "vision")
+        .with_base_url(server.uri())
+        .with_images(store, policy);
+    let outcome = step(&provider, &context, "", &[]).await;
+    assert!(
+        matches!(outcome, StepOutcome::Committed(_)),
+        "the turn failed"
+    );
+    let requests = server.received_requests().await.unwrap();
+    let body: Value = requests[0].body_json().unwrap();
+    let content = &body["messages"][0]["content"];
+    assert_eq!(content[1]["type"], "text");
+    let note = content[1]["text"].as_str().unwrap();
+    assert!(
+        note.contains(&id) && note.contains("no longer available"),
+        "{note}"
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn max_tokens_with_incomplete_tool_args_drops_the_tool_call() {
     let server = MockServer::start().await;
