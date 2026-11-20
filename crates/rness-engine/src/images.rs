@@ -415,6 +415,107 @@ mod tests {
     }
 
     #[test]
+    fn missing_stored_image_becomes_a_note_and_keeps_the_rest() {
+        use crate::session::projection::{ModelContext, ModelTurn};
+        use rness_protocol::events::{ContentPart, ToolResult, ToolResultContentPart};
+        let dir = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(dir.path().into(), ImagePolicy::default()).unwrap();
+        let kept = store.admit(&png(), "image/png").unwrap();
+        let lost = store
+            .admit(
+                &{
+                    let image = image::DynamicImage::new_rgba8(8, 8);
+                    let mut data = Vec::new();
+                    image
+                        .write_to(&mut Cursor::new(&mut data), ImageFormat::Png)
+                        .unwrap();
+                    data
+                },
+                "image/png",
+            )
+            .unwrap();
+        // The store didn't survive (a restarted container): the file is gone.
+        std::fs::remove_file(store.path(&lost.id).unwrap()).unwrap();
+        let context = ModelContext {
+            turns: vec![
+                ModelTurn::User {
+                    content: vec![
+                        ContentPart::Image {
+                            attachment: lost.clone(),
+                        },
+                        ContentPart::Image {
+                            attachment: kept.clone(),
+                        },
+                    ],
+                },
+                ModelTurn::ToolResults {
+                    results: vec![ToolResult {
+                        call: "c1".into(),
+                        name: "screenshot".into(),
+                        output: "shot".into(),
+                        content: vec![
+                            ToolResultContentPart::Text {
+                                text: "shot".into(),
+                            },
+                            ToolResultContentPart::Image {
+                                attachment: lost.clone(),
+                            },
+                        ],
+                        is_error: false,
+                        duration_ms: 0,
+                        tasks: None,
+                        plan_review: None,
+                        presentation: None,
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let projected = store
+            .project_request(&context, &ImagePolicy::default())
+            .unwrap();
+        let ModelTurn::User { content } = &projected.turns[0] else {
+            panic!("missing user turn")
+        };
+        assert!(
+            matches!(&content[0], ContentPart::Text { text } if text.contains(&lost.id) && text.contains("no longer available"))
+        );
+        assert!(matches!(&content[1], ContentPart::Image { attachment } if *attachment == kept));
+        let ModelTurn::ToolResults { results } = &projected.turns[1] else {
+            panic!("missing results")
+        };
+        assert!(results[0].output.contains("shot"));
+        assert!(results[0].output.contains("no longer available"));
+        assert!(!results[0]
+            .content
+            .iter()
+            .any(|p| matches!(p, ToolResultContentPart::Image { .. })));
+        // History is untouched.
+        assert!(
+            matches!(&context.turns[0], ModelTurn::User { content } if matches!(&content[0], ContentPart::Image { .. }))
+        );
+        // A missing image takes no budget: one image allowed keeps the one
+        // that is there.
+        let projected = store
+            .project_request(
+                &context,
+                &ImagePolicy {
+                    max_request_images: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(&projected.turns[0], ModelTurn::User { content } if matches!(&content[1], ContentPart::Image { .. }))
+        );
+        // A stored image that is there but corrupt still fails the request.
+        std::fs::write(store.path(&kept.id).unwrap(), b"corrupt").unwrap();
+        assert!(store
+            .project_request(&context, &ImagePolicy::default())
+            .is_err());
+    }
+
+    #[test]
     fn durable_source_and_cached_policy_variants() {
         let dir = tempfile::tempdir().unwrap();
         let store = ImageStore::new(dir.path().into(), ImagePolicy::default()).unwrap();
@@ -483,6 +584,11 @@ pub struct ImageStore {
 
 fn digest(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
+}
+
+/// What the model sees in place of an image whose stored original is gone.
+fn missing_note(attachment: &ImageRef) -> String {
+    format!("[Image {} is no longer available: its stored file is missing; {} × {}. Describe it from the conversation if you can, or ask the user to send it again if needed.]", attachment.id, attachment.width, attachment.height)
 }
 
 fn media_type(format: ImageFormat) -> Result<&'static str, String> {
@@ -786,6 +892,13 @@ impl ImageStore {
                 .is_file()
     }
 
+    /// Whether the stored original of a valid reference is gone (as
+    /// opposed to unreadable, corrupt or refused by policy).
+    fn is_missing(&self, reference: &ImageRef) -> bool {
+        self.path(&reference.id)
+            .is_ok_and(|path| matches!(path.try_exists(), Ok(false)))
+    }
+
     pub fn read(&self, reference: &ImageRef) -> Result<Vec<u8>, String> {
         use std::io::Read;
         let file = std::fs::File::open(self.path(&reference.id)?).map_err(|e| e.to_string())?;
@@ -830,15 +943,29 @@ impl ImageStore {
         use crate::session::projection::ModelTurn;
         use rness_protocol::events::{ContentPart, ToolResultContentPart};
         policy.validate()?;
-        let mut lengths = Vec::new();
+        // One entry per image occurrence, in request order: its base64
+        // length, or None when its stored original is gone (a store that
+        // didn't survive a restart, a deleted file). A missing image
+        // becomes a note instead of failing every later turn of the
+        // session; any other read error still fails the request.
+        let mut lengths: Vec<Option<usize>> = Vec::new();
         let mut variants = std::collections::HashMap::new();
         let mut record = |attachment: &ImageRef| -> Result<(), String> {
             let key = serde_json::to_string(attachment).map_err(|e| e.to_string())?;
             let bytes = if let Some(bytes) = variants.get(&key) {
                 *bytes
             } else {
-                let (_, data) = self.request_image(attachment, policy)?;
-                let bytes = data.len().div_ceil(3).saturating_mul(4);
+                let bytes = match self.request_image(attachment, policy) {
+                    Ok((_, data)) => Some(data.len().div_ceil(3).saturating_mul(4)),
+                    Err(_) if self.is_missing(attachment) => {
+                        tracing::warn!(
+                            image = %attachment.id,
+                            "stored image is missing; sending a note in its place"
+                        );
+                        None
+                    }
+                    Err(e) => return Err(e),
+                };
                 variants.insert(key, bytes);
                 bytes
             };
@@ -865,18 +992,28 @@ impl ImageStore {
                 }
             }
         }
+        // Budgets count the images that are there; the oldest of them are
+        // dropped first.
         let mut total = lengths
             .iter()
+            .flatten()
             .fold(0usize, |total, bytes| total.saturating_add(*bytes));
-        let mut remove = 0;
-        while lengths.len() - remove > policy.max_request_images || total > policy.max_request_bytes
-        {
-            total = total.saturating_sub(lengths[remove]);
-            remove += 1;
+        let mut count = lengths.iter().flatten().count();
+        let mut dropped = vec![false; lengths.len()];
+        for (index, bytes) in lengths.iter().enumerate() {
+            if count <= policy.max_request_images && total <= policy.max_request_bytes {
+                break;
+            }
+            if let Some(bytes) = bytes {
+                total = total.saturating_sub(*bytes);
+                count -= 1;
+                dropped[index] = true;
+            }
         }
-        // The rewrite below changes a request only when it drops images or
-        // re-derives a tool output that disagrees with its content.
-        let unchanged = remove == 0
+        // The rewrite below changes a request only when it drops or loses
+        // images or re-derives a tool output that disagrees with its content.
+        let unchanged = !dropped.contains(&true)
+            && lengths.iter().all(Option::is_some)
             && context.turns.iter().all(|turn| match turn {
                 ModelTurn::ToolResults { results } => results.iter().all(|result| {
                     result.content.is_empty()
@@ -889,19 +1026,26 @@ impl ImageStore {
             return Ok(std::borrow::Cow::Borrowed(context));
         }
         let mut projected = context.clone();
-        let placeholder = |attachment: &ImageRef| {
-            format!("[Image {} omitted from this request by image budget; {} × {}. Original attachment remains in session history. Ask the user to reattach it if needed.]", attachment.id, attachment.width, attachment.height)
+        // The note for the next image occurrence, if it doesn't go out.
+        let mut index = 0;
+        let mut note = |attachment: &ImageRef| {
+            let i = index;
+            index += 1;
+            if lengths[i].is_none() {
+                Some(missing_note(attachment))
+            } else if dropped[i] {
+                Some(format!("[Image {} omitted from this request by image budget; {} × {}. Original attachment remains in session history. Ask the user to reattach it if needed.]", attachment.id, attachment.width, attachment.height))
+            } else {
+                None
+            }
         };
         for turn in &mut projected.turns {
             match turn {
                 ModelTurn::User { content } | ModelTurn::Assistant { content } => {
                     for part in content {
-                        if remove > 0 {
-                            if let ContentPart::Image { attachment } = part {
-                                *part = ContentPart::Text {
-                                    text: placeholder(attachment),
-                                };
-                                remove -= 1;
+                        if let ContentPart::Image { attachment } = part {
+                            if let Some(text) = note(attachment) {
+                                *part = ContentPart::Text { text };
                             }
                         }
                     }
@@ -909,12 +1053,9 @@ impl ImageStore {
                 ModelTurn::ToolResults { results } => {
                     for result in results {
                         for part in &mut result.content {
-                            if remove > 0 {
-                                if let ToolResultContentPart::Image { attachment } = part {
-                                    *part = ToolResultContentPart::Text {
-                                        text: placeholder(attachment),
-                                    };
-                                    remove -= 1;
+                            if let ToolResultContentPart::Image { attachment } = part {
+                                if let Some(text) = note(attachment) {
+                                    *part = ToolResultContentPart::Text { text };
                                 }
                             }
                         }
